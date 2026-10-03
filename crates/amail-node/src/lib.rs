@@ -10,6 +10,9 @@ pub mod node;
 pub mod paths;
 pub mod persist;
 pub mod server;
+pub mod team;
+pub mod template;
 pub mod wire;
+pub mod worktree;
 
 pub use node::{Config, Node, NodeHandle, request, start};
