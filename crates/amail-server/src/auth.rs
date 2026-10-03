@@ -74,12 +74,16 @@ pub fn check_csrf(method: &axum::http::Method, headers: &axum::http::HeaderMap) 
         ));
     }
     if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-        let host = headers
-            .get(header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default();
         let origin_host = origin.split_once("://").map(|(_, h)| h).unwrap_or(origin);
-        if origin != "null" && !origin_host.eq_ignore_ascii_case(host) {
+        // Behind a reverse proxy the original host may arrive as
+        // X-Forwarded-Host.
+        let matches = [header::HOST.as_str(), "x-forwarded-host"].iter().any(|h| {
+            headers
+                .get(*h)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.eq_ignore_ascii_case(origin_host))
+        });
+        if !matches {
             return Err(ApiError::new(
                 axum::http::StatusCode::FORBIDDEN,
                 "csrf",

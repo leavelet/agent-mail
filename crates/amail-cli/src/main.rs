@@ -404,6 +404,13 @@ enum OrgCmd {
         max_recipients: Option<i64>,
         #[arg(long)]
         max_thread_depth: Option<i64>,
+        /// POST a notice (message headers only) here for every new message
+        /// to the user.
+        #[arg(long, value_name = "URL", conflicts_with = "no_webhook")]
+        webhook_url: Option<String>,
+        /// Remove the webhook.
+        #[arg(long)]
+        no_webhook: bool,
     },
 }
 
@@ -810,11 +817,19 @@ async fn run(cli: Cli) -> Result<()> {
             send_burst,
             max_recipients,
             max_thread_depth,
+            webhook_url,
+            no_webhook,
         }) => {
-            let body = json!({
+            let mut body = json!({
                 "send_rate_per_min": send_rate_per_min, "send_burst": send_burst,
                 "max_recipients": max_recipients, "max_thread_depth": max_thread_depth,
             });
+            // `webhook_url: null` clears it, so the key is only sent when asked.
+            if no_webhook {
+                body["webhook_url"] = Value::Null;
+            } else if let Some(u) = webhook_url {
+                body["webhook_url"] = json!(u);
+            }
             let v = c.raw(Method::PATCH, "/org", Some(&body)).await?;
             out.show(&v, || org_text(&v))
         }
@@ -823,10 +838,14 @@ async fn run(cli: Cli) -> Result<()> {
 
 fn org_text(v: &Value) -> Result<String> {
     let o: p::OrgInfo = parse(v)?;
-    Ok(format!(
+    let mut s = format!(
         "org {} send_rate_per_min={} send_burst={} max_recipients={} max_thread_depth={}",
         o.name, o.send_rate_per_min, o.send_burst, o.max_recipients, o.max_thread_depth
-    ))
+    );
+    if let Some(u) = o.webhook_url {
+        s.push_str(&format!(" webhook_url={u}"));
+    }
+    Ok(s)
 }
 
 async fn seat_cmd(c: &Client, out: &Out, cmd: SeatCmd) -> Result<()> {

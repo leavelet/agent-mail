@@ -442,6 +442,18 @@ async fn session_cookie_and_csrf(srv: Server) {
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
+    // Behind a proxy the original host may come as X-Forwarded-Host.
+    let r = http
+        .post(url("/messages"))
+        .header("Cookie", &cookie)
+        .header("X-Amail-Csrf", "1")
+        .header("Origin", "https://amail.example")
+        .header("X-Forwarded-Host", "amail.example")
+        .json(&send)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
     // A bearer token is not subject to the cookie rules.
     user.ok(Method::POST, "/messages", Some(send.clone())).await;
     // Server-sent events work with the cookie.

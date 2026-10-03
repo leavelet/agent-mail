@@ -44,6 +44,7 @@ team_tests!(
     start_limit_bounds_cold_starts,
     crash_restart_backoff_and_resume_fallback,
     seats_needing_a_person_show_in_ps,
+    server_commands_sleep_and_wake,
     session_without_a_turn_starts_fresh,
     staged_merge_worktrees_and_validation,
 );
@@ -826,6 +827,52 @@ async fn seats_needing_a_person_show_in_ps(b: Backend) {
         text.contains("t: Claude Code asks whether to trust"),
         "{text}"
     );
+    // The server and the user's queue know too.
+    h.wait("attention reported", || async {
+        let t = h.api.get("/seats/t").await;
+        let p = h.api.get("/seats/p").await;
+        t["presence"]["attention"] == "trust-prompt" && p["presence"]["attention"] == "permission"
+    })
+    .await;
+    let q = h.api.get("/attention").await;
+    let seats: Vec<&str> = q["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|i| i["kind"] == "seat")
+        .map(|i| i["seat"].as_str().unwrap())
+        .collect();
+    assert!(seats.contains(&"t") && seats.contains(&"p"), "{q}");
+    cli(&h, &["down"]).await;
+}
+
+/// Sleep and wake from the web interface: the server sends the command to
+/// the node, which supervises the seat.
+async fn server_commands_sleep_and_wake(b: Backend) {
+    let Some(h) = setup(b, "server_commands_sleep_and_wake", None).await else {
+        return;
+    };
+    let _i = inbox(&h, "c");
+    write_team(
+        &h,
+        "[team]\nworkroot = \"@DIR@/work\"\n[defaults]\nharness = \"claude\"\n[[seat]]\nname = \"c\"\n",
+    );
+    up(&h, &[]).await;
+    wait_state(&h, "c", "idle").await;
+    h.wait("node connected for commands", || async {
+        h.api.get("/seats/c").await["presence"]["node_connected"] == true
+    })
+    .await;
+    let r = h.api.post("/seats/c/sleep", json!({})).await;
+    assert_eq!(r["op"], "sleep", "{r}");
+    wait_state(&h, "c", "dormant").await;
+    h.wait("presence dormant", || async {
+        h.api.get("/seats/c").await["presence"]["state"] == "dormant"
+    })
+    .await;
+    h.api.post("/seats/c/wake", json!({})).await;
+    wait_state(&h, "c", "idle").await;
+    assert_eq!(launches(&h, "c").len(), 2);
     cli(&h, &["down"]).await;
 }
 

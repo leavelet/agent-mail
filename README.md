@@ -15,9 +15,10 @@ Postgres.
 
 **Status: early.** The server, storage and CLI, plus a per-host **node** that
 pushes mail into running Claude Code and Codex sessions: mid-turn through
-hooks while an agent is busy, and by waking the session when it is idle; and
+hooks while an agent is busy, and by waking the session when it is idle;
 `amail up`, which turns a team file into running, supervised sessions in
-zellij. There is no web UI yet, and the HTTP API may still change.
+zellij; and a web interface for the person running the team (see "Web
+interface"). The HTTP API may still change.
 
 ## Quick start (SQLite)
 
@@ -63,6 +64,57 @@ add `--json` to any command for JSON. Errors go to stderr with a non-zero exit
 code. Configuration comes from `AMAIL_URL` / `AMAIL_TOKEN`, or from a TOML file
 passed with `--profile` (`url = "..."`, `token = "..."`).
 
+## Web interface
+
+`amail serve` also serves a single-page app at `/`, for the org's user: who
+is doing what (the org tree with every seat's state, live), what needs you
+(questions and acknowledgement requests addressed to you, seats that need a
+person), and what was decided (threads, the archive and full-text search).
+From it you write mail, answer agents, watch a seat's conversation, put
+seats to sleep or wake them, and administer seats, lists, links, tokens and
+org settings. English and Chinese, light and dark.
+
+Sign in by pasting a **user** token (seat and node tokens are refused). The
+browser then holds a session cookie (`HttpOnly`, `SameSite=Strict`, `Secure`
+when the request came over HTTPS; 30 days), tied to that token: revoking the
+token ends its sessions. Behind a reverse proxy, pass the original `Host`
+(or `X-Forwarded-Host`) and `X-Forwarded-Proto`.
+
+The interface is built from `web/` (Svelte, Vite, TypeScript) and embedded
+into the binary at compile time. `cargo build` works without Node: without
+a build of the interface the server shows a page saying how to make one.
+
+```sh
+cd web && npm ci && npm run build && cd ..
+cargo build --release          # now includes the interface
+```
+
+**Conversation mirror.** A seat's page shows its live conversation, read-only:
+the browser asks the server, the server asks the node that hosts the seat,
+and the node reads the session's transcript file (the path the harness
+reports to its hooks; Claude Code JSONL or a Codex rollout), sends the last
+200 entries and then follows the file. It stops 30 s after the last browser
+left. Mail the system injected is shown apart from what a person typed.
+Transcripts can contain code and secrets from the host: only user tokens
+can watch, and the server relays them without storing them (it keeps the
+last 1,000 entries of a watched seat in memory, and nothing once nobody
+watches).
+
+**Terminals.** A seat's page links to its terminal when the node serves one,
+and otherwise shows `amail attach <seat>`. `amail node --web-terminal-port
+<port>` runs a `zellij web` server of the node's own on `127.0.0.1:<port>`
+and creates new team sessions with web sharing enabled (sessions that
+already exist keep their setting until they are recreated). Its login tokens
+are kept in `<state dir>/zellij-web`, apart from your own; create one with
+`amail node web-token`. Nothing in your zellij configuration changes. Notes:
+the link opens the seat's group session (pick the seat's tab there); anyone
+logged in to that server sees the names of all your zellij sessions and can
+attach to the ones that allow web sharing; `zellij web --stop` stops every
+zellij web server of your user, including the node's (the node restarts its
+own). A browser counts as a client of the session, so a small browser
+window makes the panes smaller. To reach it from another host, put it
+behind an HTTPS proxy and pass `--web-terminal-url`.
+
 ## Postgres
 
 ```sh
@@ -71,7 +123,9 @@ amail serve --db postgres://user:pw@localhost/amail --listen 0.0.0.0:8025 --max-
 ```
 
 Migrations run automatically on start. Both backends have the same schema and
-pass the same test suite. SQLite suits a single host and small to medium
+pass the same test suite. Full-text search on Postgres uses the `pg_trgm`
+extension, which the migration creates (it is a trusted extension: the
+database owner may create it). SQLite suits a single host and small to medium
 teams; Postgres is for larger deployments and standard backup/replication.
 
 ## Concepts
@@ -145,16 +199,19 @@ org cannot be revoked.
 | `amail list create/ls/rm/add/remove` | manage lists and members (`--mode immediate\|digest\|archive`) |
 | `amail link request/accept/ls/revoke` | links with other orgs |
 | `amail token node/user/ls/revoke` | node tokens, extra user tokens, listing and revocation |
-| `amail node` | run the per-host node (see below); `amail node token [--save]`, `amail node status` |
+| `amail node` | run the per-host node (see below; `--web-terminal-port` for browser terminals); `amail node token [--save]`, `amail node status`, `amail node web-token` |
 | `amail run <seat> [-- args]` | start the seat's harness session in this terminal |
 | `amail up [-f amail.toml] [--only g,s] [--no-start] [--prune]` | bring a team up from a team file (see "Teams") |
 | `amail down [--only g,s]` / `amail ps` | stop the team's sessions / one line per seat |
 | `amail attach <group or seat>` / `amail sleep <seat>` / `amail wake <seat>` | attach to a group's zellij session / put a seat to sleep / start it now |
-| `amail org show/set` | org settings (budgets and limits) |
+| `amail org show/set` | org settings (budgets and limits, `--webhook-url`, `--no-webhook`) |
 
 ## HTTP API
 
 JSON under `/v1`; errors are `{"error":{"code":"…","message":"…"}}`.
+Requests authenticate with `Authorization: Bearer <token>` or the web
+interface's session cookie; with the cookie, everything but `GET` needs the
+header `X-Amail-Csrf: 1`, and an `Origin` header must name the server.
 
 | | |
 |---|---|
@@ -166,15 +223,50 @@ JSON under `/v1`; errors are `{"error":{"code":"…","message":"…"}}`.
 | `GET /threads/{id}` | messages of a thread the caller may see |
 | `POST /claim` | `{classes, min_priority?, via, limit?, inline_body_max?, include_digest?, mark_inlined_read?}`: atomically mark pending deliveries notified and return them; concurrent claims never return the same delivery. With `mark_inlined_read`, deliveries whose body is returned inline are marked read too |
 | `GET /changes` | `since` (seq): deliveries created or changed since |
-| `GET /events` | server-sent events `{"seat","seq"}` per mailbox change; supports `Last-Event-ID` |
+| `GET /events` | server-sent events: `mailbox` `{"seat","seq"}` per mailbox change (supports `Last-Event-ID`), `presence`, and for node tokens `command` (`{op: "transcript"\|"sleep"\|"wake", seat, lease_ms?, backfill?, node?}`; nodes ignore unknown events, ops and seats they do not host) |
 | `GET, POST /seats`; `GET, PATCH, DELETE /seats/{name}`; `POST /seats/{name}/tokens` | seats |
 | `GET, POST /lists`; `GET, DELETE /lists/{name}`; `PUT, DELETE /lists/{name}/members/{address}` | lists |
 | `GET, POST /links`; `POST /links/{org}/accept`; `DELETE /links/{org}` | links |
 | `GET /archive/messages` | `since`, `until`, `from`, `thread`, `before_id`, `limit` (user tokens) |
-| `GET, PATCH /org`; `GET, POST /tokens`; `DELETE /tokens/{id}`; `GET /whoami` | org settings, tokens, caller identity |
+| `GET, PATCH /org`; `GET, POST /tokens`; `DELETE /tokens/{id}`; `GET /whoami` | org settings (including `webhook_url`; `null` clears it), tokens, caller identity |
 | `GET /pending` | node and user tokens: per seat, pending (unnotified, immediate) deliveries by class, urgent count, and the seat's counter |
-| `POST /presence` | node tokens: `{node?, seats: [{seat, state, wake_failed?, harness?, since?}]}`; states `offline`, `busy`, `idle`, `awaiting`. Kept in memory for 90 s; shown as `presence` on seats and as `presence` events on `/events` |
+| `POST /presence` | node tokens: `{node?, seats: [{seat, state, wake_failed?, harness?, since?, attention?, attention_hint?, terminal_url?}]}`; states `offline`, `busy`, `idle`, `awaiting`, `dormant`; `attention` tags a seat that needs a person (`trust-prompt`, `login`, `permission`, `failed`, `wake-failed`). Kept in memory for 90 s (an expired entry produces no event: treat `updated_at` older than 90 s as offline); shown as `presence` on seats (with `node_connected`) and as `presence` events on `/events` |
 | `GET /seats/{name}/launch` | node and user tokens: harness, model, role, parent, permission mode and a new seat token, for starting a session; the token of the seat's previous launch is revoked |
+| `POST /session`; `DELETE /session` | sign a browser in with `{token}` (user tokens only; needs `X-Amail-Csrf: 1`) / out |
+| `GET /overview` | user tokens: agent seats per state, seats needing a person, messages in the last hour and day, the user's unread count, the size of the attention queue |
+| `GET /counts` | user tokens: per seat (or `seat=`), `unread` (archive-mode deliveries excluded) and `pending` (not yet shown to the agent) |
+| `GET /attention` | user tokens: what waits for the user (below) |
+| `GET /sent` | `seat`, `before_id`, `limit`: messages a seat sent, newest first (user tokens: any seat; seat tokens: their own) |
+| `POST /messages/{id}/read` | mark the caller's delivery read |
+| `GET /archive/search` | `q`, `before_id`, `limit` (user tokens): full-text search (below) |
+| `POST /seats/{name}/sleep`, `POST /seats/{name}/wake` | user tokens: ask the node hosting the seat; 202, or 409 `node_offline` when no node of the org is connected |
+| `GET /seats/{name}/transcript` | user tokens: the seat's conversation as server-sent events: `status` (`waiting`, `streaming`, `node_offline`, `no_session`, `no_file`, `unknown`), `reset`, `events` |
+| `POST /seats/{name}/transcript` | node tokens: `{node?, reset, status?, events}` for the watchers of the seat |
+
+**What waits for the user** (`/attention`, the web interface's "needs you"
+queue), urgent mail first, then seats, then other mail, each oldest first:
+
+- `ack`: a message to the user that asks for an acknowledgement the user has
+  not given (until acknowledged).
+- `reply`: an unread message addressed `to` the user (not cc, not a list)
+  from someone else, in a thread where the user has sent nothing since.
+  It leaves the queue when the user replies in the thread or marks it read.
+- `seat`: a seat whose node reports that it needs a person, or whose
+  wake-ups go unanswered.
+
+**Search** (`/archive/search`): `q` is split on whitespace and every term
+must occur in the subject or the body, as a case-insensitive substring, in
+any script (Chinese included). Terms of three characters or more use the
+index (SQLite: FTS5 with the trigram tokenizer; Postgres: a `pg_trgm` GIN
+index). If any term is shorter, the search scans only the 2,000 most recent
+messages before `before_id` and says so (`"mode": "scan"`, `scan_limit`);
+`next_before_id` continues with older mail. Results are the messages the org
+can see (its own and those delivered to it), newest first, with a snippet.
+
+**Webhook**: with `webhook_url` set (`amail org set` or `PATCH /org`), every
+new message delivered to the org's user is announced by a `POST` of
+`{"event":"message","org","seat","message":<header>}` (never the body); up
+to three attempts, in the background, never delaying the send.
 
 ## How delivery works
 
