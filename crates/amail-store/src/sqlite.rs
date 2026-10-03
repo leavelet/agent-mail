@@ -7,7 +7,7 @@
 //! others) and commits once. Concurrent sends are thereby merged into one
 //! commit, and per-seat sequence numbers are trivially serialized.
 
-use crate::common::{join_addrs, line_count};
+use crate::common::{join_addrs, line_count, meta_to_db};
 use crate::model::*;
 use crate::{OpenOptions, Result, StoreError, now_ms};
 use futures::future::BoxFuture;
@@ -150,6 +150,7 @@ impl SqliteStore {
                         .bind(m.ack_required)
                         .bind(now)
                         .bind(deliveries)
+                        .bind(meta_to_db(&m.meta))
                         .fetch_all(&mut *c)
                         .await?)
                 })
@@ -194,6 +195,7 @@ impl SqliteStore {
                         .bind(f.limit)
                         .bind(now_ms())
                         .bind(&f.via)
+                        .bind(f.read_body_max.unwrap_or(-1))
                         .fetch_all(&mut *c)
                         .await?)
                 })
@@ -221,12 +223,12 @@ impl SqliteStore {
 
 /// Binds: $1 org, $2 sender, $3 thread (NULL for a new thread), $4 parent,
 /// $5 depth, $6 subject, $7 body, $8 lines, $9 to, $10 cc, $11 priority,
-/// $12 ack_required, $13 now, $14 deliveries JSON.
+/// $12 ack_required, $13 now, $14 deliveries JSON, $15 meta.
 /// Returns `(message_id, thread_id, seat_id, org_id, seq)` per delivery.
 const SEND_SQL: &str = "
 INSERT INTO messages (org_id, sender_seat_id, thread_id, parent_id, depth, subject, body, lines,
-                      to_addrs, cc_addrs, priority, ack_required, created_at)
-VALUES ($1, $2, COALESCE($3, 0), $4, $5, $6, $7, $8, $9, $10, $11, $12, $13);
+                      to_addrs, cc_addrs, priority, ack_required, created_at, meta)
+VALUES ($1, $2, COALESCE($3, 0), $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $15);
 UPDATE messages SET thread_id = id WHERE id = last_insert_rowid() AND $3 IS NULL;
 UPDATE seats SET last_seq = last_seq + 1
  WHERE id IN (SELECT json_extract(value, '$.s') FROM json_each($14));
@@ -239,8 +241,9 @@ SELECT m.id, m.thread_id, d.seat_id, d.org_id, d.seq
  WHERE d.message_id = (SELECT MAX(id) FROM messages)
  ORDER BY d.seat_id";
 
-/// Binds: $1..$7 as `claim_select!`, $8 now, $9 via. The candidates are
-/// numbered 1..n in `temp.claim_ids` (seq order) and get mod_seq lo+1..lo+n.
+/// Binds: $1..$7 as `claim_select!`, $8 now, $9 via, $10 read_body_max (-1:
+/// none). The candidates are numbered 1..n in `temp.claim_ids` (seq order)
+/// and get mod_seq lo+1..lo+n.
 const CLAIM_SQL: &str = concat!(
     "DELETE FROM temp.claim_ids;
 INSERT INTO temp.claim_ids (id) ",
@@ -248,6 +251,9 @@ INSERT INTO temp.claim_ids (id) ",
     ";
 UPDATE seats SET last_seq = last_seq + (SELECT COUNT(*) FROM temp.claim_ids) WHERE id = $1;
 UPDATE deliveries SET notified_at = $8, notified_via = $9,
+       read_at = CASE WHEN $10 >= 0
+                       AND (SELECT length(m.body) FROM messages m WHERE m.id = deliveries.message_id) <= $10
+                      THEN COALESCE(read_at, $8) ELSE read_at END,
        mod_seq = (SELECT last_seq FROM seats WHERE id = $1) - (SELECT COUNT(*) FROM temp.claim_ids) + c.ord
   FROM temp.claim_ids c WHERE deliveries.id = c.id;
 ",

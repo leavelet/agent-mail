@@ -1,0 +1,10 @@
+{
+ "session_id": "00000000-0000-4000-8000-000000000001",
+ "transcript_path": "/tmp/amail-fixture/session.jsonl",
+ "cwd": "/tmp/amail-fixture/work",
+ "scratchpad_dir": "/tmp/amail-fixture/scratch",
+ "hook_event_name": "Notification",
+ "prompt_id": "prompt-1",
+ "notification_type": "permission_prompt",
+ "message": "Claude needs your permission to use Bash"
+}

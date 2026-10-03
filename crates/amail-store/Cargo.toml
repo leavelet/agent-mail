@@ -10,6 +10,7 @@ publish.workspace = true
 amail-proto.workspace = true
 async-trait.workspace = true
 futures.workspace = true
+serde_json.workspace = true
 rand.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true

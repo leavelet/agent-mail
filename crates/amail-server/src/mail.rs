@@ -213,6 +213,10 @@ pub async fn claim(
         include_digest: req.include_digest,
         via: req.via,
         limit: req.limit.unwrap_or(50).clamp(1, 500) as i64,
+        read_body_max: match req.inline_body_max {
+            Some(max) if req.mark_inlined_read && max > 0 => Some(max as i64),
+            _ => None,
+        },
     };
     let (entries, bump) = st.store.claim(seat.id, &filter).await?;
     publish(&st, &seat.name, bump);
@@ -284,6 +288,8 @@ pub async fn events(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     let sub = st.bus.subscribe(auth.org.id, last.as_deref());
+    let presence_rx = st.presence.subscribe(auth.org.id);
+    let only2 = only.clone();
     let keep = move |seat: &str| only.as_deref().is_none_or(|o| o == seat);
 
     let initial: Vec<Event> = match (&last, sub.replay) {
@@ -330,7 +336,29 @@ pub async fn events(
             };
             std::future::ready(out)
         });
-    let stream = stream::iter(initial).chain(live).map(Ok);
+    // Presence events have no id and are not replayed; a lagging presence
+    // receiver just skips what it missed.
+    let presence = BroadcastStream::new(presence_rx).filter_map(move |r| {
+        let out = match r {
+            Ok(e) if only2.as_deref().is_none_or(|o| o == e.seat) => Some(
+                Event::default()
+                    .event("presence")
+                    .data(serde_json::to_string(&e).unwrap_or_default()),
+            ),
+            _ => None,
+        };
+        std::future::ready(out)
+    });
+    // The response ends when the mailbox stream ends (lag), even though the
+    // presence stream would go on.
+    let mailbox = stream::iter(initial)
+        .chain(live)
+        .map(Some)
+        .chain(stream::once(std::future::ready(None)));
+    let stream = stream::select(mailbox, presence.map(Some))
+        .take_while(|e| std::future::ready(e.is_some()))
+        .filter_map(std::future::ready)
+        .map(Ok);
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 

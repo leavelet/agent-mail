@@ -6,6 +6,8 @@ pub mod error;
 pub mod events;
 pub mod limits;
 mod mail;
+mod nodes;
+pub mod presence;
 mod render;
 mod send;
 
@@ -22,6 +24,7 @@ pub struct AppState {
     pub store: Arc<dyn Store>,
     pub bus: Arc<dyn EventBus>,
     pub limiter: Arc<limits::RateLimiter>,
+    pub presence: Arc<presence::PresenceBoard>,
 }
 
 impl AppState {
@@ -30,6 +33,7 @@ impl AppState {
             store,
             bus: Arc::new(Hub::new()),
             limiter: Arc::new(limits::RateLimiter::default()),
+            presence: Arc::new(presence::PresenceBoard::new()),
         }
     }
 }
@@ -49,7 +53,11 @@ pub fn router(state: AppState) -> Router {
         .route("/archive/messages", get(mail::archive))
         .route("/whoami", get(d::whoami))
         .route("/org", get(d::get_org).patch(d::patch_org))
-        .route("/tokens", post(d::org_token))
+        .route("/tokens", get(d::list_tokens).post(d::org_token))
+        .route("/tokens/{id}", axum::routing::delete(d::revoke_token))
+        .route("/pending", get(nodes::pending))
+        .route("/presence", post(nodes::presence))
+        .route("/seats/{name}/launch", get(nodes::launch))
         .route("/seats", get(d::list_seats).post(d::create_seat))
         .route(
             "/seats/{name}",

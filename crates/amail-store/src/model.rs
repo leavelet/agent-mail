@@ -1,7 +1,8 @@
 //! Store-level records. Timestamps are milliseconds since the Unix epoch.
 
 use amail_proto::{
-    DeliveryClass, DeliveryMode, LinkState, PostPolicy, Priority, SeatKind, TokenScope,
+    DeliveryClass, DeliveryMode, LinkState, Meta, PermissionMode, PostPolicy, Priority, SeatKind,
+    TokenScope,
 };
 
 pub use amail_proto::{NewList, NewSeat};
@@ -33,6 +34,7 @@ pub struct Seat {
     pub role: Option<String>,
     pub harness: Option<String>,
     pub model: Option<String>,
+    pub permission_mode: Option<PermissionMode>,
     pub last_seq: i64,
     pub created_at: i64,
     pub deleted_at: Option<i64>,
@@ -97,7 +99,8 @@ pub struct NewMessage {
     pub cc_addrs: Vec<String>,
     pub priority: Priority,
     pub ack_required: bool,
-    /// One per distinct recipient seat.
+    pub meta: Meta,
+    /// One per distinct recipient seat. Must not be empty.
     pub deliveries: Vec<NewDelivery>,
 }
 
@@ -145,6 +148,7 @@ pub struct MessageRec {
     pub cc_addrs: Vec<String>,
     pub priority: Priority,
     pub ack_required: bool,
+    pub meta: Meta,
     pub created_at: i64,
 }
 
@@ -190,6 +194,9 @@ pub struct ClaimFilter {
     pub include_digest: bool,
     pub via: String,
     pub limit: i64,
+    /// Mark read, in the same change, the claimed deliveries whose message
+    /// body has at most this many characters.
+    pub read_body_max: Option<i64>,
 }
 
 impl ClaimFilter {
@@ -207,4 +214,28 @@ pub struct ArchiveQuery {
     pub thread_id: Option<i64>,
     pub before_id: Option<i64>,
     pub limit: i64,
+}
+
+/// A live token, without its secret.
+#[derive(Debug, Clone)]
+pub struct TokenRec {
+    pub id: i64,
+    pub scope: TokenScope,
+    /// The token's seat (seat and user tokens).
+    pub seat_name: Option<String>,
+    pub label: Option<String>,
+    pub created_at: i64,
+}
+
+/// Pending (unnotified, `immediate`) deliveries of one seat by class, plus
+/// the seat's sequence counter, read in one snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PendingRec {
+    pub seat_id: i64,
+    pub seat_name: String,
+    pub last_seq: i64,
+    pub to: i64,
+    pub cc: i64,
+    pub list: i64,
+    pub urgent: i64,
 }

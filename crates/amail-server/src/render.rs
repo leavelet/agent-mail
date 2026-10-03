@@ -56,6 +56,7 @@ pub fn header(m: &MessageRec, viewer: &Org) -> p::MessageHeader {
         ack_required: m.ack_required,
         lines: m.lines,
         created_at: ts(m.created_at),
+        meta: m.meta.clone(),
     }
 }
 
@@ -88,7 +89,7 @@ pub fn entry(e: &Entry, viewer: &Org) -> p::InboxEntry {
     }
 }
 
-pub fn seat(s: &Seat) -> p::Seat {
+pub fn seat(s: &Seat, presence: Option<p::Presence>) -> p::Seat {
     p::Seat {
         name: s.name.clone(),
         kind: s.kind,
@@ -97,7 +98,9 @@ pub fn seat(s: &Seat) -> p::Seat {
         role: s.role.clone(),
         harness: s.harness.clone(),
         model: s.model.clone(),
+        permission_mode: s.permission_mode,
         created_at: ts(s.created_at),
+        presence,
     }
 }
 

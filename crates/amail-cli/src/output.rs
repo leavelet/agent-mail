@@ -6,10 +6,10 @@ use amail_proto::{
     Source,
 };
 
-/// `2026-10-04T10:00:01.234Z` -> `2026-10-04 10:00`.
+/// `2026-10-04T10:00:01.234Z` -> `2026-10-04 10:00Z` (always UTC).
 pub fn short_time(ts: &str) -> String {
     match (ts.get(0..10), ts.get(11..16)) {
-        (Some(d), Some(t)) => format!("{d} {t}"),
+        (Some(d), Some(t)) => format!("{d} {t}Z"),
         _ => ts.to_string(),
     }
 }
@@ -22,7 +22,7 @@ fn source(s: Source) -> &'static str {
     }
 }
 
-/// `#12 [to unread urgent ack] owner (user): Subject | 3 lines, thread 10, 2026-10-04 10:00`
+/// `#12 [to unread urgent ack] owner (user): Subject | 3 lines, thread 10, 2026-10-04 10:00Z`
 pub fn entry_line(e: &InboxEntry) -> String {
     let m = &e.message;
     let d = &e.delivery;
@@ -87,6 +87,9 @@ pub fn message(m: &Message) -> String {
     if !tags.is_empty() {
         out.push_str(&format!("Flags: {}\n", tags.join(" ")));
     }
+    for (k, v) in &h.meta {
+        out.push_str(&format!("Meta: {k}={v}\n"));
+    }
     out.push('\n');
     out.push_str(&m.body);
     if !m.body.ends_with('\n') {
@@ -144,6 +147,15 @@ pub fn seat_line(s: &p::Seat) -> String {
     if let Some(m) = &s.model {
         out.push_str(&format!(" model={m}"));
     }
+    if let Some(p) = &s.permission_mode {
+        out.push_str(&format!(" permissions={p}"));
+    }
+    if let Some(p) = &s.presence {
+        out.push_str(&format!(" state={}", p.state));
+        if p.wake_failed {
+            out.push_str(" wake_failed");
+        }
+    }
     out.push_str(&quoted("name", &s.display_name));
     out.push_str(&quoted("role", &s.role));
     out
@@ -192,4 +204,17 @@ pub fn class_list(s: &str) -> Result<Vec<DeliveryClass>, String> {
         .filter(|c| !c.is_empty())
         .map(|c| c.trim().parse())
         .collect()
+}
+
+/// `3 user owner "initial user token" 2026-10-04 10:00Z`
+pub fn token_line(t: &p::TokenInfo) -> String {
+    let mut out = format!("{} {}", t.id, t.scope);
+    if let Some(s) = &t.seat {
+        out.push_str(&format!(" {s}"));
+    }
+    if let Some(l) = &t.label {
+        out.push_str(&format!(" {l:?}"));
+    }
+    out.push_str(&format!(" {}", short_time(&t.created_at)));
+    out
 }

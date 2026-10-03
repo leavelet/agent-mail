@@ -1,7 +1,7 @@
 //! Minimal HTTP client for the `/v1` API.
 
 use amail_proto::ErrorBody;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use reqwest::Method;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -58,15 +58,23 @@ impl Client {
             .url
             .or_else(|| std::env::var("AMAIL_URL").ok())
             .unwrap_or_else(|| DEFAULT_URL.to_string());
-        let token = p
-            .token
-            .or_else(|| std::env::var("AMAIL_TOKEN").ok())
-            .ok_or_else(|| anyhow!("no token: set AMAIL_TOKEN or use --profile"))?;
+        let token = p.token.or_else(|| std::env::var("AMAIL_TOKEN").ok());
+        let (url, token) = match token {
+            Some(t) => (url, t),
+            None => match node_credentials() {
+                Some(c) => (c.url, c.token),
+                None => bail!("no token: set AMAIL_TOKEN or use --profile"),
+            },
+        };
         Ok(Client {
             base: url.trim_end_matches('/').to_string(),
             token,
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder().no_proxy().build()?,
         })
+    }
+
+    pub fn base(&self) -> &str {
+        &self.base
     }
 
     pub async fn call(&self, method: Method, path: &str, body: Option<&Value>) -> Result<Value> {
@@ -106,6 +114,24 @@ impl Client {
     pub async fn raw(&self, method: Method, path: &str, body: Option<&Value>) -> Result<Value> {
         self.call(method, path, body).await
     }
+}
+
+/// Inside a Codex session, tool commands run in the shared Codex daemon and
+/// do not see the session's environment; the node knows which seat owns the
+/// thread (`CODEX_THREAD_ID`) and holds its token.
+fn node_credentials() -> Option<amail_node::wire::Credentials> {
+    let thread = std::env::var("CODEX_THREAD_ID")
+        .ok()
+        .filter(|t| !t.is_empty())?;
+    let v = amail_node::request(
+        &amail_node::paths::socket(),
+        &amail_node::wire::Request::Credentials {
+            codex_thread: thread,
+        },
+        std::time::Duration::from_secs(5),
+    )
+    .ok()?;
+    serde_json::from_value(v).ok()
 }
 
 /// Percent-encode a path segment or query value.

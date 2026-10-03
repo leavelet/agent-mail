@@ -182,4 +182,12 @@ pub trait Store: Send + Sync + 'static {
     async fn archive(&self, org_id: i64, q: &ArchiveQuery) -> Result<Vec<MessageRec>>;
     /// `(seat_id, name, last_seq)` of every live seat in the org.
     async fn seat_seqs(&self, org_id: i64) -> Result<Vec<(i64, String, i64)>>;
+    /// Live (unrevoked) tokens of the org.
+    async fn tokens(&self, org_id: i64) -> Result<Vec<TokenRec>>;
+    /// Revoke a token of the org. Returns false if there was no live token
+    /// with that id.
+    async fn revoke_token(&self, org_id: i64, id: i64) -> Result<bool>;
+    /// Pending-notification counts of every live seat of the org (or only
+    /// `seat_id`), including seats with nothing pending.
+    async fn pending(&self, org_id: i64, seat_id: Option<i64>) -> Result<Vec<PendingRec>>;
 }

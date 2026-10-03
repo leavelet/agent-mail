@@ -99,6 +99,19 @@ string_enum!(
 string_enum!(TokenScope { User => "user", Seat => "seat", Node => "node" });
 
 string_enum!(
+    /// How a seat's harness is launched with respect to permission prompts.
+    /// `default` keeps the harness's own prompting; `unattended` runs without
+    /// prompts (Claude Code: bypass permissions; Codex: `-a never -s
+    /// workspace-write`).
+    PermissionMode { Default => "default", Unattended => "unattended" }
+);
+
+string_enum!(
+    /// Session state of a seat, as reported by the node hosting it.
+    SeatState { Offline => "offline", Busy => "busy", Idle => "idle", Awaiting => "awaiting" }
+);
+
+string_enum!(
     /// Link state as seen from one side. `requested`: we asked, they have not
     /// accepted. `invited`: they asked, we can accept. `active`: both agreed.
     LinkState { Requested => "requested", Invited => "invited", Active => "active" }
@@ -156,6 +169,27 @@ pub struct SendRequest {
     pub priority: Option<Priority>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ack_required: Option<bool>,
+    /// Free-form string key/value pairs stored with the message and shown to
+    /// recipients. The server does not interpret them.
+    #[serde(default, skip_serializing_if = "Meta::is_empty")]
+    pub meta: Meta,
+}
+
+/// Structured message fields (`meta`): a small string map.
+pub type Meta = std::collections::BTreeMap<String, String>;
+
+/// Size limits enforced on every send (HTTP 422 when exceeded).
+pub mod limits {
+    /// Maximum subject length in characters.
+    pub const MAX_SUBJECT_CHARS: usize = 300;
+    /// Maximum body size in bytes.
+    pub const MAX_BODY_BYTES: usize = 256 * 1024;
+    /// Maximum number of addresses (`to` plus `cc`, as written) per message.
+    pub const MAX_ADDRESSES: usize = 100;
+    /// Maximum number of `meta` keys.
+    pub const MAX_META_KEYS: usize = 16;
+    /// Maximum total size of `meta` keys and values in bytes.
+    pub const MAX_META_BYTES: usize = 4096;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,6 +235,8 @@ pub struct MessageHeader {
     pub ack_required: bool,
     pub lines: i64,
     pub created_at: String,
+    #[serde(default, skip_serializing_if = "Meta::is_empty")]
+    pub meta: Meta,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -294,6 +330,10 @@ pub struct ClaimRequest {
     pub inline_body_max: Option<u32>,
     #[serde(default)]
     pub include_digest: bool,
+    /// Also mark read the claimed deliveries whose whole body is returned
+    /// inline (the caller shows them in full).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mark_inlined_read: bool,
 }
 
 fn all_classes() -> Vec<DeliveryClass> {
@@ -349,7 +389,13 @@ pub struct Seat {
     pub harness: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<PermissionMode>,
     pub created_at: String,
+    /// The seat's session state as last reported by a node. Absent when no
+    /// node has reported the seat recently (treat as offline).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence: Option<Presence>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -365,6 +411,8 @@ pub struct NewSeat {
     pub harness: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<PermissionMode>,
 }
 
 /// PATCH body for a seat. A missing field is left unchanged; `null` clears it.
@@ -400,6 +448,12 @@ pub struct SeatPatch {
         skip_serializing_if = "Option::is_none"
     )]
     pub model: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub permission_mode: Option<Option<PermissionMode>>,
 }
 
 fn double_option<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
@@ -499,4 +553,117 @@ pub struct WhoAmI {
     pub scope: TokenScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seat: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Nodes: pending counts, presence, launch
+
+/// Pending (not yet notified, `immediate` mode) deliveries of one seat.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingCounts {
+    pub seat: String,
+    pub to: i64,
+    pub cc: i64,
+    pub list: i64,
+    /// Pending deliveries of urgent messages, in any class.
+    pub urgent: i64,
+    /// The seat's sequence counter when the counts were taken.
+    pub seq: i64,
+}
+
+impl PendingCounts {
+    pub fn total(&self) -> i64 {
+        self.to + self.cc + self.list
+    }
+}
+
+/// Response of `GET /v1/pending`: every live seat of the org (or the one
+/// named by `seat=`), including seats with nothing pending.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PendingResponse {
+    pub seats: Vec<PendingCounts>,
+}
+
+/// A seat's session state as shown in the directory and the event stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Presence {
+    pub state: SeatState,
+    /// The last wake-up attempt for this seat was not answered.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wake_failed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    /// Label of the reporting node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    /// When the state last changed.
+    pub since: String,
+    /// When the node last reported the seat.
+    pub updated_at: String,
+}
+
+/// One entry of `POST /v1/presence`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresenceUpdate {
+    pub seat: String,
+    pub state: SeatState,
+    #[serde(default)]
+    pub wake_failed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    /// When the state last changed, if the node knows (RFC 3339).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+}
+
+/// Body of `POST /v1/presence` (node tokens).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PresenceReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    pub seats: Vec<PresenceUpdate>,
+}
+
+/// Payload of a server-sent `presence` event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresenceEvent {
+    pub seat: String,
+    #[serde(flatten)]
+    pub presence: Presence,
+}
+
+/// Response of `GET /v1/seats/{name}/launch` (node tokens): what a node needs
+/// to start a harness session for the seat, including a fresh seat token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaunchInfo {
+    pub org: String,
+    pub seat: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<PermissionMode>,
+    /// Name of the org's user seat.
+    pub user_seat: String,
+    /// A new seat token for the session.
+    pub token: String,
+}
+
+/// A token as listed by `GET /v1/tokens` (never the secret itself).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenInfo {
+    pub id: i64,
+    pub scope: TokenScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub created_at: String,
 }

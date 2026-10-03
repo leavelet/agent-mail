@@ -37,11 +37,13 @@ dependencies = [
 name = "amail-cli"
 version = "0.1.0"
 dependencies = [
+ "amail-node",
  "amail-proto",
  "amail-server",
  "amail-store",
  "anyhow",
  "clap",
+ "futures",
  "reqwest",
  "serde",
  "serde_json",
@@ -50,6 +52,27 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "amail-node"
+version = "0.1.0"
+dependencies = [
+ "amail-proto",
+ "anyhow",
+ "async-trait",
+ "futures",
+ "hex",
+ "libc",
+ "rand 0.9.5",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
 ]
 
 [[package]]
@@ -88,6 +111,7 @@ dependencies = [
  "async-trait",
  "futures",
  "rand 0.9.5",
+ "serde_json",
  "sqlx",
  "tempfile",
  "thiserror",

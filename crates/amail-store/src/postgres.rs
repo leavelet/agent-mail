@@ -14,7 +14,7 @@
 //! `claim` selects candidates with `FOR UPDATE SKIP LOCKED`, so concurrent
 //! claims never return the same delivery.
 
-use crate::common::{join_addrs, line_count};
+use crate::common::{join_addrs, line_count, meta_to_db};
 use crate::model::*;
 use crate::{OpenOptions, Result, StoreError, now_ms};
 use futures::future::BoxFuture;
@@ -93,8 +93,8 @@ impl PgStore {
                 let thread_id = m.thread_id.unwrap_or(id);
                 sqlx::query(
                     "INSERT INTO messages (id, org_id, sender_seat_id, thread_id, parent_id, depth, subject, body, \
-                     lines, to_addrs, cc_addrs, priority, ack_required, created_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
+                     lines, to_addrs, cc_addrs, priority, ack_required, created_at, meta) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
                 )
                 .bind(id)
                 .bind(m.org_id)
@@ -110,6 +110,7 @@ impl PgStore {
                 .bind(m.priority.as_str())
                 .bind(m.ack_required)
                 .bind(now)
+                .bind(meta_to_db(&m.meta))
                 .execute(&mut *c)
                 .await?;
 
@@ -160,13 +161,17 @@ impl PgStore {
                 let hi = q::bump_seq(c, seat_id, n).await?;
                 let lo = hi - n;
                 sqlx::query(
-                    "UPDATE deliveries d SET notified_at = $1, notified_via = $2, mod_seq = $3 + x.ord \
+                    "UPDATE deliveries d SET notified_at = $1, notified_via = $2, mod_seq = $3 + x.ord, \
+                     read_at = CASE WHEN $5 >= 0 AND \
+                       (SELECT length(m.body) FROM messages m WHERE m.id = d.message_id) <= $5 \
+                       THEN COALESCE(d.read_at, $1) ELSE d.read_at END \
                      FROM UNNEST($4::bigint[]) WITH ORDINALITY AS x(id, ord) WHERE d.id = x.id",
                 )
                 .bind(now_ms())
                 .bind(&f.via)
                 .bind(lo)
                 .bind(&ids)
+                .bind(f.read_body_max.unwrap_or(-1))
                 .execute(&mut *c)
                 .await?;
                 let entries = q::entries_in_range(c, seat_id, lo, hi).await?;

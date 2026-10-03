@@ -1,0 +1,10 @@
+{
+ "session_id": "00000000-0000-7000-8000-0000000000aa",
+ "transcript_path": "/tmp/amail-fixture/codex/sessions/rollout.jsonl",
+ "cwd": "/tmp/amail-fixture/work",
+ "model": "gpt-test",
+ "permission_mode": "bypassPermissions",
+ "turn_id": "00000000-0000-7000-8000-0000000000bb",
+ "hook_event_name": "UserPromptSubmit",
+ "prompt": "Reply with READY."
+}

@@ -125,6 +125,79 @@ enum Cmd {
     /// Show or change org settings.
     #[command(subcommand)]
     Org(OrgCmd),
+    /// Run the per-host node daemon (or manage it, see `amail node --help`).
+    Node(NodeCli),
+    /// Hook entry point for a harness (`claude` or `codex`). Reads the hook
+    /// input on stdin; never fails and never blocks for long.
+    #[command(hide = true)]
+    Hook { harness: String },
+    /// Start a harness session for a seat in this terminal (through the node).
+    Run {
+        seat: String,
+        /// Override the seat's harness (`claude` or `codex`).
+        #[arg(long)]
+        harness: Option<String>,
+        /// Extra arguments for the harness, after `--`.
+        #[arg(last = true)]
+        extra: Vec<String>,
+    },
+}
+
+#[derive(Args)]
+#[command(args_conflicts_with_subcommands = true)]
+struct NodeCli {
+    #[command(subcommand)]
+    cmd: Option<NodeCmd>,
+    #[command(flatten)]
+    run: NodeArgs,
+}
+
+#[derive(Subcommand)]
+enum NodeCmd {
+    /// Issue a node token (needs a user token). With --save, also write it
+    /// with the server URL to <state dir>/node.toml for `amail node`.
+    Token {
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long)]
+        save: bool,
+        #[arg(long, env = "AMAIL_STATE_DIR")]
+        state_dir: Option<PathBuf>,
+    },
+    /// Show the running node's view of its seats.
+    Status,
+}
+
+#[derive(Args)]
+struct NodeArgs {
+    /// Server URL (default: AMAIL_URL, then <state dir>/node.toml).
+    #[arg(long)]
+    url: Option<String>,
+    /// Node token (default: AMAIL_NODE_TOKEN, then <state dir>/node.toml).
+    #[arg(long, env = "AMAIL_NODE_TOKEN", hide_env_values = true)]
+    token: Option<String>,
+    /// State directory (default: ~/.local/share/amail).
+    #[arg(long, env = "AMAIL_STATE_DIR")]
+    state_dir: Option<PathBuf>,
+    /// Node socket (default: $XDG_RUNTIME_DIR/amail/node.sock).
+    #[arg(long, env = "AMAIL_NODE_SOCK")]
+    socket: Option<PathBuf>,
+    /// Name of this host in presence reports (default: the hostname).
+    #[arg(long)]
+    label: Option<String>,
+    #[arg(long, env = "AMAIL_CLAUDE_BIN", default_value = "claude")]
+    claude_bin: String,
+    #[arg(long, env = "AMAIL_CODEX_BIN", default_value = "codex")]
+    codex_bin: String,
+    /// auth.json that the node's Codex home links to (default: ~/.codex/auth.json).
+    #[arg(long, env = "AMAIL_CODEX_AUTH")]
+    codex_auth: Option<PathBuf>,
+    /// Coalescing window for wake-ups, in milliseconds.
+    #[arg(long, default_value_t = 3000)]
+    wake_window_ms: u64,
+    /// How long to wait for a wake-up to start a turn before retrying, in milliseconds.
+    #[arg(long, default_value_t = 10000)]
+    wake_confirm_ms: u64,
 }
 
 #[derive(Args)]
@@ -132,6 +205,9 @@ struct SendOpts {
     /// Message body; read from stdin when omitted.
     #[arg(short = 'm', long = "message")]
     body: Option<String>,
+    /// Structured field `key=value` (repeatable), shown to recipients.
+    #[arg(long = "meta", value_name = "KEY=VALUE")]
+    meta: Vec<String>,
     #[arg(long)]
     urgent: bool,
     /// Ask recipients to acknowledge.
@@ -165,6 +241,25 @@ enum SeatCmd {
         model: Option<String>,
         #[arg(long)]
         display_name: Option<String>,
+        /// `default` or `unattended` (run without permission prompts).
+        #[arg(long)]
+        permission_mode: Option<String>,
+    },
+    /// Change a seat's settings.
+    Set {
+        name: String,
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long)]
+        role: Option<String>,
+        #[arg(long)]
+        harness: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        display_name: Option<String>,
+        #[arg(long)]
+        permission_mode: Option<String>,
     },
     Ls,
     Rm {
@@ -229,6 +324,10 @@ enum TokenCmd {
         #[arg(long)]
         label: Option<String>,
     },
+    /// List live tokens (labels and scopes; never the secrets).
+    Ls,
+    /// Revoke a token by id (see `amail token ls`).
+    Revoke { id: i64 },
 }
 
 #[derive(Subcommand)]
@@ -248,6 +347,31 @@ enum OrgCmd {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    // The hook client runs on every harness hook: no runtime, no failures.
+    if let Cmd::Hook { harness } = &cli.cmd {
+        let out = amail_node::hook_client::run(harness);
+        if !out.is_empty() {
+            use std::io::Write;
+            let mut stdout = std::io::stdout().lock();
+            let _ = stdout.write_all(out.as_bytes());
+            let _ = stdout.flush();
+        }
+        return ExitCode::SUCCESS;
+    }
+    if let Cmd::Run {
+        seat,
+        harness,
+        extra,
+    } = &cli.cmd
+    {
+        return match run_seat(seat, harness.clone(), extra.clone()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -312,11 +436,62 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Admin(AdminCmd::CreateOrg { org, user_name, db }) => {
             return create_org(&db, &org, &user_name, &out).await;
         }
+        Cmd::Node(NodeCli { cmd: None, run }) => return node_daemon(run).await,
+        Cmd::Node(NodeCli {
+            cmd: Some(NodeCmd::Status),
+            ..
+        }) => {
+            let v = amail_node::request(
+                &amail_node::paths::socket(),
+                &amail_node::wire::Request::Status,
+                std::time::Duration::from_secs(5),
+            )?;
+            return out.show(&v, || node_status_text(&v));
+        }
         _ => {}
     }
     let c = Client::from_config(cli.profile.as_deref())?;
     match cli.cmd {
-        Cmd::Serve { .. } | Cmd::Admin(_) => unreachable!(),
+        Cmd::Serve { .. }
+        | Cmd::Admin(_)
+        | Cmd::Hook { .. }
+        | Cmd::Run { .. }
+        | Cmd::Node(NodeCli { cmd: None, .. })
+        | Cmd::Node(NodeCli {
+            cmd: Some(NodeCmd::Status),
+            ..
+        }) => unreachable!(),
+        Cmd::Node(NodeCli {
+            cmd:
+                Some(NodeCmd::Token {
+                    label,
+                    save,
+                    state_dir,
+                }),
+            ..
+        }) => {
+            let v = c
+                .raw(
+                    Method::POST,
+                    "/tokens",
+                    Some(&json!({ "scope": "node", "label": label })),
+                )
+                .await?;
+            let token = parse::<p::TokenResponse>(&v)?.token;
+            if save {
+                let dir = state_dir.unwrap_or_else(amail_node::paths::state_dir);
+                std::fs::create_dir_all(&dir)?;
+                let path = dir.join("node.toml");
+                let text = toml::to_string(&NodeFile {
+                    url: Some(c.base().to_string()),
+                    token: Some(token.clone()),
+                    label: None,
+                })?;
+                amail_node::persist::write_atomic(&path, text.as_bytes(), 0o600)?;
+                eprintln!("saved to {}", path.display());
+            }
+            out.show(&v, || Ok(token))
+        }
         Cmd::Send {
             to,
             cc,
@@ -324,7 +499,8 @@ async fn run(cli: Cli) -> Result<()> {
             opts,
         } => {
             let body = json!({
-                "to": to, "cc": cc, "subject": subject, "body": read_body(opts.body)?,
+                "to": to, "cc": cc, "subject": subject, "meta": parse_meta(&opts.meta)?,
+                "body": read_body(opts.body)?,
                 "priority": if opts.urgent { "urgent" } else { "normal" }, "ack_required": opts.ack,
             });
             let v = c.raw(Method::POST, "/messages", Some(&body)).await?;
@@ -390,7 +566,8 @@ async fn run(cli: Cli) -> Result<()> {
                 format!("Re: {}", h.subject)
             };
             let body = json!({
-                "to": to, "cc": cc, "subject": subject, "body": read_body(opts.body)?, "in_reply_to": id,
+                "to": to, "cc": cc, "subject": subject, "meta": parse_meta(&opts.meta)?,
+                "body": read_body(opts.body)?, "in_reply_to": id,
                 "priority": if opts.urgent { "urgent" } else { "normal" }, "ack_required": opts.ack,
             });
             let v = c.raw(Method::POST, "/messages", Some(&body)).await?;
@@ -481,10 +658,23 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Seat(cmd) => seat_cmd(&c, &out, cmd).await,
         Cmd::List(cmd) => list_cmd(&c, &out, cmd).await,
         Cmd::Link(cmd) => link_cmd(&c, &out, cmd).await,
+        Cmd::Token(TokenCmd::Ls) => {
+            let v = c.raw(Method::GET, "/tokens", None).await?;
+            out.show(&v, || {
+                Ok(lines(&parse::<Vec<p::TokenInfo>>(&v)?, output::token_line))
+            })
+        }
+        Cmd::Token(TokenCmd::Revoke { id }) => {
+            let v = c
+                .raw(Method::DELETE, &format!("/tokens/{id}"), None)
+                .await?;
+            out.show(&v, || Ok(format!("revoked token {id}")))
+        }
         Cmd::Token(cmd) => {
             let (scope, label) = match cmd {
                 TokenCmd::Node { label } => ("node", label),
                 TokenCmd::User { label } => ("user", label),
+                TokenCmd::Ls | TokenCmd::Revoke { .. } => unreachable!(),
             };
             let v = c
                 .raw(
@@ -532,12 +722,54 @@ async fn seat_cmd(c: &Client, out: &Out, cmd: SeatCmd) -> Result<()> {
             harness,
             model,
             display_name,
+            permission_mode,
         } => {
+            let pm = permission_mode
+                .map(|m| m.parse::<p::PermissionMode>())
+                .transpose()
+                .map_err(anyhow::Error::msg)?;
             let body = json!({
                 "name": name, "parent": parent, "role": role, "harness": harness, "model": model,
-                "display_name": display_name,
+                "display_name": display_name, "permission_mode": pm,
             });
             let v = c.raw(Method::POST, "/seats", Some(&body)).await?;
+            out.show(&v, || Ok(output::seat_line(&parse(&v)?)))
+        }
+        SeatCmd::Set {
+            name,
+            parent,
+            role,
+            harness,
+            model,
+            display_name,
+            permission_mode,
+        } => {
+            let pm = permission_mode
+                .map(|m| m.parse::<p::PermissionMode>())
+                .transpose()
+                .map_err(anyhow::Error::msg)?;
+            let mut body = serde_json::Map::new();
+            for (k, v) in [
+                ("parent", parent),
+                ("role", role),
+                ("harness", harness),
+                ("model", model),
+                ("display_name", display_name),
+            ] {
+                if let Some(v) = v {
+                    body.insert(k.into(), json!(v));
+                }
+            }
+            if let Some(pm) = pm {
+                body.insert("permission_mode".into(), json!(pm));
+            }
+            let v = c
+                .raw(
+                    Method::PATCH,
+                    &format!("/seats/{}", enc(&name)),
+                    Some(&Value::Object(body)),
+                )
+                .await?;
             out.show(&v, || Ok(output::seat_line(&parse(&v)?)))
         }
         SeatCmd::Ls => {
@@ -710,4 +942,144 @@ async fn create_org(db: &str, org: &str, user_name: &str, out: &Out) -> Result<(
         eprintln!("created org {org} with user seat {user_name}; user token:");
         Ok(token.clone())
     })
+}
+
+fn parse_meta(items: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut m = std::collections::BTreeMap::new();
+    for it in items {
+        let (k, v) = it
+            .split_once('=')
+            .with_context(|| format!("--meta {it:?}: expected key=value"))?;
+        m.insert(k.trim().to_string(), v.to_string());
+    }
+    Ok(m)
+}
+
+/// `<state dir>/node.toml`: settings for `amail node`.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct NodeFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+}
+
+fn hostname() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+async fn node_daemon(a: NodeArgs) -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+    let state_dir = a.state_dir.unwrap_or_else(amail_node::paths::state_dir);
+    let file: NodeFile = match std::fs::read_to_string(state_dir.join("node.toml")) {
+        Ok(t) => toml::from_str(&t).context("parsing node.toml")?,
+        Err(_) => NodeFile::default(),
+    };
+    let url = a
+        .url
+        .or_else(|| std::env::var("AMAIL_URL").ok())
+        .or(file.url)
+        .unwrap_or_else(|| client::DEFAULT_URL.to_string());
+    let token = a.token.or(file.token).context(
+        "no node token: pass --token, set AMAIL_NODE_TOKEN, or run `amail node token --save`",
+    )?;
+    let mut cfg = amail_node::Config::new(&url, &token);
+    cfg.state_dir = state_dir;
+    if let Some(s) = a.socket {
+        cfg.socket = s;
+    }
+    cfg.label = a.label.or(file.label).or_else(hostname);
+    cfg.claude_bin = a.claude_bin;
+    cfg.codex_bin = a.codex_bin;
+    if let Some(p) = a.codex_auth {
+        cfg.codex_auth = p;
+    }
+    cfg.wake_window = std::time::Duration::from_millis(a.wake_window_ms);
+    cfg.wake_confirm = std::time::Duration::from_millis(a.wake_confirm_ms);
+    let socket = cfg.socket.clone();
+    let handle = amail_node::start(cfg).await?;
+    tracing::info!("amail node listening on {} for {url}", socket.display());
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+    }
+    handle.shutdown();
+    Ok(())
+}
+
+fn node_status_text(v: &Value) -> Result<String> {
+    let mut out = vec![format!(
+        "node {} server {} ({} registered sessions)",
+        if v["connected"].as_bool() == Some(true) {
+            "connected to"
+        } else {
+            "NOT connected to"
+        },
+        v["server"].as_str().unwrap_or("?"),
+        v["registered_sessions"]
+    )];
+    for s in v["seats"].as_array().into_iter().flatten() {
+        let p = &s["pending"];
+        let mut line = format!(
+            "{} {} {} since {} pending to={} cc={} list={} urgent={} wakes={}",
+            s["seat"].as_str().unwrap_or("?"),
+            s["harness"].as_str().unwrap_or("-"),
+            s["state"].as_str().unwrap_or("?"),
+            output::short_time(s["since"].as_str().unwrap_or("")),
+            p["to"],
+            p["cc"],
+            p["list"],
+            p["urgent"],
+            s["wakes"],
+        );
+        if s["wake_failed"].as_bool() == Some(true) {
+            line.push_str(" wake_failed");
+        }
+        out.push(line);
+    }
+    Ok(out.join("\n"))
+}
+
+/// `amail run`: ask the node how to start the seat's harness, then exec it.
+fn run_seat(seat: &str, harness: Option<String>, extra: Vec<String>) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
+    let v = amail_node::request(
+        &amail_node::paths::socket(),
+        &amail_node::wire::Request::Launch {
+            seat: seat.to_string(),
+            cwd,
+            pid: std::process::id(),
+            harness,
+            extra,
+        },
+        std::time::Duration::from_secs(180),
+    )?;
+    let plan: amail_node::wire::LaunchPlan = serde_json::from_value(v)?;
+    let mut cmd = std::process::Command::new(&plan.program);
+    cmd.args(&plan.args);
+    for k in &plan.unset_env {
+        cmd.env_remove(k);
+    }
+    cmd.envs(&plan.env);
+    if !plan.path_prepend.is_empty() {
+        let mut path = plan.path_prepend.join(":");
+        if let Some(cur) = std::env::var_os("PATH") {
+            path.push(':');
+            path.push_str(&cur.to_string_lossy());
+        }
+        cmd.env("PATH", path);
+    }
+    let err = cmd.exec();
+    Err(anyhow::anyhow!("starting {}: {err}", plan.program))
 }

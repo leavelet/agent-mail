@@ -1,0 +1,18 @@
+{
+ "session_id": "00000000-0000-4000-8000-000000000001",
+ "transcript_path": "/tmp/amail-fixture/session.jsonl",
+ "cwd": "/tmp/amail-fixture/work",
+ "scratchpad_dir": "/tmp/amail-fixture/scratch",
+ "hook_event_name": "PreToolUse",
+ "permission_mode": "bypassPermissions",
+ "prompt_id": "prompt-1",
+ "effort": {
+  "level": "medium"
+ },
+ "tool_name": "Bash",
+ "tool_input": {
+  "command": "echo hi",
+  "description": "Print hi"
+ },
+ "tool_use_id": "toolu_01"
+}

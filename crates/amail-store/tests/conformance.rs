@@ -50,6 +50,12 @@ conformance!(
     claim_concurrent_never_duplicates,
     seq_concurrent_sends_monotonic,
     seq_mixed_workload_feed_complete,
+    empty_send_rejected,
+    meta_round_trip,
+    pending_counts,
+    token_list_and_revoke,
+    seat_permission_mode,
+    claim_marks_inlined_read,
 );
 
 async fn org(s: &S, name: &str) -> (Org, Seat) {
@@ -83,6 +89,7 @@ fn msg(org_id: i64, from: i64, subject: &str, to: &[(&Seat, C)]) -> NewMessage {
         cc_addrs: vec![],
         priority: Priority::Normal,
         ack_required: false,
+        meta: Default::default(),
         deliveries: to
             .iter()
             .map(|(s, c)| NewDelivery {
@@ -102,6 +109,7 @@ fn filter(classes: &[C]) -> ClaimFilter {
         include_digest: false,
         via: "test".into(),
         limit: 100,
+        read_body_max: None,
     }
 }
 
@@ -169,6 +177,7 @@ async fn seats(s: S) {
                 harness: Some("claude".into()),
                 model: Some("sonnet".into()),
                 display_name: Some("Worker 1".into()),
+                permission_mode: Some(amail_proto::PermissionMode::Unattended),
             },
         )
         .await
@@ -1187,5 +1196,196 @@ async fn seq_mixed_workload_feed_complete(s: S) {
     assert_eq!(
         state, fresh,
         "incremental reader diverged from the final state"
+    );
+}
+
+async fn empty_send_rejected(s: S) {
+    let (o, u) = org(&s, "acme").await;
+    let m = msg(o.id, u.id, "nobody", &[]);
+    assert!(matches!(s.send(&m).await, Err(StoreError::Invalid(_))));
+    // Nothing was stored.
+    let a = s
+        .archive(
+            o.id,
+            &ArchiveQuery {
+                limit: 10,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(a.is_empty(), "{a:?}");
+}
+
+async fn meta_round_trip(s: S) {
+    let (o, u) = org(&s, "acme").await;
+    let a = seat(&s, o.id, "a").await;
+    let mut m = msg(o.id, u.id, "merge", &[(&a, C::To)]);
+    m.meta = BTreeMap::from([
+        ("repo".to_string(), "core".to_string()),
+        ("commit".to_string(), "abc\"123".to_string()),
+    ]);
+    let sent = s.send(&m).await.unwrap();
+    let got = s.message(sent.message_id).await.unwrap().unwrap();
+    assert_eq!(got.meta, m.meta);
+    let plain = s
+        .send(&msg(o.id, u.id, "plain", &[(&a, C::To)]))
+        .await
+        .unwrap();
+    assert!(
+        s.message(plain.message_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .meta
+            .is_empty()
+    );
+    // Headers (inbox, claim) carry meta too.
+    let (claimed, _) = s.claim(a.id, &filter(&[C::To])).await.unwrap();
+    assert_eq!(claimed.len(), 2);
+    assert_eq!(claimed[0].message.meta, m.meta);
+}
+
+async fn pending_counts(s: S) {
+    let (o, u) = org(&s, "acme").await;
+    let a = seat(&s, o.id, "a").await;
+    let b = seat(&s, o.id, "b").await;
+    s.send(&msg(o.id, u.id, "1", &[(&a, C::To), (&b, C::Cc)]))
+        .await
+        .unwrap();
+    let mut urgent = msg(o.id, u.id, "2", &[(&a, C::Cc)]);
+    urgent.priority = Priority::Urgent;
+    s.send(&urgent).await.unwrap();
+    let mut digest = msg(o.id, u.id, "3", &[(&a, C::List)]);
+    digest.deliveries[0].mode = M::Digest;
+    s.send(&digest).await.unwrap();
+
+    let all = s.pending(o.id, None).await.unwrap();
+    let names: Vec<&str> = all.iter().map(|p| p.seat_name.as_str()).collect();
+    assert_eq!(names, ["a", "b", "owner"]);
+    let pa = &all[0];
+    assert_eq!((pa.to, pa.cc, pa.list, pa.urgent), (1, 1, 0, 1));
+    assert_eq!(pa.last_seq, 3);
+    let pb = &all[1];
+    assert_eq!((pb.to, pb.cc, pb.list, pb.urgent), (0, 1, 0, 0));
+    assert_eq!(
+        all[2],
+        PendingRec {
+            seat_id: u.id,
+            seat_name: "owner".into(),
+            ..Default::default()
+        }
+    );
+
+    s.claim(a.id, &filter(&[C::To])).await.unwrap();
+    let one = s.pending(o.id, Some(a.id)).await.unwrap();
+    assert_eq!(one.len(), 1);
+    assert_eq!((one[0].to, one[0].cc, one[0].urgent), (0, 1, 1));
+    assert_eq!(one[0].last_seq, 4);
+}
+
+async fn token_list_and_revoke(s: S) {
+    let (o, u) = org(&s, "acme").await;
+    let (o2, _) = org(&s, "beta").await;
+    let a = seat(&s, o.id, "a").await;
+    for (scope, seat, hash, label) in [
+        (
+            amail_proto::TokenScope::Seat,
+            Some(a.id),
+            "h-a",
+            Some("agent a"),
+        ),
+        (amail_proto::TokenScope::Node, None, "h-n", None),
+    ] {
+        s.create_token(&NewToken {
+            org_id: o.id,
+            scope,
+            seat_id: seat,
+            hash: hash.into(),
+            label: label.map(str::to_string),
+        })
+        .await
+        .unwrap();
+    }
+    let t = s.tokens(o.id).await.unwrap();
+    assert_eq!(t.len(), 3);
+    assert_eq!(t[0].scope, amail_proto::TokenScope::User);
+    assert_eq!(t[0].seat_name.as_deref(), Some(u.name.as_str()));
+    assert_eq!(t[1].seat_name.as_deref(), Some("a"));
+    assert_eq!(t[1].label.as_deref(), Some("agent a"));
+    assert!(t[2].seat_name.is_none());
+    // Other orgs cannot revoke it; revoking works once.
+    assert!(!s.revoke_token(o2.id, t[1].id).await.unwrap());
+    assert!(s.revoke_token(o.id, t[1].id).await.unwrap());
+    assert!(!s.revoke_token(o.id, t[1].id).await.unwrap());
+    assert!(s.token_auth("h-a").await.unwrap().is_none());
+    assert_eq!(s.tokens(o.id).await.unwrap().len(), 2);
+}
+
+async fn seat_permission_mode(s: S) {
+    use amail_proto::PermissionMode as P;
+    let (o, _) = org(&s, "acme").await;
+    let a = seat(&s, o.id, "a").await;
+    assert_eq!(a.permission_mode, None);
+    let set = |v: Option<P>| SeatUpdate {
+        permission_mode: Some(v),
+        ..Default::default()
+    };
+    let a = s
+        .update_seat(o.id, "a", &set(Some(P::Unattended)))
+        .await
+        .unwrap();
+    assert_eq!(a.permission_mode, Some(P::Unattended));
+    // Untouched by unrelated patches.
+    let a = s
+        .update_seat(
+            o.id,
+            "a",
+            &SeatUpdate {
+                role: Some(Some("r".into())),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(a.permission_mode, Some(P::Unattended));
+    let a = s.update_seat(o.id, "a", &set(None)).await.unwrap();
+    assert_eq!(a.permission_mode, None);
+}
+
+/// A claim can mark read, in the same change, the deliveries whose whole
+/// body the caller shows.
+async fn claim_marks_inlined_read(s: S) {
+    let (o, u) = org(&s, "acme").await;
+    let a = seat(&s, o.id, "a").await;
+    let mut short = msg(o.id, u.id, "short", &[(&a, C::To)]);
+    short.body = "é".repeat(10); // characters, not bytes
+    let mut long = msg(o.id, u.id, "long", &[(&a, C::To)]);
+    long.body = "x".repeat(11);
+    let s1 = s.send(&short).await.unwrap();
+    let s2 = s.send(&long).await.unwrap();
+    let before = s.seat_seqs(o.id).await.unwrap();
+    let mut f = filter(&[C::To]);
+    f.read_body_max = Some(10);
+    let (got, bump) = s.claim(a.id, &f).await.unwrap();
+    assert_eq!(got.len(), 2);
+    let short_d = s.delivery(s1.message_id, a.id).await.unwrap().unwrap();
+    let long_d = s.delivery(s2.message_id, a.id).await.unwrap().unwrap();
+    assert!(short_d.notified_at.is_some() && short_d.read_at.is_some());
+    assert!(long_d.notified_at.is_some() && long_d.read_at.is_none());
+    assert_eq!(got[0].delivery.read_at, short_d.read_at);
+    // One sequence step per delivery, as for a plain claim.
+    let a_before = before.iter().find(|x| x.0 == a.id).unwrap().2;
+    assert_eq!(bump.unwrap().seq, a_before + 2);
+    // Without the option nothing is marked read.
+    let s3 = s.send(&short).await.unwrap();
+    s.claim(a.id, &filter(&[C::To])).await.unwrap();
+    assert!(
+        s.delivery(s3.message_id, a.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .read_at
+            .is_none()
     );
 }

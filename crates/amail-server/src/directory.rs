@@ -56,6 +56,10 @@ pub async fn patch_org(
 
 // --- seats -------------------------------------------------------------------
 
+fn seat_out(st: &AppState, auth: &Auth, s: &amail_store::Seat) -> p::Seat {
+    render::seat(s, st.presence.get(auth.org.id, &s.name))
+}
+
 pub async fn list_seats(State(st): State<AppState>, auth: Auth) -> ApiResult<Json<Vec<p::Seat>>> {
     auth.require_directory()?;
     Ok(Json(
@@ -63,7 +67,7 @@ pub async fn list_seats(State(st): State<AppState>, auth: Auth) -> ApiResult<Jso
             .seats(auth.org.id)
             .await?
             .iter()
-            .map(render::seat)
+            .map(|s| seat_out(&st, &auth, s))
             .collect(),
     ))
 }
@@ -76,7 +80,7 @@ pub async fn create_seat(
     auth.require_user()?;
     check_name(&seat.name)?;
     let s = st.store.create_seat(auth.org.id, &seat).await?;
-    Ok((StatusCode::CREATED, Json(render::seat(&s))))
+    Ok((StatusCode::CREATED, Json(seat_out(&st, &auth, &s))))
 }
 
 pub async fn get_seat(
@@ -90,7 +94,7 @@ pub async fn get_seat(
         .seat_by_name(auth.org.id, &name)
         .await?
         .ok_or_else(|| ApiError::not_found(format!("no seat {name:?}")))?;
-    Ok(Json(render::seat(&s)))
+    Ok(Json(seat_out(&st, &auth, &s)))
 }
 
 pub async fn patch_seat(
@@ -100,9 +104,8 @@ pub async fn patch_seat(
     Json(patch): Json<p::SeatPatch>,
 ) -> ApiResult<Json<p::Seat>> {
     auth.require_user()?;
-    Ok(Json(render::seat(
-        &st.store.update_seat(auth.org.id, &name, &patch).await?,
-    )))
+    let s = st.store.update_seat(auth.org.id, &name, &patch).await?;
+    Ok(Json(seat_out(&st, &auth, &s)))
 }
 
 pub async fn delete_seat(
@@ -183,6 +186,60 @@ pub async fn org_token(
             seat: seat.map(|s| s.name),
         }),
     ))
+}
+
+/// `GET /v1/tokens`: live tokens of the org (labels and scopes only).
+pub async fn list_tokens(
+    State(st): State<AppState>,
+    auth: Auth,
+) -> ApiResult<Json<Vec<p::TokenInfo>>> {
+    auth.require_user()?;
+    Ok(Json(
+        st.store
+            .tokens(auth.org.id)
+            .await?
+            .into_iter()
+            .map(|t| p::TokenInfo {
+                id: t.id,
+                scope: t.scope,
+                seat: t.seat_name,
+                label: t.label,
+                created_at: render::ts(t.created_at),
+            })
+            .collect(),
+    ))
+}
+
+/// `DELETE /v1/tokens/{id}`. The org's last user token cannot be revoked.
+pub async fn revoke_token(
+    State(st): State<AppState>,
+    auth: Auth,
+    Path(id): Path<i64>,
+) -> ApiResult<StatusCode> {
+    auth.require_user()?;
+    let tokens = st.store.tokens(auth.org.id).await?;
+    let target = tokens
+        .iter()
+        .find(|t| t.id == id)
+        .ok_or_else(|| ApiError::not_found(format!("no token {id}")))?;
+    if target.scope == TokenScope::User
+        && tokens
+            .iter()
+            .filter(|t| t.scope == TokenScope::User)
+            .count()
+            == 1
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "last_user_token",
+            "cannot revoke the org's last user token",
+        ));
+    }
+    if st.store.revoke_token(auth.org.id, id).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found(format!("no token {id}")))
+    }
 }
 
 // --- lists -------------------------------------------------------------------

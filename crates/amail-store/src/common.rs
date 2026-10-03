@@ -12,7 +12,9 @@
 
 use crate::model::*;
 use crate::{Result, StoreError};
-use amail_proto::{DeliveryClass, DeliveryMode, LinkState, PostPolicy, Priority, SeatKind};
+use amail_proto::{
+    DeliveryClass, DeliveryMode, LinkState, Meta, PermissionMode, PostPolicy, Priority, SeatKind,
+};
 use std::str::FromStr;
 
 // Column lists and joins, as macros so they can be `concat!`ed into
@@ -21,7 +23,8 @@ use std::str::FromStr;
 macro_rules! seat_select {
     () => {
         "SELECT s.id, s.org_id, s.name, s.kind, s.parent_id, p.name AS parent_name, \
-         s.display_name, s.role, s.harness, s.model, s.last_seq, s.created_at, s.deleted_at \
+         s.display_name, s.role, s.harness, s.model, s.permission_mode, s.last_seq, s.created_at, \
+         s.deleted_at \
          FROM seats s LEFT JOIN seats p ON p.id = s.parent_id"
     };
 }
@@ -38,7 +41,7 @@ macro_rules! msg_cols {
     () => {
         "m.id, m.org_id, mo.name AS org_name, m.sender_seat_id, ms.name AS sender_name, \
          ms.kind AS sender_kind, m.thread_id, m.parent_id, m.depth, m.subject, m.lines, \
-         m.to_addrs, m.cc_addrs, m.priority, m.ack_required, m.created_at"
+         m.to_addrs, m.cc_addrs, m.priority, m.ack_required, m.meta, m.created_at"
     };
 }
 
@@ -138,6 +141,26 @@ pub(crate) fn line_count(body: &str) -> i64 {
     body.lines().count() as i64
 }
 
+/// `meta` is stored as a JSON object, or `''` when empty.
+pub(crate) fn meta_to_db(m: &Meta) -> String {
+    if m.is_empty() {
+        String::new()
+    } else {
+        serde_json::to_string(m).unwrap_or_default()
+    }
+}
+
+fn meta_from_db(s: &str) -> Result<Meta> {
+    if s.is_empty() {
+        return Ok(Meta::new());
+    }
+    serde_json::from_str(s).map_err(|e| StoreError::Invalid(format!("corrupt meta: {e}")))
+}
+
+fn opt_parse<T: FromStr<Err = String>>(s: Option<&str>) -> Result<Option<T>> {
+    s.map(parse).transpose()
+}
+
 #[derive(sqlx::FromRow)]
 pub(crate) struct OrgRow {
     id: i64,
@@ -175,6 +198,7 @@ pub(crate) struct SeatRow {
     role: Option<String>,
     harness: Option<String>,
     model: Option<String>,
+    permission_mode: Option<String>,
     last_seq: i64,
     created_at: i64,
     deleted_at: Option<i64>,
@@ -193,6 +217,7 @@ impl SeatRow {
             role: self.role,
             harness: self.harness,
             model: self.model,
+            permission_mode: opt_parse::<PermissionMode>(self.permission_mode.as_deref())?,
             last_seq: self.last_seq,
             created_at: self.created_at,
             deleted_at: self.deleted_at,
@@ -216,6 +241,7 @@ pub(crate) struct AuthRow {
     s_role: Option<String>,
     s_harness: Option<String>,
     s_model: Option<String>,
+    s_permission_mode: Option<String>,
     s_last_seq: Option<i64>,
     s_created_at: Option<i64>,
     s_deleted_at: Option<i64>,
@@ -237,6 +263,7 @@ impl AuthRow {
                 role: self.s_role,
                 harness: self.s_harness,
                 model: self.s_model,
+                permission_mode: opt_parse::<PermissionMode>(self.s_permission_mode.as_deref())?,
                 last_seq: self.s_last_seq.unwrap_or_default(),
                 created_at: self.s_created_at.unwrap_or_default(),
                 deleted_at: None,
@@ -328,6 +355,7 @@ pub(crate) struct MsgRow {
     cc_addrs: String,
     priority: String,
     ack_required: bool,
+    meta: String,
     created_at: i64,
 }
 
@@ -350,6 +378,7 @@ impl MsgRow {
             cc_addrs: split_addrs(&self.cc_addrs),
             priority: parse::<Priority>(&self.priority)?,
             ack_required: self.ack_required,
+            meta: meta_from_db(&self.meta)?,
             created_at: self.created_at,
         })
     }
@@ -408,6 +437,52 @@ impl EntryRow {
             delivery: self.d.into_delivery()?,
             message: self.m.into_message()?,
         })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+pub(crate) struct TokenRow {
+    id: i64,
+    scope: String,
+    seat_name: Option<String>,
+    label: Option<String>,
+    created_at: i64,
+}
+
+impl TokenRow {
+    pub(crate) fn into_token(self) -> Result<TokenRec> {
+        Ok(TokenRec {
+            id: self.id,
+            scope: parse(&self.scope)?,
+            seat_name: self.seat_name,
+            label: self.label,
+            created_at: self.created_at,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+pub(crate) struct PendingRow {
+    seat_id: i64,
+    seat_name: String,
+    last_seq: i64,
+    to_n: i64,
+    cc_n: i64,
+    list_n: i64,
+    urgent_n: i64,
+}
+
+impl From<PendingRow> for PendingRec {
+    fn from(r: PendingRow) -> PendingRec {
+        PendingRec {
+            seat_id: r.seat_id,
+            seat_name: r.seat_name,
+            last_seq: r.last_seq,
+            to: r.to_n,
+            cc: r.cc_n,
+            list: r.list_n,
+            urgent: r.urgent_n,
+        }
     }
 }
 
@@ -511,8 +586,8 @@ macro_rules! impl_store_common {
             ) -> Result<Seat> {
                 reserve_name(c, org_id, &s.name).await?;
                 let id: i64 = sqlx::query_scalar(
-                    "INSERT INTO seats (org_id, name, kind, parent_id, display_name, role, harness, model, created_at) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
+                    "INSERT INTO seats (org_id, name, kind, parent_id, display_name, role, harness, model, \
+                     permission_mode, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id",
                 )
                 .bind(org_id)
                 .bind(&s.name)
@@ -522,6 +597,7 @@ macro_rules! impl_store_common {
                 .bind(&s.role)
                 .bind(&s.harness)
                 .bind(&s.model)
+                .bind(s.permission_mode.map(|m| m.as_str()))
                 .bind(now_ms())
                 .fetch_one(&mut *c)
                 .await?;
@@ -590,7 +666,7 @@ macro_rules! impl_store_common {
                      o.max_thread_depth, o.created_at, s.id AS s_id, s.org_id AS s_org_id, s.name AS s_name, \
                      s.kind AS s_kind, s.parent_id AS s_parent_id, p.name AS s_parent_name, \
                      s.display_name AS s_display_name, s.role AS s_role, s.harness AS s_harness, \
-                     s.model AS s_model, s.last_seq AS s_last_seq, s.created_at AS s_created_at, \
+                     s.model AS s_model, s.permission_mode AS s_permission_mode, s.last_seq AS s_last_seq, s.created_at AS s_created_at, \
                      s.deleted_at AS s_deleted_at \
                      FROM tokens t JOIN orgs o ON o.id = t.org_id \
                      LEFT JOIN seats s ON s.id = t.seat_id LEFT JOIN seats p ON p.id = s.parent_id \
@@ -660,14 +736,18 @@ macro_rules! impl_store_common {
                     Some(v) => v.clone(),
                 };
                 sqlx::query(
-                    "UPDATE seats SET parent_id = $1, display_name = $2, role = $3, harness = $4, model = $5 \
-                     WHERE id = $6",
+                    "UPDATE seats SET parent_id = $1, display_name = $2, role = $3, harness = $4, model = $5, \
+                     permission_mode = $6 WHERE id = $7",
                 )
                 .bind(parent_id)
                 .bind(pick(&p.display_name, &seat.display_name))
                 .bind(pick(&p.role, &seat.role))
                 .bind(pick(&p.harness, &seat.harness))
                 .bind(pick(&p.model, &seat.model))
+                .bind(match p.permission_mode {
+                    None => seat.permission_mode,
+                    Some(v) => v,
+                }.map(|m| m.as_str()))
                 .bind(seat.id)
                 .execute(&mut *c)
                 .await?;
@@ -1080,6 +1160,51 @@ macro_rules! impl_store_common {
                 .await?)
             }
 
+            pub async fn tokens(c: &mut Conn, org_id: i64) -> Result<Vec<TokenRec>> {
+                let rows: Vec<TokenRow> = sqlx::query_as(
+                    "SELECT t.id, t.scope, s.name AS seat_name, t.label, t.created_at FROM tokens t \
+                     LEFT JOIN seats s ON s.id = t.seat_id \
+                     WHERE t.org_id = $1 AND t.revoked_at IS NULL ORDER BY t.id",
+                )
+                .bind(org_id)
+                .fetch_all(&mut *c)
+                .await?;
+                collect(rows, TokenRow::into_token)
+            }
+
+            pub async fn revoke_token(c: &mut Conn, org_id: i64, id: i64) -> Result<bool> {
+                let n = sqlx::query(
+                    "UPDATE tokens SET revoked_at = $1 WHERE org_id = $2 AND id = $3 AND revoked_at IS NULL",
+                )
+                .bind(now_ms())
+                .bind(org_id)
+                .bind(id)
+                .execute(&mut *c)
+                .await?
+                .rows_affected();
+                Ok(n > 0)
+            }
+
+            pub async fn pending(c: &mut Conn, org_id: i64, seat_id: Option<i64>) -> Result<Vec<PendingRec>> {
+                let rows: Vec<PendingRow> = sqlx::query_as(
+                    "SELECT s.id AS seat_id, s.name AS seat_name, s.last_seq, \
+                     COALESCE(SUM(CASE WHEN d.class = 'to' THEN 1 ELSE 0 END), 0) AS to_n, \
+                     COALESCE(SUM(CASE WHEN d.class = 'cc' THEN 1 ELSE 0 END), 0) AS cc_n, \
+                     COALESCE(SUM(CASE WHEN d.class = 'list' THEN 1 ELSE 0 END), 0) AS list_n, \
+                     COALESCE(SUM(CASE WHEN m.priority = 'urgent' THEN 1 ELSE 0 END), 0) AS urgent_n \
+                     FROM seats s \
+                     LEFT JOIN deliveries d ON d.seat_id = s.id AND d.notified_at IS NULL AND d.mode = 'immediate' \
+                     LEFT JOIN messages m ON m.id = d.message_id \
+                     WHERE s.org_id = $1 AND s.deleted_at IS NULL AND ($2 IS NULL OR s.id = $2) \
+                     GROUP BY s.id, s.name, s.last_seq ORDER BY s.name",
+                )
+                .bind(org_id)
+                .bind(seat_id)
+                .fetch_all(&mut *c)
+                .await?;
+                Ok(rows.into_iter().map(PendingRec::from).collect())
+            }
+
             /// Ids of claimable deliveries. `sql` is `claim_select!()`,
             /// possibly with a locking suffix.
             pub async fn claim_candidates(c: &mut Conn, sql: &'static str, seat_id: i64, f: &ClaimFilter) -> Result<Vec<i64>> {
@@ -1226,6 +1351,9 @@ macro_rules! impl_store_common {
             }
 
             async fn send(&self, msg: &$crate::NewMessage) -> $crate::Result<$crate::Sent> {
+                if msg.deliveries.is_empty() {
+                    return Err(StoreError::Invalid("a message needs at least one delivery".into()));
+                }
                 self.send_impl(msg).await
             }
 
@@ -1296,6 +1424,18 @@ macro_rules! impl_store_common {
 
             async fn seat_seqs(&self, org_id: i64) -> $crate::Result<Vec<(i64, String, i64)>> {
                 run!(self.read, |c| q::seat_seqs(c, org_id).await)
+            }
+
+            async fn tokens(&self, org_id: i64) -> $crate::Result<Vec<$crate::TokenRec>> {
+                run!(self.read, |c| q::tokens(c, org_id).await)
+            }
+
+            async fn revoke_token(&self, org_id: i64, id: i64) -> $crate::Result<bool> {
+                run!(self.write, |c| q::revoke_token(c, org_id, id).await)
+            }
+
+            async fn pending(&self, org_id: i64, seat_id: Option<i64>) -> $crate::Result<Vec<$crate::PendingRec>> {
+                run!(self.read, |c| q::pending(c, org_id, seat_id).await)
             }
         }
     };

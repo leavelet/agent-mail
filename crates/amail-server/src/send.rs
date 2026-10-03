@@ -30,6 +30,7 @@ pub async fn send(st: &AppState, auth: &Auth, req: SendRequest) -> ApiResult<Sen
     if req.to.is_empty() && req.cc.is_empty() {
         return Err(ApiError::bad_request("at least one recipient is required"));
     }
+    check_sizes(&req)?;
     let limited = sender.kind != SeatKind::User;
     if limited {
         st.limiter
@@ -41,6 +42,75 @@ pub async fn send(st: &AppState, auth: &Auth, req: SendRequest) -> ApiResult<Sen
         st.limiter.refund(sender.id, org.send_burst);
     }
     result
+}
+
+/// Fixed size limits (see [`amail_proto::limits`]).
+fn check_sizes(req: &SendRequest) -> ApiResult<()> {
+    use amail_proto::limits::*;
+    let too = |code: &'static str, msg: String| Err(ApiError::unprocessable(code, msg));
+    if req.subject.chars().any(char::is_control) {
+        return too(
+            "invalid_subject",
+            "the subject must be a single line without control characters".into(),
+        );
+    }
+    if req.subject.chars().count() > MAX_SUBJECT_CHARS {
+        return too(
+            "subject_too_long",
+            format!("subject is limited to {MAX_SUBJECT_CHARS} characters"),
+        );
+    }
+    if req.body.len() > MAX_BODY_BYTES {
+        return too(
+            "body_too_large",
+            format!("body is limited to {} KB", MAX_BODY_BYTES / 1024),
+        );
+    }
+    if req.to.len() + req.cc.len() > MAX_ADDRESSES {
+        return too(
+            "too_many_addresses",
+            format!("a message may name at most {MAX_ADDRESSES} addresses"),
+        );
+    }
+    if req.meta.len() > MAX_META_KEYS {
+        return too(
+            "invalid_meta",
+            format!("meta is limited to {MAX_META_KEYS} keys"),
+        );
+    }
+    let bytes: usize = req.meta.iter().map(|(k, v)| k.len() + v.len()).sum();
+    if bytes > MAX_META_BYTES {
+        return too(
+            "invalid_meta",
+            format!("meta is limited to {MAX_META_BYTES} bytes"),
+        );
+    }
+    if let Some(k) = req.meta.keys().find(|k| !valid_meta_key(k)) {
+        return too(
+            "invalid_meta",
+            format!("invalid meta key {k:?}: use 1-32 of [a-z0-9_.-]"),
+        );
+    }
+    if let Some(k) = req
+        .meta
+        .iter()
+        .find(|(_, v)| v.chars().any(char::is_control))
+        .map(|(k, _)| k)
+    {
+        return too(
+            "invalid_meta",
+            format!("meta value of {k:?} must be a single line without control characters"),
+        );
+    }
+    Ok(())
+}
+
+fn valid_meta_key(k: &str) -> bool {
+    !k.is_empty()
+        && k.len() <= 32
+        && k.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+        })
 }
 
 async fn send_inner(
@@ -109,6 +179,7 @@ async fn send_inner(
         cc_addrs: r.cc_addrs,
         priority: req.priority.unwrap_or(Priority::Normal),
         ack_required: req.ack_required.unwrap_or(false),
+        meta: req.meta,
         deliveries,
     };
     let sent = st.store.send(&msg).await?;

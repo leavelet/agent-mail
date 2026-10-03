@@ -223,6 +223,8 @@ async fn run(backend: Backend) {
         )),
         "{inbox}"
     );
+    // Plain-text times are UTC and say so.
+    assert!(inbox.trim_end().ends_with('Z'), "{inbox}");
     let lead_inbox = lead.run(&["inbox"]);
     assert!(
         lead_inbox.contains("[list digest unread ack]"),
@@ -395,6 +397,83 @@ async fn run(backend: Backend) {
     assert!(
         !node
             .try_run(&["send", "--to", "w1", "-s", "x", "-m", ""], None)
+            .status
+            .success()
+    );
+
+    // Structured fields.
+    let sent = w1.run(&[
+        "send",
+        "--to",
+        "lead",
+        "-s",
+        "Merge request",
+        "-m",
+        "Ready.",
+        "--meta",
+        "repo=core",
+        "--meta",
+        "commit=abc123",
+    ]);
+    let mr = first_id(&sent);
+    let read = lead.run(&["read", &mr.to_string()]);
+    assert!(
+        read.contains("Meta: commit=abc123\nMeta: repo=core\n"),
+        "{read}"
+    );
+    assert!(
+        !w1.try_run(
+            &[
+                "send", "--to", "lead", "-s", "x", "-m", "", "--meta", "novalue"
+            ],
+            None
+        )
+        .status
+        .success()
+    );
+
+    // Token management: list shows labels, never secrets; revoke works.
+    let tokens = acme.run(&["token", "ls"]);
+    assert!(
+        tokens
+            .lines()
+            .next()
+            .unwrap()
+            .contains(" user owner \"initial user token\" "),
+        "{tokens}"
+    );
+    assert!(!tokens.contains("amail_"), "{tokens}");
+    let node_id = tokens
+        .lines()
+        .find(|l| l.contains(" node"))
+        .and_then(|l| l.split(' ').next())
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        acme.run(&["token", "revoke", &node_id]).trim(),
+        format!("revoked token {node_id}")
+    );
+    assert!(
+        !node
+            .try_run(&["inbox", "--seat", "w1"], None)
+            .status
+            .success()
+    );
+
+    // Seat settings, including the permission mode used by `amail run`.
+    let set = acme.run(&[
+        "seat",
+        "set",
+        "w1",
+        "--model",
+        "sonnet",
+        "--permission-mode",
+        "unattended",
+    ]);
+    assert!(set.contains("model=sonnet permissions=unattended"), "{set}");
+    assert!(
+        !acme
+            .try_run(&["seat", "set", "w1", "--permission-mode", "yolo"], None)
             .status
             .success()
     );
