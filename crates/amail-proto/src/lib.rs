@@ -108,7 +108,9 @@ string_enum!(
 
 string_enum!(
     /// Session state of a seat, as reported by the node hosting it.
-    SeatState { Offline => "offline", Busy => "busy", Idle => "idle", Awaiting => "awaiting" }
+    /// `dormant`: the seat sleeps; its session can be resumed but no process
+    /// runs (mail for it starts the session again).
+    SeatState { Offline => "offline", Busy => "busy", Idle => "idle", Awaiting => "awaiting", Dormant => "dormant" }
 );
 
 string_enum!(
@@ -391,6 +393,9 @@ pub struct Seat {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<PermissionMode>,
+    /// The team group the seat belongs to (for display; set by `amail up`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     pub created_at: String,
     /// The seat's session state as last reported by a node. Absent when no
     /// node has reported the seat recently (treat as offline).
@@ -413,6 +418,8 @@ pub struct NewSeat {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<PermissionMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 /// PATCH body for a seat. A missing field is left unchanged; `null` clears it.
@@ -454,6 +461,12 @@ pub struct SeatPatch {
         skip_serializing_if = "Option::is_none"
     )]
     pub permission_mode: Option<Option<PermissionMode>>,
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub group: Option<Option<String>>,
 }
 
 fn double_option<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
@@ -488,6 +501,10 @@ pub struct List {
     pub description: Option<String>,
     pub post_policy: PostPolicy,
     pub member_count: i64,
+    /// Maintained by `amail up` (generated from the team file); lists
+    /// without the mark are the user's and `amail up` leaves them alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub managed: bool,
     /// Present on `GET /lists/{name}`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub members: Option<Vec<ListMember>>,
@@ -500,6 +517,8 @@ pub struct NewList {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_policy: Option<PostPolicy>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub managed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

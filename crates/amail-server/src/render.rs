@@ -99,6 +99,7 @@ pub fn seat(s: &Seat, presence: Option<p::Presence>) -> p::Seat {
         harness: s.harness.clone(),
         model: s.model.clone(),
         permission_mode: s.permission_mode,
+        group: s.group.clone(),
         created_at: ts(s.created_at),
         presence,
     }
@@ -110,6 +111,7 @@ pub fn list(l: &List, members: Option<Vec<p::ListMember>>) -> p::List {
         description: l.description.clone(),
         post_policy: l.post_policy,
         member_count: l.member_count,
+        managed: l.managed,
         members,
     }
 }

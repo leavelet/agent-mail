@@ -79,6 +79,9 @@ pub async fn create_seat(
 ) -> ApiResult<(StatusCode, Json<p::Seat>)> {
     auth.require_user()?;
     check_name(&seat.name)?;
+    if let Some(g) = &seat.group {
+        check_name(g)?;
+    }
     let s = st.store.create_seat(auth.org.id, &seat).await?;
     Ok((StatusCode::CREATED, Json(seat_out(&st, &auth, &s))))
 }
@@ -104,6 +107,9 @@ pub async fn patch_seat(
     Json(patch): Json<p::SeatPatch>,
 ) -> ApiResult<Json<p::Seat>> {
     auth.require_user()?;
+    if let Some(Some(g)) = &patch.group {
+        check_name(g)?;
+    }
     let s = st.store.update_seat(auth.org.id, &name, &patch).await?;
     Ok(Json(seat_out(&st, &auth, &s)))
 }

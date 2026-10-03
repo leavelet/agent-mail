@@ -56,6 +56,7 @@ http_tests!(
     message_meta,
     header_injection_rejected,
     claim_marks_inlined_read_http,
+    team_fields,
 );
 
 struct Server {
@@ -1923,4 +1924,62 @@ async fn claim_marks_inlined_read_http(srv: Server) {
     assert_eq!(state(short).await, "read");
     assert_eq!(state(long).await, "notified");
     assert_eq!(state(plain).await, "notified");
+}
+
+/// M3: seat groups, managed lists and the dormant state.
+async fn team_fields(srv: Server) {
+    let user = srv.org("acme").await;
+    let v = user
+        .ok(
+            Method::POST,
+            "/seats",
+            Some(json!({ "name": "be-1", "group": "backend" })),
+        )
+        .await;
+    assert_eq!(v["group"], "backend");
+    let (s, _) = user
+        .post("/seats", json!({ "name": "x", "group": "Not Valid" }))
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let v = user
+        .ok(
+            Method::PATCH,
+            "/seats/be-1",
+            Some(json!({ "group": "frontend" })),
+        )
+        .await;
+    assert_eq!(v["group"], "frontend");
+    let v = user
+        .ok(Method::PATCH, "/seats/be-1", Some(json!({ "group": null })))
+        .await;
+    assert!(v.get("group").is_none());
+
+    let v = user
+        .ok(
+            Method::POST,
+            "/lists",
+            Some(json!({ "name": "backend", "managed": true, "post_policy": "anyone" })),
+        )
+        .await;
+    assert_eq!(v["managed"], true);
+    user.list("mine", "anyone", &[]).await;
+    let lists = user.ok(Method::GET, "/lists", None).await;
+    let managed: Vec<&str> = lists
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|l| l["managed"] == true)
+        .map(|l| l["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(managed, vec!["backend"]);
+
+    let node = node_token(&user).await;
+    node.ok(
+        Method::POST,
+        "/presence",
+        Some(json!({ "seats": [{"seat": "be-1", "state": "dormant", "harness": "codex"}] })),
+    )
+    .await;
+    let v = user.ok(Method::GET, "/seats/be-1", None).await;
+    assert_eq!(v["presence"]["state"], "dormant");
 }

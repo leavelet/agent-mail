@@ -150,6 +150,9 @@ pub fn seat_line(s: &p::Seat) -> String {
     if let Some(p) = &s.permission_mode {
         out.push_str(&format!(" permissions={p}"));
     }
+    if let Some(g) = &s.group {
+        out.push_str(&format!(" group={g}"));
+    }
     if let Some(p) = &s.presence {
         out.push_str(&format!(" state={}", p.state));
         if p.wake_failed {
@@ -163,10 +166,11 @@ pub fn seat_line(s: &p::Seat) -> String {
 
 pub fn list_line(l: &p::List) -> String {
     format!(
-        "list {} members={} policy={}{}",
+        "list {} members={} policy={}{}{}",
         l.name,
         l.member_count,
         l.post_policy,
+        if l.managed { " managed" } else { "" },
         quoted("description", &l.description)
     )
 }

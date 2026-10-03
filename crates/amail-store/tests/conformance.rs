@@ -178,11 +178,49 @@ async fn seats(s: S) {
                 model: Some("sonnet".into()),
                 display_name: Some("Worker 1".into()),
                 permission_mode: Some(amail_proto::PermissionMode::Unattended),
+                group: Some("backend".into()),
             },
         )
         .await
         .unwrap();
     assert_eq!(w.parent_id, Some(lead.id));
+    assert_eq!(w.group.as_deref(), Some("backend"));
+    // The group can be changed and cleared like the other fields.
+    let w2 = s
+        .update_seat(
+            o.id,
+            "w1",
+            &SeatUpdate {
+                group: Some(Some("frontend".into())),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(w2.group.as_deref(), Some("frontend"));
+    assert_eq!(w2.role.as_deref(), Some("worker"));
+    let w3 = s
+        .update_seat(
+            o.id,
+            "w1",
+            &SeatUpdate {
+                group: Some(None),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(w3.group, None);
+    s.update_seat(
+        o.id,
+        "w1",
+        &SeatUpdate {
+            group: Some(Some("backend".into())),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     let found = s
         .seats_by_names(o.id, &["w1".into(), "lead".into(), "ghost".into()])
         .await
@@ -411,11 +449,33 @@ async fn lists_and_members(s: S) {
                 name: "team".into(),
                 description: Some("d".into()),
                 post_policy: Some(PostPolicy::Members),
+                managed: false,
             },
         )
         .await
         .unwrap();
     assert_eq!(l.post_policy, PostPolicy::Members);
+    assert!(!l.managed);
+    let generated = s
+        .create_list(
+            o.id,
+            &NewList {
+                name: "generated".into(),
+                managed: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(generated.managed);
+    assert!(
+        s.lists(o.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|l| l.name == "generated" && l.managed)
+    );
+    s.delete_list(o.id, "generated").await.unwrap();
     assert_eq!(l.member_count, 0);
     s.put_member(
         o.id,

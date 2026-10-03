@@ -23,15 +23,15 @@ use std::str::FromStr;
 macro_rules! seat_select {
     () => {
         "SELECT s.id, s.org_id, s.name, s.kind, s.parent_id, p.name AS parent_name, \
-         s.display_name, s.role, s.harness, s.model, s.permission_mode, s.last_seq, s.created_at, \
-         s.deleted_at \
+         s.display_name, s.role, s.harness, s.model, s.permission_mode, s.group_name, s.last_seq, \
+         s.created_at, s.deleted_at \
          FROM seats s LEFT JOIN seats p ON p.id = s.parent_id"
     };
 }
 
 macro_rules! list_select {
     () => {
-        "SELECT l.id, l.org_id, l.name, l.description, l.post_policy, \
+        "SELECT l.id, l.org_id, l.name, l.description, l.post_policy, l.managed, \
          (SELECT COUNT(*) FROM list_members lm WHERE lm.list_id = l.id) AS member_count, \
          l.created_at FROM lists l"
     };
@@ -199,6 +199,7 @@ pub(crate) struct SeatRow {
     harness: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
+    group_name: Option<String>,
     last_seq: i64,
     created_at: i64,
     deleted_at: Option<i64>,
@@ -218,6 +219,7 @@ impl SeatRow {
             harness: self.harness,
             model: self.model,
             permission_mode: opt_parse::<PermissionMode>(self.permission_mode.as_deref())?,
+            group: self.group_name,
             last_seq: self.last_seq,
             created_at: self.created_at,
             deleted_at: self.deleted_at,
@@ -242,6 +244,7 @@ pub(crate) struct AuthRow {
     s_harness: Option<String>,
     s_model: Option<String>,
     s_permission_mode: Option<String>,
+    s_group_name: Option<String>,
     s_last_seq: Option<i64>,
     s_created_at: Option<i64>,
     s_deleted_at: Option<i64>,
@@ -264,6 +267,7 @@ impl AuthRow {
                 harness: self.s_harness,
                 model: self.s_model,
                 permission_mode: opt_parse::<PermissionMode>(self.s_permission_mode.as_deref())?,
+                group: self.s_group_name,
                 last_seq: self.s_last_seq.unwrap_or_default(),
                 created_at: self.s_created_at.unwrap_or_default(),
                 deleted_at: None,
@@ -285,6 +289,7 @@ pub(crate) struct ListRow {
     name: String,
     description: Option<String>,
     post_policy: String,
+    managed: bool,
     member_count: i64,
     created_at: i64,
 }
@@ -297,6 +302,7 @@ impl ListRow {
             name: self.name,
             description: self.description,
             post_policy: parse::<PostPolicy>(&self.post_policy)?,
+            managed: self.managed,
             member_count: self.member_count,
             created_at: self.created_at,
         })
@@ -587,7 +593,8 @@ macro_rules! impl_store_common {
                 reserve_name(c, org_id, &s.name).await?;
                 let id: i64 = sqlx::query_scalar(
                     "INSERT INTO seats (org_id, name, kind, parent_id, display_name, role, harness, model, \
-                     permission_mode, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id",
+                     permission_mode, group_name, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                     RETURNING id",
                 )
                 .bind(org_id)
                 .bind(&s.name)
@@ -598,6 +605,7 @@ macro_rules! impl_store_common {
                 .bind(&s.harness)
                 .bind(&s.model)
                 .bind(s.permission_mode.map(|m| m.as_str()))
+                .bind(&s.group)
                 .bind(now_ms())
                 .fetch_one(&mut *c)
                 .await?;
@@ -666,7 +674,8 @@ macro_rules! impl_store_common {
                      o.max_thread_depth, o.created_at, s.id AS s_id, s.org_id AS s_org_id, s.name AS s_name, \
                      s.kind AS s_kind, s.parent_id AS s_parent_id, p.name AS s_parent_name, \
                      s.display_name AS s_display_name, s.role AS s_role, s.harness AS s_harness, \
-                     s.model AS s_model, s.permission_mode AS s_permission_mode, s.last_seq AS s_last_seq, s.created_at AS s_created_at, \
+                     s.model AS s_model, s.permission_mode AS s_permission_mode, s.group_name AS s_group_name, \
+                     s.last_seq AS s_last_seq, s.created_at AS s_created_at, \
                      s.deleted_at AS s_deleted_at \
                      FROM tokens t JOIN orgs o ON o.id = t.org_id \
                      LEFT JOIN seats s ON s.id = t.seat_id LEFT JOIN seats p ON p.id = s.parent_id \
@@ -737,7 +746,7 @@ macro_rules! impl_store_common {
                 };
                 sqlx::query(
                     "UPDATE seats SET parent_id = $1, display_name = $2, role = $3, harness = $4, model = $5, \
-                     permission_mode = $6 WHERE id = $7",
+                     permission_mode = $6, group_name = $7 WHERE id = $8",
                 )
                 .bind(parent_id)
                 .bind(pick(&p.display_name, &seat.display_name))
@@ -748,6 +757,7 @@ macro_rules! impl_store_common {
                     None => seat.permission_mode,
                     Some(v) => v,
                 }.map(|m| m.as_str()))
+                .bind(pick(&p.group, &seat.group))
                 .bind(seat.id)
                 .execute(&mut *c)
                 .await?;
@@ -807,13 +817,14 @@ macro_rules! impl_store_common {
                 reserve_name(c, org_id, &l.name).await?;
                 let policy = l.post_policy.unwrap_or(amail_proto::PostPolicy::Anyone);
                 sqlx::query(
-                    "INSERT INTO lists (org_id, name, description, post_policy, created_at) \
-                     VALUES ($1, $2, $3, $4, $5)",
+                    "INSERT INTO lists (org_id, name, description, post_policy, managed, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6)",
                 )
                 .bind(org_id)
                 .bind(&l.name)
                 .bind(&l.description)
                 .bind(policy.as_str())
+                .bind(l.managed)
                 .bind(now_ms())
                 .execute(&mut *c)
                 .await?;

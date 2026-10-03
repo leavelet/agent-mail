@@ -35,6 +35,7 @@ pub struct Seat {
     pub harness: Option<String>,
     pub model: Option<String>,
     pub permission_mode: Option<PermissionMode>,
+    pub group: Option<String>,
     pub last_seq: i64,
     pub created_at: i64,
     pub deleted_at: Option<i64>,
@@ -65,6 +66,8 @@ pub struct List {
     pub name: String,
     pub description: Option<String>,
     pub post_policy: PostPolicy,
+    /// Maintained by `amail up`.
+    pub managed: bool,
     pub member_count: i64,
     pub created_at: i64,
 }
