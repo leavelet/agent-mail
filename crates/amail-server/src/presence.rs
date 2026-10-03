@@ -1,10 +1,14 @@
 //! Seat presence: the session state of each seat as reported by nodes
-//! (`POST /v1/presence`). Stored in the database (table `presence`), so
-//! every server instance sees what a node reported to any of them, and a
-//! restarted server still knows it. An entry that has not been refreshed
-//! within [`TTL`] counts as absent (offline). Changes are broadcast to
-//! `GET /v1/events` subscribers as `presence` events: by the instance that
-//! received the report, and through [`crate::cluster`] by the others.
+//! (`POST /v1/presence`). An entry that has not been refreshed within
+//! [`TTL`] counts as absent (offline). Changes are broadcast to
+//! `GET /v1/events` subscribers as `presence` events.
+//!
+//! A single server keeps presence in memory: it changes with every turn of
+//! every seat, and is worth nothing after the nodes' next report (nodes
+//! report every seat when they connect and every 30 s). Several instances
+//! keep it in the database (table `presence`), so every instance sees what
+//! a node reported to any of them; the instance that received a report
+//! announces the change, and through [`crate::cluster`] so do the others.
 
 use amail_proto::{Presence, PresenceEvent, PresenceUpdate};
 use amail_store::{PresenceRec, Store};
@@ -20,6 +24,9 @@ const CHANNEL: usize = 1024;
 
 pub struct PresenceBoard {
     store: Arc<dyn Store>,
+    /// Kept in the database (several instances) or here.
+    shared: bool,
+    mem: Mutex<HashMap<i64, HashMap<String, PresenceRec>>>,
     orgs: Mutex<HashMap<i64, broadcast::Sender<PresenceEvent>>>,
 }
 
@@ -47,12 +54,62 @@ fn fresh(r: &PresenceRec, now: i64) -> bool {
     now - r.updated_at <= ttl_ms()
 }
 
+/// Merge reports into `prev` (seat -> entry); returns the entries that
+/// changed or were absent, as stored. The same rule as the store's.
+fn merge(
+    prev: &mut HashMap<String, PresenceRec>,
+    recs: Vec<PresenceRec>,
+    now: i64,
+) -> Vec<PresenceRec> {
+    let mut changed = Vec::new();
+    for mut rec in recs {
+        let old = prev.get(&rec.seat).filter(|p| fresh(p, now));
+        rec.updated_at = now;
+        rec.since = match old {
+            Some(o) if o.state == rec.state => o.since,
+            _ => rec.since.min(now),
+        };
+        if old.is_none_or(|o| !o.same_as(&rec)) {
+            changed.push(rec.clone());
+        }
+        prev.insert(rec.seat.clone(), rec);
+    }
+    changed
+}
+
 impl PresenceBoard {
+    /// Presence of a single instance (in memory).
     pub fn new(store: Arc<dyn Store>) -> Self {
         PresenceBoard {
             store,
+            shared: false,
+            mem: Mutex::new(HashMap::new()),
             orgs: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Presence shared by several instances (in the database).
+    pub fn shared(store: Arc<dyn Store>) -> Self {
+        PresenceBoard {
+            shared: true,
+            ..PresenceBoard::new(store)
+        }
+    }
+
+    async fn rows(&self, org_id: i64, seat: Option<&str>) -> amail_store::Result<Vec<PresenceRec>> {
+        if self.shared {
+            return self.store.presence(org_id, seat).await;
+        }
+        let mem = self.mem.lock().unwrap();
+        Ok(mem
+            .get(&org_id)
+            .map(|m| {
+                m.values()
+                    .filter(|r| seat.is_none_or(|s| s == r.seat))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     fn sender(&self, org_id: i64) -> broadcast::Sender<PresenceEvent> {
@@ -94,7 +151,15 @@ impl PresenceBoard {
                 terminal_url: u.terminal_url.clone(),
             })
             .collect();
-        let changed = self.store.put_presence(org_id, &recs, ttl_ms()).await?;
+        let changed = if self.shared {
+            self.store.put_presence(org_id, &recs, ttl_ms()).await?
+        } else {
+            merge(
+                self.mem.lock().unwrap().entry(org_id).or_default(),
+                recs,
+                now,
+            )
+        };
         self.announce(org_id, &changed);
         Ok(changed.into_iter().map(|r| r.seat).collect())
     }
@@ -124,7 +189,7 @@ impl PresenceBoard {
         {
             return;
         }
-        match self.store.presence(org_id, None).await {
+        match self.rows(org_id, None).await {
             Ok(rows) => {
                 let rows: Vec<PresenceRec> = rows
                     .into_iter()
@@ -140,8 +205,7 @@ impl PresenceBoard {
     pub async fn get(&self, org_id: i64, seat: &str) -> amail_store::Result<Option<Presence>> {
         let now = amail_store::now_ms();
         Ok(self
-            .store
-            .presence(org_id, Some(seat))
+            .rows(org_id, Some(seat))
             .await?
             .iter()
             .find(|r| r.seat == seat && fresh(r, now))
@@ -152,8 +216,7 @@ impl PresenceBoard {
     pub async fn snapshot(&self, org_id: i64) -> amail_store::Result<Vec<(String, Presence)>> {
         let now = amail_store::now_ms();
         Ok(self
-            .store
-            .presence(org_id, None)
+            .rows(org_id, None)
             .await?
             .iter()
             .filter(|r| fresh(r, now))

@@ -548,6 +548,7 @@ impl TokenRow {
 pub(crate) struct PendingRow {
     seat_id: i64,
     seat_name: String,
+    kind: String,
     last_seq: i64,
     to_n: i64,
     cc_n: i64,
@@ -562,6 +563,7 @@ impl From<PendingRow> for PendingRec {
     fn from(r: PendingRow) -> PendingRec {
         PendingRec {
             seat_id: r.seat_id,
+            user: r.kind == "user",
             seat_name: r.seat_name,
             last_seq: r.last_seq,
             to: r.to_n,
@@ -1458,7 +1460,7 @@ macro_rules! impl_store_common {
 
             pub async fn pending(c: &mut Conn, org_id: i64, seat_id: Option<i64>) -> Result<Vec<PendingRec>> {
                 let rows: Vec<PendingRow> = sqlx::query_as(
-                    "SELECT s.id AS seat_id, s.name AS seat_name, s.last_seq, s.focus_until, \
+                    "SELECT s.id AS seat_id, s.name AS seat_name, s.kind, s.last_seq, s.focus_until, \
                      COALESCE(SUM(CASE WHEN d.mode = 'immediate' AND d.class = 'to' THEN 1 ELSE 0 END), 0) AS to_n, \
                      COALESCE(SUM(CASE WHEN d.mode = 'immediate' AND d.class = 'cc' THEN 1 ELSE 0 END), 0) AS cc_n, \
                      COALESCE(SUM(CASE WHEN d.mode = 'immediate' AND d.class = 'list' THEN 1 ELSE 0 END), 0) AS list_n, \
@@ -1470,7 +1472,7 @@ macro_rules! impl_store_common {
                        AND d.mode IN ('immediate', 'digest') \
                      LEFT JOIN messages m ON m.id = d.message_id \
                      WHERE s.org_id = $1 AND s.deleted_at IS NULL AND ($2 IS NULL OR s.id = $2) \
-                     GROUP BY s.id, s.name, s.last_seq, s.focus_until ORDER BY s.name",
+                     GROUP BY s.id, s.name, s.kind, s.last_seq, s.focus_until ORDER BY s.name",
                 )
                 .bind(org_id)
                 .bind(seat_id)
@@ -1752,40 +1754,21 @@ macro_rules! impl_store_common {
                 if ids.is_empty() {
                     return Ok(Vec::new());
                 }
-                #[derive(sqlx::FromRow)]
-                struct Row {
-                    seat_id: i64,
-                    kind: String,
-                    focus_until: Option<i64>,
-                    has: Option<i64>,
-                    #[sqlx(flatten)]
-                    p: PresenceRow,
-                }
                 let sql = format!(
-                    "SELECT s.id AS seat_id, s.name AS seat, s.kind, s.focus_until, p.seat_id AS has, \
-                     COALESCE(p.state, 'offline') AS state, COALESCE(p.wake_failed, FALSE) AS wake_failed, \
-                     p.harness, p.node, COALESCE(p.since, 0) AS since, COALESCE(p.updated_at, 0) AS updated_at, \
-                     p.attention, p.attention_hint, p.terminal_url \
-                     FROM seats s LEFT JOIN presence p ON p.seat_id = s.id WHERE s.id IN ({})",
+                    "SELECT s.id, s.name, s.kind, s.focus_until FROM seats s WHERE s.id IN ({})",
                     placeholders(1, ids.len())
                 );
-                let mut q = sqlx::query_as::<_, Row>(&sql);
+                let mut q = sqlx::query_as::<_, (i64, String, String, Option<i64>)>(&sql);
                 for id in ids {
                     q = q.bind(*id);
                 }
-                let mut out = Vec::new();
-                for r in q.fetch_all(&mut *c).await? {
-                    let has = r.has.is_some();
-                    let p = r.p.into_rec()?;
-                    out.push(RecipientState {
-                        seat_id: r.seat_id,
-                        name: p.seat.clone(),
-                        kind: parse(&r.kind)?,
-                        focus_until: r.focus_until,
-                        presence: has.then_some(p),
-                    });
-                }
-                Ok(out)
+                q.fetch_all(&mut *c)
+                    .await?
+                    .into_iter()
+                    .map(|(seat_id, name, kind, focus_until)| {
+                        Ok(RecipientState { seat_id, name, kind: parse(&kind)?, focus_until })
+                    })
+                    .collect()
             }
 
             pub async fn due_acks(c: &mut Conn, now: i64, limit: i64) -> Result<Vec<AckDue>> {

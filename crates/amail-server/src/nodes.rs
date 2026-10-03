@@ -43,21 +43,11 @@ pub async fn pending(
     let rows = st.store.pending(auth.org.id, seat_id).await?;
     // Nodes host agent sessions only: the user seat has none (its mail is
     // read through the CLI or the web), so nodes do not see it here.
-    let users: HashSet<String> = if auth.scope == TokenScope::Node {
-        st.store
-            .seats(auth.org.id)
-            .await?
-            .into_iter()
-            .filter(|s| s.kind == SeatKind::User)
-            .map(|s| s.name)
-            .collect()
-    } else {
-        HashSet::new()
-    };
+    let node = auth.scope == TokenScope::Node;
     Ok(Json(p::PendingResponse {
         seats: rows
             .into_iter()
-            .filter(|r| !users.contains(&r.seat_name))
+            .filter(|r| !(node && r.user))
             .map(|r| p::PendingCounts {
                 seat: r.seat_name,
                 to: r.to,

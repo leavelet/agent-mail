@@ -254,8 +254,15 @@ async fn notes(
             return Vec::new();
         }
     };
+    let presence: HashMap<String, amail_proto::Presence> = match st.presence.snapshot(org.id).await
+    {
+        Ok(p) => p.into_iter().collect(),
+        Err(e) => {
+            tracing::warn!("reading presence: {e}");
+            return Vec::new();
+        }
+    };
     let now = amail_store::now_ms();
-    let ttl = crate::presence::TTL.as_millis() as i64;
     let urgent = priority == Priority::Urgent;
     let mut out = Vec::new();
     for s in states.iter().filter(|s| s.kind == SeatKind::Agent) {
@@ -273,8 +280,7 @@ async fn notes(
             });
             continue;
         }
-        let p = s.presence.as_ref().filter(|p| now - p.updated_at <= ttl);
-        let state = match p {
+        let state = match presence.get(&s.name) {
             None => "offline",
             Some(p) if p.state == SeatState::Offline => "offline",
             Some(p) if p.state == SeatState::Dormant => "dormant",

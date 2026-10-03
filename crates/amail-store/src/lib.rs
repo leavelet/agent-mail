@@ -273,7 +273,7 @@ pub trait Store: Send + Sync + 'static {
     async fn set_focus(&self, seat_id: i64, until: Option<i64>) -> Result<SeqBump>;
     /// The org's hidden `system` seat (created on first use).
     async fn system_seat(&self, org_id: i64) -> Result<Seat>;
-    /// Kind, focus and presence of the given seats.
+    /// Kind and focus of the given seats.
     async fn recipient_states(&self, seat_ids: &[i64]) -> Result<Vec<RecipientState>>;
     /// Acknowledgement-requiring messages whose next escalation step is due.
     async fn due_acks(&self, now: i64, limit: i64) -> Result<Vec<AckDue>>;

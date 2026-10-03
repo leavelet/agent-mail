@@ -13,6 +13,8 @@
 //! inside the client (when `--max-inflight` is exhausted) counts against the
 //! server.
 
+mod e2e;
+
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use futures::{StreamExt, stream};
@@ -27,10 +29,33 @@ use tokio::time::Instant;
 
 #[derive(Parser, Clone)]
 #[command(about = "Load generator for agent-mail")]
-struct Opts {
-    /// Base URL of a running `amail serve`.
+pub struct Opts {
+    /// Base URL of a running `amail serve` (`e2e`: several, comma-separated,
+    /// for several instances; nodes and sends are spread over them).
     #[arg(long, default_value = "http://127.0.0.1:8025")]
     url: String,
+    /// `server`: sends and periodic claims against the API. `e2e`: one
+    /// real node per org with simulated sessions (see `e2e.rs`).
+    #[arg(long, default_value = "server")]
+    mode: String,
+    /// e2e: where nodes keep state and seats' inbox sockets.
+    #[arg(long)]
+    run_dir: Option<String>,
+    /// e2e: mean seconds between turns a seat starts on its own.
+    #[arg(long, default_value_t = 300.0)]
+    prompt_every: f64,
+    /// e2e: seconds between tool calls in a turn (uniform in this range).
+    #[arg(long, default_value_t = 1.0)]
+    tool_gap_min: f64,
+    #[arg(long, default_value_t = 5.0)]
+    tool_gap_max: f64,
+    /// e2e: orgs with a browser-like event subscriber.
+    #[arg(long, default_value_t = 30)]
+    browsers: usize,
+    /// e2e: seconds after each step's window during which late deliveries
+    /// still count.
+    #[arg(long, default_value_t = 10)]
+    drain: u64,
     /// Database of that server (used only to create the orgs).
     #[arg(long)]
     db: String,
@@ -71,17 +96,18 @@ struct Opts {
     out: Option<String>,
 }
 
-struct SeatW {
+pub struct SeatW {
     org: usize,
     idx: usize,
     token: String,
 }
 
-struct World {
+pub struct World {
     seats: Vec<SeatW>,
     /// Per org: list names; list j holds seats [j*list_size, (j+1)*list_size).
     lists: Vec<Vec<String>>,
     seat_names: Vec<Vec<String>>,
+    user_tokens: Arc<Vec<String>>,
 }
 
 #[tokio::main]
@@ -94,6 +120,9 @@ async fn main() -> Result<()> {
         .build()?;
     let t = Instant::now();
     let world = Arc::new(setup(&opts, &http).await?);
+    if opts.mode == "e2e" {
+        return run_e2e(&opts, &http, world).await;
+    }
     eprintln!(
         "setup: {} orgs, {} seats, {} lists in {:.1}s",
         opts.orgs,
@@ -143,13 +172,67 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+async fn run_e2e(opts: &Opts, http: &reqwest::Client, world: Arc<World>) -> Result<()> {
+    let sim = e2e::start(opts, http, &world).await?;
+    println!(
+        "{:>7} {:>8} {:>8} {:>8} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>5} {:>8} {:>8}",
+        "target",
+        "sent/s",
+        "send_p50",
+        "send_p99",
+        "busy_p50",
+        "busy_p99",
+        "wake_p50",
+        "wake_p99",
+        "lag_p50",
+        "lag_p99",
+        "dups",
+        "hooks/s",
+        "errors"
+    );
+    for &rate in &opts.rates {
+        let r = e2e::run_step(opts, http, world.clone(), &sim, rate).await;
+        println!(
+            "{:>7.0} {:>8.1} {:>8} {:>8} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>5} {:>8.0} {:>8}",
+            rate,
+            r["sent_per_s"].as_f64().unwrap_or(0.0),
+            ms(&r["send_ms"]["p50"]),
+            ms(&r["send_ms"]["p99"]),
+            ms(&r["to_busy_ms"]["p50"]),
+            ms(&r["to_busy_ms"]["p99"]),
+            ms(&r["to_wake_ms"]["p50"]),
+            ms(&r["to_wake_ms"]["p99"]),
+            ms(&r["event_lag_ms"]["p50"]),
+            ms(&r["event_lag_ms"]["p99"]),
+            r["duplicates"],
+            r["hooks_per_s"].as_f64().unwrap_or(0.0),
+            r["errors"],
+        );
+        if let Some(e) = r["first_error"].as_str() {
+            eprintln!("first error at rate {rate}: {e}");
+        }
+        if let Some(path) = &opts.out {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?;
+            writeln!(f, "{r}")?;
+        }
+    }
+    for n in sim.nodes {
+        n.shutdown();
+    }
+    Ok(())
+}
+
 fn ms(v: &Value) -> String {
     v.as_f64()
         .map(|x| format!("{x:.1}ms"))
         .unwrap_or_else(|| "-".into())
 }
 
-async fn call(
+pub(crate) async fn call(
     http: &reqwest::Client,
     url: String,
     token: &str,
@@ -199,7 +282,14 @@ async fn setup(o: &Opts, http: &reqwest::Client) -> Result<World> {
         .collect();
 
     // Org settings: lift the per-seat budget so it does not cap the benchmark.
-    let base = o.url.trim_end_matches('/').to_string();
+    let base = o
+        .url
+        .split(',')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
     for t in user_tokens.iter() {
         call(
             http,
@@ -290,6 +380,7 @@ async fn setup(o: &Opts, http: &reqwest::Client) -> Result<World> {
         seats,
         lists,
         seat_names,
+        user_tokens,
     })
 }
 
@@ -308,7 +399,7 @@ struct Stats {
     first_error: Option<String>,
 }
 
-fn pct(v: &mut [u64], p: f64) -> Option<f64> {
+pub(crate) fn pct(v: &mut [u64], p: f64) -> Option<f64> {
     if v.is_empty() {
         return None;
     }
@@ -317,7 +408,7 @@ fn pct(v: &mut [u64], p: f64) -> Option<f64> {
     Some(v[i] as f64 / 1000.0)
 }
 
-fn message_for(o: &Opts, w: &World, rng: &mut impl Rng) -> (usize, Value) {
+pub(crate) fn message_for(o: &Opts, w: &World, rng: &mut impl Rng) -> (usize, Value) {
     let si = rng.random_range(0..w.seats.len());
     let s = &w.seats[si];
     let names = &w.seat_names[s.org];
@@ -351,7 +442,14 @@ fn message_for(o: &Opts, w: &World, rng: &mut impl Rng) -> (usize, Value) {
 }
 
 async fn run_step(o: &Opts, http: &reqwest::Client, w: Arc<World>, rate: f64) -> Value {
-    let base = o.url.trim_end_matches('/').to_string();
+    let base = o
+        .url
+        .split(',')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
     let stats = Arc::new(Mutex::new(Stats::default()));
     let start = Instant::now() + Duration::from_millis(200);
     let measure_from = start + Duration::from_secs(o.warmup);

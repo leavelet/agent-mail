@@ -68,7 +68,8 @@ impl AppState {
     /// `db_url`; `url` is where the other instances can reach this one.
     pub fn clustered(store: Arc<dyn Store>, db_url: &str, url: Option<String>) -> Self {
         let c = cluster::Cluster::new(db_url, url);
-        let mut st = AppState::new(store);
+        let mut st = AppState::new(store.clone());
+        st.presence = Arc::new(presence::PresenceBoard::shared(store));
         st.bus = Arc::new(cluster::ClusterBus {
             hub: Hub::new(),
             cluster: c.clone(),

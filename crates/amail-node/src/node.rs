@@ -299,6 +299,10 @@ impl Default for State {
 const DIGEST_EVERY_DEFAULT: i64 = 30 * 60 * 1000;
 /// Full pending-count resync, to pick up anything an event stream missed.
 const RESYNC: Duration = Duration::from_secs(30);
+/// Mailbox events within this window share one pending-count refresh.
+const REFRESH_BATCH: Duration = Duration::from_millis(30);
+/// Presence changes within this window go in one report.
+const PRESENCE_BATCH: Duration = Duration::from_millis(300);
 
 impl State {
     fn seat(&mut self, name: &str) -> &mut SeatRt {
@@ -1522,6 +1526,15 @@ impl Node {
                             let mut st = self.lock();
                             self.apply_pending(&mut st, p);
                             st.connected = true;
+                            // The server (or another instance) may know
+                            // nothing about the seats: report them all.
+                            let all: Vec<String> = st
+                                .seats
+                                .iter()
+                                .filter(|(_, s)| s.harness.is_some())
+                                .map(|(n, _)| n.clone())
+                                .collect();
+                            st.dirty_presence.extend(all);
                             backoff = Duration::from_millis(250);
                             tracing::info!("connected to {}", self.cfg.url);
                         }
@@ -1576,7 +1589,12 @@ impl Node {
         let mut backoff = Duration::from_millis(200);
         loop {
             let full = tokio::select! {
-                _ = self.refresh_kick.notified() => false,
+                _ = self.refresh_kick.notified() => {
+                    // Mailbox events come in bursts (a message to a list,
+                    // a claim): refresh them together.
+                    tokio::time::sleep(REFRESH_BATCH).await;
+                    false
+                }
                 _ = tokio::time::sleep(RESYNC) => true,
             };
             let connected = self.lock().connected;
@@ -1591,7 +1609,9 @@ impl Node {
                 if dirty.is_empty() && !(full && first) {
                     break;
                 }
-                let whole = (full && first) || dirty.len() > 32;
+                // One query answers for the whole org about as fast as for
+                // one seat.
+                let whole = (full && first) || dirty.len() > 4;
                 first = false;
                 let results: Vec<Result<amail_proto::PendingResponse>> = if whole {
                     vec![self.server.pending(None).await]
@@ -1789,8 +1809,9 @@ impl Node {
         loop {
             let full = tokio::select! {
                 _ = self.presence_kick.notified() => {
-                    // Batch changes that arrive together.
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    // Batch changes that arrive together (a turn of a seat
+                    // is busy and idle again within a fraction of a second).
+                    tokio::time::sleep(PRESENCE_BATCH).await;
                     false
                 }
                 _ = tick.tick() => true,

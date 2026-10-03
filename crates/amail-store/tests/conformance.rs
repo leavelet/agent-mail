@@ -1342,6 +1342,7 @@ async fn pending_counts(s: S) {
         PendingRec {
             seat_id: u.id,
             seat_name: "owner".into(),
+            user: true,
             ..Default::default()
         }
     );
@@ -1559,7 +1560,7 @@ async fn presence_store(s: S) {
     assert_eq!(changed[0].state, SeatState::Idle);
     // A stale entry counts as absent: the same state is a change again.
     let changed = s
-        .put_presence(o.id, &[rec("a", SeatState::Idle, now)], 0)
+        .put_presence(o.id, &[rec("a", SeatState::Idle, now)], -1)
         .await
         .unwrap();
     assert_eq!(changed.len(), 1);

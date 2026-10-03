@@ -253,6 +253,8 @@ pub struct TokenRec {
 pub struct PendingRec {
     pub seat_id: i64,
     pub seat_name: String,
+    /// The org's user seat (it has no session).
+    pub user: bool,
     pub last_seq: i64,
     pub to: i64,
     pub cc: i64,
@@ -302,7 +304,6 @@ pub struct RecipientState {
     pub name: String,
     pub kind: SeatKind,
     pub focus_until: Option<i64>,
-    pub presence: Option<PresenceRec>,
 }
 
 /// An acknowledgement-requiring message whose next escalation step is due.
