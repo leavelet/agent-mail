@@ -96,6 +96,8 @@ pub struct Config {
     pub mirror_poll: Duration,
     /// Serve the supervised sessions in the browser (`zellij web`).
     pub web_terminal: Option<WebTerminal>,
+    /// Use this digest interval instead of the org's (for tests).
+    pub digest_every: Option<Duration>,
 }
 
 /// The node's browser terminal: a `zellij web` server of its own (on its
@@ -143,6 +145,7 @@ impl Config {
             supervise_interval: Duration::from_millis(500),
             mirror_poll: Duration::from_millis(500),
             web_terminal: None,
+            digest_every: None,
         }
     }
 }
@@ -496,6 +499,14 @@ pub struct NodeHandle {
 }
 
 impl NodeHandle {
+    /// Stop at once, as if the process had been killed: nothing is saved
+    /// beyond what the save loop already wrote, and the socket file stays.
+    pub fn crash(self) {
+        for t in &self.tasks {
+            t.abort();
+        }
+    }
+
     pub fn shutdown(self) {
         for t in &self.tasks {
             t.abort();
@@ -1475,7 +1486,9 @@ impl Node {
     // --- server sync ----------------------------------------------------------
 
     fn apply_pending(&self, st: &mut State, resp: amail_proto::PendingResponse) {
-        if let Some(ms) = resp.digest_interval_ms {
+        if let Some(d) = self.cfg.digest_every {
+            st.digest_every = d.as_millis() as i64;
+        } else if let Some(ms) = resp.digest_interval_ms {
             st.digest_every = ms as i64;
         }
         for c in resp.seats {

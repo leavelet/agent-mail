@@ -43,6 +43,9 @@ node_tests!(
     restart_restores_idle_seat,
     inlined_mail_is_read,
     transcript_mirror_follows_file,
+    focus_holds_mail,
+    digest_at_natural_points,
+    lost_claim_answer_is_recovered,
 );
 
 use amail_store::testutil::Backend;
@@ -1208,4 +1211,198 @@ async fn transcript_mirror_follows_file(b: Backend) {
         h.status().await["mirrors"] == json!([])
     })
     .await;
+}
+
+/// In focus only urgent mail is shown or wakes the seat; held mail comes
+/// when the focus ends (or is ended).
+async fn focus_holds_mail(b: Backend) {
+    let opts = Opts {
+        wake_window: Duration::from_millis(100),
+        ..Default::default()
+    };
+    let Some(h) = setup(b, "focus_holds_mail", opts).await else {
+        return;
+    };
+    h.seat("w1", "claude").await;
+    let inbox = FakeInbox::start(h.dir.path().join("cc.sock"), None);
+    let env = claude_env("w1", &inbox.path);
+    h.hook("claude", env.clone(), claude("SessionStart")).await;
+    h.api
+        .call(
+            reqwest::Method::PUT,
+            "/focus?seat=w1",
+            Some(json!({ "for_s": 3 })),
+        )
+        .await;
+    h.wait("focus known", || async {
+        h.seat_status("w1").await["seat"] == "w1"
+    })
+    .await;
+    let normal = h.api.send(&["w1"], &[], "can wait", false).await;
+    h.wait_pending("w1", 1, 0, 0).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(inbox.count(), 0, "focus: no wake-up for normal mail");
+    // Busy in focus: PostToolUse and Stop show nothing normal.
+    h.hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    assert_eq!(
+        h.hook("claude", env.clone(), claude("PostToolUse")).await,
+        Value::Null
+    );
+    let urgent = h.api.send(&[], &["w1"], "now", true).await;
+    h.wait_pending("w1", 1, 1, 0).await;
+    let v = h.hook("claude", env.clone(), claude("PostToolUse")).await;
+    assert_eq!(injected_ids(&hook_text(&v).unwrap()), vec![urgent]);
+    assert_eq!(
+        h.hook("claude", env.clone(), claude("Stop")).await,
+        Value::Null
+    );
+    assert_eq!(h.state("w1").await, "idle");
+    // The focus ends: the held mail wakes the seat.
+    h.wait("wake-up after focus", || async { inbox.count() == 1 })
+        .await;
+    let v = h
+        .hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    assert_eq!(injected_ids(&hook_text(&v).unwrap()), vec![normal]);
+    h.hook("claude", env.clone(), claude("Stop")).await;
+    // Ending a focus early delivers at once.
+    h.api
+        .call(
+            reqwest::Method::PUT,
+            "/focus?seat=w1",
+            Some(json!({ "for_s": 600 })),
+        )
+        .await;
+    let held = h.api.send(&["w1"], &[], "held", false).await;
+    h.wait_pending("w1", 1, 0, 0).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(inbox.count(), 1);
+    h.api
+        .call(reqwest::Method::DELETE, "/focus?seat=w1", None)
+        .await;
+    h.wait("wake-up after focus off", || async { inbox.count() == 2 })
+        .await;
+    let v = h
+        .hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    assert_eq!(injected_ids(&hook_text(&v).unwrap()), vec![held]);
+}
+
+/// Digest mail is not shown on its own: the next UserPromptSubmit or Stop
+/// shows a digest; an idle seat is woken for it once per interval.
+async fn digest_at_natural_points(b: Backend) {
+    let opts = Opts {
+        wake_window: Duration::from_millis(100),
+        tweak: Some(|c| c.digest_every = Some(Duration::from_secs(2))),
+        ..Default::default()
+    };
+    let Some(h) = setup(b, "digest_at_natural_points", opts).await else {
+        return;
+    };
+    h.seat("w1", "claude").await;
+    h.api
+        .post("/lists", json!({ "name": "news", "post_policy": "anyone" }))
+        .await;
+    h.api
+        .call(
+            reqwest::Method::PUT,
+            "/lists/news/members/w1",
+            Some(json!({ "mode": "digest" })),
+        )
+        .await;
+    let inbox = FakeInbox::start(h.dir.path().join("cc.sock"), None);
+    let env = claude_env("w1", &inbox.path);
+    h.hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    let d1 = h.api.send(&["news"], &[], "Release notes", false).await;
+    let d2 = h.api.send(&["news"], &[], "Re: Release notes", false).await;
+    h.wait("digest pending", || async {
+        h.seat_status("w1").await["pending"]["to"] == 0
+            && h.api.get("/pending?seat=w1").await["seats"][0]["digest"] == 2
+    })
+    .await;
+    // Not between tool calls...
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        h.hook("claude", env.clone(), claude("PostToolUse")).await,
+        Value::Null
+    );
+    // ...but at Stop, as one digest line per thread.
+    let v = h.hook("claude", env.clone(), claude("Stop")).await;
+    let t = hook_text(&v).unwrap();
+    assert!(
+        t.starts_with("[amail] Digest for w1: 2 message(s) in 2 thread(s):"),
+        "{t}"
+    );
+    assert!(
+        t.contains(&format!("latest #{d1}")) && t.contains(&format!("latest #{d2}")),
+        "{t}"
+    );
+    assert_eq!(v["decision"], "block");
+    assert_eq!(
+        h.hook("claude", env.clone(), claude("Stop")).await,
+        Value::Null
+    );
+    assert_eq!(h.state("w1").await, "idle");
+    // Idle: no wake-up until the digest has waited an interval, then one.
+    let t0 = Instant::now();
+    let d3 = h.api.send(&["news"], &[], "Later", false).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(inbox.count(), 0);
+    h.wait("digest wake-up", || async { inbox.count() == 1 })
+        .await;
+    assert!(
+        t0.elapsed() >= Duration::from_millis(1800),
+        "{:?}",
+        t0.elapsed()
+    );
+    let v = h
+        .hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    let t = hook_text(&v).unwrap();
+    assert!(t.contains(&format!("latest #{d3}")), "{t}");
+    h.hook("claude", env.clone(), claude("Stop")).await;
+    // Digest mail stays unread (it was only summarized).
+    let st = h.api.get(&format!("/messages/{d3}/status")).await;
+    assert_eq!(st["recipients"][0]["state"], "notified");
+}
+
+/// A claim whose answer never reaches the node (it times out) is retried
+/// with the same key: the mail it took is shown once, with the next hook.
+async fn lost_claim_answer_is_recovered(b: Backend) {
+    let opts = Opts {
+        slow_claims: Some((1, Duration::from_millis(1500))),
+        tweak: Some(|c| c.hook_server_timeout = Duration::from_millis(300)),
+        ..Default::default()
+    };
+    let Some(h) = setup(b, "lost_claim_answer_is_recovered", opts).await else {
+        return;
+    };
+    h.seat("w1", "claude").await;
+    let inbox = FakeInbox::start(h.dir.path().join("cc.sock"), None);
+    let env = claude_env("w1", &inbox.path);
+    h.hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    let m = h.api.send(&["w1"], &[], "slow answer", false).await;
+    h.wait_pending("w1", 1, 0, 0).await;
+    // The claim goes through on the server, its answer comes too late.
+    let v = h.hook("claude", env.clone(), claude("PostToolUse")).await;
+    assert_eq!(v, Value::Null);
+    let st = h.api.get(&format!("/messages/{m}/status")).await;
+    assert_eq!(st["recipients"][0]["notified_via"], "hook:PostToolUse");
+    // The node asks again with the same key and keeps what it took.
+    h.wait("kept", || async {
+        h.seat_status("w1").await["stashed"] == 1
+    })
+    .await;
+    let v = h.hook("claude", env.clone(), claude("PostToolUse")).await;
+    assert_eq!(injected_ids(&hook_text(&v).unwrap()), vec![m]);
+    for _ in 0..3 {
+        assert_eq!(
+            h.hook("claude", env.clone(), claude("PostToolUse")).await,
+            Value::Null
+        );
+    }
+    assert_eq!(h.status().await["seats"][0]["stashed"], 0);
 }

@@ -156,6 +156,9 @@ pub struct Opts {
     pub tweak: Option<fn(&mut amail_node::Config)>,
     /// Adjust the server state.
     pub server_tweak: Option<fn(&mut AppState)>,
+    /// Hold back the server's answers to the first `n` claims by this long
+    /// (the claim itself is done), like an answer lost on the way.
+    pub slow_claims: Option<(usize, Duration)>,
 }
 
 impl Default for Opts {
@@ -168,11 +171,12 @@ impl Default for Opts {
             supervise: false,
             tweak: None,
             server_tweak: None,
+            slow_claims: None,
         }
     }
 }
 
-const FAKE_HARNESS: &str = include_str!("fake_harness.sh");
+pub const FAKE_HARNESS: &str = include_str!("fake_harness.sh");
 
 impl Harness {
     pub async fn start(backend: Backend, test: &str, opts: Opts) -> Option<Harness> {
@@ -183,7 +187,37 @@ impl Harness {
         if let Some(t) = opts.server_tweak {
             t(&mut state);
         }
-        tokio::spawn(amail_server::serve(listener, state, std::future::pending()));
+        match opts.slow_claims {
+            None => {
+                tokio::spawn(amail_server::serve(listener, state, std::future::pending()));
+            }
+            Some((n, delay)) => {
+                let left = Arc::new(std::sync::atomic::AtomicUsize::new(n));
+                let _tasks = amail_server::start_background(&state);
+                let app = amail_server::router(state).layer(axum::middleware::from_fn(
+                    move |req: axum::extract::Request, next: axum::middleware::Next| {
+                        let left = left.clone();
+                        async move {
+                            let claim = req.uri().path() == "/v1/claim";
+                            let resp = next.run(req).await;
+                            if claim
+                                && left
+                                    .fetch_update(
+                                        std::sync::atomic::Ordering::SeqCst,
+                                        std::sync::atomic::Ordering::SeqCst,
+                                        |x| x.checked_sub(1),
+                                    )
+                                    .is_ok()
+                            {
+                                tokio::time::sleep(delay).await;
+                            }
+                            resp
+                        }
+                    },
+                ));
+                tokio::spawn(async move { axum::serve(listener, app).await });
+            }
+        }
         let token = new_token();
         db.store
             .create_org("acme", "owner", &hash_token(&token))

@@ -6,6 +6,8 @@
 # Files in $D (the directory of this script):
 #   <seat>.launches  one line per start: "<unix ms> <pid> <args...>"
 #   <seat>.mode      optional behaviour: trust | exit3 | badresume | slow | noturn
+#   <seat>.busy      while it exists, a turn keeps making tool calls
+#   <seat>.prompt    created by the test: start a turn (like a person typing)
 #   <seat>.answer    answers the trust prompt (mode trust)
 #   <seat>.wake      created by the test when the node wakes the seat
 #                    (Claude: via the inbox socket; Codex: `codex queue`)
@@ -95,8 +97,13 @@ hook() {
 }
 
 turn() {
-    # A turn: the prompt hook, then Stop (again while it blocks).
+    # A turn: the prompt hook, tool calls while <seat>.busy exists, then
+    # Stop (again while it blocks).
     hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$sid\",\"prompt\":$1}" > /dev/null
+    while [ -f "$D/$seat.busy" ]; do
+        hook "{\"hook_event_name\":\"PostToolUse\",\"session_id\":\"$sid\",\"tool_name\":\"Bash\"}" > /dev/null
+        sleep 0.2
+    done
     active=false
     n=0
     while [ $n -lt 5 ]; do
@@ -134,6 +141,10 @@ while :; do
             resumed=""
         fi
         turn "\"[amail] You have new mail.\""
+    fi
+    if [ -f "$D/$seat.prompt" ]; then
+        rm -f "$D/$seat.prompt"
+        turn "\"a prompt\""
     fi
     if [ -f "$D/$seat.ask" ]; then
         rm -f "$D/$seat.ask"

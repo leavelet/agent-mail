@@ -102,13 +102,12 @@ impl NodeHub {
     /// Send a command to the org's connected nodes, on every instance;
     /// returns how many there are.
     pub fn send(&self, org_id: i64, cmd: NodeCommand) -> usize {
-        let remote = self.remote(org_id);
-        if remote > 0
-            && let Some(f) = self.forward.get()
-        {
+        // Forwarded even when no remote stream is known yet: the counts of
+        // other instances lag by a second or two.
+        if let Some(f) = self.forward.get() {
             f(org_id, &cmd);
         }
-        self.deliver(org_id, cmd) + remote
+        self.deliver(org_id, cmd) + self.remote(org_id)
     }
 
     fn remote(&self, org_id: i64) -> usize {
@@ -179,6 +178,6 @@ mod tests {
         assert_eq!(hub.connected(1), 2);
         assert_eq!(hub.send(1, cmd.clone()), 2);
         assert_eq!(hub.send(2, cmd.clone()), 0);
-        assert_eq!(*sent.lock().unwrap(), vec![(1, cmd)]);
+        assert_eq!(sent.lock().unwrap().len(), 2);
     }
 }
