@@ -396,8 +396,9 @@ impl Node {
                 let rt = st.sup.get(name);
                 m.pid.is_some()
                     && s.state == SeatState::Idle
+                    // Pending cc and list mail never wakes a seat, so it must
+                    // not keep one awake either; it is shown at the next turn.
                     && !s.wants_wake()
-                    && s.pending.total() == 0
                     && s.wake_out.is_none()
                     && rt.is_none_or(|r| r.stopping.is_none() && r.starting_since.is_none())
             };
