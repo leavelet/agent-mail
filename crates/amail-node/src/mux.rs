@@ -766,7 +766,12 @@ impl Mux for ProcessMux {
             .and_then(|m| m.get(&pane))
             .context("no such pane")?;
         let out = p.output.lock().unwrap();
-        Ok(String::from_utf8_lossy(&out).into_owned())
+        let text = String::from_utf8_lossy(&out).into_owned();
+        // Like a terminal: a clear-screen sequence hides what came before.
+        Ok(match text.rfind("\x1b[2J") {
+            Some(i) => text[i + 4..].to_string(),
+            None => text,
+        })
     }
 
     async fn kill_session(&self, session: &str) -> Result<()> {

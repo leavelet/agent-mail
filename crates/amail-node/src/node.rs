@@ -77,6 +77,9 @@ pub struct Config {
     /// A session without a hook this long after launch is checked for a
     /// prompt that needs a person (and stops holding a start slot).
     pub start_timeout: Duration,
+    /// How often a starting session's screen is checked for prompts that
+    /// need a person (less often once `start_timeout` has passed).
+    pub probe_interval: Duration,
     /// SIGTERM, then SIGKILL after this long.
     pub kill_grace: Duration,
     /// First restart delay after a crash; doubles per consecutive crash.
@@ -131,6 +134,7 @@ impl Config {
             pane_rows: 60,
             start_limit: 4,
             start_timeout: Duration::from_secs(60),
+            probe_interval: Duration::from_secs(3),
             kill_grace: Duration::from_secs(10),
             restart_backoff: Duration::from_secs(2),
             max_restarts: 3,
@@ -395,6 +399,7 @@ pub struct Node {
     server: ServerClient,
     mux: Arc<dyn crate::mux::Mux>,
     sup_kick: Notify,
+    save_lock: Mutex<()>,
     claude: Arc<dyn Adapter>,
     codex: Arc<dyn Adapter>,
     prepared: HashMap<Harness, Arc<OnceCell<Result<(), String>>>>,
@@ -530,6 +535,7 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
         cfg,
         mux,
         sup_kick: Notify::new(),
+        save_lock: Mutex::new(()),
         st: Mutex::new(st),
         state_file,
         wake_kick: Notify::new(),
@@ -597,6 +603,8 @@ impl Node {
 
     /// Write the state file if it changed.
     fn save_now(&self) {
+        // One writer at a time, so an older snapshot never replaces a newer.
+        let _w = self.save_lock.lock().unwrap_or_else(|e| e.into_inner());
         let saved = {
             let mut st = self.lock();
             if !st.save_dirty {
@@ -1035,9 +1043,15 @@ impl Node {
             match tokio::time::timeout_at(deadline.into(), call).await {
                 Ok(Ok(r)) => {
                     let seen: HashSet<i64> = claimed.iter().map(|e| e.message.id).collect();
+                    // Mail still waiting to be notified is injected in full by
+                    // the next claim; listing it here too would show it twice.
                     r.entries
                         .into_iter()
                         .filter(|e| !seen.contains(&e.message.id))
+                        .filter(|e| {
+                            e.delivery.notified_at.is_some()
+                                || e.delivery.mode != amail_proto::DeliveryMode::Immediate
+                        })
                         .collect()
                 }
                 _ => Vec::new(),
@@ -1229,7 +1243,18 @@ impl Node {
             "connected": st.connected,
             "server": self.cfg.url,
             "uptime_s": self.started.elapsed().as_secs(),
-            "registered_sessions": st.saved.sessions.len(),
+            // Registrations of sessions that are running now (others are
+            // kept only so a sleeping or stopped seat can resume).
+            "registered_sessions": st
+                .saved
+                .sessions
+                .values()
+                .filter(|r| {
+                    st.seats
+                        .get(&r.seat)
+                        .is_some_and(|s| !matches!(s.state, SeatState::Offline | SeatState::Dormant))
+                })
+                .count(),
             "mirrors": mirrors,
             "seats": seats,
         })

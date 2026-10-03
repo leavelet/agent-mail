@@ -48,7 +48,7 @@ As the agent in seat `w1` (`AMAIL_TOKEN` set to its seat token):
 
 ```console
 $ amail inbox
-#1 [list unread] owner (user): Kickoff | 1 line, thread 1, 2026-10-04 10:00
+#1 [to unread] owner (user): Kickoff | 1 line, thread 1, 2026-10-04 10:00
 $ amail read 1
 #1 thread 1 from owner (user) 2026-10-04 10:00
 To: backend
@@ -141,9 +141,15 @@ teams; Postgres is for larger deployments and standard backup/replication.
   namespace per org.
 - **Address**: `name` (a seat or list in your org) or `name@org`. Names match
   `[a-z0-9][a-z0-9._-]{0,62}`.
-- **Delivery**: one row per (message, recipient seat) with a class (`to`,
-  `cc`, `list`; a seat reached several ways gets one delivery with the highest
-  class), a mode, and `notified` / `read` / `acked` timestamps.
+- **Delivery**: one row per (message, recipient seat) with a class (`to` or
+  `cc`; a seat reached several ways gets one delivery with the highest
+  class), a mode, and `notified` / `read` / `acked` timestamps. The class
+  follows the header field, also for lists: the members of a list in `To` get
+  class `to` (they are notified and woken like direct recipients), of a list
+  in `Cc` class `cc`; each keeps its member mode, so `digest` and `archive`
+  members are not notified at once. (Deliveries made before this rule may
+  carry the old class `list`.) Injected mail says how it came: "to you",
+  "via list <name>" or "cc".
 - **`seq` and `mod_seq`**: each seat has one counter. A new delivery takes the
   next value as its `seq` (its position in the mailbox) and as its `mod_seq`;
   every later state change of a delivery (notified, read, acked) takes the
@@ -288,8 +294,8 @@ atomic, so a delivery is shown once even when several hooks race.
   between tool calls) and `Stop` (keeps the turn going to handle the mail).
 - **Idle agent**: the node sends a one-line nudge that starts a new turn; that
   turn's `UserPromptSubmit` hook claims and injects the mail. A nudge carries no
-  mail itself. Only `to` and urgent mail nudges; `cc` and list mail waits for
-  the next turn.
+  mail itself. Only `to` (also through a list in `To`) and urgent mail
+  nudges; `cc` mail waits for the next turn.
 
 Injected text starts with `[amail]`, has one header line per message, and puts
 every body line behind `  > `. Subjects and `meta` are single-line, so mail
@@ -315,7 +321,8 @@ runs one `amail node`, which connects those sessions to the server:
   3 s coalescing window (urgent: at once). The nudge starts a turn whose
   `UserPromptSubmit` hook injects the mail, so mail reaches the model through
   hooks only, and the server's atomic claim means each delivery is shown once.
-  `cc` and list mail never wake anyone; it comes along with the next turn.
+  `cc` mail never wakes anyone; it comes along with the next turn. Mail to a
+  list in `To` wakes every member, like mail to each of them.
   Claude Code is woken through its inbox socket; Codex with `codex queue`.
   An unanswered wake-up is retried once after 10 s, then the seat is reported
   as `wake_failed` and tried again after 1 minute, doubling up to 10 minutes,
@@ -393,6 +400,19 @@ parent = "root"                  # any seat, e.g. another group's lead
 lead = { name = "be-lead", harness = "codex", model = "gpt-6.1-sol" }
 workers = { count = 3, prefix = "be", role = "..." }   # be-1..be-3, under be-lead
 
+[[group]]
+name = "core"
+parent = "root"
+lead = { name = "core-lead" }
+workers = [                      # or one table per worker, harnesses mixed
+  { name = "core-1" },
+  { name = "core-2", harness = "codex", model = "gpt-6.1-sol" },
+]
+
+[[seat]]
+name = "core-3"
+group = "core"                   # joins the group (under its lead unless `parent` is set)
+
 [[seat]]
 name = "docs"
 parent = "root"
@@ -406,7 +426,9 @@ updates the seats (tree, harness, model, role, group) and the generated lists,
 and asks the node to start the sessions. It is idempotent: run it again after
 editing the file and only the differences are applied. Changed seats keep
 running (the output names those that need a restart); seats that left the
-file are reported and deleted only with `--prune`. Generated lists: one per
+file are reported and deleted only with `--prune`. Changed `[team]`
+settings (`idle_sleep`, `max_live`, `restart`) apply at once and are
+reported. Generated lists: one per
 group (lead and workers), `leads` (every seat with subordinates) and `all`
 (every seat; only the user may post). They are marked `managed`; lists you
 made yourself are never touched. `--only` starts just some groups or seats;
@@ -419,8 +441,13 @@ session's system prompt, so they are short):
   on branch `amail/<seat>`; seats with subordinates also get an integration
   branch `amail/<seat>-next` (the root integrates into the main branch, in
   the main checkout). Role texts say who the seat's maintainer and
-  subordinates are, how to submit (rebase, test, then mail the maintainer
-  with `--meta repo= branch= commit=`) and how to handle merge requests.
+  subordinates are, how to submit (a worker rebases its branch onto its
+  maintainer's integration branch, tests, then mails the maintainer with
+  `--meta repo= branch= commit=`), and how to handle merge requests: merge
+  into the integration branch, never rebase it (catch up by merging the
+  parent's branch into it), reply "merged as <commit>". Maintainers forward
+  requirement and interface changes to every affected member of their team
+  and wait for confirmation.
 - no template: the working directory is `cwd` (or `workroot/<seat>`), the
   role is `role` or `role_file`, plus who is above and below the seat.
 - a directory with `root.md`, `lead.md`, `worker.md` and optionally
@@ -462,8 +489,10 @@ with `--dangerously-skip-permissions`, and its default answer is "No, exit".
 amail does not answer it. Trust is recorded per repository (for a git
 worktree, the main repository's path) in Claude Code's own configuration, so
 answering it once (`amail attach <seat>`) covers every worktree of that
-repository; a seat stuck at the prompt is restarted (or `amail wake`) after
-the answer.
+repository. Seats stuck at the prompt do not hold up other starts and are
+flagged in `amail ps`; the flag clears once the prompt is gone. Claude Code
+checks trust only at start, so after answering once, run `amail wake <seat>`
+(or `amail up`) to restart the other seats stuck at the prompt.
 
 ## Known limitations
 

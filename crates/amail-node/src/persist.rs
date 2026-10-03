@@ -84,6 +84,9 @@ pub struct Managed {
     pub pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid_start: Option<u64>,
+    /// Position in the team file (parents first): start order.
+    #[serde(default)]
+    pub order: u32,
     /// How the last run ended, for `amail ps`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_exit: Option<String>,
@@ -118,7 +121,10 @@ pub struct Reservation {
 
 /// Write `data` to `path` through a temporary file and rename.
 pub fn write_atomic(path: &Path, data: &[u8], mode: u32) -> Result<()> {
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    // Unique per call: concurrent writers must not share a temporary file.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp{}.{n}", std::process::id()));
     {
         let mut f = std::fs::OpenOptions::new()
             .write(true)

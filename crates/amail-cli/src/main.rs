@@ -1164,7 +1164,7 @@ async fn node_daemon(a: NodeArgs) -> Result<()> {
 
 fn node_status_text(v: &Value) -> Result<String> {
     let mut out = vec![format!(
-        "node {} server {} ({} registered sessions)",
+        "node {} server {} ({} running registered sessions)",
         if v["connected"].as_bool() == Some(true) {
             "connected to"
         } else {

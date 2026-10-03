@@ -46,6 +46,7 @@ team_tests!(
     seats_needing_a_person_show_in_ps,
     server_commands_sleep_and_wake,
     session_without_a_turn_starts_fresh,
+    list_mail_wakes_and_cold_starts,
     staged_merge_worktrees_and_validation,
 );
 
@@ -772,77 +773,117 @@ async fn crash_restart_backoff_and_resume_fallback(b: Backend) {
     cli(&h, &["down"]).await;
 }
 
-fn quick_start_timeout(c: &mut amail_node::Config) {
-    c.start_timeout = Duration::from_millis(1500);
+fn one_start_at_a_time(c: &mut amail_node::Config) {
+    c.start_limit = 1;
+    c.start_timeout = Duration::from_secs(20);
 }
 
-/// A seat stuck at the directory-trust prompt and one waiting for a
-/// permission decision are flagged in `ps` with what to do.
+/// Seats stuck at the directory-trust prompt: flagged in `ps` and not
+/// holding start slots; the flag clears when the prompt goes away; after
+/// one answer, `amail wake` and `amail up` restart the other stuck seats.
+/// A seat waiting for a permission decision is flagged too.
 async fn seats_needing_a_person_show_in_ps(b: Backend) {
     let Some(h) = setup(
         b,
         "seats_needing_a_person_show_in_ps",
-        Some(quick_start_timeout),
+        Some(one_start_at_a_time),
     )
     .await
     else {
         return;
     };
-    let _i: Vec<FakeInbox> = ["t", "p"].iter().map(|s| inbox(&h, s)).collect();
-    set_mode(&h, "t", "trust");
+    let _i: Vec<FakeInbox> = ["t1", "t2", "t3", "p"]
+        .iter()
+        .map(|s| inbox(&h, s))
+        .collect();
+    for s in ["t1", "t2", "t3"] {
+        set_mode(&h, s, "trust");
+    }
     write_team(
         &h,
         "[team]\nworkroot = \"@DIR@/work\"\n[defaults]\nharness = \"claude\"\n\
-         [[seat]]\nname = \"t\"\n[[seat]]\nname = \"p\"\n",
+         [[seat]]\nname = \"t1\"\n[[seat]]\nname = \"t2\"\n[[seat]]\nname = \"t3\"\n\
+         [[seat]]\nname = \"p\"\n",
     );
+    // One start at a time, and the start timeout is long: `p` comes up
+    // quickly only because blocked seats give their slot back.
+    let t0 = Instant::now();
     up(&h, &[]).await;
     wait_state(&h, "p", "idle").await;
+    assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
+    for s in ["t1", "t2", "t3"] {
+        let r = row(&h, s).await;
+        assert_eq!(r.attention.as_deref(), Some("trust-prompt"), "{r:?}");
+        assert_eq!(r.state, "starting");
+        let hint = r.hint.unwrap();
+        assert!(
+            hint.contains(
+                &h.dir
+                    .path()
+                    .join("work")
+                    .join(s)
+                    .to_string_lossy()
+                    .into_owned()
+            ),
+            "{hint}"
+        );
+        assert!(hint.contains(&format!("amail attach {s}")), "{hint}");
+        assert!(hint.contains("amail wake"), "{hint}");
+    }
+
+    // Answered in t1's pane: the flag clears once the prompt is gone, then
+    // the session comes up.
+    std::fs::write(h.fake.join("t1.answer"), "").unwrap();
     let t0 = Instant::now();
     loop {
-        let r = row(&h, "t").await;
-        if r.attention.as_deref() == Some("trust-prompt") {
-            let hint = r.hint.unwrap();
-            assert!(hint.contains("trust"), "{hint}");
-            assert!(
-                hint.contains(&h.dir.path().join("work/t").to_string_lossy().into_owned()),
-                "{hint}"
-            );
-            assert!(hint.contains("amail attach t"), "{hint}");
-            assert_eq!(r.state, "starting");
+        let r = row(&h, "t1").await;
+        if r.attention.is_none() {
             break;
         }
-        assert!(t0.elapsed() < Duration::from_secs(15), "{r:?}");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(t0.elapsed() < Duration::from_secs(10), "{r:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    wait_state(&h, "t1", "idle").await;
+    // The others still sit at the prompt (Claude Code checks trust only at
+    // start). Trust is now granted: `wake` and `up` restart them.
+    set_mode(&h, "t2", "");
+    set_mode(&h, "t3", "");
+    let (ok, out) = cli(&h, &["wake", "t2"]).await;
+    assert!(ok && out.contains("t2: restarting"), "{out}");
+    let out = up(&h, &[]).await;
+    assert!(
+        out.contains("restarting (was stuck at a prompt): t3"),
+        "{out}"
+    );
+    for s in ["t2", "t3"] {
+        wait_state(&h, s, "idle").await;
+        assert_eq!(launches(&h, s).len(), 2, "{s}");
+        assert_eq!(row(&h, s).await.restarts, 0, "a restart is not a failure");
+    }
+    // A working seat is not restarted by wake.
+    let (ok, out) = cli(&h, &["wake", "t1"]).await;
+    assert!(ok && out.contains("t1: running"), "{out}");
+
     std::fs::write(h.fake.join("p.ask"), "").unwrap();
     wait_state(&h, "p", "awaiting").await;
     let r = row(&h, "p").await;
     assert_eq!(r.attention.as_deref(), Some("permission"));
     let (_, text) = cli(&h, &["ps"]).await;
-    assert!(
-        text.contains("trust-prompt") && text.contains("permission"),
-        "{text}"
-    );
-    assert!(
-        text.contains("t: Claude Code asks whether to trust"),
-        "{text}"
-    );
+    assert!(text.contains("permission"), "{text}");
     // The server and the user's queue know too.
     h.wait("attention reported", || async {
-        let t = h.api.get("/seats/t").await;
-        let p = h.api.get("/seats/p").await;
-        t["presence"]["attention"] == "trust-prompt" && p["presence"]["attention"] == "permission"
+        h.api.get("/seats/p").await["presence"]["attention"] == "permission"
     })
     .await;
     let q = h.api.get("/attention").await;
-    let seats: Vec<&str> = q["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|i| i["kind"] == "seat")
-        .map(|i| i["seat"].as_str().unwrap())
-        .collect();
-    assert!(seats.contains(&"t") && seats.contains(&"p"), "{q}");
+    assert!(
+        q["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["kind"] == "seat" && i["seat"] == "p"),
+        "{q}"
+    );
     cli(&h, &["down"]).await;
 }
 
@@ -1027,5 +1068,63 @@ async fn session_without_a_turn_starts_fresh(b: Backend) {
     kill9(row(&h, "n").await.pid.unwrap());
     wait_for("a third launch", || launches(&h, "n").len() == 3).await;
     assert!(launches(&h, "n")[2].contains(&format!("--resume {sid}")));
+    cli(&h, &["down"]).await;
+}
+
+/// Mail `To` a generated list wakes its idle members and starts its
+/// sleeping ones, like direct mail; a list in `Cc` does neither.
+async fn list_mail_wakes_and_cold_starts(b: Backend) {
+    let Some(h) = setup(b, "list_mail_wakes_and_cold_starts", None).await else {
+        return;
+    };
+    let _i: Vec<FakeInbox> = ["l", "a"].iter().map(|s| inbox(&h, s)).collect();
+    let team = r#"
+[team]
+workroot = "@DIR@/work"
+[defaults]
+harness = "claude"
+[[group]]
+name = "g"
+lead = { name = "l" }
+workers = [{ name = "a" }, { name = "b", harness = "codex" }]
+"#;
+    write_team(&h, team);
+    up(&h, &[]).await;
+    for s in ["l", "a", "b"] {
+        wait_state(&h, s, "idle").await;
+    }
+    let members = list_members(&h, "g").await;
+    assert_eq!(members, vec!["a", "b", "l"]);
+    let (ok, out) = cli(&h, &["sleep", "b"]).await;
+    assert!(ok, "{out}");
+
+    // A list in Cc: not shown at once, nobody woken or started.
+    h.api.send(&["l"], &["g"], "fyi", false).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(row(&h, "b").await.state, "dormant");
+    assert_eq!(launches(&h, "b").len(), 1);
+
+    // A list in To: everyone gets it now; the sleeping Codex seat resumes.
+    let id = h.api.send(&["g"], &[], "to the group", false).await;
+    for s in ["l", "a", "b"] {
+        wait_injected(&h, s, id).await;
+    }
+    assert!(
+        injected(&h, "a").contains("via list g"),
+        "{}",
+        injected(&h, "a")
+    );
+    assert!(launches(&h, "b")[1].contains(" resume "));
+
+    // Changed settings are reported (and apply at once).
+    write_team(
+        &h,
+        &team.replace("[defaults]", "idle_sleep = \"1m\"\n[defaults]"),
+    );
+    let out = up(&h, &[]).await;
+    assert!(
+        out.contains("settings changed (in effect now): idle_sleep off -> 60s"),
+        "{out}"
+    );
     cli(&h, &["down"]).await;
 }

@@ -219,7 +219,7 @@ async fn run(backend: Backend) {
     assert_eq!(inbox.lines().count(), 1);
     assert!(
         inbox.contains(&format!(
-            "#{kickoff} [list unread ack] owner (user): Kickoff | 2 lines"
+            "#{kickoff} [to unread ack] owner (user): Kickoff | 2 lines"
         )),
         "{inbox}"
     );
@@ -227,7 +227,7 @@ async fn run(backend: Backend) {
     assert!(inbox.trim_end().ends_with('Z'), "{inbox}");
     let lead_inbox = lead.run(&["inbox"]);
     assert!(
-        lead_inbox.contains("[list digest unread ack]"),
+        lead_inbox.contains("[to digest unread ack]"),
         "{lead_inbox}"
     );
 
@@ -267,12 +267,9 @@ async fn run(backend: Backend) {
     let status = acme.run(&["status", &kickoff.to_string()]);
     let lines: Vec<&str> = status.lines().collect();
     assert_eq!(lines.len(), 3, "{status}");
-    assert!(
-        lines[0].starts_with("lead queued [list digest]"),
-        "{status}"
-    );
-    assert!(lines[1].starts_with("w1 acked [list]"), "{status}");
-    assert!(lines[2].starts_with("w2 queued [list]"), "{status}");
+    assert!(lines[0].starts_with("lead queued [to digest]"), "{status}");
+    assert!(lines[1].starts_with("w1 acked [to]"), "{status}");
+    assert!(lines[2].starts_with("w2 queued [to]"), "{status}");
     // Status is only for the sender.
     let out = w2.try_run(&["status", &kickoff.to_string()], None);
     assert!(!out.status.success());

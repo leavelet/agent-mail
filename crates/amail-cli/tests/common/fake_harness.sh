@@ -6,6 +6,7 @@
 # Files in $D (the directory of this script):
 #   <seat>.launches  one line per start: "<unix ms> <pid> <args...>"
 #   <seat>.mode      optional behaviour: trust | exit3 | badresume | slow | noturn
+#   <seat>.answer    answers the trust prompt (mode trust)
 #   <seat>.wake      created by the test when the node wakes the seat
 #                    (Claude: via the inbox socket; Codex: `codex queue`)
 #   <seat>.injected  every hook answer the node gave
@@ -55,11 +56,16 @@ if [ "$kind" = codex ] && [ -n "$resumed" ]; then sid=$last; fi
 
 case "$mode" in
 trust)
+    # Wait at the prompt until the test answers (<seat>.answer), then clear
+    # the screen and start up a moment later.
     echo "Do you trust the files in this folder?"
     echo "  1. Yes, proceed"
     echo "  2. No, exit"
-    sleep 600
-    exit 0
+    while [ ! -f "$D/$seat.answer" ]; do sleep 0.1; done
+    rm -f "$D/$seat.answer"
+    printf '\033[2J'
+    echo "trusted"
+    sleep 1.5
     ;;
 exit3)
     echo "crashing on purpose"

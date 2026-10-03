@@ -93,31 +93,53 @@ fn staged_merge(team: &Team, seat: &str, main_branch: &str) -> String {
         let int = team.integration_branch(seat, main_branch);
         let how = if pos == Position::Root {
             format!(
-                "merge it into `{int}` in the main checkout: `git -C {repo} merge --no-ff <branch>`"
+                "merge it into `{int}` in the main checkout (`git -C {repo} merge --no-ff \
+                 <branch>`), run the tests"
             )
         } else {
+            let up = parent
+                .as_deref()
+                .map(|p| team.integration_branch(p, main_branch))
+                .unwrap_or_else(|| main_branch.to_string());
             format!(
                 "`git switch {int}`, `git merge --no-ff <branch>`, run the tests, then \
-                 `git switch {branch}` to continue your own work"
+                 `git switch {branch}`. Never rebase `{int}`: your team builds on it and the \
+                 commits named in their requests must stay reachable; to catch up with \
+                 `{up}`, merge it into `{int}`"
             )
         };
+        let list = team
+            .groups
+            .iter()
+            .find(|g| g.lead == seat)
+            .map(|g| format!(" (or the list `{}`)", g.name))
+            .unwrap_or_default();
         out.push(format!(
             "You maintain {}: they mail you merge requests (meta repo, branch, commit). \
              Review with `git log -p {int}..<branch>`; to accept, {how}. Reply to each request \
-             with \"merged\", \"changes needed: ...\" or \"rejected: ...\".",
+             with \"merged as <commit>\", \"changes needed: ...\" or \"rejected: ...\". \
+             When you get a requirement or interface change, forward it to every member of \
+             your team it affects{list} and wait until each has confirmed; let them make \
+             the changes in their own branches.",
             quoted_list(&kids)
         ));
     }
     if let Some(p) = &parent {
         let target = team.integration_branch(p, main_branch);
+        let prepare = if kids.is_empty() {
+            format!("rebase `{branch}` onto `{target}`")
+        } else {
+            let int = team.integration_branch(seat, main_branch);
+            format!("merge `{target}` into `{int}` (do not rebase it)")
+        };
         let submit = if kids.is_empty() {
             branch.clone()
         } else {
             team.integration_branch(seat, main_branch)
         };
         out.push(format!(
-            "Your maintainer is `{p}`. To submit: rebase `{submit}` onto `{target}` and run the \
-             tests, then `amail send --to {p} -s \"merge: <summary>\" --meta repo={repo} \
+            "Your maintainer is `{p}`. To submit: {prepare} and run the tests, then \
+             `amail send --to {p} -s \"merge: <summary>\" --meta repo={repo} \
              --meta branch={submit} --meta commit=$(git rev-parse {submit}) -m \"<what and why>\"`. \
              Ask `{p}` first when you are stuck."
         ));
@@ -203,11 +225,17 @@ workers = { count = 2, prefix = "be" }
         );
         assert!(lead.contains("You maintain `be-1`, `be-2`"), "{lead}");
         assert!(lead.contains("git switch amail/be-lead-next"), "{lead}");
+        assert!(lead.contains("Never rebase `amail/be-lead-next`"), "{lead}");
+        assert!(lead.contains("to catch up with `main`, merge it"), "{lead}");
+        assert!(lead.contains("forward it to every member"), "{lead}");
+        assert!(lead.contains("(or the list `backend`)"), "{lead}");
+        assert!(lead.contains("merged as <commit>"), "{lead}");
         assert!(lead.contains("Your maintainer is `root`"), "{lead}");
         assert!(
-            lead.contains("rebase `amail/be-lead-next` onto `main`"),
+            lead.contains("merge `main` into `amail/be-lead-next` (do not rebase it)"),
             "{lead}"
         );
+        assert!(!lead.contains("rebase `amail/be-lead-next` onto"), "{lead}");
         assert!(lead.contains("--meta branch=amail/be-lead-next"), "{lead}");
 
         let w = role_text(&t, "be-2", "main");

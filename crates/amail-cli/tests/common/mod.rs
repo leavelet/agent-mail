@@ -240,6 +240,7 @@ impl Harness {
         cfg.hook_server_timeout = Duration::from_secs(5);
         cfg.supervise_interval = Duration::from_millis(100);
         cfg.start_timeout = Duration::from_secs(3);
+        cfg.probe_interval = Duration::from_millis(300);
         cfg.kill_grace = Duration::from_secs(2);
         cfg.restart_backoff = Duration::from_millis(200);
         cfg.resume_grace = Duration::from_secs(3);

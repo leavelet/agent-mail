@@ -327,8 +327,35 @@ async fn recipient_resolution(srv: Server) {
         rows,
         vec![
             ("a".into(), "to".into(), "immediate".into()),
-            ("b".into(), "list".into(), "digest".into()),
-            ("c".into(), "list".into(), "archive".into()),
+            ("b".into(), "to".into(), "digest".into()),
+            ("c".into(), "to".into(), "archive".into()),
+        ]
+    );
+    // The class follows the header field: a list in Cc gives class `cc`.
+    let v = user
+        .send(json!({ "to": ["a"], "cc": ["team"], "subject": "cc list", "body": "" }))
+        .await;
+    let id = v["id"].as_i64().unwrap();
+    let st = user
+        .ok(Method::GET, &format!("/messages/{id}/status"), None)
+        .await;
+    let classes: Vec<(String, String)> = st["recipients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["address"].as_str().unwrap().into(),
+                r["class"].as_str().unwrap().into(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        classes,
+        vec![
+            ("a".into(), "to".into()),
+            ("b".into(), "cc".into()),
+            ("c".into(), "cc".into()),
         ]
     );
 
