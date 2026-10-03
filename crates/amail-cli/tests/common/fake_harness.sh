@@ -5,7 +5,7 @@
 #
 # Files in $D (the directory of this script):
 #   <seat>.launches  one line per start: "<unix ms> <pid> <args...>"
-#   <seat>.mode      optional behaviour: trust | exit3 | badresume | slow
+#   <seat>.mode      optional behaviour: trust | exit3 | badresume | slow | noturn
 #   <seat>.wake      created by the test when the node wakes the seat
 #                    (Claude: via the inbox socket; Codex: `codex queue`)
 #   <seat>.injected  every hook answer the node gave
@@ -103,11 +103,11 @@ if [ "$kind" = claude ]; then
     [ -n "$sid" ] || sid="claude-$$"
     src=startup
     [ -n "$resumed" ] && src=resume
-    hook "{\"hook_event_name\":\"SessionStart\",\"session_id\":\"$sid\",\"source\":\"$src\"}" > /dev/null
     echo "$(now) $$" >> "$D/$seat.started"
-    case "$last" in
-    "[amail]"*) turn "\"first prompt\"" ;;
-    esac
+    hook "{\"hook_event_name\":\"SessionStart\",\"session_id\":\"$sid\",\"source\":\"$src\"}" > /dev/null
+    # A first turn, so the session can be resumed later (Claude Code
+    # cannot resume a session that never had one), unless mode `noturn`.
+    [ "$mode" = noturn ] || turn "\"first prompt\""
 else
     if [ -z "$resumed" ]; then
         sid="thread-$$-$(now)"

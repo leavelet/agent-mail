@@ -44,6 +44,7 @@ team_tests!(
     start_limit_bounds_cold_starts,
     crash_restart_backoff_and_resume_fallback,
     seats_needing_a_person_show_in_ps,
+    session_without_a_turn_starts_fresh,
     staged_merge_worktrees_and_validation,
 );
 
@@ -236,9 +237,14 @@ async fn wait_injected(h: &Harness, seat: &str, id: i64) {
             .iter()
             .find(|r| r["seat"] == seat)
             .and_then(|r| r["notified_via"].as_str().map(str::to_string));
+        // Claimed by a hook; the fake harness records the answer just after.
         if let Some(via) = via {
             assert!(via.starts_with("hook:"), "{st}");
-            assert!(injected(h, seat).contains(&format!("#{id} from")));
+            let needle = format!("#{id} from");
+            wait_for("the injection to be recorded", || {
+                injected(h, seat).contains(&needle)
+            })
+            .await;
             return;
         }
         if t0.elapsed() > Duration::from_secs(20) {
@@ -938,4 +944,41 @@ workers = {{ count = 2, prefix = "core" }}
     // Again: no git changes.
     let out = up(&h, &["--no-start"]).await;
     assert!(!out.contains("git:"), "{out}");
+}
+
+/// A session that never had a turn cannot be resumed: after a crash the seat
+/// starts a new session, without claiming that context was lost.
+async fn session_without_a_turn_starts_fresh(b: Backend) {
+    let Some(h) = setup(b, "session_without_a_turn_starts_fresh", None).await else {
+        return;
+    };
+    let _i = inbox(&h, "n");
+    set_mode(&h, "n", "noturn");
+    write_team(
+        &h,
+        "[team]\nworkroot = \"@DIR@/work\"\n[defaults]\nharness = \"claude\"\n[[seat]]\nname = \"n\"\n",
+    );
+    up(&h, &[]).await;
+    wait_state(&h, "n", "idle").await;
+    kill9(row(&h, "n").await.pid.unwrap());
+    wait_for("a second launch", || launches(&h, "n").len() == 2).await;
+    wait_state(&h, "n", "idle").await;
+    let l = launches(&h, "n");
+    assert!(l[1].contains("--session-id"), "{l:?}");
+    assert!(!l[1].contains("--resume"), "{l:?}");
+    assert!(!l[1].contains("This is a new session"), "{l:?}");
+    // Once it had a turn, it is resumed.
+    let id = h.api.send(&["n"], &[], "work", false).await;
+    wait_injected(&h, "n", id).await;
+    wait_state(&h, "n", "idle").await;
+    let sid = l[1]
+        .split(' ')
+        .skip_while(|w| *w != "--session-id")
+        .nth(1)
+        .unwrap()
+        .to_string();
+    kill9(row(&h, "n").await.pid.unwrap());
+    wait_for("a third launch", || launches(&h, "n").len() == 3).await;
+    assert!(launches(&h, "n")[2].contains(&format!("--resume {sid}")));
+    cli(&h, &["down"]).await;
 }

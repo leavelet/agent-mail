@@ -93,6 +93,7 @@ pub(super) fn classify_screen(screen: &str, seat: &str, cwd: &str) -> Option<(St
     if has("trust the files")
         || has("do you trust")
         || has("trust this folder")
+        || has("one you trust")
         || (has("trust") && has("folder") && has("proceed"))
     {
         return Some((
@@ -1090,6 +1091,13 @@ mod tests {
 
     #[test]
     fn screens_that_need_a_person() {
+        // As Claude Code 2.1 shows it.
+        let real = "Accessing workspace:\n/w/a\nQuick safety check: Is this a project you \
+                    created or one you trust?\n❯ No, exit\n  Yes, I trust this folder";
+        assert_eq!(
+            classify_screen(real, "a", "/w/a").map(|x| x.0),
+            Some("trust-prompt".into())
+        );
         let trust =
             "Do you trust the files in this folder?\n/w/a\n❯ 1. Yes, proceed\n  2. No, exit";
         assert_eq!(

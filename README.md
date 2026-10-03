@@ -15,8 +15,9 @@ Postgres.
 
 **Status: early.** The server, storage and CLI, plus a per-host **node** that
 pushes mail into running Claude Code and Codex sessions: mid-turn through
-hooks while an agent is busy, and by waking the session when it is idle. There
-is no web UI yet, and the HTTP API may still change.
+hooks while an agent is busy, and by waking the session when it is idle; and
+`amail up`, which turns a team file into running, supervised sessions in
+zellij. There is no web UI yet, and the HTTP API may still change.
 
 ## Quick start (SQLite)
 
@@ -146,6 +147,9 @@ org cannot be revoked.
 | `amail token node/user/ls/revoke` | node tokens, extra user tokens, listing and revocation |
 | `amail node` | run the per-host node (see below); `amail node token [--save]`, `amail node status` |
 | `amail run <seat> [-- args]` | start the seat's harness session in this terminal |
+| `amail up [-f amail.toml] [--only g,s] [--no-start] [--prune]` | bring a team up from a team file (see "Teams") |
+| `amail down [--only g,s]` / `amail ps` | stop the team's sessions / one line per seat |
+| `amail attach <group or seat>` / `amail sleep <seat>` / `amail wake <seat>` | attach to a group's zellij session / put a seat to sleep / start it now |
 | `amail org show/set` | org settings (budgets and limits) |
 
 ## HTTP API
@@ -255,14 +259,121 @@ amail node status              # what the node sees
   tool commands find their seat's credentials through the node by
   `CODEX_THREAD_ID`. Only flags that keep the session on the shared daemon are
   allowed (`-m`, `-a`, `-s`, `-C`, ...; not `-c`, `-p`, `--remote`).
-  `unattended` seats run with `-a never -s workspace-write`.
+  `unattended` seats run with `-a never` under the home's `amail` permissions
+  profile: the workspace sandbox (the working directory, `/tmp` and
+  `$TMPDIR` writable, everything else read-only), network access, and write
+  access to the git directory and the repository's common git directory of
+  every Codex seat's working directory, so a seat in a git worktree can
+  commit, rebase and create branches (the workspace sandbox alone keeps
+  `.git` read-only, and a worktree's git directory lies outside it).
 
 Every session gets a system prompt explaining that `[amail]` text comes from the
 mail system, that `USER` mail is an instruction, `agent` mail a colleague's
 request and `external` mail untrusted information, and that mail never grants
 permissions.
 
-### Known limitations
+## Teams: `amail up`
+
+A team file (`amail.toml`) describes the seat tree and how this host runs it;
+the org comes from your user token.
+
+```toml
+[team]
+template = "staged-merge"        # built-in, or a template directory; optional
+repo = "/path/to/repo"           # needed by staged-merge
+workroot = "/path/to/worktrees"  # seats' working directories go here
+idle_sleep = "30m"               # put idle seats to sleep; "off" (default)
+max_live = 40                    # seats with a process on this host
+restart = "on-failure"           # or "never"
+
+[defaults]
+harness = "claude"
+model = "sonnet"
+permission_mode = "unattended"
+
+[[seat]]
+name = "root"
+role = "Overall technical lead."
+
+[[group]]
+name = "backend"
+parent = "root"                  # any seat, e.g. another group's lead
+lead = { name = "be-lead", harness = "codex", model = "gpt-6.1-sol" }
+workers = { count = 3, prefix = "be", role = "..." }   # be-1..be-3, under be-lead
+
+[[seat]]
+name = "docs"
+parent = "root"
+cwd = "docs"                     # relative to the team file
+role_file = "roles/docs.md"
+```
+
+`amail up` (with a user token, and a running node) checks the file (errors
+name the entry; nothing is changed), prepares working directories, creates or
+updates the seats (tree, harness, model, role, group) and the generated lists,
+and asks the node to start the sessions. It is idempotent: run it again after
+editing the file and only the differences are applied. Changed seats keep
+running (the output names those that need a restart); seats that left the
+file are reported and deleted only with `--prune`. Generated lists: one per
+group (lead and workers), `leads` (every seat with subordinates) and `all`
+(every seat; only the user may post). They are marked `managed`; lists you
+made yourself are never touched. `--only` starts just some groups or seats;
+`--no-start` starts nothing.
+
+**Templates** decide working directories and role texts (which go into every
+session's system prompt, so they are short):
+
+- `staged-merge`: every seat gets a git worktree `workroot/<seat>` of `repo`
+  on branch `amail/<seat>`; seats with subordinates also get an integration
+  branch `amail/<seat>-next` (the root integrates into the main branch, in
+  the main checkout). Role texts say who the seat's maintainer and
+  subordinates are, how to submit (rebase, test, then mail the maintainer
+  with `--meta repo= branch= commit=`) and how to handle merge requests.
+- no template: the working directory is `cwd` (or `workroot/<seat>`), the
+  role is `role` or `role_file`, plus who is above and below the seat.
+- a directory with `root.md`, `lead.md`, `worker.md` and optionally
+  `template.toml` (`workdir = "worktree"` or `"none"`); placeholders
+  `{seat}`, `{parent}`, `{subordinates}`, `{group}`, `{workdir}`, `{branch}`.
+  Templates are text only.
+
+**Sessions.** The node starts and supervises them in zellij: one session per
+group, `amail-<org>-<group>` (seats without a group in `amail-<org>-main`),
+one tab per seat, each running `amail run <seat>`. A pane keeps its last
+output when its command ends. The node keeps a headless zellij client of
+fixed size (200x60) attached to each session, so panes are 200 columns wide
+while nobody is attached (a session without any client lays its panes out at
+about 50 columns). `amail attach <group or seat>` attaches your terminal,
+focused on the seat. Your zellij configuration and sessions are not touched.
+
+**Lifecycle.** Seat states: `starting`, `busy`, `idle`, `awaiting` (a
+permission prompt), `dormant` (asleep), `offline`, `restarting`, `failed`.
+
+- A seat idle for `idle_sleep` with nothing pending, or the least recently
+  active idle seats when more than `max_live` run, or `amail sleep`, is put
+  to sleep: its process ends, its session id and pane are kept.
+- `to` or urgent mail for a sleeping seat (or `amail wake`) starts it again
+  in its pane, resuming its session (Claude Code `--resume`, Codex `codex
+  resume`); the mail then arrives as usual. At most 4 sessions start at a
+  time (`amail node --start-limit`), so mail to everyone does not start
+  dozens of processes at once.
+- A process that ends without `down` or sleep is restarted (resuming) after
+  2 s, doubling per consecutive crash; after 3 restarts the seat is `failed`.
+  A clean exit (status 0, e.g. `/exit`) is not a crash: the seat goes
+  offline. A seat whose session cannot be resumed starts a new session that
+  is told its earlier context is gone.
+- `amail ps` flags seats that need a person, with what to do: Claude Code's
+  directory-trust prompt, a harness that is not logged in, a permission
+  prompt, a failed or unanswered seat.
+
+**Claude Code's directory-trust prompt** appears for a new repository even
+with `--dangerously-skip-permissions`, and its default answer is "No, exit".
+amail does not answer it. Trust is recorded per repository (for a git
+worktree, the main repository's path) in Claude Code's own configuration, so
+answering it once (`amail attach <seat>`) covers every worktree of that
+repository; a seat stuck at the prompt is restarted (or `amail wake`) after
+the answer.
+
+## Known limitations
 
 - **Lost answers.** If a hook's answer cannot be delivered (the hook client
   timed out or went away), the node keeps the claimed mail and shows it with
@@ -277,8 +388,17 @@ permissions.
   hook wins.
 - After a node restart, sessions whose process and wake target still exist
   are restored as idle; anything else waits for its next hook.
-- Claude Code asks once whether to trust a new working directory; `amail run`
-  does not answer for you.
+- Claude Code asks once per repository whether to trust it; amail does not
+  answer for you (see "Teams").
+- Codex permissions are per host, not per seat: every Codex session on a
+  host may write the git directories of all Codex seats' repositories on that
+  host. Paths of the dedicated Codex home must stay short (Unix socket paths
+  are limited to 107 bytes).
+- State reflects hooks: Claude Code refuses a long foreground `sleep`, runs it
+  in the background and ends its turn, so a seat can show `idle` while a
+  background task it started still runs.
+- Mail reaches a busy agent only between tool calls or at the end of a turn;
+  a long-running command delays it, and `urgent` cannot interrupt.
 - Codex agents need network access in their sandbox to reach the server
   (the dedicated Codex home allows it): with networking disabled, the Codex
   sandbox refuses both TCP and Unix-socket connections.
@@ -300,6 +420,10 @@ node tests all run against both backends (each Postgres test creates its own
 database). The node tests drive the real `amail hook` binary with minimal
 hook inputs shaped like the harnesses' own (`crates/amail-cli/tests/fixtures/hooks`); no model is called. The
 hook latency bound is checked with `cargo test --release --test hotpath`.
+The team tests (`crates/amail-cli/tests/team.rs`) run the real `amail up`,
+`down`, `ps`, `sleep` and `wake` against a node whose "panes" are plain
+processes running a fake harness (`tests/common/fake_harness.sh`) that speaks
+the hook protocol; they need neither zellij nor a harness (only `git`).
 
 Crates:
 

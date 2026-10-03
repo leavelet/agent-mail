@@ -856,7 +856,13 @@ impl Node {
                 if hook.event == Event::SessionEnd {
                     return (Output::None, Vec::new());
                 }
-                if supervise::on_hook(&mut st, seat, hook.session_id.as_deref()) {
+                // A session is worth resuming once it has a turn (Claude Code
+                // cannot resume a session that never had one).
+                let resumable = match hook.event {
+                    Event::SessionStart { .. } => None,
+                    _ => hook.session_id.as_deref(),
+                };
+                if supervise::on_hook(&mut st, seat, resumable) {
                     self.sup_kick.notify_one();
                 }
             }
