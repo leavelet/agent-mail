@@ -1,0 +1,424 @@
+//! Endpoints the web interface needs: overview, mailbox counts, the
+//! "needs you" queue, a seat's sent mail, search, and seat commands.
+
+use crate::AppState;
+use crate::auth::Auth;
+use crate::error::{ApiError, ApiResult, Json, Path, Query};
+use crate::render;
+use amail_proto::{
+    self as p, AttentionItem, AttentionKind, NodeCommand, Presence, Priority, SeatKind, SeatState,
+    TokenScope,
+};
+use amail_store::{ArchiveQuery, SearchQuery};
+use axum::extract::State;
+use axum::http::StatusCode;
+use serde::Deserialize;
+use std::collections::HashMap;
+
+/// Messages one scan-mode search page looks at.
+pub const SCAN_LIMIT: i64 = 2000;
+const MAX_TERMS: usize = 10;
+const ATTENTION_LIMIT: i64 = 500;
+
+/// Presence of every seat of the org that a node reports, with
+/// `node_connected` filled in.
+pub fn presences(st: &AppState, org_id: i64) -> HashMap<String, Presence> {
+    let connected = st.nodes.connected(org_id) > 0;
+    st.presence
+        .snapshot(org_id)
+        .into_iter()
+        .map(|(n, mut p)| {
+            p.node_connected = connected;
+            (n, p)
+        })
+        .collect()
+}
+
+/// Seats that need a person, as attention items.
+fn seat_items(presence: &HashMap<String, Presence>) -> Vec<AttentionItem> {
+    presence
+        .iter()
+        .filter(|(_, p)| p.attention.is_some() || p.wake_failed)
+        .map(|(name, p)| AttentionItem {
+            kind: AttentionKind::Seat,
+            since: p.since.clone(),
+            seat: Some(name.clone()),
+            message: None,
+            delivery: None,
+            state: Some(p.state),
+            attention: p
+                .attention
+                .clone()
+                .or_else(|| p.wake_failed.then(|| "wake-failed".to_string())),
+            hint: p.attention_hint.clone(),
+            wake_failed: p.wake_failed,
+        })
+        .collect()
+}
+
+async fn attention_items(st: &AppState, auth: &Auth) -> ApiResult<Vec<AttentionItem>> {
+    let user = auth.mail_seat()?;
+    let entries = st.store.attention(user.id, ATTENTION_LIMIT).await?;
+    let mut urgent = Vec::new();
+    let mut normal = Vec::new();
+    for e in &entries {
+        let kind = if e.message.ack_required && e.delivery.acked_at.is_none() {
+            AttentionKind::Ack
+        } else {
+            AttentionKind::Reply
+        };
+        let header = render::header(&e.message, &auth.org);
+        let item = AttentionItem {
+            kind,
+            since: header.created_at.clone(),
+            seat: Some(header.from.clone()),
+            message: Some(header),
+            delivery: Some(render::delivery(&e.delivery, &auth.org)),
+            state: None,
+            attention: None,
+            hint: None,
+            wake_failed: false,
+        };
+        if e.message.priority == Priority::Urgent {
+            urgent.push(item);
+        } else {
+            normal.push(item);
+        }
+    }
+    let mut seats = seat_items(&presences(st, auth.org.id));
+    // Timestamps are RFC 3339 in UTC with a fixed format, so they sort as
+    // strings.
+    seats.sort_by(|a, b| (&a.since, &a.seat).cmp(&(&b.since, &b.seat)));
+    let mut items = urgent;
+    items.append(&mut seats);
+    items.append(&mut normal);
+    Ok(items)
+}
+
+/// `GET /v1/attention`: what waits for the user (see the README).
+pub async fn attention(
+    State(st): State<AppState>,
+    auth: Auth,
+) -> ApiResult<Json<p::AttentionResponse>> {
+    auth.require_user()?;
+    Ok(Json(p::AttentionResponse {
+        items: attention_items(&st, &auth).await?,
+    }))
+}
+
+/// `GET /v1/overview`: seats per state and recent mail volume.
+pub async fn overview(State(st): State<AppState>, auth: Auth) -> ApiResult<Json<p::Overview>> {
+    auth.require_user()?;
+    let seats = st.store.seats(auth.org.id).await?;
+    let presence = presences(&st, auth.org.id);
+    let mut out = p::Overview::default();
+    for s in [
+        SeatState::Busy,
+        SeatState::Idle,
+        SeatState::Awaiting,
+        SeatState::Dormant,
+        SeatState::Offline,
+    ] {
+        out.states.insert(s.as_str().to_string(), 0);
+    }
+    for s in seats.iter().filter(|s| s.kind == SeatKind::Agent) {
+        out.seats += 1;
+        let pr = presence.get(&s.name);
+        let state = pr.map_or(SeatState::Offline, |p| p.state);
+        *out.states.entry(state.as_str().to_string()).or_default() += 1;
+        if pr.is_some_and(|p| p.attention.is_some()) {
+            out.needs_person += 1;
+        }
+        if pr.is_some_and(|p| p.wake_failed) {
+            out.wake_failed += 1;
+        }
+    }
+    let now = amail_store::now_ms();
+    out.mail_last_hour = st.store.message_count(auth.org.id, now - 3_600_000).await?;
+    out.mail_last_day = st
+        .store
+        .message_count(auth.org.id, now - 86_400_000)
+        .await?;
+    let user = auth.mail_seat()?;
+    out.user_unread = st
+        .store
+        .counts(auth.org.id, Some(user.id))
+        .await?
+        .first()
+        .map_or(0, |c| c.unread);
+    out.attention = attention_items(&st, &auth).await?.len() as i64;
+    Ok(Json(out))
+}
+
+#[derive(Deserialize)]
+pub struct SeatParam {
+    seat: Option<String>,
+}
+
+/// `GET /v1/counts`: unread and pending deliveries per seat (user tokens).
+pub async fn counts(
+    State(st): State<AppState>,
+    auth: Auth,
+    Query(q): Query<SeatParam>,
+) -> ApiResult<Json<p::CountsResponse>> {
+    auth.require_user()?;
+    let seat_id = match &q.seat {
+        Some(name) => Some(auth.mailbox(&st, Some(name)).await?.id),
+        None => None,
+    };
+    let rows = st.store.counts(auth.org.id, seat_id).await?;
+    Ok(Json(p::CountsResponse {
+        seats: rows
+            .into_iter()
+            .map(|r| p::SeatCounts {
+                seat: r.seat_name,
+                unread: r.unread,
+                pending: r.pending,
+                seq: r.last_seq,
+            })
+            .collect(),
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct SentParams {
+    seat: Option<String>,
+    before_id: Option<i64>,
+    limit: Option<i64>,
+}
+
+/// `GET /v1/sent`: messages a seat sent, newest first. User tokens may name
+/// any seat; seat tokens see their own.
+pub async fn sent(
+    State(st): State<AppState>,
+    auth: Auth,
+    Query(q): Query<SentParams>,
+) -> ApiResult<Json<p::ArchiveResponse>> {
+    if auth.scope == TokenScope::Node {
+        return Err(ApiError::forbidden("node tokens cannot read messages"));
+    }
+    let seat = auth.mailbox(&st, q.seat.as_deref()).await?;
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let query = ArchiveQuery {
+        from: Some((auth.org.name.clone(), seat.name.clone())),
+        before_id: q.before_id,
+        limit,
+        ..Default::default()
+    };
+    let msgs = st.store.archive(auth.org.id, &query).await?;
+    let next_before_id = (msgs.len() as i64 == limit)
+        .then(|| msgs.last().map(|m| m.id))
+        .flatten();
+    Ok(Json(p::ArchiveResponse {
+        messages: msgs.iter().map(|m| render::header(m, &auth.org)).collect(),
+        next_before_id,
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct SearchParams {
+    q: String,
+    before_id: Option<i64>,
+    limit: Option<i64>,
+}
+
+/// `GET /v1/archive/search`: substring search over subjects and bodies of
+/// the messages the org can see.
+pub async fn search(
+    State(st): State<AppState>,
+    auth: Auth,
+    Query(q): Query<SearchParams>,
+) -> ApiResult<Json<p::SearchResponse>> {
+    auth.require_user()?;
+    let terms: Vec<String> = q.q.split_whitespace().map(str::to_string).collect();
+    if terms.is_empty() {
+        return Err(ApiError::bad_request("q must contain a search term"));
+    }
+    if terms.len() > MAX_TERMS || terms.iter().any(|t| t.chars().count() > 200) {
+        return Err(ApiError::bad_request(format!(
+            "at most {MAX_TERMS} terms of up to 200 characters"
+        )));
+    }
+    let scan = terms.iter().any(|t| t.chars().count() < 3);
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let query = SearchQuery {
+        terms: terms.clone(),
+        before_id: q.before_id,
+        limit,
+        scan: scan.then_some(SCAN_LIMIT),
+    };
+    let r = st.store.search(auth.org.id, &query).await?;
+    let full = r.messages.len() as i64 == limit;
+    let next_before_id = if full {
+        r.messages.last().map(|m| m.id)
+    } else if scan && !r.scan_exhausted {
+        r.scanned_to
+    } else {
+        None
+    };
+    Ok(Json(p::SearchResponse {
+        messages: r
+            .messages
+            .iter()
+            .map(|m| p::SearchHit {
+                header: render::header(m, &auth.org),
+                snippet: snippet(&m.subject, &m.body, &terms),
+            })
+            .collect(),
+        next_before_id,
+        mode: if scan {
+            p::SearchMode::Scan
+        } else {
+            p::SearchMode::Index
+        },
+        scan_limit: scan.then_some(SCAN_LIMIT),
+    }))
+}
+
+/// About 160 characters of `body` around the first match of any term
+/// (case-insensitive), on one line; the start of the body if only the
+/// subject matched.
+pub fn snippet(_subject: &str, body: &str, terms: &[String]) -> String {
+    let chars: Vec<char> = body.chars().collect();
+    let lower: Vec<char> = body.to_lowercase().chars().collect();
+    let mut at = None;
+    if lower.len() == chars.len() {
+        for t in terms {
+            let t: Vec<char> = t.to_lowercase().chars().collect();
+            if t.is_empty() || t.len() > lower.len() {
+                continue;
+            }
+            if let Some(i) = (0..=lower.len() - t.len()).find(|&i| lower[i..i + t.len()] == t[..]) {
+                at = Some(at.map_or(i, |a: usize| a.min(i)));
+            }
+        }
+    }
+    let start = at.map_or(0, |i| i.saturating_sub(40));
+    let end = (start + 160).min(chars.len());
+    let mut s: String = chars[start..end]
+        .iter()
+        .map(|&c| if c.is_whitespace() { ' ' } else { c })
+        .collect();
+    s = s
+        .split(' ')
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if start > 0 {
+        s.insert(0, '…');
+    }
+    if end < chars.len() {
+        s.push('…');
+    }
+    s
+}
+
+/// `POST /v1/messages/{id}/read`: mark the caller's delivery read.
+pub async fn mark_read(
+    State(st): State<AppState>,
+    auth: Auth,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<p::AckResponse>> {
+    let seat = auth.mail_seat()?.clone();
+    let m = st
+        .store
+        .message(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("no message {id}")))?;
+    if !crate::mail::can_read(&st, &auth, &m).await? {
+        return Err(ApiError::not_found(format!("no message {id}")));
+    }
+    let (d, bump) = st.store.mark_read(id, seat.id).await?.ok_or_else(|| {
+        ApiError::not_found(format!("message {id} was not delivered to {}", seat.name))
+    })?;
+    if let Some(b) = bump {
+        st.bus.publish(b.org_id, &[(seat.name.clone(), b.seq)]);
+    }
+    Ok(Json(p::AckResponse {
+        delivery: render::delivery(&d, &auth.org),
+    }))
+}
+
+async fn seat_op(
+    st: &AppState,
+    auth: &Auth,
+    name: &str,
+    op: &str,
+) -> ApiResult<(StatusCode, Json<p::SeatOpResponse>)> {
+    auth.require_user()?;
+    let seat = st
+        .store
+        .seat_by_name(auth.org.id, name)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("no seat {name:?}")))?;
+    if seat.kind != SeatKind::Agent {
+        return Err(ApiError::unprocessable(
+            "not_an_agent",
+            "only agent seats have sessions",
+        ));
+    }
+    let cmd = NodeCommand {
+        op: op.to_string(),
+        seat: seat.name.clone(),
+        lease_ms: None,
+        backfill: None,
+        node: st
+            .presence
+            .get(auth.org.id, &seat.name)
+            .and_then(|p| p.node),
+    };
+    let nodes = st.nodes.send(auth.org.id, cmd);
+    if nodes == 0 {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "node_offline",
+            "no node of this org is connected",
+        ));
+    }
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(p::SeatOpResponse {
+            seat: seat.name,
+            op: op.to_string(),
+            nodes: nodes as u32,
+        }),
+    ))
+}
+
+/// `POST /v1/seats/{name}/sleep`: ask the hosting node to put the seat to
+/// sleep.
+pub async fn sleep(
+    State(st): State<AppState>,
+    auth: Auth,
+    Path(name): Path<String>,
+) -> ApiResult<(StatusCode, Json<p::SeatOpResponse>)> {
+    seat_op(&st, &auth, &name, "sleep").await
+}
+
+/// `POST /v1/seats/{name}/wake`: ask the hosting node to start the seat.
+pub async fn wake(
+    State(st): State<AppState>,
+    auth: Auth,
+    Path(name): Path<String>,
+) -> ApiResult<(StatusCode, Json<p::SeatOpResponse>)> {
+    seat_op(&st, &auth, &name, "wake").await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::snippet;
+
+    #[test]
+    fn snippets() {
+        let t = |s: &str| vec![s.to_string()];
+        assert_eq!(snippet("s", "hello world", &t("WORLD")), "hello world");
+        let long = format!("{}needle{}", "a ".repeat(100), " b".repeat(200));
+        let s = snippet("s", &long, &t("needle"));
+        assert!(s.starts_with('…') && s.ends_with('…') && s.contains("needle"));
+        assert_eq!(
+            snippet("s", "数据库\n迁移方案", &t("迁移")),
+            "数据库 迁移方案"
+        );
+        assert_eq!(snippet("subject only", "body", &t("subject")), "body");
+    }
+}

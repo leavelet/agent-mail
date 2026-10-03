@@ -207,6 +207,8 @@ pub struct Zellij {
     clients: Mutex<HashMap<String, Headless>>,
     /// Serializes structural changes (sessions, tabs, panes).
     op: tokio::sync::Mutex<()>,
+    /// Create sessions that a `zellij web` server may serve.
+    web_sharing: bool,
 }
 
 fn kdl(s: &str) -> String {
@@ -232,7 +234,16 @@ impl Zellij {
             rows: rows.max(24),
             clients: Mutex::new(HashMap::new()),
             op: tokio::sync::Mutex::new(()),
+            web_sharing: false,
         }
+    }
+
+    /// Let browsers attach to the sessions this node creates (through the
+    /// node's own `zellij web` server). Set per session at creation, so the
+    /// user's zellij configuration is not involved.
+    pub fn with_web_sharing(mut self, on: bool) -> Zellij {
+        self.web_sharing = on;
+        self
     }
 
     fn command(&self) -> std::process::Command {
@@ -314,6 +325,9 @@ impl Zellij {
             .args(["--session-serialization", "false"])
             .args(["--show-startup-tips", "false"])
             .args(["--show-release-notes", "false"]);
+        if self.web_sharing {
+            c.args(["--web-sharing", "on"]);
+        }
         let h = Headless::spawn(&mut c, self.cols, self.rows)?;
         self.clients
             .lock()

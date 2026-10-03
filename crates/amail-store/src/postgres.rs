@@ -14,7 +14,7 @@
 //! `claim` selects candidates with `FOR UPDATE SKIP LOCKED`, so concurrent
 //! claims never return the same delivery.
 
-use crate::common::{join_addrs, line_count, meta_to_db};
+use crate::common::{join_addrs, like_pattern, line_count, meta_to_db, search_sql};
 use crate::model::*;
 use crate::{OpenOptions, Result, StoreError, now_ms};
 use futures::future::BoxFuture;
@@ -142,6 +142,38 @@ impl PgStore {
             })
         })
         .await
+    }
+
+    /// `ILIKE` on `subject || ' ' || body`, the expression of the trigram
+    /// index; in scan mode the same condition limited to the window.
+    async fn search_impl(
+        &self,
+        org_id: i64,
+        q: &SearchQuery,
+        lower: Option<i64>,
+    ) -> Result<Vec<MessageRec>> {
+        let conds: Vec<String> = (0..q.terms.len())
+            .map(|i| format!("(m.subject || ' ' || m.body) ILIKE ${} ESCAPE '\\'", i + 5))
+            .collect();
+        let sql = search_sql(&conds);
+        let binds: Vec<String> = q.terms.iter().map(|t| like_pattern(t)).collect();
+        let (before, limit) = (q.before_id, q.limit);
+        let rows: Vec<crate::common::MsgRow> = self
+            .read(move |c| {
+                Box::pin(async move {
+                    let mut query = sqlx::query_as(&sql)
+                        .bind(org_id)
+                        .bind(before)
+                        .bind(lower)
+                        .bind(limit);
+                    for b in &binds {
+                        query = query.bind(b);
+                    }
+                    Ok(query.fetch_all(&mut *c).await?)
+                })
+            })
+            .await?;
+        crate::common::collect(rows, crate::common::MsgRow::into_message)
     }
 
     async fn claim_impl(

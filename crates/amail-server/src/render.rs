@@ -123,5 +123,6 @@ pub fn org(o: &Org) -> p::OrgInfo {
         send_burst: o.send_burst,
         max_recipients: o.max_recipients,
         max_thread_depth: o.max_thread_depth,
+        webhook_url: o.webhook_url.clone(),
     }
 }

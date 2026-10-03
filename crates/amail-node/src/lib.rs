@@ -13,6 +13,7 @@ pub mod persist;
 pub mod server;
 pub mod team;
 pub mod template;
+pub mod transcript;
 pub mod wire;
 pub mod worktree;
 

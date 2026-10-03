@@ -124,6 +124,40 @@ pub(super) fn classify_screen(screen: &str, seat: &str, cwd: &str) -> Option<(St
     None
 }
 
+/// Whether a seat needs a person, and what to do: `(tag, hint)`.
+pub(super) fn attention_of(st: &State, name: &str) -> Option<(String, String)> {
+    let s = st.seats.get(name);
+    let m = st.saved.managed.get(name);
+    let mut attention = st.sup.get(name).and_then(|rt| rt.blocked.clone());
+    if attention.is_none() && s.is_some_and(|s| s.state == SeatState::Awaiting) {
+        attention = Some((
+            "permission".into(),
+            format!(
+                "waiting for a permission decision: answer it in the pane (amail attach {name})"
+            ),
+        ));
+    }
+    if attention.is_none()
+        && let Some(m) = m.filter(|m| m.failed)
+    {
+        attention = Some((
+            "failed".into(),
+            format!(
+                "{} ({} times in a row); look at the pane (amail attach {name}), then amail wake {name}",
+                m.last_exit.clone().unwrap_or_else(|| "failed".into()),
+                m.failures
+            ),
+        ));
+    }
+    if attention.is_none() && s.is_some_and(|s| s.wake_failed) {
+        attention = Some((
+            "wake-failed".into(),
+            format!("wake-ups are not answered; look at the pane (amail attach {name})"),
+        ));
+    }
+    attention
+}
+
 /// Rebuild runtime state of supervised seats at node start.
 pub(super) fn restore(st: &mut State, harness: impl Fn(&str) -> Option<Harness>) {
     for (name, m) in st.saved.managed.clone() {
@@ -1020,29 +1054,7 @@ impl Node {
                 } else {
                     "offline".into()
                 };
-                let mut attention = rt.blocked.clone();
-                if attention.is_none() && s.is_some_and(|s| s.state == SeatState::Awaiting) {
-                    attention = Some((
-                        "permission".into(),
-                        format!("waiting for a permission decision: answer it in the pane (amail attach {name})"),
-                    ));
-                }
-                if attention.is_none() && m.failed {
-                    attention = Some((
-                        "failed".into(),
-                        format!(
-                            "{} ({} times in a row); look at the pane (amail attach {name}), then amail wake {name}",
-                            m.last_exit.clone().unwrap_or_else(|| "failed".into()),
-                            m.failures
-                        ),
-                    ));
-                }
-                if attention.is_none() && s.is_some_and(|s| s.wake_failed) {
-                    attention = Some((
-                        "wake-failed".into(),
-                        format!("wake-ups are not answered; look at the pane (amail attach {name})"),
-                    ));
-                }
+                let attention = attention_of(&st, name);
                 let (tag, hint) = attention.unzip();
                 PsRow {
                     seat: name.clone(),
@@ -1053,7 +1065,9 @@ impl Node {
                     pane: m.pane,
                     pid: m.pid,
                     pending: s.map_or(0, |s| s.pending.total() + s.stash.len() as i64),
-                    last_activity: s.filter(|s| s.last_activity > 0).map(|s| ts(s.last_activity)),
+                    last_activity: s
+                        .filter(|s| s.last_activity > 0)
+                        .map(|s| ts(s.last_activity)),
                     attention: tag,
                     hint,
                     restarts: m.failures,

@@ -1,6 +1,7 @@
 //! The agent-mail HTTP API (`/v1`).
 
 pub mod auth;
+pub mod commands;
 mod directory;
 pub mod error;
 pub mod events;
@@ -10,6 +11,10 @@ mod nodes;
 pub mod presence;
 mod render;
 mod send;
+pub mod transcript;
+mod ui;
+pub mod web;
+pub mod webhook;
 
 use amail_store::Store;
 use axum::Router;
@@ -25,6 +30,14 @@ pub struct AppState {
     pub bus: Arc<dyn EventBus>,
     pub limiter: Arc<limits::RateLimiter>,
     pub presence: Arc<presence::PresenceBoard>,
+    /// Commands for nodes (sleep, wake, transcript leases).
+    pub nodes: Arc<commands::NodeHub>,
+    /// Conversation mirrors being watched.
+    pub mirror: Arc<transcript::MirrorHub>,
+    pub mirror_config: transcript::MirrorConfig,
+    /// Client for notification webhooks.
+    pub http: reqwest::Client,
+    pub webhook_config: webhook::WebhookConfig,
 }
 
 impl AppState {
@@ -34,6 +47,15 @@ impl AppState {
             bus: Arc::new(Hub::new()),
             limiter: Arc::new(limits::RateLimiter::default()),
             presence: Arc::new(presence::PresenceBoard::new()),
+            nodes: Arc::new(commands::NodeHub::new()),
+            mirror: Arc::new(transcript::MirrorHub::new()),
+            mirror_config: transcript::MirrorConfig::default(),
+            http: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("building the HTTP client"),
+            webhook_config: webhook::WebhookConfig::default(),
         }
     }
 }
@@ -45,6 +67,19 @@ pub fn router(state: AppState) -> Router {
         .route("/messages/{id}", get(mail::read))
         .route("/messages/{id}/ack", post(mail::ack))
         .route("/messages/{id}/status", get(mail::status))
+        .route("/messages/{id}/read", post(ui::mark_read))
+        .route("/session", post(web::login).delete(web::logout))
+        .route("/overview", get(ui::overview))
+        .route("/counts", get(ui::counts))
+        .route("/attention", get(ui::attention))
+        .route("/sent", get(ui::sent))
+        .route("/archive/search", get(ui::search))
+        .route("/seats/{name}/sleep", post(ui::sleep))
+        .route("/seats/{name}/wake", post(ui::wake))
+        .route(
+            "/seats/{name}/transcript",
+            get(transcript::watch).post(transcript::post),
+        )
         .route("/threads/{id}", get(mail::thread))
         .route("/inbox", get(mail::inbox))
         .route("/claim", post(mail::claim))
@@ -73,9 +108,7 @@ pub fn router(state: AppState) -> Router {
         .route("/links", get(d::list_links).post(d::request_link))
         .route("/links/{org}/accept", post(d::accept_link))
         .route("/links/{org}", axum::routing::delete(d::revoke_link));
-    Router::new()
-        .nest("/v1", v1)
-        .route("/healthz", get(|| async { "ok" }))
+    let v1 = v1
         .fallback(|| async { error::ApiError::not_found("no such endpoint") })
         .method_not_allowed_fallback(|| async {
             error::ApiError::new(
@@ -83,7 +116,12 @@ pub fn router(state: AppState) -> Router {
                 "method_not_allowed",
                 "method not allowed",
             )
-        })
+        });
+    Router::new()
+        .nest("/v1", v1)
+        .route("/healthz", get(|| async { "ok" }))
+        .fallback(web::static_file)
+        .layer(axum::middleware::from_fn(web::headers))
         .with_state(state)
 }
 

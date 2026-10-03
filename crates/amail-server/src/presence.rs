@@ -41,6 +41,9 @@ struct Entry {
     node: Option<String>,
     since: i64,
     updated: i64,
+    attention: Option<String>,
+    attention_hint: Option<String>,
+    terminal_url: Option<String>,
 }
 
 impl Entry {
@@ -52,6 +55,10 @@ impl Entry {
             node: self.node.clone(),
             since: crate::render::ts(self.since),
             updated_at: crate::render::ts(self.updated),
+            attention: self.attention.clone(),
+            attention_hint: self.attention_hint.clone(),
+            terminal_url: self.terminal_url.clone(),
+            node_connected: false,
         }
     }
 
@@ -91,7 +98,12 @@ impl PresenceBoard {
                 .min(now);
             let prev = org.seats.get(&u.seat).filter(|e| e.fresh(now)).cloned();
             let changed = prev.as_ref().is_none_or(|p| {
-                p.state != u.state || p.wake_failed != u.wake_failed || p.harness != u.harness
+                p.state != u.state
+                    || p.wake_failed != u.wake_failed
+                    || p.harness != u.harness
+                    || p.attention != u.attention
+                    || p.attention_hint != u.attention_hint
+                    || p.terminal_url != u.terminal_url
             });
             let entry = Entry {
                 state: u.state,
@@ -103,6 +115,9 @@ impl PresenceBoard {
                     _ => since,
                 },
                 updated: now,
+                attention: u.attention.clone(),
+                attention_hint: u.attention_hint.clone(),
+                terminal_url: u.terminal_url.clone(),
             };
             if changed {
                 let _ = org.tx.send(PresenceEvent {
@@ -126,6 +141,21 @@ impl PresenceBoard {
             .map(Entry::presence)
     }
 
+    /// Every seat of the org with a recent report.
+    pub fn snapshot(&self, org_id: i64) -> Vec<(String, Presence)> {
+        let now = amail_store::now_ms();
+        let orgs = self.orgs.lock().unwrap();
+        orgs.get(&org_id)
+            .map(|o| {
+                o.seats
+                    .iter()
+                    .filter(|(_, e)| e.fresh(now))
+                    .map(|(n, e)| (n.clone(), e.presence()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub fn subscribe(&self, org_id: i64) -> broadcast::Receiver<PresenceEvent> {
         let mut orgs = self.orgs.lock().unwrap();
         orgs.entry(org_id)
@@ -146,6 +176,9 @@ mod tests {
             wake_failed: false,
             harness: Some("claude".into()),
             since: None,
+            attention: None,
+            attention_hint: None,
+            terminal_url: None,
         }
     }
 

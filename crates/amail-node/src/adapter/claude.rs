@@ -131,6 +131,9 @@ impl Adapter for Claude {
             name,
             event,
             session_id: str_field(input, "session_id").map(str::to_string),
+            transcript_path: str_field(input, "transcript_path")
+                .filter(|p| !p.is_empty())
+                .map(str::to_string),
         })
     }
 

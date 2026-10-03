@@ -349,13 +349,31 @@ pub async fn events(
         };
         std::future::ready(out)
     });
+    // Node tokens also get `command` events (sleep, wake, transcript leases);
+    // while the stream is open the node counts as connected.
+    let commands = if auth.scope == TokenScope::Node {
+        let (rx, conn) = st.nodes.connect(auth.org.id);
+        BroadcastStream::new(rx)
+            .filter_map(move |r| {
+                let _conn = &conn;
+                std::future::ready(r.ok().map(|c| {
+                    Event::default()
+                        .event("command")
+                        .data(serde_json::to_string(&c).unwrap_or_default())
+                }))
+            })
+            .boxed()
+    } else {
+        stream::empty().boxed()
+    };
     // The response ends when the mailbox stream ends (lag), even though the
     // presence stream would go on.
     let mailbox = stream::iter(initial)
         .chain(live)
         .map(Some)
         .chain(stream::once(std::future::ready(None)));
-    let stream = stream::select(mailbox, presence.map(Some))
+    let others = stream::select(presence, commands).map(Some);
+    let stream = stream::select(mailbox, others)
         .take_while(|e| std::future::ready(e.is_some()))
         .filter_map(std::future::ready)
         .map(Ok);

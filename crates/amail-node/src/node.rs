@@ -35,6 +35,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Notify, OnceCell};
 
+mod mirror;
 mod supervise;
 
 /// Node configuration.
@@ -88,6 +89,20 @@ pub struct Config {
     /// resume failed: the next start is a new session.
     pub resume_grace: Duration,
     pub supervise_interval: Duration,
+    /// How often a mirrored transcript file is checked for new lines.
+    pub mirror_poll: Duration,
+    /// Serve the supervised sessions in the browser (`zellij web`).
+    pub web_terminal: Option<WebTerminal>,
+}
+
+/// The node's browser terminal: a `zellij web` server of its own (on its
+/// own port, with its login tokens in the node's state directory).
+#[derive(Debug, Clone)]
+pub struct WebTerminal {
+    pub port: u16,
+    /// Base URL people open (default `http://127.0.0.1:<port>`); a seat's
+    /// terminal is `<base>/<zellij session>`.
+    pub base_url: String,
 }
 
 impl Config {
@@ -122,6 +137,8 @@ impl Config {
             stable_after: Duration::from_secs(600),
             resume_grace: Duration::from_secs(30),
             supervise_interval: Duration::from_millis(500),
+            mirror_poll: Duration::from_millis(500),
+            web_terminal: None,
         }
     }
 }
@@ -163,6 +180,8 @@ struct SeatRt {
     stash: Vec<InboxEntry>,
     /// Last hook or launch (Unix ms).
     last_activity: i64,
+    /// What the server was last told about the seat needing a person.
+    reported_attention: Option<(String, String)>,
 }
 
 impl SeatRt {
@@ -186,6 +205,7 @@ impl SeatRt {
             reported: false,
             stash: Vec::new(),
             last_activity: 0,
+            reported_attention: None,
         }
     }
 
@@ -213,6 +233,8 @@ struct State {
     sup: HashMap<String, supervise::SupRt>,
     /// Supervised seats waiting for a start slot, in order.
     start_queue: std::collections::VecDeque<String>,
+    /// Transcripts being forwarded to the server, by seat.
+    mirrors: HashMap<String, mirror::MirrorRt>,
 }
 
 impl State {
@@ -403,13 +425,23 @@ impl NodeHandle {
 /// Start a node: bind the socket and spawn its tasks. Supervised sessions
 /// run in zellij.
 pub async fn start(cfg: Config) -> Result<NodeHandle> {
-    let mux = Arc::new(crate::mux::Zellij::new(
-        &cfg.zellij_bin,
-        &cfg.state_dir,
-        cfg.pane_cols,
-        cfg.pane_rows,
-    ));
-    start_with_mux(cfg, mux).await
+    let mux = Arc::new(
+        crate::mux::Zellij::new(
+            &cfg.zellij_bin,
+            &cfg.state_dir,
+            cfg.pane_cols,
+            cfg.pane_rows,
+        )
+        .with_web_sharing(cfg.web_terminal.is_some()),
+    );
+    let web = cfg.web_terminal.clone();
+    let (zellij, state_dir) = (cfg.zellij_bin.clone(), cfg.state_dir.clone());
+    let mut h = start_with_mux(cfg, mux).await?;
+    if let Some(w) = web {
+        h.tasks
+            .push(tokio::spawn(web_terminal_loop(zellij, state_dir, w.port)));
+    }
+    Ok(h)
 }
 
 /// [`start`] with another multiplexer (tests use [`crate::mux::ProcessMux`]).
@@ -893,6 +925,17 @@ impl Node {
                     sess.target = hint.wake_target.clone();
                 }
             }
+            if let Some(path) = &hook.transcript_path {
+                let r = crate::persist::TranscriptRef {
+                    harness: adapter.harness().as_str().to_string(),
+                    path: path.clone(),
+                    session_id: hook.session_id.clone(),
+                };
+                if st.saved.transcripts.get(seat) != Some(&r) {
+                    st.saved.transcripts.insert(seat.to_string(), r);
+                    st.save_dirty = true;
+                }
+            }
             let mut plan = Plan::default();
             match &hook.event {
                 Event::SessionStart { source } => {
@@ -1180,11 +1223,14 @@ impl Node {
             })
             .collect();
         seats.sort_by(|a, b| a["seat"].as_str().cmp(&b["seat"].as_str()));
+        let mut mirrors: Vec<&String> = st.mirrors.keys().collect();
+        mirrors.sort();
         json!({
             "connected": st.connected,
             "server": self.cfg.url,
             "uptime_s": self.started.elapsed().as_secs(),
             "registered_sessions": st.saved.sessions.len(),
+            "mirrors": mirrors,
             "seats": seats,
         })
     }
@@ -1235,6 +1281,13 @@ impl Node {
                     use futures::StreamExt;
                     while let Some(ev) = stream.next().await {
                         let Ok(ev) = ev else { break };
+                        if ev.event == "command" {
+                            match serde_json::from_str::<amail_proto::NodeCommand>(&ev.data) {
+                                Ok(cmd) => self.on_command(cmd),
+                                Err(e) => tracing::debug!("ignoring a command: {e}"),
+                            }
+                            continue;
+                        }
                         if ev.event != "mailbox" {
                             continue;
                         }
@@ -1439,7 +1492,29 @@ impl Node {
                 if !st.connected {
                     continue;
                 }
-                let dirty = std::mem::take(&mut st.dirty_presence);
+                let mut dirty = std::mem::take(&mut st.dirty_presence);
+                // Needing a person comes from several places (screens,
+                // crashes, permission prompts); report its changes.
+                let names_all: Vec<String> = st.seats.keys().cloned().collect();
+                let mut attention = HashMap::new();
+                for name in names_all {
+                    let a = supervise::attention_of(&st, &name);
+                    if st
+                        .seats
+                        .get(&name)
+                        .is_some_and(|s| s.reported_attention != a)
+                    {
+                        dirty.insert(name.clone());
+                    }
+                    attention.insert(name, a);
+                }
+                let web = self.cfg.web_terminal.clone();
+                let sessions: HashMap<String, String> = st
+                    .saved
+                    .managed
+                    .iter()
+                    .map(|(n, m)| (n.clone(), m.mux_session.clone()))
+                    .collect();
                 let mut out = Vec::new();
                 let mut names = Vec::new();
                 for (name, s) in st.seats.iter_mut() {
@@ -1449,6 +1524,9 @@ impl Node {
                         continue;
                     }
                     s.reported = s.state != SeatState::Offline;
+                    let a = attention.remove(name).flatten();
+                    s.reported_attention = a.clone();
+                    let (tag, hint) = a.unzip();
                     names.push(name.clone());
                     out.push(PresenceUpdate {
                         seat: name.clone(),
@@ -1456,6 +1534,14 @@ impl Node {
                         wake_failed: s.wake_failed,
                         harness: s.harness.map(|h| h.as_str().to_string()),
                         since: Some(ts(s.since)),
+                        attention: tag,
+                        attention_hint: hint,
+                        terminal_url: match (&web, sessions.get(name)) {
+                            (Some(w), Some(session)) => {
+                                Some(format!("{}/{}", w.base_url.trim_end_matches('/'), session))
+                            }
+                            _ => None,
+                        },
                     });
                 }
                 (out, names)
@@ -1504,6 +1590,66 @@ impl Node {
                 self.presence_kick.notify_one();
             }
         }
+    }
+}
+
+/// Where the node's `zellij web` server keeps its login tokens
+/// (`$XDG_DATA_HOME/zellij/tokens.db` under this directory), apart from the
+/// user's own.
+pub fn web_terminal_data_dir(state_dir: &std::path::Path) -> PathBuf {
+    state_dir.join("zellij-web")
+}
+
+/// A `zellij web` command with the node's token store.
+pub fn web_terminal_command(zellij: &str, state_dir: &std::path::Path) -> std::process::Command {
+    let mut c = std::process::Command::new(zellij);
+    crate::mux::scrub_env(&mut c);
+    c.env("XDG_DATA_HOME", web_terminal_data_dir(state_dir));
+    c
+}
+
+/// Run the node's `zellij web` server on 127.0.0.1:`port` while the node
+/// runs, restarting it if it stops. It is the node's own process (never
+/// `zellij web --stop`, which would stop every server of the user).
+async fn web_terminal_loop(zellij: String, state_dir: PathBuf, port: u16) {
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        let _ = std::fs::create_dir_all(web_terminal_data_dir(&state_dir));
+        let mut c = tokio::process::Command::from(web_terminal_command(&zellij, &state_dir));
+        c.args(["web", "--start", "--port", &port.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        // Stopped with the node: `kill_on_drop` when the task ends, and the
+        // parent-death signal if the node process dies.
+        // SAFETY: prctl is async-signal-safe and touches no memory.
+        unsafe {
+            c.pre_exec(|| {
+                libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                Ok(())
+            });
+        }
+        let started = Instant::now();
+        match c.spawn() {
+            Ok(child) => {
+                tracing::info!("serving terminals with zellij web on 127.0.0.1:{port}");
+                match child.wait_with_output().await {
+                    Ok(out) => tracing::warn!(
+                        "zellij web exited ({}): {}",
+                        out.status,
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    ),
+                    Err(e) => tracing::warn!("zellij web: {e}"),
+                }
+            }
+            Err(e) => tracing::warn!("starting zellij web: {e}"),
+        }
+        if started.elapsed() > Duration::from_secs(60) {
+            backoff = Duration::from_secs(1);
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(60));
     }
 }
 

@@ -49,6 +49,13 @@ pub async fn patch_org(
     check(patch.send_burst, 1, "send_burst")?;
     check(patch.max_recipients, 1, "max_recipients")?;
     check(patch.max_thread_depth, 1, "max_thread_depth")?;
+    if let Some(Some(url)) = &patch.webhook_url
+        && !crate::webhook::valid_url(url)
+    {
+        return Err(ApiError::bad_request(
+            "webhook_url must be an http:// or https:// URL",
+        ));
+    }
     Ok(Json(render::org(
         &st.store.update_org(auth.org.id, &patch).await?,
     )))
@@ -57,7 +64,11 @@ pub async fn patch_org(
 // --- seats -------------------------------------------------------------------
 
 fn seat_out(st: &AppState, auth: &Auth, s: &amail_store::Seat) -> p::Seat {
-    render::seat(s, st.presence.get(auth.org.id, &s.name))
+    let presence = st.presence.get(auth.org.id, &s.name).map(|mut p| {
+        p.node_connected = st.nodes.connected(auth.org.id) > 0;
+        p
+    });
+    render::seat(s, presence)
 }
 
 pub async fn list_seats(State(st): State<AppState>, auth: Auth) -> ApiResult<Json<Vec<p::Seat>>> {

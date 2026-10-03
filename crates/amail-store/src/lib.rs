@@ -190,4 +190,25 @@ pub trait Store: Send + Sync + 'static {
     /// Pending-notification counts of every live seat of the org (or only
     /// `seat_id`), including seats with nothing pending.
     async fn pending(&self, org_id: i64, seat_id: Option<i64>) -> Result<Vec<PendingRec>>;
+
+    // --- web interface ------------------------------------------------------
+
+    /// The token behind a live (unexpired) browser session, if its token is
+    /// still live.
+    async fn session_auth(&self, hash: &str) -> Result<Option<TokenAuth>>;
+    /// Store a browser session (and drop expired ones).
+    async fn create_session(&self, hash: &str, token_id: i64, expires_at: i64) -> Result<()>;
+    async fn delete_session(&self, hash: &str) -> Result<bool>;
+    /// The org's user seat.
+    async fn user_seat(&self, org_id: i64) -> Result<Option<Seat>>;
+    /// Unread and pending counts of every live seat (or only `seat_id`).
+    async fn counts(&self, org_id: i64, seat_id: Option<i64>) -> Result<Vec<CountRec>>;
+    /// Deliveries to the user seat that wait for the user (see the server's
+    /// `/v1/attention`), oldest first.
+    async fn attention(&self, user_seat_id: i64, limit: i64) -> Result<Vec<Entry>>;
+    /// Messages visible to the org created at or after `since`.
+    async fn message_count(&self, org_id: i64, since: i64) -> Result<i64>;
+    /// Full-text search over messages visible to the org, newest first, with
+    /// bodies.
+    async fn search(&self, org_id: i64, q: &SearchQuery) -> Result<SearchResult>;
 }

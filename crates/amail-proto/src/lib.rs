@@ -551,6 +551,10 @@ pub struct OrgInfo {
     pub send_burst: i64,
     pub max_recipients: i64,
     pub max_thread_depth: i64,
+    /// Every new message to the org's user is announced here (POST, headers
+    /// only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -563,6 +567,13 @@ pub struct OrgPatch {
     pub max_recipients: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_thread_depth: Option<i64>,
+    /// `null` clears it.
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub webhook_url: Option<Option<String>>,
 }
 
 /// Response of `GET /v1/whoami`.
@@ -619,6 +630,20 @@ pub struct Presence {
     pub since: String,
     /// When the node last reported the seat.
     pub updated_at: String,
+    /// The seat needs a person: a short tag (`trust-prompt`, `login`,
+    /// `permission`, `failed`, `wake-failed`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<String>,
+    /// What to do about `attention`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_hint: Option<String>,
+    /// A browser terminal for the seat's session, if its node serves one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_url: Option<String>,
+    /// Some node of the org has its event stream open, so commands (sleep,
+    /// wake, transcript) can reach it. Set by the server when rendering.
+    #[serde(default)]
+    pub node_connected: bool,
 }
 
 /// One entry of `POST /v1/presence`.
@@ -633,6 +658,13 @@ pub struct PresenceUpdate {
     /// When the state last changed, if the node knows (RFC 3339).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since: Option<String>,
+    /// The seat needs a person (see [`Presence::attention`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_url: Option<String>,
 }
 
 /// Body of `POST /v1/presence` (node tokens).
@@ -685,4 +717,233 @@ pub struct TokenInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     pub created_at: String,
+}
+
+// ---------------------------------------------------------------------------
+// Web interface: overview, counts, attention, search, sessions
+
+/// Body of `POST /v1/session`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionRequest {
+    pub token: String,
+}
+
+/// Response of `GET /v1/overview`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Overview {
+    /// Agent seats.
+    pub seats: i64,
+    /// Agent seats per state (`busy`, `idle`, `awaiting`, `dormant`,
+    /// `offline`); seats no node reports count as offline.
+    pub states: std::collections::BTreeMap<String, i64>,
+    /// Seats whose presence carries an `attention` tag.
+    pub needs_person: i64,
+    pub wake_failed: i64,
+    /// Messages the org can see, created in the last hour / day.
+    pub mail_last_hour: i64,
+    pub mail_last_day: i64,
+    /// Unread messages in the user's mailbox.
+    pub user_unread: i64,
+    /// Entries of `GET /v1/attention`.
+    pub attention: i64,
+}
+
+/// Mailbox counters of one seat (`GET /v1/counts`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeatCounts {
+    pub seat: String,
+    /// Deliveries not yet read (archive-mode deliveries excluded).
+    pub unread: i64,
+    /// Deliveries not yet shown to the seat's agent (immediate mode).
+    pub pending: i64,
+    /// The seat's sequence counter.
+    pub seq: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CountsResponse {
+    pub seats: Vec<SeatCounts>,
+}
+
+string_enum!(
+    /// Why an entry is in the user's "needs you" queue.
+    AttentionKind { Ack => "ack", Reply => "reply", Seat => "seat" }
+);
+
+/// One entry of `GET /v1/attention`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttentionItem {
+    pub kind: AttentionKind,
+    /// When the entry started waiting.
+    pub since: String,
+    /// The seat concerned: the sender of a message, or the seat that needs
+    /// a person.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<MessageHeader>,
+    /// The user's delivery of `message`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<Delivery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<SeatState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub wake_failed: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AttentionResponse {
+    pub items: Vec<AttentionItem>,
+}
+
+/// One result of `GET /v1/archive/search`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchHit {
+    #[serde(flatten)]
+    pub header: MessageHeader,
+    /// A short excerpt around the first match (plain text).
+    pub snippet: String,
+}
+
+string_enum!(
+    /// How a search ran: through the full-text index, or as a bounded scan
+    /// of recent messages (some term shorter than three characters).
+    SearchMode { Index => "index", Scan => "scan" }
+);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResponse {
+    pub messages: Vec<SearchHit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_before_id: Option<i64>,
+    pub mode: SearchMode,
+    /// In `scan` mode: how many of the most recent messages one page scans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_limit: Option<i64>,
+}
+
+/// Response of `POST /v1/seats/{name}/sleep` and `/wake`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeatOpResponse {
+    pub seat: String,
+    pub op: String,
+    /// Connected nodes the command was sent to.
+    pub nodes: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Node commands (`command` events on `/v1/events`, node tokens only)
+
+/// A command for the node hosting `seat`. Nodes ignore unknown ops and
+/// seats they do not host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeCommand {
+    /// `transcript`, `sleep` or `wake`.
+    pub op: String,
+    pub seat: String,
+    /// `transcript`: forward until this many milliseconds from now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_ms: Option<u64>,
+    /// `transcript`: how many recent events to send first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backfill: Option<u32>,
+    /// The label of the node that last reported the seat, if known; other
+    /// nodes ignore the command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Transcript mirror
+
+string_enum!(TranscriptRole { User => "user", Assistant => "assistant", Tool => "tool", System => "system" });
+
+string_enum!(
+    /// `notice`: text the mail system put into the session (injected mail,
+    /// wake-ups), as opposed to what a person typed.
+    TranscriptKind { Text => "text", ToolCall => "tool_call", ToolResult => "tool_result", Notice => "notice" }
+);
+
+/// One entry of a seat's conversation, in a harness-independent form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ts: Option<String>,
+    pub role: TranscriptRole,
+    pub kind: TranscriptKind,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// `text` was cut.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+    /// A tool result that reports an error.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub error: bool,
+}
+
+string_enum!(
+    /// What the mirror of a seat currently shows.
+    TranscriptState {
+        Waiting => "waiting",
+        Streaming => "streaming",
+        NodeOffline => "node_offline",
+        NoSession => "no_session",
+        NoFile => "no_file",
+        Unknown => "unknown"
+    }
+);
+
+/// Payload of a transcript `status` event (and part of a node's post).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptStatus {
+    pub state: TranscriptState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// Lines of the file that could not be parsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<u64>,
+}
+
+impl TranscriptStatus {
+    pub fn new(state: TranscriptState) -> Self {
+        TranscriptStatus {
+            state,
+            message: None,
+            harness: None,
+            path: None,
+            session: None,
+            skipped: None,
+        }
+    }
+}
+
+/// Body of `POST /v1/seats/{name}/transcript` (node tokens).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TranscriptPost {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    /// Drop what was sent before: a new file or session follows.
+    #[serde(default)]
+    pub reset: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<TranscriptStatus>,
+    #[serde(default)]
+    pub events: Vec<TranscriptEvent>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TranscriptPostResponse {
+    /// Browsers currently watching the seat.
+    pub subscribers: u32,
 }

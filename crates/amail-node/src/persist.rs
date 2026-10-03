@@ -36,6 +36,19 @@ pub struct Saved {
     /// Lifecycle settings of the supervised team.
     #[serde(default)]
     pub settings: crate::team::Settings,
+    /// Seat -> the transcript file of its most recent session (for the
+    /// conversation mirror; kept while the seat sleeps).
+    #[serde(default)]
+    pub transcripts: BTreeMap<String, TranscriptRef>,
+}
+
+/// Where a seat's conversation is recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptRef {
+    pub harness: String,
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 /// A supervised seat: where it runs and what the supervisor knows about it.

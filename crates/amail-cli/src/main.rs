@@ -202,6 +202,18 @@ enum NodeCmd {
     },
     /// Show the running node's view of its seats.
     Status,
+    /// Create a login token for the node's browser terminal
+    /// (`--web-terminal-port`); shown once. Kept apart from your own zellij
+    /// tokens.
+    WebToken {
+        /// A token that can only watch sessions.
+        #[arg(long)]
+        read_only: bool,
+        #[arg(long, env = "AMAIL_STATE_DIR")]
+        state_dir: Option<PathBuf>,
+        #[arg(long, env = "AMAIL_ZELLIJ_BIN", default_value = "zellij")]
+        zellij_bin: String,
+    },
 }
 
 #[derive(Args)]
@@ -239,6 +251,15 @@ struct NodeArgs {
     /// How long to wait for a wake-up to start a turn before retrying, in milliseconds.
     #[arg(long, default_value_t = 10000)]
     wake_confirm_ms: u64,
+    /// Serve the supervised sessions in the browser: run a `zellij web`
+    /// server of the node's own on 127.0.0.1:PORT (off by default). The web
+    /// interface then links each seat to its session.
+    #[arg(long, value_name = "PORT")]
+    web_terminal_port: Option<u16>,
+    /// The base URL people use to reach that server (default
+    /// http://127.0.0.1:PORT), e.g. behind an HTTPS reverse proxy.
+    #[arg(long, value_name = "URL", requires = "web_terminal_port")]
+    web_terminal_url: Option<String>,
 }
 
 #[derive(Args)]
@@ -495,6 +516,31 @@ async fn run(cli: Cli) -> Result<()> {
             )?;
             return out.show(&v, || node_status_text(&v));
         }
+        Cmd::Node(NodeCli {
+            cmd:
+                Some(NodeCmd::WebToken {
+                    read_only,
+                    state_dir,
+                    zellij_bin,
+                }),
+            ..
+        }) => {
+            let dir = state_dir.unwrap_or_else(amail_node::paths::state_dir);
+            std::fs::create_dir_all(amail_node::node::web_terminal_data_dir(&dir))?;
+            let status = amail_node::node::web_terminal_command(&zellij_bin, &dir)
+                .arg("web")
+                .arg(if read_only {
+                    "--create-read-only-token"
+                } else {
+                    "--create-token"
+                })
+                .status()
+                .with_context(|| format!("running {zellij_bin}"))?;
+            if !status.success() {
+                bail!("zellij web failed ({status})");
+            }
+            return Ok(());
+        }
         _ => {}
     }
     let c = Client::from_config(cli.profile.as_deref())?;
@@ -510,7 +556,7 @@ async fn run(cli: Cli) -> Result<()> {
         | Cmd::Wake { .. }
         | Cmd::Node(NodeCli { cmd: None, .. })
         | Cmd::Node(NodeCli {
-            cmd: Some(NodeCmd::Status),
+            cmd: Some(NodeCmd::Status | NodeCmd::WebToken { .. }),
             ..
         }) => unreachable!(),
         Cmd::Node(NodeCli {
@@ -1077,6 +1123,14 @@ async fn node_daemon(a: NodeArgs) -> Result<()> {
     }
     cfg.wake_window = std::time::Duration::from_millis(a.wake_window_ms);
     cfg.wake_confirm = std::time::Duration::from_millis(a.wake_confirm_ms);
+    if let Some(port) = a.web_terminal_port {
+        cfg.web_terminal = Some(amail_node::node::WebTerminal {
+            port,
+            base_url: a
+                .web_terminal_url
+                .unwrap_or_else(|| format!("http://127.0.0.1:{port}")),
+        });
+    }
     let socket = cfg.socket.clone();
     let handle = amail_node::start(cfg).await?;
     tracing::info!("amail node listening on {} for {url}", socket.display());

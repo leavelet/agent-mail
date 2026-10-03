@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>amail</title>
+<style>
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem; color: #222; background: #fff; }
+  code, pre { font: 13px ui-monospace, monospace; background: #f2f2f2; padding: .1rem .3rem; border-radius: 3px; }
+  pre { padding: .6rem .8rem; }
+  @media (prefers-color-scheme: dark) { body { color: #ddd; background: #161616; } code, pre { background: #262626; } }
+</style>
+</head>
+<body>
+<h1>amail</h1>
+<p>The server is running, but this binary was built without the web interface.</p>
+<p>To include it, build the interface and then the server (Node 20 or later):</p>
+<pre>cd web
+npm ci
+npm run build
+cd ..
+cargo build --release</pre>
+<p>The HTTP API under <code>/v1</code> works either way.</p>
+</body>
+</html>

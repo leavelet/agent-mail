@@ -110,6 +110,29 @@ macro_rules! claim_select {
     };
 }
 
+/// Columns and joins of [`AuthRow`]: a token (`t`) with its org and seat.
+macro_rules! auth_select {
+    () => {
+        "SELECT t.id AS token_id, t.scope, t.seat_id, o.id, o.name, o.send_rate_per_min, o.send_burst, \
+         o.max_recipients, o.max_thread_depth, o.webhook_url, o.created_at, s.id AS s_id, \
+         s.org_id AS s_org_id, s.name AS s_name, \
+         s.kind AS s_kind, s.parent_id AS s_parent_id, p.name AS s_parent_name, \
+         s.display_name AS s_display_name, s.role AS s_role, s.harness AS s_harness, \
+         s.model AS s_model, s.permission_mode AS s_permission_mode, s.group_name AS s_group_name, \
+         s.last_seq AS s_last_seq, s.created_at AS s_created_at, \
+         s.deleted_at AS s_deleted_at \
+         FROM tokens t JOIN orgs o ON o.id = t.org_id \
+         LEFT JOIN seats s ON s.id = t.seat_id LEFT JOIN seats p ON p.id = s.parent_id"
+    };
+}
+
+/// Visibility of message `m` to org `$1`: sent by it or delivered to it.
+macro_rules! visible_to_org {
+    () => {
+        "(m.org_id = $1 OR EXISTS (SELECT 1 FROM deliveries vd WHERE vd.message_id = m.id AND vd.org_id = $1))"
+    };
+}
+
 /// Runs a query body in an owned, boxed closure via `read` or `write`.
 macro_rules! run {
     ($self:ident . $how:ident, |$c:ident| $body:expr) => {
@@ -135,6 +158,41 @@ fn split_addrs(s: &str) -> Vec<String> {
 
 pub(crate) fn join_addrs(v: &[String]) -> String {
     v.join(",")
+}
+
+/// A `LIKE` pattern matching `term` anywhere (escape character `\`).
+pub(crate) fn like_pattern(term: &str) -> String {
+    let mut p = String::with_capacity(term.len() + 2);
+    p.push('%');
+    for ch in term.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            p.push('\\');
+        }
+        p.push(ch);
+    }
+    p.push('%');
+    p
+}
+
+/// The query part shared by both backends' search: visibility, the page
+/// (`before_id`) and, in scan mode, the window's lower bound. Binds `$1` org,
+/// `$2` before_id, `$3` lower bound, `$4` limit; terms start at `$5`.
+pub(crate) fn search_sql(term_conds: &[String]) -> String {
+    let mut sql = String::from(concat!(
+        "SELECT ",
+        msg_cols!(),
+        ", m.body FROM messages m",
+        msg_joins!(),
+        " WHERE ",
+        visible_to_org!(),
+        " AND ($2 IS NULL OR m.id < $2) AND ($3 IS NULL OR m.id >= $3)"
+    ));
+    for c in term_conds {
+        sql.push_str(" AND ");
+        sql.push_str(c);
+    }
+    sql.push_str(" ORDER BY m.id DESC LIMIT $4");
+    sql
 }
 
 pub(crate) fn line_count(body: &str) -> i64 {
@@ -169,6 +227,7 @@ pub(crate) struct OrgRow {
     send_burst: i64,
     max_recipients: i64,
     max_thread_depth: i64,
+    webhook_url: Option<String>,
     created_at: i64,
 }
 
@@ -181,6 +240,7 @@ impl From<OrgRow> for Org {
             send_burst: r.send_burst,
             max_recipients: r.max_recipients,
             max_thread_depth: r.max_thread_depth,
+            webhook_url: r.webhook_url,
             created_at: r.created_at,
         }
     }
@@ -229,6 +289,7 @@ impl SeatRow {
 
 #[derive(sqlx::FromRow)]
 pub(crate) struct AuthRow {
+    token_id: i64,
     scope: String,
     seat_id: Option<i64>,
     #[sqlx(flatten)]
@@ -275,6 +336,7 @@ impl AuthRow {
             (Some(_), _) => return Ok(None),
         };
         Ok(Some(TokenAuth {
+            token_id: self.token_id,
             scope: parse(&self.scope)?,
             org: self.org.into(),
             seat,
@@ -656,35 +718,147 @@ macro_rules! impl_store_common {
                 sqlx::query(
                     "UPDATE orgs SET send_rate_per_min = COALESCE($1, send_rate_per_min), \
                      send_burst = COALESCE($2, send_burst), max_recipients = COALESCE($3, max_recipients), \
-                     max_thread_depth = COALESCE($4, max_thread_depth) WHERE id = $5",
+                     max_thread_depth = COALESCE($4, max_thread_depth), \
+                     webhook_url = CASE WHEN $6 THEN $7 ELSE webhook_url END WHERE id = $5",
                 )
                 .bind(p.send_rate_per_min)
                 .bind(p.send_burst)
                 .bind(p.max_recipients)
                 .bind(p.max_thread_depth)
                 .bind(org_id)
+                .bind(p.webhook_url.is_some())
+                .bind(p.webhook_url.clone().flatten())
                 .execute(&mut *c)
                 .await?;
                 org_by_id(c, org_id).await?.ok_or_else(|| StoreError::NotFound("org".into()))
             }
 
             pub async fn token_auth(c: &mut Conn, hash: &str) -> Result<Option<TokenAuth>> {
-                let row: Option<AuthRow> = sqlx::query_as(
-                    "SELECT t.scope, t.seat_id, o.id, o.name, o.send_rate_per_min, o.send_burst, o.max_recipients, \
-                     o.max_thread_depth, o.created_at, s.id AS s_id, s.org_id AS s_org_id, s.name AS s_name, \
-                     s.kind AS s_kind, s.parent_id AS s_parent_id, p.name AS s_parent_name, \
-                     s.display_name AS s_display_name, s.role AS s_role, s.harness AS s_harness, \
-                     s.model AS s_model, s.permission_mode AS s_permission_mode, s.group_name AS s_group_name, \
-                     s.last_seq AS s_last_seq, s.created_at AS s_created_at, \
-                     s.deleted_at AS s_deleted_at \
-                     FROM tokens t JOIN orgs o ON o.id = t.org_id \
-                     LEFT JOIN seats s ON s.id = t.seat_id LEFT JOIN seats p ON p.id = s.parent_id \
-                     WHERE t.hash = $1 AND t.revoked_at IS NULL",
-                )
+                let row: Option<AuthRow> = sqlx::query_as(concat!(
+                    auth_select!(),
+                    " WHERE t.hash = $1 AND t.revoked_at IS NULL"
+                ))
                 .bind(hash)
                 .fetch_optional(&mut *c)
                 .await?;
                 row.map(AuthRow::into_auth).transpose().map(Option::flatten)
+            }
+
+            pub async fn session_auth(c: &mut Conn, hash: &str, now: i64) -> Result<Option<TokenAuth>> {
+                let row: Option<AuthRow> = sqlx::query_as(concat!(
+                    auth_select!(),
+                    " JOIN web_sessions w ON w.token_id = t.id \
+                     WHERE w.hash = $1 AND w.expires_at > $2 AND t.revoked_at IS NULL"
+                ))
+                .bind(hash)
+                .bind(now)
+                .fetch_optional(&mut *c)
+                .await?;
+                row.map(AuthRow::into_auth).transpose().map(Option::flatten)
+            }
+
+            pub async fn create_session(c: &mut Conn, hash: &str, token_id: i64, expires_at: i64) -> Result<()> {
+                let now = now_ms();
+                sqlx::query("DELETE FROM web_sessions WHERE expires_at <= $1")
+                    .bind(now)
+                    .execute(&mut *c)
+                    .await?;
+                sqlx::query(
+                    "INSERT INTO web_sessions (hash, token_id, created_at, expires_at) VALUES ($1, $2, $3, $4)",
+                )
+                .bind(hash)
+                .bind(token_id)
+                .bind(now)
+                .bind(expires_at)
+                .execute(&mut *c)
+                .await?;
+                Ok(())
+            }
+
+            pub async fn delete_session(c: &mut Conn, hash: &str) -> Result<bool> {
+                let n = sqlx::query("DELETE FROM web_sessions WHERE hash = $1")
+                    .bind(hash)
+                    .execute(&mut *c)
+                    .await?
+                    .rows_affected();
+                Ok(n > 0)
+            }
+
+            pub async fn user_seat(c: &mut Conn, org_id: i64) -> Result<Option<Seat>> {
+                let r: Option<SeatRow> = sqlx::query_as(concat!(
+                    seat_select!(),
+                    " WHERE s.org_id = $1 AND s.kind = 'user' AND s.deleted_at IS NULL"
+                ))
+                .bind(org_id)
+                .fetch_optional(&mut *c)
+                .await?;
+                r.map(SeatRow::into_seat).transpose()
+            }
+
+            pub async fn counts(c: &mut Conn, org_id: i64, seat_id: Option<i64>) -> Result<Vec<CountRec>> {
+                let rows: Vec<(i64, String, i64, i64, i64)> = sqlx::query_as(
+                    "SELECT s.id, s.name, s.last_seq, \
+                     (SELECT COUNT(*) FROM deliveries d WHERE d.seat_id = s.id AND d.read_at IS NULL \
+                       AND d.mode <> 'archive') AS unread, \
+                     (SELECT COUNT(*) FROM deliveries d WHERE d.seat_id = s.id AND d.notified_at IS NULL \
+                       AND d.mode = 'immediate') AS pending \
+                     FROM seats s WHERE s.org_id = $1 AND s.deleted_at IS NULL AND ($2 IS NULL OR s.id = $2) \
+                     ORDER BY s.name",
+                )
+                .bind(org_id)
+                .bind(seat_id)
+                .fetch_all(&mut *c)
+                .await?;
+                Ok(rows
+                    .into_iter()
+                    .map(|(seat_id, seat_name, last_seq, unread, pending)| CountRec { seat_id, seat_name, last_seq, unread, pending })
+                    .collect())
+            }
+
+            /// Deliveries to the user seat that wait for the user: ack
+            /// requested and not given, or unread `to` mail the user has not
+            /// answered (sent nothing later in the thread).
+            pub async fn attention(c: &mut Conn, user_seat_id: i64, limit: i64) -> Result<Vec<Entry>> {
+                let rows: Vec<EntryRow> = sqlx::query_as(concat!(
+                    entry_select!(),
+                    " WHERE d.seat_id = $1 AND d.mode <> 'archive' AND m.sender_seat_id <> $1 AND ( \
+                       (m.ack_required AND d.acked_at IS NULL) \
+                       OR (d.class = 'to' AND d.read_at IS NULL AND NOT EXISTS ( \
+                           SELECT 1 FROM messages r WHERE r.thread_id = m.thread_id \
+                           AND r.sender_seat_id = $1 AND r.id > m.id))) \
+                     ORDER BY d.seq LIMIT $2"
+                ))
+                .bind(user_seat_id)
+                .bind(limit)
+                .fetch_all(&mut *c)
+                .await?;
+                collect(rows, EntryRow::into_entry)
+            }
+
+            pub async fn message_count(c: &mut Conn, org_id: i64, since: i64) -> Result<i64> {
+                Ok(sqlx::query_scalar(concat!(
+                    "SELECT COUNT(*) FROM messages m WHERE m.created_at >= $2 AND ",
+                    visible_to_org!()
+                ))
+                .bind(org_id)
+                .bind(since)
+                .fetch_one(&mut *c)
+                .await?)
+            }
+
+            /// The `n` most recent messages visible to the org before
+            /// `before_id`: `(count, oldest id)`.
+            pub async fn scan_window(c: &mut Conn, org_id: i64, before_id: Option<i64>, n: i64) -> Result<(i64, Option<i64>)> {
+                Ok(sqlx::query_as(concat!(
+                    "SELECT COUNT(*), MIN(id) FROM (SELECT m.id FROM messages m WHERE ",
+                    visible_to_org!(),
+                    " AND ($2 IS NULL OR m.id < $2) ORDER BY m.id DESC LIMIT $3) w"
+                ))
+                .bind(org_id)
+                .bind(before_id)
+                .bind(n)
+                .fetch_one(&mut *c)
+                .await?)
             }
 
             /// Live seats of the org with the given names (missing ones are skipped).
@@ -1447,6 +1621,57 @@ macro_rules! impl_store_common {
 
             async fn pending(&self, org_id: i64, seat_id: Option<i64>) -> $crate::Result<Vec<$crate::PendingRec>> {
                 run!(self.read, |c| q::pending(c, org_id, seat_id).await)
+            }
+
+            async fn session_auth(&self, hash: &str) -> $crate::Result<Option<$crate::TokenAuth>> {
+                let hash = hash.to_string();
+                let now = now_ms();
+                run!(self.read, |c| q::session_auth(c, &hash, now).await)
+            }
+
+            async fn create_session(&self, hash: &str, token_id: i64, expires_at: i64) -> $crate::Result<()> {
+                let hash = hash.to_string();
+                run!(self.write, |c| q::create_session(c, &hash, token_id, expires_at).await)
+            }
+
+            async fn delete_session(&self, hash: &str) -> $crate::Result<bool> {
+                let hash = hash.to_string();
+                run!(self.write, |c| q::delete_session(c, &hash).await)
+            }
+
+            async fn user_seat(&self, org_id: i64) -> $crate::Result<Option<$crate::Seat>> {
+                run!(self.read, |c| q::user_seat(c, org_id).await)
+            }
+
+            async fn counts(&self, org_id: i64, seat_id: Option<i64>) -> $crate::Result<Vec<$crate::CountRec>> {
+                run!(self.read, |c| q::counts(c, org_id, seat_id).await)
+            }
+
+            async fn attention(&self, user_seat_id: i64, limit: i64) -> $crate::Result<Vec<$crate::Entry>> {
+                run!(self.read, |c| q::attention(c, user_seat_id, limit).await)
+            }
+
+            async fn message_count(&self, org_id: i64, since: i64) -> $crate::Result<i64> {
+                run!(self.read, |c| q::message_count(c, org_id, since).await)
+            }
+
+            async fn search(&self, org_id: i64, query: &$crate::SearchQuery) -> $crate::Result<$crate::SearchResult> {
+                if query.terms.is_empty() {
+                    return Ok($crate::SearchResult::default());
+                }
+                let (scanned_to, exhausted) = match query.scan {
+                    Some(n) => {
+                        let before = query.before_id;
+                        let (count, oldest) = run!(self.read, |c| q::scan_window(c, org_id, before, n).await)?;
+                        (oldest, count < n)
+                    }
+                    None => (None, false),
+                };
+                if query.scan.is_some() && scanned_to.is_none() {
+                    return Ok($crate::SearchResult { messages: Vec::new(), scanned_to: None, scan_exhausted: true });
+                }
+                let messages = self.search_impl(org_id, query, scanned_to).await?;
+                Ok($crate::SearchResult { messages, scanned_to, scan_exhausted: exhausted })
             }
         }
     };

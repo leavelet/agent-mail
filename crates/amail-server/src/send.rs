@@ -189,9 +189,10 @@ async fn send_inner(
         let name = r.seats[&b.seat_id].1.clone();
         by_org.entry(b.org_id).or_default().push((name, b.seq));
     }
-    for (org_id, events) in by_org {
-        st.bus.publish(org_id, &events);
+    for (org_id, events) in &by_org {
+        st.bus.publish(*org_id, events);
     }
+    notify_users(st, org, &r.orgs, &sent).await;
 
     Ok(SendResponse {
         id: sent.message_id,
@@ -200,6 +201,48 @@ async fn send_inner(
         rejected: r.rejected,
         deliveries: sent.seqs.len() as u32,
     })
+}
+
+/// Webhook notices for the orgs whose user seat got the message.
+async fn notify_users(
+    st: &AppState,
+    org: &Org,
+    seen: &HashMap<String, Option<Org>>,
+    sent: &amail_store::Sent,
+) {
+    let mut orgs: HashMap<i64, &Org> = seen.values().flatten().map(|o| (o.id, o)).collect();
+    orgs.insert(org.id, org);
+    let mut message = None;
+    for (org_id, target) in orgs {
+        let Some(url) = target.webhook_url.clone() else {
+            continue;
+        };
+        if !sent.seqs.iter().any(|b| b.org_id == org_id) {
+            continue;
+        }
+        let user = match st.store.user_seat(org_id).await {
+            Ok(Some(u)) => u,
+            _ => continue,
+        };
+        if !sent.seqs.iter().any(|b| b.seat_id == user.id) {
+            continue;
+        }
+        if message.is_none() {
+            message = st.store.message(sent.message_id).await.ok().flatten();
+        }
+        let Some(m) = &message else { return };
+        crate::webhook::spawn(
+            st.http.clone(),
+            st.webhook_config.clone(),
+            url,
+            crate::webhook::Notice {
+                event: "message",
+                org: target.name.clone(),
+                seat: user.name.clone(),
+                message: crate::render::header(m, target),
+            },
+        );
+    }
 }
 
 struct Resolver<'a> {

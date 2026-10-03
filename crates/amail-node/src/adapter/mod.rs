@@ -60,6 +60,8 @@ pub struct Hook {
     pub name: String,
     pub event: Event,
     pub session_id: Option<String>,
+    /// The session's transcript file, as the harness reports it.
+    pub transcript_path: Option<String>,
 }
 
 /// What a hook should answer.

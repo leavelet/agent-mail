@@ -154,6 +154,8 @@ pub struct Opts {
     pub supervise: bool,
     /// Adjust the node configuration.
     pub tweak: Option<fn(&mut amail_node::Config)>,
+    /// Adjust the server state.
+    pub server_tweak: Option<fn(&mut AppState)>,
 }
 
 impl Default for Opts {
@@ -165,6 +167,7 @@ impl Default for Opts {
             server_down: false,
             supervise: false,
             tweak: None,
+            server_tweak: None,
         }
     }
 }
@@ -176,11 +179,11 @@ impl Harness {
         let db = amail_store::testutil::open(backend, test).await?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(amail_server::serve(
-            listener,
-            AppState::new(db.store.clone()),
-            std::future::pending(),
-        ));
+        let mut state = AppState::new(db.store.clone());
+        if let Some(t) = opts.server_tweak {
+            t(&mut state);
+        }
+        tokio::spawn(amail_server::serve(listener, state, std::future::pending()));
         let token = new_token();
         db.store
             .create_org("acme", "owner", &hash_token(&token))

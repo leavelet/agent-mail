@@ -19,6 +19,7 @@ pub struct Org {
     pub send_burst: i64,
     pub max_recipients: i64,
     pub max_thread_depth: i64,
+    pub webhook_url: Option<String>,
     pub created_at: i64,
 }
 
@@ -53,6 +54,7 @@ pub struct NewToken {
 
 #[derive(Debug, Clone)]
 pub struct TokenAuth {
+    pub token_id: i64,
     pub scope: TokenScope,
     pub org: Org,
     /// Set for `seat` and `user` tokens.
@@ -241,4 +243,37 @@ pub struct PendingRec {
     pub cc: i64,
     pub list: i64,
     pub urgent: i64,
+}
+
+/// A full-text search (`Store::search`). Every term must occur in the
+/// subject or the body (case-insensitive substring).
+#[derive(Debug, Clone, Default)]
+pub struct SearchQuery {
+    pub terms: Vec<String>,
+    pub before_id: Option<i64>,
+    pub limit: i64,
+    /// `None`: use the index (every term has at least three characters).
+    /// `Some(n)`: scan only the `n` most recent visible messages before
+    /// `before_id`.
+    pub scan: Option<i64>,
+}
+
+/// Result of [`SearchQuery`]: matches newest first, with bodies, and in scan
+/// mode the oldest message id that was scanned.
+#[derive(Debug, Clone, Default)]
+pub struct SearchResult {
+    pub messages: Vec<MessageRec>,
+    pub scanned_to: Option<i64>,
+    /// Scan mode: fewer than `scan` messages were left to scan.
+    pub scan_exhausted: bool,
+}
+
+/// Mailbox counters of one seat.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CountRec {
+    pub seat_id: i64,
+    pub seat_name: String,
+    pub last_seq: i64,
+    pub unread: i64,
+    pub pending: i64,
 }

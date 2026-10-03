@@ -42,6 +42,7 @@ node_tests!(
     lost_answer_is_kept,
     restart_restores_idle_seat,
     inlined_mail_is_read,
+    transcript_mirror_follows_file,
 );
 
 use amail_store::testutil::Backend;
@@ -981,4 +982,202 @@ async fn inlined_mail_is_read(b: Backend) {
     };
     assert_eq!(state(short).await, "read");
     assert_eq!(state(long).await, "notified");
+}
+
+/// Server-sent events of a response, as `(event, data)`.
+struct Sse {
+    stream: futures::stream::BoxStream<'static, reqwest::Result<Vec<u8>>>,
+    buf: String,
+}
+
+impl Sse {
+    async fn open(api: &Api, path: &str) -> Sse {
+        use futures::StreamExt;
+        let r = api
+            .http
+            .get(format!("{}/v1{path}", api.base))
+            .bearer_auth(&api.token)
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success(), "GET {path}: {}", r.status());
+        Sse {
+            stream: r.bytes_stream().map(|c| c.map(|b| b.to_vec())).boxed(),
+            buf: String::new(),
+        }
+    }
+
+    async fn next(&mut self, secs: u64) -> Option<(String, Value)> {
+        use futures::StreamExt;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+        loop {
+            if let Some(i) = self.buf.find("\n\n") {
+                let block: String = self.buf.drain(..i + 2).collect();
+                let mut event = String::new();
+                let mut data = None;
+                for line in block.lines() {
+                    if let Some(v) = line.strip_prefix("event:") {
+                        event = v.trim().to_string();
+                    } else if let Some(v) = line.strip_prefix("data:") {
+                        data = serde_json::from_str(v.trim()).ok();
+                    }
+                }
+                if let Some(d) = data {
+                    return Some((event, d));
+                }
+                continue;
+            }
+            match tokio::time::timeout_at(deadline, self.stream.next()).await {
+                Ok(Some(Ok(c))) => self.buf.push_str(&String::from_utf8_lossy(&c)),
+                _ => return None,
+            }
+        }
+    }
+
+    /// Texts of the `events` received until `n` have arrived; panics on
+    /// timeout. A `reset` clears what was collected.
+    async fn texts(&mut self, n: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        while out.len() < n {
+            let (ev, d) = self.next(10).await.expect("timed out waiting for events");
+            match ev.as_str() {
+                "reset" => out.clear(),
+                "events" => {
+                    for e in d["events"].as_array().unwrap() {
+                        out.push(format!(
+                            "{}/{}:{}",
+                            e["role"].as_str().unwrap(),
+                            e["kind"].as_str().unwrap(),
+                            e["text"].as_str().unwrap()
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
+fn claude_line(v: Value) -> String {
+    let mut s = v.to_string();
+    s.push('\n');
+    s
+}
+
+fn append(path: &std::path::Path, text: &str) {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    f.write_all(text.as_bytes()).unwrap();
+}
+
+/// The conversation mirror end to end: a hook reports the transcript file,
+/// a browser watches, the node backfills and follows the growing file
+/// (including a line written in two parts), switches to the file of a new
+/// session, and stops when the lease runs out after the browser left.
+async fn transcript_mirror_follows_file(b: Backend) {
+    let opts = Opts {
+        tweak: Some(|c| c.mirror_poll = Duration::from_millis(100)),
+        server_tweak: Some(|s| {
+            s.mirror_config.lease = Duration::from_millis(1500);
+            s.mirror_config.answer_timeout = Duration::from_millis(500);
+        }),
+        ..Opts::default()
+    };
+    let Some(h) = setup(b, "transcript_mirror_follows_file", opts).await else {
+        return;
+    };
+    h.seat("w1", "claude").await;
+    let inbox = FakeInbox::start(h.dir.path().join("cc.sock"), None);
+    let env = claude_env("w1", &inbox.path);
+    let file = h.dir.path().join("session-1.jsonl");
+    let user = |t: &str| {
+        claude_line(json!({"type": "user", "timestamp": "2026-10-04T10:00:00Z",
+        "message": {"role": "user", "content": t}}))
+    };
+    let say = |t: &str| {
+        claude_line(
+            json!({"type": "assistant", "timestamp": "2026-10-04T10:00:01Z",
+        "message": {"role": "assistant", "content": [{"type": "text", "text": t}]}}),
+        )
+    };
+    append(&file, &user("Run the tests."));
+    append(&file, &say("Running them now."));
+    append(&file, "not json at all\n");
+    append(&file, &user("[amail] You have new mail (wake #1)."));
+
+    // Before any hook no node knows the seat; the server says so.
+    let mut w = Sse::open(&h.api, "/seats/w1/transcript").await;
+    let mut states = Vec::new();
+    while let Some((ev, d)) = w.next(5).await {
+        if ev == "status" {
+            states.push(d["state"].as_str().unwrap().to_string());
+            if d["state"] == "unknown" {
+                break;
+            }
+        }
+    }
+    assert_eq!(states, vec!["waiting", "unknown"]);
+
+    // A hook reports the transcript: the watcher gets the backfill.
+    h.hook(
+        "claude",
+        env.clone(),
+        with(
+            claude("UserPromptSubmit"),
+            &[("transcript_path", json!(file))],
+        ),
+    )
+    .await;
+    assert_eq!(
+        w.texts(3).await,
+        vec![
+            "user/text:Run the tests.",
+            "assistant/text:Running them now.",
+            "user/notice:[amail] You have new mail (wake #1).",
+        ]
+    );
+    // Growth, including a line that arrives in two writes.
+    let line = say("All 12 tests pass.");
+    let (a, rest) = line.split_at(20);
+    append(&file, a);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    append(&file, rest);
+    assert_eq!(w.texts(1).await, vec!["assistant/text:All 12 tests pass."]);
+    let st = h.status().await;
+    assert_eq!(st["mirrors"], json!(["w1"]));
+
+    // A new session (another transcript file): reset, then its backfill.
+    let file2 = h.dir.path().join("session-2.jsonl");
+    append(&file2, &user("Second session."));
+    h.hook(
+        "claude",
+        env.clone(),
+        with(
+            claude("UserPromptSubmit"),
+            &[
+                ("transcript_path", json!(file2)),
+                ("session_id", json!("00000000-0000-4000-8000-000000000002")),
+            ],
+        ),
+    )
+    .await;
+    loop {
+        let (ev, _) = w.next(10).await.expect("reset");
+        if ev == "reset" {
+            break;
+        }
+    }
+    assert_eq!(w.texts(1).await, vec!["user/text:Second session."]);
+
+    // The browser leaves: the node stops when the lease runs out.
+    drop(w);
+    h.wait("mirror stopped", || async {
+        h.status().await["mirrors"] == json!([])
+    })
+    .await;
 }

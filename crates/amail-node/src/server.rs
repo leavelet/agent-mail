@@ -137,6 +137,23 @@ impl ServerClient {
         Ok(())
     }
 
+    /// Forward transcript events of `seat` to the server's watchers.
+    pub async fn post_transcript(
+        &self,
+        seat: &str,
+        post: &amail_proto::TranscriptPost,
+    ) -> Result<amail_proto::TranscriptPostResponse> {
+        Self::json(
+            self.req(
+                reqwest::Method::POST,
+                &format!("/seats/{}/transcript", enc(seat)),
+            )
+            .timeout(Duration::from_secs(15))
+            .json(post),
+        )
+        .await
+    }
+
     pub async fn launch(&self, seat: &str) -> Result<LaunchInfo> {
         Self::json(
             self.req(
