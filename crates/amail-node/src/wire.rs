@@ -37,12 +37,84 @@ pub enum Request {
         harness: Option<String>,
         #[serde(default)]
         extra: Vec<String>,
+        /// The zellij pane and session `amail run` runs in, if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mux_session: Option<String>,
     },
     /// Mail credentials for the seat that owns a harness thread (for agents
     /// whose tool commands do not inherit the launch environment).
     Credentials { codex_thread: String },
     /// Node state, for people and tests.
     Status,
+    /// `amail up`: supervise these seats (replacing earlier placements of
+    /// the same seats) and, with `start`, start the ones not running.
+    Up {
+        seats: Vec<SeatPlacement>,
+        settings: crate::team::Settings,
+        start: bool,
+    },
+    /// `amail down`: stop the sessions of these seats (all supervised seats
+    /// when empty); they stay offline until the next `up`.
+    Down {
+        #[serde(default)]
+        seats: Vec<String>,
+    },
+    /// Stop supervising these seats (after `down`), e.g. for `up --prune`.
+    Forget { seats: Vec<String> },
+    /// Put a seat to sleep: end its process, keep its session for resuming.
+    Sleep { seat: String },
+    /// Start a sleeping (or stopped) seat now.
+    Wake { seat: String },
+    /// One row per supervised seat.
+    Ps,
+    /// Where a seat's pane (or a group's session) is, and how to attach.
+    Locate { target: String },
+}
+
+/// Where and how a supervised seat runs on this host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeatPlacement {
+    pub seat: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    pub harness: String,
+    pub cwd: String,
+    /// The zellij session, `amail-<org>-<group>`.
+    pub mux_session: String,
+    pub tab: String,
+}
+
+/// A row of `amail ps`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PsRow {
+    pub seat: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    pub harness: String,
+    /// offline, starting, busy, idle, awaiting, dormant, stopping,
+    /// restarting or failed.
+    pub state: String,
+    pub mux_session: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    /// Pending (not yet shown) deliveries.
+    pub pending: i64,
+    /// Last hook or launch, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity: Option<String>,
+    /// Needs a person: a short tag (`trust-prompt`, `login`, `permission`,
+    /// `failed`, `wake-failed`, `no-activity`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<String>,
+    /// What to do about it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    #[serde(default)]
+    pub restarts: u32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

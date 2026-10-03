@@ -290,6 +290,22 @@ impl Codex {
     }
 }
 
+/// Processes of this user whose environment contains `entry` exactly.
+fn processes_with_env(entry: &str) -> Vec<u32> {
+    let me = std::process::id();
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|&pid| pid != me)
+        .filter(|pid| {
+            std::fs::read(format!("/proc/{pid}/environ"))
+                .map(|env| env.split(|b| *b == 0).any(|kv| kv == entry.as_bytes()))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
 /// Parse `[amail:seat=<seat> launch=<nonce>]` anywhere in `prompt`.
 pub fn parse_marker(prompt: &str) -> Option<(String, String)> {
     let start = prompt.find("[amail:seat=")?;
@@ -440,6 +456,10 @@ impl Adapter for Codex {
         }
         let info = ctx.info;
         let mut args = Vec::new();
+        if ctx.resume.is_some() {
+            // Queued messages for the thread run when it is resumed.
+            args.push("resume".to_string());
+        }
         if let Some(m) = &info.model {
             args.extend(["-m".to_string(), m.clone()]);
         }
@@ -447,12 +467,21 @@ impl Adapter for Codex {
             args.extend(["-a", "never", "-s", "workspace-write"].map(String::from));
         }
         args.extend(ctx.extra.iter().cloned());
-        args.push(format!(
-            "{}\n{}\n\nThis is the start of your session. Handle any new mail shown to you. \
-             If there is none, say that you are ready and stop.",
-            Self::marker(&info.seat, ctx.nonce),
-            crate::inject::seat_intro(info)
-        ));
+        if let Some(id) = ctx.resume {
+            args.push(id.to_string());
+        } else {
+            let start = if ctx.context_lost {
+                CONTEXT_LOST
+            } else {
+                "This is the start of your session. Handle any new mail shown to you. \
+                 If there is none, say that you are ready and stop."
+            };
+            args.push(format!(
+                "{}\n{}\n\n{start}",
+                Self::marker(&info.seat, ctx.nonce),
+                crate::inject::seat_intro(info)
+            ));
+        }
         let env = BTreeMap::from([
             (
                 "CODEX_HOME".to_string(),
@@ -473,6 +502,30 @@ impl Adapter for Codex {
             unset_env: UNSET.iter().map(|s| s.to_string()).collect(),
             path_prepend: self.env.amail_dir().into_iter().collect(),
         })
+    }
+
+    fn resume_is_lazy(&self) -> bool {
+        true
+    }
+
+    async fn shutdown(&self) {
+        let _g = self.lock.lock().await;
+        let out = tokio::process::Command::new(&self.env.codex_bin)
+            .args(["app-server", "daemon", "stop"])
+            .env("CODEX_HOME", self.home())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = tokio::time::timeout(Duration::from_secs(20), out).await;
+        // `daemon stop` leaves helpers (the pid-update loop) running: end
+        // every remaining process that runs with our CODEX_HOME.
+        let want = format!("CODEX_HOME={}", self.home().display());
+        for pid in processes_with_env(&want) {
+            tracing::info!("stopping leftover codex process {pid}");
+            // SAFETY: plain signal to a process of ours.
+            unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        }
     }
 
     async fn registered(&self, session_id: &str, seat: &str) {

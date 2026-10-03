@@ -612,10 +612,10 @@ impl Team {
     /// The seat's working directory.
     pub fn workdir(&self, name: &str) -> PathBuf {
         let s = self.seat(name);
-        if self.uses_worktrees() {
-            if let Some(w) = &self.workroot {
-                return w.join(name);
-            }
+        if self.uses_worktrees()
+            && let Some(w) = &self.workroot
+        {
+            return w.join(name);
         }
         if let Some(c) = s.and_then(|s| s.cwd.clone()) {
             return c;

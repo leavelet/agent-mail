@@ -119,7 +119,17 @@ pub struct LaunchCtx<'a> {
     pub extra: &'a [String],
     /// One-time registration nonce, for adapters that register sessions.
     pub nonce: &'a str,
+    /// Resume this harness session instead of starting a new one.
+    pub resume: Option<&'a str>,
+    /// For a new session of a harness that accepts one: its id.
+    pub new_session_id: Option<&'a str>,
+    /// The seat had a session whose context is gone; tell the new one.
+    pub context_lost: bool,
 }
+
+/// The first prompt of a new session that replaces a lost one.
+pub const CONTEXT_LOST: &str = "[amail] This is a new session: the context of your previous \
+session is gone. Read your unread mail first (amail inbox), then carry on with your role.";
 
 #[async_trait::async_trait]
 pub trait Adapter: Send + Sync + 'static {
@@ -183,6 +193,16 @@ pub trait Adapter: Send + Sync + 'static {
 
     /// A session was tied to `seat` through a registration marker.
     async fn registered(&self, _session_id: &str, _seat: &str) {}
+
+    /// No supervised session of this harness is left: stop helpers the
+    /// adapter started (called after `amail down`).
+    async fn shutdown(&self) {}
+
+    /// Whether a resumed session reports itself only once a turn runs (its
+    /// wake target is the session id, known before any hook).
+    fn resume_is_lazy(&self) -> bool {
+        false
+    }
 }
 
 pub fn str_field<'a>(v: &'a Value, key: &str) -> Option<&'a str> {

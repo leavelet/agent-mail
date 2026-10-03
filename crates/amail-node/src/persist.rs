@@ -27,6 +27,50 @@ pub struct Saved {
     /// Seat -> claimed mail whose injection did not reach the agent.
     #[serde(default)]
     pub stash: BTreeMap<String, Vec<amail_proto::InboxEntry>>,
+    /// Seats this node supervises (`amail up`).
+    #[serde(default)]
+    pub managed: BTreeMap<String, Managed>,
+    /// Lifecycle settings of the supervised team.
+    #[serde(default)]
+    pub settings: crate::team::Settings,
+}
+
+/// A supervised seat: where it runs and what the supervisor knows about it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Managed {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    pub harness: String,
+    pub cwd: String,
+    pub mux_session: String,
+    pub tab: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<u32>,
+    /// Wanted running (`up`); false after `down` or a clean exit.
+    pub up: bool,
+    /// Asleep: no process; mail for the seat starts it again.
+    #[serde(default)]
+    pub dormant: bool,
+    /// Harness session to resume at the next start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<String>,
+    /// The seat had a session that is gone: the next fresh start says so.
+    #[serde(default)]
+    pub context_lost: bool,
+    /// Consecutive failed runs.
+    #[serde(default)]
+    pub failures: u32,
+    /// Gave up restarting.
+    #[serde(default)]
+    pub failed: bool,
+    /// The running harness process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_start: Option<u64>,
+    /// How the last run ended, for `amail ps`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_exit: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

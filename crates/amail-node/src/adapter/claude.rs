@@ -220,6 +220,11 @@ impl Adapter for Claude {
             "--name".into(),
             info.seat.clone(),
         ];
+        match (ctx.resume, ctx.new_session_id) {
+            (Some(id), _) => args.extend(["--resume".into(), id.to_string()]),
+            (None, Some(id)) => args.extend(["--session-id".into(), id.to_string()]),
+            (None, None) => {}
+        }
         if let Some(m) = &info.model {
             args.push("--model".into());
             args.push(m.clone());
@@ -228,6 +233,9 @@ impl Adapter for Claude {
             args.push("--dangerously-skip-permissions".into());
         }
         args.extend(ctx.extra.iter().cloned());
+        if ctx.resume.is_none() && ctx.context_lost {
+            args.push(CONTEXT_LOST.to_string());
+        }
         let env = BTreeMap::from([
             ("AMAIL_SEAT".to_string(), info.seat.clone()),
             ("AMAIL_URL".to_string(), self.env.server_url.clone()),

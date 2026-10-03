@@ -35,6 +35,8 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Notify, OnceCell};
 
+mod supervise;
+
 /// Node configuration.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -64,6 +66,28 @@ pub struct Config {
     /// Must stay well below the hook client's wait (300 ms), which is well
     /// below the harness's hook timeout (3-5 s); see [`crate::hook_client`].
     pub hook_server_timeout: Duration,
+    /// The zellij binary, and the size of the headless client that keeps
+    /// panes wide while nobody is attached (see [`crate::mux`]).
+    pub zellij_bin: String,
+    pub pane_cols: u16,
+    pub pane_rows: u16,
+    /// Most sessions starting at once (from launch to their first hook).
+    pub start_limit: usize,
+    /// A session without a hook this long after launch is checked for a
+    /// prompt that needs a person (and stops holding a start slot).
+    pub start_timeout: Duration,
+    /// SIGTERM, then SIGKILL after this long.
+    pub kill_grace: Duration,
+    /// First restart delay after a crash; doubles per consecutive crash.
+    pub restart_backoff: Duration,
+    /// Restarts after consecutive crashes before giving up.
+    pub max_restarts: u32,
+    /// A run that lasted this long resets the crash count.
+    pub stable_after: Duration,
+    /// A resumed session that dies this soon without a hook means the
+    /// resume failed: the next start is a new session.
+    pub resume_grace: Duration,
+    pub supervise_interval: Duration,
 }
 
 impl Config {
@@ -87,6 +111,17 @@ impl Config {
             heartbeat: Duration::from_secs(30),
             liveness_interval: Duration::from_secs(2),
             hook_server_timeout: crate::server::HOOK_SERVER_TIMEOUT,
+            zellij_bin: "zellij".into(),
+            pane_cols: 200,
+            pane_rows: 60,
+            start_limit: 4,
+            start_timeout: Duration::from_secs(60),
+            kill_grace: Duration::from_secs(10),
+            restart_backoff: Duration::from_secs(2),
+            max_restarts: 3,
+            stable_after: Duration::from_secs(600),
+            resume_grace: Duration::from_secs(30),
+            supervise_interval: Duration::from_millis(500),
         }
     }
 }
@@ -126,6 +161,8 @@ struct SeatRt {
     /// Claimed mail whose injection never reached the agent; shown by the
     /// next injecting hook.
     stash: Vec<InboxEntry>,
+    /// Last hook or launch (Unix ms).
+    last_activity: i64,
 }
 
 impl SeatRt {
@@ -148,6 +185,7 @@ impl SeatRt {
             wakes: 0,
             reported: false,
             stash: Vec::new(),
+            last_activity: 0,
         }
     }
 
@@ -171,6 +209,10 @@ struct State {
     dirty_presence: HashSet<String>,
     /// `saved` changed and must be written.
     save_dirty: bool,
+    /// Supervisor state of supervised seats (not persisted).
+    sup: HashMap<String, supervise::SupRt>,
+    /// Supervised seats waiting for a start slot, in order.
+    start_queue: std::collections::VecDeque<String>,
 }
 
 impl State {
@@ -284,12 +326,17 @@ fn ts(ms: i64) -> String {
     )
 }
 
-/// The start time of process `pid`, if it exists.
+/// The start time of process `pid`, if it exists and is not a zombie.
 fn proc_start(pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // Field 22, counted after the parenthesized command name.
+    // Fields after the parenthesized command name: state is field 3, the
+    // start time field 22.
     let rest = &stat[stat.rfind(')')? + 2..];
-    rest.split(' ').nth(19)?.parse().ok()
+    let mut f = rest.split(' ');
+    if matches!(f.next(), Some("Z") | Some("X")) {
+        return None;
+    }
+    f.nth(18)?.parse().ok()
 }
 
 fn alive(pid: u32, start: Option<u64>) -> bool {
@@ -324,6 +371,8 @@ impl Plan {
 pub struct Node {
     cfg: Config,
     server: ServerClient,
+    mux: Arc<dyn crate::mux::Mux>,
+    sup_kick: Notify,
     claude: Arc<dyn Adapter>,
     codex: Arc<dyn Adapter>,
     prepared: HashMap<Harness, Arc<OnceCell<Result<(), String>>>>,
@@ -351,8 +400,20 @@ impl NodeHandle {
     }
 }
 
-/// Start a node: bind the socket and spawn its tasks.
+/// Start a node: bind the socket and spawn its tasks. Supervised sessions
+/// run in zellij.
 pub async fn start(cfg: Config) -> Result<NodeHandle> {
+    let mux = Arc::new(crate::mux::Zellij::new(
+        &cfg.zellij_bin,
+        &cfg.state_dir,
+        cfg.pane_cols,
+        cfg.pane_rows,
+    ));
+    start_with_mux(cfg, mux).await
+}
+
+/// [`start`] with another multiplexer (tests use [`crate::mux::ProcessMux`]).
+pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Result<NodeHandle> {
     std::fs::create_dir_all(&cfg.state_dir)
         .with_context(|| format!("creating {}", cfg.state_dir.display()))?;
     let sock_dir = cfg.socket.parent().context("socket path has no parent")?;
@@ -418,6 +479,11 @@ pub async fn start(cfg: Config) -> Result<NodeHandle> {
     for (seat, entries) in st.saved.stash.clone() {
         st.seat(&seat).stash = entries;
     }
+    supervise::restore(&mut st, |h| match Harness::parse(h) {
+        Some(Harness::Claude) => Some(claude.harness()),
+        Some(Harness::Codex) => Some(codex.harness()),
+        None => None,
+    });
     let node = Arc::new(Node {
         server: ServerClient::new(&cfg.url, &cfg.token, cfg.hook_server_timeout)?,
         claude,
@@ -427,6 +493,8 @@ pub async fn start(cfg: Config) -> Result<NodeHandle> {
             .map(|h| (h, Arc::new(OnceCell::new())))
             .collect(),
         cfg,
+        mux,
+        sup_kick: Notify::new(),
         st: Mutex::new(st),
         state_file,
         wake_kick: Notify::new(),
@@ -456,6 +524,8 @@ pub async fn start(cfg: Config) -> Result<NodeHandle> {
     tasks.push(tokio::spawn(async move { n.liveness_loop().await }));
     let n = node.clone();
     tasks.push(tokio::spawn(async move { n.save_loop().await }));
+    let n = node.clone();
+    tasks.push(tokio::spawn(async move { n.supervise_loop().await }));
     Ok(NodeHandle { node, tasks })
 }
 
@@ -624,8 +694,18 @@ impl Node {
                 pid,
                 harness,
                 extra,
+                pane,
+                mux_session,
             } => match self
-                .launch(&seat, &cwd, pid, harness.as_deref(), &extra)
+                .launch(
+                    &seat,
+                    &cwd,
+                    pid,
+                    harness.as_deref(),
+                    &extra,
+                    pane,
+                    mux_session,
+                )
                 .await
             {
                 Ok(plan) => serde_json::to_value(plan).unwrap_or_default(),
@@ -636,6 +716,17 @@ impl Node {
                 None => json!({"error": "no seat is registered for this thread"}),
             },
             Request::Status => self.status(),
+            Request::Up {
+                seats,
+                settings,
+                start,
+            } => self.sup_up(seats, settings, start),
+            Request::Down { seats } => self.sup_down(seats).await,
+            Request::Forget { seats } => self.sup_forget(seats).await,
+            Request::Sleep { seat } => self.sup_sleep(&seat).await,
+            Request::Wake { seat } => self.sup_wake(&seat),
+            Request::Ps => self.sup_ps(),
+            Request::Locate { target } => self.sup_locate(&target),
         }
     }
 
@@ -754,6 +845,18 @@ impl Node {
         let plan = {
             let mut st = self.lock();
             let connected = st.connected;
+            if st.saved.managed.contains_key(seat) {
+                // Supervised: the process is watched directly. SessionEnd
+                // may come late (Codex: about a minute after the TUI ended,
+                // possibly after the seat was restarted), so it is ignored.
+                if hook.event == Event::SessionEnd {
+                    return (Output::None, Vec::new());
+                }
+                if supervise::on_hook(&mut st, seat, hook.session_id.as_deref()) {
+                    self.sup_kick.notify_one();
+                }
+            }
+            st.seat(seat).last_activity = now_ms();
             {
                 let s = st.seat(seat);
                 s.harness = Some(adapter.harness());
@@ -944,6 +1047,7 @@ impl Node {
 
     // --- launch and credentials ---------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     async fn launch(
         &self,
         seat: &str,
@@ -951,7 +1055,11 @@ impl Node {
         pid: u32,
         harness: Option<&str>,
         extra: &[String],
+        pane: Option<u32>,
+        mux_session: Option<String>,
     ) -> Result<LaunchPlan> {
+        let managed = self.lock().saved.managed.get(seat).cloned();
+        let harness = harness.or(managed.as_ref().map(|m| m.harness.as_str()));
         let info = self.server.launch(seat).await?;
         let name = harness
             .map(str::to_string)
@@ -978,15 +1086,49 @@ impl Node {
             st.seat(seat).harness = Some(h);
             st.save_dirty = true;
         }
+        // A supervised seat resumes its last session when it has one;
+        // Claude Code sessions get their id up front.
+        let resume = managed
+            .as_ref()
+            .filter(|m| Harness::parse(&m.harness) == Some(h))
+            .and_then(|m| m.resume.clone());
+        let context_lost = managed.as_ref().is_some_and(|m| m.context_lost);
+        let new_id = (resume.is_none() && h == Harness::Claude).then(supervise::uuid_v4);
         self.save_now();
-        self.adapter(h)
+        let plan = self
+            .adapter(h)
             .launch(&LaunchCtx {
                 info: &info,
                 cwd,
                 extra,
                 nonce: &nonce,
+                resume: resume.as_deref(),
+                new_session_id: new_id.as_deref(),
+                context_lost,
             })
-            .await
+            .await?;
+        if managed.is_some() {
+            let lazy = self.adapter(h).resume_is_lazy();
+            let mut st = self.lock();
+            supervise::launched(
+                &mut st,
+                seat,
+                h,
+                pid,
+                proc_start(pid),
+                pane.filter(|_| {
+                    managed.as_ref().map(|m| m.mux_session.as_str()) == mux_session.as_deref()
+                }),
+                resume.as_deref(),
+                new_id.as_deref(),
+                lazy,
+            );
+            drop(st);
+            self.presence_kick.notify_one();
+            self.wake_kick.notify_one();
+            self.sup_kick.notify_one();
+        }
+        Ok(plan)
     }
 
     fn credentials(&self, thread: &str) -> Option<Credentials> {
@@ -1325,9 +1467,11 @@ impl Node {
         loop {
             tick.tick().await;
             let mut st = self.lock();
+            let managed: HashSet<String> = st.saved.managed.keys().cloned().collect();
             let gone: Vec<String> = st
                 .seats
                 .iter()
+                .filter(|(n, _)| !managed.contains(*n))
                 .filter(|(_, s)| s.state != SeatState::Offline)
                 .filter(|(_, s)| {
                     s.session

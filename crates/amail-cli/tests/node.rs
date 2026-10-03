@@ -354,6 +354,8 @@ async fn codex_registration_and_rows(b: Backend) {
             pid: std::process::id(),
             harness: None,
             extra: vec![],
+            pane: None,
+            mux_session: None,
         })
         .await;
     assert!(plan.get("error").is_none(), "{plan}");
@@ -384,6 +386,8 @@ async fn codex_registration_and_rows(b: Backend) {
             pid: std::process::id(),
             harness: None,
             extra: vec!["-c".into(), "model=x".into()],
+            pane: None,
+            mux_session: None,
         })
         .await;
     assert!(

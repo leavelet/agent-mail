@@ -64,13 +64,13 @@ fn worktrees(repo: &Path) -> Result<HashMap<PathBuf, Option<String>>> {
             let p = PathBuf::from(p);
             out.insert(p.clone(), None);
             cur = Some(p);
-        } else if let Some(b) = line.strip_prefix("branch ") {
-            if let Some(p) = &cur {
-                out.insert(
-                    p.clone(),
-                    Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string()),
-                );
-            }
+        } else if let Some(b) = line.strip_prefix("branch ")
+            && let Some(p) = &cur
+        {
+            out.insert(
+                p.clone(),
+                Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string()),
+            );
         }
     }
     Ok(out)

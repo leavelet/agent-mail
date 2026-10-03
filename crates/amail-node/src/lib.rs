@@ -6,6 +6,7 @@ pub mod adapter;
 pub mod codex_rpc;
 pub mod hook_client;
 pub mod inject;
+pub mod mux;
 pub mod node;
 pub mod paths;
 pub mod persist;

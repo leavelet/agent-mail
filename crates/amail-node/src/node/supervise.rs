@@ -1,0 +1,1059 @@
+//! Supervised seats (`amail up`): the node starts their sessions in the
+//! multiplexer, puts idle ones to sleep, starts sleeping ones again when
+//! mail arrives, and restarts crashed ones.
+//!
+//! Life of a supervised seat:
+//!
+//! - **start**: queued, then (at most `start_limit` at a time) a pane runs
+//!   `amail run <seat>`, which asks the node for the launch plan. The plan
+//!   resumes the seat's last harness session when there is one. The start
+//!   slot is held until the session's first hook (or `start_timeout`, after
+//!   which the pane's screen is checked for prompts that need a person).
+//! - **sleep** (idle longer than `idle_sleep` with nothing pending, or the
+//!   least recently active idle seats when more than `max_live` run, or
+//!   `amail sleep`): the process gets SIGTERM (SIGKILL after `kill_grace`);
+//!   the seat becomes `dormant`, keeping its session id and its pane.
+//! - **cold start**: a dormant seat with pending `to` or urgent mail is
+//!   started again (resuming its session); the mail then arrives through
+//!   the usual wake-up path.
+//! - **crash**: a process that ends without `down` or sleep is restarted
+//!   (resuming) after a backoff that doubles per consecutive crash, unless
+//!   `restart = "never"`; after `max_restarts` restarts it is marked failed.
+//!   A clean exit (status 0, e.g. the person typed `/exit`) is not a crash:
+//!   the seat goes offline until the next `amail up` or `amail wake`.
+
+use super::*;
+use crate::mux::PaneSpec;
+use crate::persist::Managed;
+use crate::team::Restart;
+use crate::wire::{PsRow, SeatPlacement};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Intent {
+    Sleep,
+    Down,
+}
+
+/// Runtime state of a supervised seat.
+#[derive(Debug, Clone, Default)]
+pub(super) struct SupRt {
+    /// Waiting in the start queue.
+    queued: bool,
+    /// The pane is being opened.
+    opening: bool,
+    /// Launched; no hook yet.
+    starting_since: Option<Instant>,
+    /// Counts against the start limit.
+    holds_slot: bool,
+    launched_at: Option<Instant>,
+    resumed: bool,
+    hooked: bool,
+    stopping: Option<(Intent, Instant, bool)>,
+    retry_at: Option<Instant>,
+    exiting: bool,
+    probing: bool,
+    probed_at: Option<Instant>,
+    /// Needs a person: (tag, hint).
+    blocked: Option<(String, String)>,
+}
+
+pub fn uuid_v4() -> String {
+    let mut b: [u8; 16] = rand::random();
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    let h = hex::encode(b);
+    format!(
+        "{}-{}-{}-{}-{}",
+        &h[0..8],
+        &h[8..12],
+        &h[12..16],
+        &h[16..20],
+        &h[20..32]
+    )
+}
+
+/// Signal `pid`'s process group if it leads one (harnesses run as group
+/// leaders in their panes; their tool processes are in the group), else
+/// the process alone.
+fn signal(pid: u32, sig: libc::c_int) {
+    // SAFETY: getpgid and kill have no memory-safety preconditions.
+    unsafe {
+        if libc::getpgid(pid as i32) == pid as i32 {
+            libc::kill(-(pid as i32), sig);
+        } else {
+            libc::kill(pid as i32, sig);
+        }
+    }
+}
+
+/// Recognize prompts that need a person on a pane's screen.
+pub(super) fn classify_screen(screen: &str, seat: &str, cwd: &str) -> Option<(String, String)> {
+    let s = screen.to_lowercase();
+    let has = |w: &str| s.contains(w);
+    if has("trust the files")
+        || has("do you trust")
+        || has("trust this folder")
+        || (has("trust") && has("folder") && has("proceed"))
+    {
+        return Some((
+            "trust-prompt".into(),
+            format!(
+                "Claude Code asks whether to trust {cwd}: answer it in the pane \
+                 (amail attach {seat}); amail does not answer it for you"
+            ),
+        ));
+    }
+    if has("/login")
+        || has("not logged in")
+        || has("invalid api key")
+        || has("please log in")
+        || has("login required")
+        || has("authentication_error")
+        || has("token has expired")
+        || has("sign in with")
+    {
+        return Some((
+            "login".into(),
+            format!(
+                "the harness is not logged in: log in (amail attach {seat}), or fix the \
+                 login outside amail and run amail wake {seat}"
+            ),
+        ));
+    }
+    None
+}
+
+/// Rebuild runtime state of supervised seats at node start.
+pub(super) fn restore(st: &mut State, harness: impl Fn(&str) -> Option<Harness>) {
+    for (name, m) in st.saved.managed.clone() {
+        let s = st.seat(&name);
+        s.harness = harness(&m.harness);
+        if let Some(pid) = m.pid
+            && alive(pid, m.pid_start)
+        {
+            if s.state == SeatState::Offline {
+                s.state = SeatState::Idle;
+            }
+            let sess = s.session.get_or_insert_with(SessionRt::default);
+            sess.pid = Some((pid, m.pid_start));
+            if sess.id.is_none() {
+                sess.id = m.resume.clone();
+            }
+            st.sup.entry(name.clone()).or_default().hooked = true;
+        } else if m.dormant {
+            s.state = SeatState::Dormant;
+        }
+        // A dead pid is handled as an exit by the first supervisor pass.
+    }
+}
+
+/// A hook from a supervised seat. Returns true if a start slot was freed.
+pub(super) fn on_hook(st: &mut State, seat: &str, session_id: Option<&str>) -> bool {
+    if let (Some(m), Some(sid)) = (st.saved.managed.get_mut(seat), session_id)
+        && m.resume.as_deref() != Some(sid)
+    {
+        m.resume = Some(sid.to_string());
+        st.save_dirty = true;
+    }
+    let rt = st.sup.entry(seat.to_string()).or_default();
+    rt.hooked = true;
+    rt.starting_since = None;
+    rt.blocked = None;
+    std::mem::take(&mut rt.holds_slot)
+}
+
+/// `amail run` of a supervised seat asked for its launch plan.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn launched(
+    st: &mut State,
+    seat: &str,
+    h: Harness,
+    pid: u32,
+    pid_start: Option<u64>,
+    pane: Option<u32>,
+    resume: Option<&str>,
+    new_id: Option<&str>,
+    lazy_resume: bool,
+) {
+    let now = Instant::now();
+    if let Some(m) = st.saved.managed.get_mut(seat) {
+        m.pid = Some(pid);
+        m.pid_start = pid_start;
+        if pane.is_some() {
+            m.pane = pane;
+        }
+        if resume.is_none() {
+            m.context_lost = false;
+        }
+        m.dormant = false;
+        st.save_dirty = true;
+    }
+    let rt = st.sup.entry(seat.to_string()).or_default();
+    rt.launched_at = Some(now);
+    rt.resumed = resume.is_some();
+    rt.hooked = false;
+    rt.blocked = None;
+    rt.starting_since.get_or_insert(now);
+    let lazy = lazy_resume && resume.is_some();
+    if lazy {
+        // Such a session fires no hook until a turn runs; it is ready to
+        // be woken (its wake target is the session id) once launched.
+        rt.holds_slot = false;
+    }
+    let s = st.seat(seat);
+    s.harness = Some(h);
+    s.last_activity = now_ms();
+    s.session = Some(SessionRt {
+        id: resume.or(new_id).map(str::to_string),
+        pid: Some((pid, pid_start)),
+        target: if lazy {
+            resume.map(str::to_string)
+        } else {
+            None
+        },
+    });
+    if lazy {
+        st.set_state(seat, SeatState::Idle);
+    } else {
+        st.set_state(seat, SeatState::Offline);
+    }
+}
+
+impl State {
+    /// Seats with a process, or about to have one.
+    fn live_count(&self) -> usize {
+        self.saved
+            .managed
+            .iter()
+            .filter(|(n, m)| {
+                m.pid.is_some()
+                    || self
+                        .sup
+                        .get(*n)
+                        .is_some_and(|r| r.queued || r.opening || r.starting_since.is_some())
+            })
+            .count()
+    }
+}
+
+impl Node {
+    fn pane_argv(&self, seat: &str) -> Vec<String> {
+        vec![
+            self.cfg.amail_exe.to_string_lossy().into_owned(),
+            "run".into(),
+            seat.into(),
+            "--socket".into(),
+            self.cfg.socket.to_string_lossy().into_owned(),
+        ]
+    }
+
+    pub(super) async fn supervise_loop(self: Arc<Self>) {
+        let mut maintained = Instant::now();
+        loop {
+            self.supervise_pass();
+            if maintained.elapsed() > Duration::from_secs(5) {
+                maintained = Instant::now();
+                let sessions: Vec<String> = {
+                    let st = self.lock();
+                    let mut v: Vec<String> = st
+                        .saved
+                        .managed
+                        .values()
+                        .filter(|m| m.up || m.pid.is_some())
+                        .map(|m| m.mux_session.clone())
+                        .collect();
+                    v.sort();
+                    v.dedup();
+                    v
+                };
+                self.mux.maintain(&sessions).await;
+            }
+            tokio::select! {
+                _ = self.sup_kick.notified() => {}
+                _ = tokio::time::sleep(self.cfg.supervise_interval) => {}
+            }
+        }
+    }
+
+    /// One pass: notice exits, escalate stops, put seats to sleep, start
+    /// what should run.
+    fn supervise_pass(self: &Arc<Self>) {
+        let now = Instant::now();
+        let mut exits = Vec::new();
+        let mut probes = Vec::new();
+        let mut sleeps = Vec::new();
+        let mut starts = Vec::new();
+        {
+            let mut st = self.lock();
+            let connected = st.connected;
+            let settings = st.saved.settings.clone();
+            let names: Vec<String> = st.saved.managed.keys().cloned().collect();
+            for name in &names {
+                let m = st.saved.managed[name].clone();
+                let wants_mail = st.seats.get(name).is_some_and(|s| s.wants_wake());
+                let rt = st.sup.entry(name.clone()).or_default();
+                if let Some(pid) = m.pid {
+                    if !alive(pid, m.pid_start) {
+                        if !rt.exiting {
+                            rt.exiting = true;
+                            exits.push(name.clone());
+                        }
+                        continue;
+                    }
+                    if let Some((intent, since, false)) = rt.stopping
+                        && now >= since + self.cfg.kill_grace
+                    {
+                        tracing::warn!("seat {name}: still running; sending SIGKILL");
+                        signal(pid, libc::SIGKILL);
+                        rt.stopping = Some((intent, since, true));
+                    }
+                }
+                if let Some(since) = rt.starting_since
+                    && !rt.hooked
+                    && !rt.opening
+                    && !rt.probing
+                {
+                    let elapsed = now - since;
+                    let due = rt
+                        .probed_at
+                        .is_none_or(|t| now - t > Duration::from_secs(10));
+                    // Without a pid the pane may have failed before launching.
+                    if (m.pid.is_none() && elapsed > Duration::from_secs(2) && due)
+                        || (elapsed >= self.cfg.start_timeout && due)
+                    {
+                        rt.probing = true;
+                        rt.probed_at = Some(now);
+                        if elapsed >= self.cfg.start_timeout {
+                            rt.holds_slot = false;
+                        }
+                        probes.push(name.clone());
+                    }
+                }
+                let busy = m.pid.is_some()
+                    || rt.queued
+                    || rt.opening
+                    || rt.exiting
+                    || rt.starting_since.is_some();
+                if busy || !m.up || m.failed {
+                    continue;
+                }
+                if rt.retry_at.is_some_and(|t| now < t) {
+                    continue;
+                }
+                if m.dormant && !(connected && wants_mail) {
+                    continue;
+                }
+                rt.retry_at = None;
+                rt.queued = true;
+                st.start_queue.push_back(name.clone());
+            }
+
+            // Sleep: idle too long, or too many live seats.
+            let idle_ok = |st: &State, name: &str| -> bool {
+                let (Some(s), Some(m)) = (st.seats.get(name), st.saved.managed.get(name)) else {
+                    return false;
+                };
+                let rt = st.sup.get(name);
+                m.pid.is_some()
+                    && s.state == SeatState::Idle
+                    && !s.wants_wake()
+                    && s.pending.total() == 0
+                    && s.wake_out.is_none()
+                    && rt.is_none_or(|r| r.stopping.is_none() && r.starting_since.is_none())
+            };
+            if let Some(ms) = settings.idle_sleep_ms {
+                let cutoff = now_ms() - ms as i64;
+                for name in &names {
+                    if idle_ok(&st, name) && st.seats[name].since <= cutoff {
+                        tracing::info!("seat {name}: idle for {} s; going to sleep", ms / 1000);
+                        sleeps.push(name.clone());
+                    }
+                }
+            }
+            if let Some(max) = settings.max_live {
+                let live = st.live_count().saturating_sub(sleeps.len());
+                if live > max as usize {
+                    let mut idle: Vec<(i64, String)> = names
+                        .iter()
+                        .filter(|n| idle_ok(&st, n) && !sleeps.contains(n))
+                        .map(|n| (st.seats[n].last_activity, n.clone()))
+                        .collect();
+                    idle.sort();
+                    for (_, n) in idle.into_iter().take(live - max as usize) {
+                        tracing::info!("seat {n}: more than {max} live seats; going to sleep");
+                        sleeps.push(n);
+                    }
+                }
+            }
+            for n in &sleeps {
+                self.begin_stop(&mut st, n, Intent::Sleep);
+            }
+
+            // Starts, within the limit.
+            let mut busy = st
+                .sup
+                .values()
+                .filter(|r| r.opening || r.holds_slot)
+                .count();
+            while busy < self.cfg.start_limit.max(1) {
+                let Some(name) = st.start_queue.pop_front() else {
+                    break;
+                };
+                let rt = st.sup.entry(name.clone()).or_default();
+                if !rt.queued {
+                    continue;
+                }
+                rt.queued = false;
+                rt.opening = true;
+                busy += 1;
+                starts.push(name);
+            }
+        }
+        for n in exits {
+            let me = self.clone();
+            tokio::spawn(async move { me.handle_exit(&n).await });
+        }
+        for n in probes {
+            let me = self.clone();
+            tokio::spawn(async move { me.probe(&n).await });
+        }
+        for n in starts {
+            let me = self.clone();
+            tokio::spawn(async move { me.start_seat(&n).await });
+        }
+        if !sleeps.is_empty() {
+            self.presence_kick.notify_one();
+        }
+    }
+
+    /// Ask the process of `seat` to end; the exit is handled when it is gone.
+    fn begin_stop(&self, st: &mut State, seat: &str, intent: Intent) {
+        let Some(m) = st.saved.managed.get(seat).cloned() else {
+            return;
+        };
+        let rt = st.sup.entry(seat.to_string()).or_default();
+        rt.queued = false;
+        rt.retry_at = None;
+        match m.pid {
+            Some(pid) if alive(pid, m.pid_start) => {
+                if rt.stopping.is_none() {
+                    rt.stopping = Some((intent, Instant::now(), false));
+                    signal(pid, libc::SIGTERM);
+                } else if let Some((i, since, k)) = rt.stopping
+                    && i == Intent::Sleep
+                    && intent == Intent::Down
+                {
+                    rt.stopping = Some((Intent::Down, since, k));
+                }
+            }
+            _ => {
+                // Not running (maybe starting): settle at once.
+                rt.starting_since = None;
+                rt.holds_slot = false;
+                let m = st.saved.managed.get_mut(seat).expect("checked");
+                match intent {
+                    Intent::Sleep => {
+                        m.dormant = true;
+                        st.set_state(seat, SeatState::Dormant);
+                    }
+                    Intent::Down => {
+                        m.up = false;
+                        m.dormant = false;
+                        st.set_state(seat, SeatState::Offline);
+                    }
+                }
+                st.save_dirty = true;
+            }
+        }
+        self.sup_kick.notify_one();
+    }
+
+    async fn start_seat(self: Arc<Self>, seat: &str) {
+        let Some(m) = self.lock().saved.managed.get(seat).cloned() else {
+            return;
+        };
+        let spec = PaneSpec {
+            name: seat.to_string(),
+            cwd: PathBuf::from(&m.cwd),
+            argv: self.pane_argv(seat),
+        };
+        let r = async {
+            if let Some(p) = m.pane
+                && let Some(panes) = self.mux.panes(&m.mux_session).await?
+                && let Some(info) = panes.iter().find(|x| x.id == p && x.name == seat)
+            {
+                if !info.exited {
+                    bail!("its pane terminal_{p} is still running");
+                }
+                self.mux.rerun(&m.mux_session, p).await?;
+                return Ok(p);
+            }
+            self.mux.open(&m.mux_session, &m.tab, &spec).await
+        }
+        .await;
+        let mut st = self.lock();
+        let rt = st.sup.entry(seat.to_string()).or_default();
+        rt.opening = false;
+        match r {
+            Ok(pane) => {
+                tracing::info!("seat {seat}: started in {} pane {pane}", m.mux_session);
+                rt.starting_since = Some(Instant::now());
+                rt.holds_slot = true;
+                rt.hooked = false;
+                rt.probed_at = None;
+                if let Some(m) = st.saved.managed.get_mut(seat) {
+                    m.pane = Some(pane);
+                    m.dormant = false;
+                }
+                st.save_dirty = true;
+            }
+            Err(e) => {
+                tracing::warn!("seat {seat}: could not start: {e:#}");
+                let msg = format!("could not start: {e:#}");
+                self.failed_run(&mut st, seat, None, msg);
+            }
+        }
+        drop(st);
+        self.sup_kick.notify_one();
+    }
+
+    /// Check a starting seat's pane: did it exit before launching, or is it
+    /// waiting for a person?
+    async fn probe(self: Arc<Self>, seat: &str) {
+        let Some(m) = self.lock().saved.managed.get(seat).cloned() else {
+            return;
+        };
+        let lazy = self.lock().sup.get(seat).is_some_and(|r| r.resumed)
+            && Harness::parse(&m.harness).is_some_and(|h| self.adapter(h).resume_is_lazy());
+        let mut exited = None;
+        let mut blocked = None;
+        if let Some(p) = m.pane {
+            if let Ok(Some(panes)) = self.mux.panes(&m.mux_session).await
+                && let Some(info) = panes.iter().find(|x| x.id == p)
+                && info.exited
+            {
+                exited = Some(info.exit_status);
+            }
+            if exited.is_none()
+                && let Ok(screen) = self.mux.screen(&m.mux_session, p).await
+            {
+                blocked = classify_screen(&screen, seat, &m.cwd);
+            }
+        }
+        let mut st = self.lock();
+        let timed_out = st
+            .sup
+            .get(seat)
+            .and_then(|r| r.starting_since)
+            .is_some_and(|t| t.elapsed() >= self.cfg.start_timeout);
+        let rt = st.sup.entry(seat.to_string()).or_default();
+        rt.probing = false;
+        if rt.hooked {
+            return;
+        }
+        if let Some(status) = exited {
+            if m.pid.is_none() {
+                // The pane's command ended before it launched a harness.
+                rt.starting_since = None;
+                rt.holds_slot = false;
+                let msg = format!(
+                    "the pane exited before the harness started (status {})",
+                    status.map_or("unknown".into(), |s| s.to_string())
+                );
+                self.failed_run(&mut st, seat, None, msg);
+                drop(st);
+                self.sup_kick.notify_one();
+            }
+            return;
+        }
+        if let Some(b) = blocked {
+            tracing::warn!("seat {seat}: needs a person: {}", b.0);
+            rt.blocked = Some(b);
+        } else if timed_out && !lazy {
+            rt.blocked = Some((
+                "no-activity".into(),
+                format!(
+                    "no sign of life from the session {} s after its start: look at the pane \
+                     (amail attach {seat})",
+                    self.cfg.start_timeout.as_secs()
+                ),
+            ));
+        }
+    }
+
+    async fn handle_exit(self: Arc<Self>, seat: &str) {
+        let Some(m) = self.lock().saved.managed.get(seat).cloned() else {
+            return;
+        };
+        let intent = self
+            .lock()
+            .sup
+            .get(seat)
+            .and_then(|r| r.stopping.map(|s| s.0));
+        let mut status = None;
+        if intent.is_none()
+            && let Some(p) = m.pane
+        {
+            // zellij needs a moment to mark the pane as exited.
+            for _ in 0..10 {
+                if let Ok(Some(panes)) = self.mux.panes(&m.mux_session).await
+                    && let Some(info) = panes.iter().find(|x| x.id == p)
+                    && info.exited
+                {
+                    status = Some(info.exit_status);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        let mut st = self.lock();
+        let rt = st.sup.entry(seat.to_string()).or_default();
+        let lived = rt.launched_at.map(|t| t.elapsed());
+        let (resumed, hooked) = (rt.resumed, rt.hooked);
+        rt.exiting = false;
+        rt.stopping = None;
+        rt.starting_since = None;
+        rt.holds_slot = false;
+        rt.blocked = None;
+        rt.launched_at = None;
+        let Some(mm) = st.saved.managed.get_mut(seat) else {
+            return;
+        };
+        mm.pid = None;
+        mm.pid_start = None;
+        st.save_dirty = true;
+        match intent {
+            Some(Intent::Sleep) => {
+                tracing::info!("seat {seat}: asleep");
+                let mm = st.saved.managed.get_mut(seat).expect("present");
+                mm.dormant = true;
+                mm.last_exit = Some("put to sleep".into());
+                st.set_state(seat, SeatState::Dormant);
+                st.seat(seat).session = None;
+            }
+            Some(Intent::Down) => {
+                tracing::info!("seat {seat}: stopped");
+                let mm = st.saved.managed.get_mut(seat).expect("present");
+                mm.up = false;
+                mm.dormant = false;
+                mm.last_exit = Some("stopped by amail down".into());
+                st.set_state(seat, SeatState::Offline);
+            }
+            None => {
+                st.set_state(seat, SeatState::Offline);
+                let resume_failed =
+                    resumed && !hooked && lived.is_some_and(|l| l < self.cfg.resume_grace);
+                if resume_failed {
+                    tracing::warn!(
+                        "seat {seat}: resuming its session failed; the next start is a new session"
+                    );
+                    let mm = st.saved.managed.get_mut(seat).expect("present");
+                    mm.resume = None;
+                    mm.context_lost = true;
+                }
+                let code = status.flatten();
+                if code == Some(0) && !resume_failed {
+                    tracing::info!("seat {seat}: the session ended normally");
+                    let mm = st.saved.managed.get_mut(seat).expect("present");
+                    mm.up = false;
+                    mm.failures = 0;
+                    mm.last_exit = Some("exited normally (status 0)".into());
+                } else {
+                    let what = match (resume_failed, code) {
+                        (true, _) => "could not resume its session".to_string(),
+                        (false, Some(c)) => format!("exited with status {c}"),
+                        (false, None) => "was killed or vanished".to_string(),
+                    };
+                    tracing::warn!("seat {seat}: the session {what}");
+                    let stable = lived.is_some_and(|l| l >= self.cfg.stable_after);
+                    self.failed_run(&mut st, seat, Some(stable), what);
+                }
+            }
+        }
+        drop(st);
+        self.presence_kick.notify_one();
+        self.sup_kick.notify_one();
+    }
+
+    /// Count a failed run and schedule the restart (or give up).
+    fn failed_run(&self, st: &mut State, seat: &str, stable: Option<bool>, what: String) {
+        let restart = st.saved.settings.restart;
+        let Some(m) = st.saved.managed.get_mut(seat) else {
+            return;
+        };
+        m.failures = if stable == Some(true) {
+            1
+        } else {
+            m.failures + 1
+        };
+        m.last_exit = Some(what);
+        let failures = m.failures;
+        st.save_dirty = true;
+        let rt = st.sup.entry(seat.to_string()).or_default();
+        if restart == Restart::Never {
+            st.saved.managed.get_mut(seat).expect("present").up = false;
+            return;
+        }
+        if failures > self.cfg.max_restarts {
+            tracing::warn!(
+                "seat {seat}: failed {failures} times in a row; not restarting it again"
+            );
+            st.saved.managed.get_mut(seat).expect("present").failed = true;
+            return;
+        }
+        let delay = self.cfg.restart_backoff * 2u32.saturating_pow(failures - 1);
+        rt.retry_at = Some(Instant::now() + delay);
+        tracing::info!(
+            "seat {seat}: restarting in {:.1} s (failure {failures} of {})",
+            delay.as_secs_f64(),
+            self.cfg.max_restarts
+        );
+    }
+
+    // --- requests ---------------------------------------------------------
+
+    pub(super) fn sup_up(
+        &self,
+        seats: Vec<SeatPlacement>,
+        settings: crate::team::Settings,
+        start: bool,
+    ) -> Value {
+        let mut out = Vec::new();
+        let mut st = self.lock();
+        st.saved.settings = settings;
+        for p in seats {
+            let h = Harness::parse(&p.harness);
+            let entry = st.saved.managed.get(&p.seat).cloned();
+            let mut m = entry.clone().unwrap_or(Managed {
+                group: None,
+                harness: p.harness.clone(),
+                cwd: p.cwd.clone(),
+                mux_session: p.mux_session.clone(),
+                tab: p.tab.clone(),
+                pane: None,
+                up: false,
+                dormant: false,
+                resume: None,
+                context_lost: false,
+                failures: 0,
+                failed: false,
+                pid: None,
+                pid_start: None,
+                last_exit: None,
+            });
+            if m.harness != p.harness {
+                // A session cannot move to another harness.
+                if m.resume.take().is_some() {
+                    m.context_lost = true;
+                }
+            }
+            if m.mux_session != p.mux_session || m.tab != p.tab {
+                m.pane = None;
+            }
+            m.group = p.group.clone();
+            m.harness = p.harness.clone();
+            m.cwd = p.cwd.clone();
+            m.mux_session = p.mux_session.clone();
+            m.tab = p.tab.clone();
+            let running = m.pid.is_some_and(|pid| alive(pid, m.pid_start));
+            let action = if running {
+                "running"
+            } else if m.dormant && m.up {
+                "dormant"
+            } else if start {
+                m.up = true;
+                m.failed = false;
+                m.failures = 0;
+                "starting"
+            } else {
+                "not started"
+            };
+            if start {
+                m.up = true;
+            }
+            out.push(json!({"seat": p.seat, "action": action}));
+            let name = p.seat.clone();
+            st.saved.managed.insert(name.clone(), m);
+            st.seat(&name).harness = h;
+            if action == "starting" {
+                st.sup.entry(name).or_default().retry_at = None;
+            }
+        }
+        st.save_dirty = true;
+        drop(st);
+        self.save_now();
+        self.sup_kick.notify_one();
+        json!({"seats": out})
+    }
+
+    fn targets(&self, seats: &[String]) -> Result<Vec<String>, String> {
+        let st = self.lock();
+        if seats.is_empty() {
+            return Ok(st.saved.managed.keys().cloned().collect());
+        }
+        for s in seats {
+            if !st.saved.managed.contains_key(s) {
+                return Err(format!(
+                    "seat {s:?} is not supervised by this node (see amail ps)"
+                ));
+            }
+        }
+        Ok(seats.to_vec())
+    }
+
+    /// Wait until none of `seats` has a process (or the time is up).
+    async fn wait_stopped(&self, seats: &[String]) -> Vec<String> {
+        let deadline = Instant::now() + self.cfg.kill_grace + Duration::from_secs(10);
+        loop {
+            let running: Vec<String> = {
+                let st = self.lock();
+                seats
+                    .iter()
+                    .filter(|s| {
+                        st.saved.managed.get(*s).is_some_and(|m| m.pid.is_some())
+                            || st.sup.get(*s).is_some_and(|r| r.opening || r.exiting)
+                    })
+                    .cloned()
+                    .collect()
+            };
+            if running.is_empty() || Instant::now() > deadline {
+                return running;
+            }
+            self.sup_kick.notify_one();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    pub(super) async fn sup_down(&self, seats: Vec<String>) -> Value {
+        let targets = match self.targets(&seats) {
+            Ok(t) => t,
+            Err(e) => return json!({"error": e}),
+        };
+        {
+            let mut st = self.lock();
+            for s in &targets {
+                if let Some(m) = st.saved.managed.get_mut(s) {
+                    m.up = false;
+                    m.dormant = false;
+                    m.failed = false;
+                    m.failures = 0;
+                }
+                if let Some(rt) = st.sup.get_mut(s) {
+                    rt.blocked = None;
+                }
+                self.begin_stop(&mut st, s, Intent::Down);
+            }
+            st.start_queue.retain(|n| !targets.contains(n));
+        }
+        let left = self.wait_stopped(&targets).await;
+        // Close sessions none of whose seats is wanted any more.
+        let (close, codex_left) = {
+            let st = self.lock();
+            let mut by_session: BTreeMap<String, bool> = BTreeMap::new();
+            for m in st.saved.managed.values() {
+                let keep = m.up || m.pid.is_some();
+                *by_session.entry(m.mux_session.clone()).or_default() |= keep;
+            }
+            let close: Vec<String> = by_session
+                .into_iter()
+                .filter(|(_, keep)| !keep)
+                .map(|(s, _)| s)
+                .collect();
+            let codex_left = st.seats.values().any(|s| {
+                s.harness == Some(Harness::Codex)
+                    && !matches!(s.state, SeatState::Offline | SeatState::Dormant)
+            }) || st
+                .saved
+                .managed
+                .values()
+                .any(|m| m.harness == "codex" && m.pid.is_some());
+            (close, codex_left)
+        };
+        for s in &close {
+            if let Err(e) = self.mux.kill_session(s).await {
+                tracing::warn!("closing {s}: {e:#}");
+            }
+        }
+        if !codex_left {
+            self.codex.shutdown().await;
+        }
+        self.presence_kick.notify_one();
+        self.save_now();
+        json!({"stopped": targets, "still_running": left, "closed_sessions": close})
+    }
+
+    pub(super) async fn sup_forget(&self, seats: Vec<String>) -> Value {
+        let targets = match self.targets(&seats) {
+            Ok(t) => t,
+            Err(e) => return json!({"error": e}),
+        };
+        let _ = self.sup_down(targets.clone()).await;
+        let mut st = self.lock();
+        for s in &targets {
+            st.saved.managed.remove(s);
+            st.sup.remove(s);
+            st.set_state(s, SeatState::Offline);
+        }
+        st.save_dirty = true;
+        drop(st);
+        self.save_now();
+        json!({"forgotten": targets})
+    }
+
+    pub(super) async fn sup_sleep(&self, seat: &str) -> Value {
+        if let Err(e) = self.targets(&[seat.to_string()]) {
+            return json!({"error": e});
+        }
+        {
+            let mut st = self.lock();
+            let up = st.saved.managed.get(seat).is_some_and(|m| m.up);
+            if !up {
+                return json!({"error": format!("seat {seat} is down; start it with amail up or amail wake")});
+            }
+            st.start_queue.retain(|n| n != seat);
+            self.begin_stop(&mut st, seat, Intent::Sleep);
+        }
+        let left = self.wait_stopped(&[seat.to_string()]).await;
+        self.presence_kick.notify_one();
+        json!({"seat": seat, "asleep": left.is_empty()})
+    }
+
+    pub(super) fn sup_wake(&self, seat: &str) -> Value {
+        if let Err(e) = self.targets(&[seat.to_string()]) {
+            return json!({"error": e});
+        }
+        let mut st = self.lock();
+        let running = st.saved.managed.get(seat).is_some_and(|m| m.pid.is_some());
+        if let Some(m) = st.saved.managed.get_mut(seat) {
+            m.up = true;
+            m.dormant = false;
+            m.failed = false;
+            m.failures = 0;
+        }
+        if let Some(rt) = st.sup.get_mut(seat) {
+            rt.retry_at = None;
+        }
+        st.save_dirty = true;
+        drop(st);
+        self.sup_kick.notify_one();
+        json!({"seat": seat, "action": if running { "running" } else { "starting" }})
+    }
+
+    pub(super) fn sup_ps(&self) -> Value {
+        let st = self.lock();
+        let now = Instant::now();
+        let mut rows: Vec<PsRow> = st
+            .saved
+            .managed
+            .iter()
+            .map(|(name, m)| {
+                let s = st.seats.get(name);
+                let rt = st.sup.get(name).cloned().unwrap_or_default();
+                let running = m.pid.is_some();
+                let state = if m.failed {
+                    "failed".to_string()
+                } else if rt.stopping.is_some() {
+                    "stopping".into()
+                } else if !running && rt.retry_at.is_some_and(|t| t > now) {
+                    "restarting".into()
+                } else if rt.queued || rt.opening || (rt.starting_since.is_some() && !rt.hooked) {
+                    "starting".into()
+                } else if running {
+                    match s.map(|s| s.state) {
+                        Some(SeatState::Offline) | None => "starting".into(),
+                        Some(x) => x.as_str().to_string(),
+                    }
+                } else if m.dormant {
+                    "dormant".into()
+                } else {
+                    "offline".into()
+                };
+                let mut attention = rt.blocked.clone();
+                if attention.is_none() && s.is_some_and(|s| s.state == SeatState::Awaiting) {
+                    attention = Some((
+                        "permission".into(),
+                        format!("waiting for a permission decision: answer it in the pane (amail attach {name})"),
+                    ));
+                }
+                if attention.is_none() && m.failed {
+                    attention = Some((
+                        "failed".into(),
+                        format!(
+                            "{} ({} times in a row); look at the pane (amail attach {name}), then amail wake {name}",
+                            m.last_exit.clone().unwrap_or_else(|| "failed".into()),
+                            m.failures
+                        ),
+                    ));
+                }
+                if attention.is_none() && s.is_some_and(|s| s.wake_failed) {
+                    attention = Some((
+                        "wake-failed".into(),
+                        format!("wake-ups are not answered; look at the pane (amail attach {name})"),
+                    ));
+                }
+                let (tag, hint) = attention.unzip();
+                PsRow {
+                    seat: name.clone(),
+                    group: m.group.clone(),
+                    harness: m.harness.clone(),
+                    state,
+                    mux_session: m.mux_session.clone(),
+                    pane: m.pane,
+                    pid: m.pid,
+                    pending: s.map_or(0, |s| s.pending.total() + s.stash.len() as i64),
+                    last_activity: s.filter(|s| s.last_activity > 0).map(|s| ts(s.last_activity)),
+                    attention: tag,
+                    hint,
+                    restarts: m.failures,
+                }
+            })
+            .collect();
+        rows.sort_by(|a, b| (&a.mux_session, &a.seat).cmp(&(&b.mux_session, &b.seat)));
+        json!({"connected": st.connected, "seats": rows})
+    }
+
+    pub(super) fn sup_locate(&self, target: &str) -> Value {
+        let st = self.lock();
+        let (session, pane) = if let Some(m) = st.saved.managed.get(target) {
+            (m.mux_session.clone(), m.pane)
+        } else if let Some(m) = st
+            .saved
+            .managed
+            .values()
+            .find(|m| m.group.as_deref().unwrap_or("main") == target)
+        {
+            (m.mux_session.clone(), None)
+        } else {
+            return json!({"error": format!("no supervised seat or group {target:?} (see amail ps)")});
+        };
+        json!({
+            "session": session,
+            "pane": pane,
+            "commands": self.mux.attach_commands(&session, pane),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn screens_that_need_a_person() {
+        let trust =
+            "Do you trust the files in this folder?\n/w/a\n❯ 1. Yes, proceed\n  2. No, exit";
+        assert_eq!(
+            classify_screen(trust, "a", "/w/a").map(|x| x.0),
+            Some("trust-prompt".into())
+        );
+        let login = "Invalid API key · Please run /login";
+        assert_eq!(
+            classify_screen(login, "a", "/w").map(|x| x.0),
+            Some("login".into())
+        );
+        assert_eq!(classify_screen("> ready", "a", "/w"), None);
+        let id = uuid_v4();
+        assert_eq!(id.len(), 36);
+        assert_eq!(&id[14..15], "4");
+    }
+}

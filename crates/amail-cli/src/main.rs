@@ -2,6 +2,7 @@
 
 mod client;
 mod output;
+mod team_cmd;
 
 use amail_proto::{self as p, DeliveryMode, PostPolicy};
 use anyhow::{Context, Result, bail};
@@ -137,10 +138,45 @@ enum Cmd {
         /// Override the seat's harness (`claude` or `codex`).
         #[arg(long)]
         harness: Option<String>,
+        /// The node socket (default: AMAIL_NODE_SOCK, then the standard path).
+        #[arg(long)]
+        socket: Option<PathBuf>,
         /// Extra arguments for the harness, after `--`.
         #[arg(last = true)]
         extra: Vec<String>,
     },
+    /// Bring a team up from a team file: create or update its seats and
+    /// lists, prepare working directories, start the sessions (in zellij,
+    /// supervised by the node). Running it again applies only the changes.
+    Up {
+        /// The team file.
+        #[arg(short, long, default_value = "amail.toml")]
+        file: PathBuf,
+        /// Only start (or place) these groups or seats (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        only: Vec<String>,
+        /// Update seats, lists and working directories; start nothing.
+        #[arg(long)]
+        no_start: bool,
+        /// Delete seats (and generated lists) that are no longer in the file.
+        #[arg(long)]
+        prune: bool,
+    },
+    /// Stop the team's sessions (seats are kept and go offline).
+    Down {
+        /// Only these groups or seats (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        only: Vec<String>,
+    },
+    /// One line per supervised seat: state, pane, pending mail, activity,
+    /// and whether a person is needed.
+    Ps,
+    /// Attach this terminal to a group's zellij session, focused on a seat.
+    Attach { target: String },
+    /// End a seat's process but keep its session; mail starts it again.
+    Sleep { seat: String },
+    /// Start a sleeping or stopped seat now.
+    Wake { seat: String },
 }
 
 #[derive(Args)]
@@ -189,6 +225,11 @@ struct NodeArgs {
     claude_bin: String,
     #[arg(long, env = "AMAIL_CODEX_BIN", default_value = "codex")]
     codex_bin: String,
+    #[arg(long, env = "AMAIL_ZELLIJ_BIN", default_value = "zellij")]
+    zellij_bin: String,
+    /// Most supervised sessions starting at once.
+    #[arg(long, default_value_t = 4)]
+    start_limit: usize,
     /// auth.json that the node's Codex home links to (default: ~/.codex/auth.json).
     #[arg(long, env = "AMAIL_CODEX_AUTH")]
     codex_auth: Option<PathBuf>,
@@ -361,10 +402,11 @@ fn main() -> ExitCode {
     if let Cmd::Run {
         seat,
         harness,
+        socket,
         extra,
     } = &cli.cmd
     {
-        return match run_seat(seat, harness.clone(), extra.clone()) {
+        return match run_seat(seat, harness.clone(), socket.clone(), extra.clone()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {e:#}");
@@ -386,12 +428,12 @@ fn main() -> ExitCode {
 }
 
 /// Print either the raw JSON or the text rendering.
-struct Out {
+pub(crate) struct Out {
     json: bool,
 }
 
 impl Out {
-    fn show(&self, v: &Value, text: impl FnOnce() -> Result<String>) -> Result<()> {
+    pub(crate) fn show(&self, v: &Value, text: impl FnOnce() -> Result<String>) -> Result<()> {
         if self.json {
             println!("{}", serde_json::to_string(v)?);
         } else {
@@ -437,6 +479,11 @@ async fn run(cli: Cli) -> Result<()> {
             return create_org(&db, &org, &user_name, &out).await;
         }
         Cmd::Node(NodeCli { cmd: None, run }) => return node_daemon(run).await,
+        Cmd::Down { only } => return team_cmd::down(&only, &out),
+        Cmd::Ps => return team_cmd::ps(&out),
+        Cmd::Attach { target } => return team_cmd::attach(&target),
+        Cmd::Sleep { seat } => return team_cmd::sleep(&seat, &out),
+        Cmd::Wake { seat } => return team_cmd::wake(&seat, &out),
         Cmd::Node(NodeCli {
             cmd: Some(NodeCmd::Status),
             ..
@@ -456,6 +503,11 @@ async fn run(cli: Cli) -> Result<()> {
         | Cmd::Admin(_)
         | Cmd::Hook { .. }
         | Cmd::Run { .. }
+        | Cmd::Down { .. }
+        | Cmd::Ps
+        | Cmd::Attach { .. }
+        | Cmd::Sleep { .. }
+        | Cmd::Wake { .. }
         | Cmd::Node(NodeCli { cmd: None, .. })
         | Cmd::Node(NodeCli {
             cmd: Some(NodeCmd::Status),
@@ -654,6 +706,24 @@ async fn run(cli: Cli) -> Result<()> {
                 }
                 Ok(text.join("\n"))
             })
+        }
+        Cmd::Up {
+            file,
+            only,
+            no_start,
+            prune,
+        } => {
+            team_cmd::up(
+                &c,
+                &out,
+                &team_cmd::UpOpts {
+                    file,
+                    only,
+                    no_start,
+                    prune,
+                },
+            )
+            .await
         }
         Cmd::Seat(cmd) => seat_cmd(&c, &out, cmd).await,
         Cmd::List(cmd) => list_cmd(&c, &out, cmd).await,
@@ -1000,6 +1070,8 @@ async fn node_daemon(a: NodeArgs) -> Result<()> {
     cfg.label = a.label.or(file.label).or_else(hostname);
     cfg.claude_bin = a.claude_bin;
     cfg.codex_bin = a.codex_bin;
+    cfg.zellij_bin = a.zellij_bin;
+    cfg.start_limit = a.start_limit;
     if let Some(p) = a.codex_auth {
         cfg.codex_auth = p;
     }
@@ -1050,18 +1122,52 @@ fn node_status_text(v: &Value) -> Result<String> {
     Ok(out.join("\n"))
 }
 
+/// A terminal whose size is not set yet (a pane being re-run by zellij
+/// starts at 0x0 for a moment): wait briefly so the harness starts with the
+/// pane's real width.
+fn wait_for_terminal_size() {
+    // SAFETY: isatty and ioctl(TIOCGWINSZ) only read into a local struct.
+    unsafe {
+        if libc::isatty(0) != 1 {
+            return;
+        }
+        for _ in 0..60 {
+            let mut ws: libc::winsize = std::mem::zeroed();
+            if libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
 /// `amail run`: ask the node how to start the seat's harness, then exec it.
-fn run_seat(seat: &str, harness: Option<String>, extra: Vec<String>) -> Result<()> {
+fn run_seat(
+    seat: &str,
+    harness: Option<String>,
+    socket: Option<PathBuf>,
+    extra: Vec<String>,
+) -> Result<()> {
     use std::os::unix::process::CommandExt;
     let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
+    let socket = socket.unwrap_or_else(amail_node::paths::socket);
+    let pane = std::env::var("ZELLIJ_PANE_ID")
+        .ok()
+        .and_then(|p| p.trim().parse().ok());
+    let mux_session = std::env::var("ZELLIJ_SESSION_NAME")
+        .ok()
+        .filter(|s| !s.is_empty());
+    wait_for_terminal_size();
     let v = amail_node::request(
-        &amail_node::paths::socket(),
+        &socket,
         &amail_node::wire::Request::Launch {
             seat: seat.to_string(),
             cwd,
             pid: std::process::id(),
             harness,
             extra,
+            pane,
+            mux_session,
         },
         std::time::Duration::from_secs(180),
     )?;
