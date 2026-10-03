@@ -253,6 +253,9 @@ pub(super) fn launched(
     } else {
         st.set_state(seat, SeatState::Offline);
     }
+    // Report the seat now (with its terminal), not at its first hook: a
+    // session stuck before its first hook is when people need it most.
+    st.dirty_presence.insert(seat.to_string());
 }
 
 impl State {
