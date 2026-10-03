@@ -270,10 +270,46 @@ impl Node {
                     v
                 };
                 self.mux.maintain(&sessions).await;
+                self.check_closed_panes(&sessions).await;
             }
             tokio::select! {
                 _ = self.sup_kick.notified() => {}
                 _ = tokio::time::sleep(self.cfg.supervise_interval) => {}
+            }
+        }
+    }
+
+    /// A person closed a running seat's pane: its process may live on,
+    /// invisible. Stop it; the seat is down until `amail up` or `wake`.
+    async fn check_closed_panes(&self, sessions: &[String]) {
+        for session in sessions {
+            let Ok(Some(panes)) = self.mux.panes(session).await else {
+                continue;
+            };
+            let gone: Vec<String> = {
+                let st = self.lock();
+                st.saved
+                    .managed
+                    .iter()
+                    .filter(|(n, m)| {
+                        &m.mux_session == session
+                            && m.pid.is_some()
+                            && m.pane.is_some_and(|p| !panes.iter().any(|x| x.id == p))
+                            && st.sup.get(*n).is_none_or(|r| {
+                                !r.opening && r.starting_since.is_none() && r.stopping.is_none()
+                            })
+                    })
+                    .map(|(n, _)| n.clone())
+                    .collect()
+            };
+            for n in gone {
+                tracing::warn!("seat {n}: its pane was closed; stopping the seat");
+                let mut st = self.lock();
+                if let Some(m) = st.saved.managed.get_mut(&n) {
+                    m.pane = None;
+                    m.last_exit = Some("its pane was closed".into());
+                }
+                self.begin_stop(&mut st, &n, Intent::Down);
             }
         }
     }
@@ -480,6 +516,7 @@ impl Node {
             cwd: PathBuf::from(&m.cwd),
             argv: self.pane_argv(seat),
         };
+        let opened_at = Instant::now();
         let r = async {
             if let Some(p) = m.pane
                 && let Some(panes) = self.mux.panes(&m.mux_session).await?
@@ -500,10 +537,16 @@ impl Node {
         match r {
             Ok(pane) => {
                 tracing::info!("seat {seat}: started in {} pane {pane}", m.mux_session);
-                rt.starting_since = Some(Instant::now());
-                rt.holds_slot = true;
-                rt.hooked = false;
-                rt.probed_at = None;
+                // The session may have launched (and even hooked) before
+                // the multiplexer call returned.
+                if rt.launched_at.is_some_and(|t| t >= opened_at) {
+                    rt.holds_slot = !rt.hooked && rt.starting_since.is_some();
+                } else {
+                    rt.starting_since = Some(Instant::now());
+                    rt.holds_slot = true;
+                    rt.hooked = false;
+                    rt.probed_at = None;
+                }
                 if let Some(m) = st.saved.managed.get_mut(seat) {
                     m.pane = Some(pane);
                     m.dormant = false;

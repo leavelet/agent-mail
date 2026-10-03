@@ -1,10 +1,9 @@
 //! Terminal multiplexing: where supervised sessions run.
 //!
 //! [`Mux`] is the small interface the supervisor uses. [`Zellij`] is the
-//! real implementation: one zellij session per team group, one named pane
-//! per seat, panes stacked (every pane full width) in tabs of at most
-//! [`crate::team::PANES_PER_TAB`]. [`ProcessMux`] runs "panes" as plain child
-//! processes, for tests.
+//! real implementation: one zellij session per team group, one tab per seat
+//! holding one pane named after the seat. [`ProcessMux`] runs "panes" as
+//! plain child processes, for tests.
 //!
 //! # Pane width without a human attached
 //!
@@ -26,14 +25,18 @@
 //! starts with the environment the node chose, not the caller's).
 //!
 //! A connected client is also needed for zellij 0.45 to apply layout
-//! changes reliably: without one, `new-tab` and `run --stacked` start their
-//! commands but the panes never appear in the layout.
+//! changes reliably: without one, `new-tab` starts its command but the pane
+//! never appears in the layout.
 //!
-//! Panes are stacked: in a stack every pane has the full width of the tab
-//! and only one is expanded, so 24 seats in one tab still get 200 columns
-//! each. A pane whose command exits is kept ("held") with its last output;
-//! the supervisor restarts the seat in the same pane (zellij re-runs a held
-//! pane's command on Enter) so a seat keeps its place.
+//! Every pane has a tab of its own, so it always gets the full width. (Not
+//! several panes per tab: tiling would split the width, and stacked panes
+//! are fragile in zellij 0.45: once the focused pane of a stack is closed,
+//! panes added to the stack never appear, and moving the focus can crash
+//! the session's server.) A pane whose command exits is kept ("held") with
+//! its last output; the supervisor restarts the seat in the same pane
+//! (zellij re-runs a held pane's command on Enter), so a seat keeps its
+//! place. A re-run command starts on a 0x0 pty until the pane prints
+//! something; `amail run` prints a line first and waits for the size.
 
 use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
@@ -220,10 +223,6 @@ fn kdl(s: &str) -> String {
     out
 }
 
-fn pane_id(s: &str) -> Option<u32> {
-    s.trim().strip_prefix("terminal_")?.trim().parse().ok()
-}
-
 impl Zellij {
     pub fn new(bin: &str, state_dir: &Path, cols: u16, rows: u16) -> Zellij {
         Zellij {
@@ -285,9 +284,9 @@ impl Zellij {
         let args: Vec<String> = args.iter().map(|a| kdl(a)).collect();
         format!(
             "layout {{\n    tab name={tab} {{\n        pane size=1 borderless=true {{\n            \
-             plugin location=\"zellij:tab-bar\"\n        }}\n        pane stacked=true {{\n            \
-             pane name={name} command={cmd} cwd={cwd} {{\n                args {args}\n            }}\n        \
-             }}\n        pane size=2 borderless=true {{\n            plugin location=\"zellij:status-bar\"\n        \
+             plugin location=\"zellij:tab-bar\"\n        }}\n        \
+             pane name={name} command={cmd} cwd={cwd} {{\n            args {args}\n        }}\n        \
+             pane size=2 borderless=true {{\n            plugin location=\"zellij:status-bar\"\n        \
              }}\n    }}\n}}\n",
             tab = kdl(tab),
             name = kdl(&spec.name),
@@ -350,28 +349,33 @@ impl Zellij {
         }
     }
 
-    async fn ensure_client(&self, session: &str) -> Result<()> {
-        if !self.client_running(session) {
-            self.spawn_client(session, None)?;
-        }
-        self.wait_client(session).await
+    async fn has_client(&self, session: &str) -> bool {
+        matches!(
+            self.run(&["--session", session, "action", "list-clients"]).await,
+            Ok(out) if out.lines().skip(1).any(|l| !l.trim().is_empty())
+        )
     }
 
-    async fn tabs(&self, session: &str) -> Result<Vec<(u64, String)>> {
-        let out = self
-            .run(&["--session", session, "action", "list-tabs", "--json"])
-            .await?;
-        let v: serde_json::Value = serde_json::from_str(&out).context("parsing list-tabs")?;
-        Ok(v.as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|t| {
-                Some((
-                    t.get("tab_id").or_else(|| t.get("id"))?.as_u64()?,
-                    t.get("name")?.as_str()?.to_string(),
-                ))
-            })
-            .collect())
+    /// Make sure our headless client is attached. One that zellij no longer
+    /// lists (a client can lose its focus when panes are closed under it)
+    /// is replaced.
+    async fn ensure_client(&self, session: &str) -> Result<()> {
+        if self.client_running(session) {
+            if self.has_client(session).await {
+                return Ok(());
+            }
+            if let Some(mut h) = self
+                .clients
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(session)
+            {
+                tracing::info!("replacing the headless client of zellij session {session}");
+                h.kill();
+            }
+        }
+        self.spawn_client(session, None)?;
+        self.wait_client(session).await
     }
 
     async fn find_pane(&self, session: &str, tab: &str, name: &str) -> Result<u32> {
@@ -408,27 +412,29 @@ impl Mux for Zellij {
             return self.find_pane(session, tab, &spec.name).await;
         }
         self.ensure_client(session).await?;
-        let tabs = self.tabs(session).await?;
-        if let Some((id, _)) = tabs.iter().find(|(_, n)| n == tab) {
-            let id = id.to_string();
-            let cwd = spec.cwd.to_string_lossy().into_owned();
-            let mut args = vec![
+        // The seat's tab may still be there (e.g. after a node restart).
+        if let Some(p) = self
+            .panes(session)
+            .await?
+            .into_iter()
+            .flatten()
+            .find(|p| p.tab == tab && p.name == spec.name)
+        {
+            if !p.exited {
+                bail!("tab {tab} of {session} already runs pane terminal_{}", p.id);
+            }
+            let id = format!("terminal_{}", p.id);
+            self.run(&[
                 "--session",
                 session,
-                "run",
-                "--stacked",
-                "--tab-id",
+                "action",
+                "send-keys",
+                "--pane-id",
                 &id,
-                "--no-focus",
-                "--name",
-                &spec.name,
-                "--cwd",
-                &cwd,
-                "--",
-            ];
-            args.extend(spec.argv.iter().map(String::as_str));
-            let out = self.run(&args).await?;
-            return pane_id(&out).with_context(|| format!("zellij run printed {out:?}"));
+                "Enter",
+            ])
+            .await?;
+            return Ok(p.id);
         }
         let layout = self.write_layout(session, tab, spec)?;
         let l = layout.to_string_lossy().into_owned();
@@ -789,13 +795,11 @@ mod tests {
             },
         );
         assert!(t.contains("tab name=\"backend\""), "{t}");
-        assert!(t.contains("pane stacked=true"), "{t}");
+        assert!(!t.contains("stacked"), "{t}");
         assert!(
             t.contains("pane name=\"be-1\" command=\"/bin/amail\" cwd=\"/w/be \\\"1\\\"\""),
             "{t}"
         );
         assert!(t.contains("args \"run\" \"be-1\""), "{t}");
-        assert_eq!(pane_id("terminal_12\n"), Some(12));
-        assert_eq!(pane_id("plugin_1"), None);
     }
 }

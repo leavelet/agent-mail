@@ -29,15 +29,12 @@
 
 use amail_proto::{PermissionMode, valid_name};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Names `amail up` uses for generated lists; seats and groups cannot take them.
 pub const RESERVED_LISTS: &[&str] = &["leads", "all"];
-
-/// Most seats one zellij tab holds; more go to further tabs.
-pub const PANES_PER_TAB: usize = 24;
 
 const MAX_WORKERS: u32 = 200;
 
@@ -746,23 +743,13 @@ impl Team {
     }
 
     /// `(seat, session group, tab)` for every seat: each session holds the
-    /// seats of one group (ungrouped seats share `main`), at most
-    /// [`PANES_PER_TAB`] per tab; tabs are named after the group, then
-    /// `<group>-2`, `<group>-3`, ...
+    /// seats of one group (ungrouped seats share `main`), one tab per seat,
+    /// named after the seat (see [`crate::mux`] for why not several panes
+    /// per tab).
     pub fn placements(&self) -> Vec<(String, String, String)> {
-        let mut count: BTreeMap<String, usize> = BTreeMap::new();
         self.seats
             .iter()
-            .map(|s| {
-                let g = self.session_group(&s.name);
-                let n = count.entry(g.clone()).or_default();
-                let tab = match *n / PANES_PER_TAB {
-                    0 => g.clone(),
-                    k => format!("{g}-{}", k + 1),
-                };
-                *n += 1;
-                (s.name.clone(), g, tab)
-            })
+            .map(|s| (s.name.clone(), self.session_group(&s.name), s.name.clone()))
             .collect()
     }
 }
@@ -896,24 +883,10 @@ cwd = "docs"
         assert!(t.select(&["nope".into()]).is_err());
 
         let p = t.placements();
-        assert!(p.contains(&("root".into(), "main".into(), "main".into())));
-        assert!(p.contains(&("docs".into(), "main".into(), "main".into())));
-        assert!(p.contains(&("be-3".into(), "backend".into(), "backend".into())));
-        assert!(p.contains(&("db-1".into(), "db".into(), "db".into())));
-    }
-
-    #[test]
-    fn big_groups_spill_into_more_tabs() {
-        let t = team(
-            "[team]\nworkroot = \"/w\"\n[[group]]\nname = \"big\"\nlead = { name = \"l\", harness = \"claude\" }\n\
-             workers = { count = 30, harness = \"codex\" }\n",
-        )
-        .unwrap();
-        let p = t.placements();
-        assert_eq!(p.len(), 31);
-        assert_eq!(p[23].2, "big");
-        assert_eq!(p[24].2, "big-2");
-        assert_eq!(p[30], ("big-30".into(), "big".into(), "big-2".into()));
+        assert!(p.contains(&("root".into(), "main".into(), "root".into())));
+        assert!(p.contains(&("docs".into(), "main".into(), "docs".into())));
+        assert!(p.contains(&("be-3".into(), "backend".into(), "be-3".into())));
+        assert!(p.contains(&("db-1".into(), "db".into(), "db-1".into())));
     }
 
     #[test]

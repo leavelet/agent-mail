@@ -1122,22 +1122,28 @@ fn node_status_text(v: &Value) -> Result<String> {
     Ok(out.join("\n"))
 }
 
-/// A terminal whose size is not set yet (a pane being re-run by zellij
-/// starts at 0x0 for a moment): wait briefly so the harness starts with the
-/// pane's real width.
-fn wait_for_terminal_size() {
-    // SAFETY: isatty and ioctl(TIOCGWINSZ) only read into a local struct.
-    unsafe {
-        if libc::isatty(0) != 1 {
+/// A terminal whose size is not set yet: zellij re-runs a held pane's
+/// command on a pty of size 0x0 and applies the pane's size only once the
+/// pane prints something. Print a line, then wait briefly for the size, so
+/// the harness starts with the pane's real width.
+fn wait_for_terminal_size(seat: &str) {
+    let size = || {
+        // SAFETY: ioctl(TIOCGWINSZ) only writes into a local struct.
+        unsafe {
+            let mut ws: libc::winsize = std::mem::zeroed();
+            (libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) == 0).then_some(ws.ws_col)
+        }
+    };
+    // SAFETY: isatty has no preconditions.
+    if unsafe { libc::isatty(0) } != 1 || size() != Some(0) {
+        return;
+    }
+    eprintln!("amail: starting seat {seat}");
+    for _ in 0..60 {
+        if size().is_some_and(|c| c > 0) {
             return;
         }
-        for _ in 0..60 {
-            let mut ws: libc::winsize = std::mem::zeroed();
-            if libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 
@@ -1157,7 +1163,7 @@ fn run_seat(
     let mux_session = std::env::var("ZELLIJ_SESSION_NAME")
         .ok()
         .filter(|s| !s.is_empty());
-    wait_for_terminal_size();
+    wait_for_terminal_size(seat);
     let v = amail_node::request(
         &socket,
         &amail_node::wire::Request::Launch {
