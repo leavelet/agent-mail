@@ -1,0 +1,295 @@
+<script lang="ts">
+  import { store } from '../lib/store.svelte';
+  import { t, ui } from '../lib/ui.svelte';
+  import { href, go } from '../lib/router.svelte';
+  import { get, qs, ApiError } from '../lib/api';
+  import { effectiveState, freshPresence, stateAge, nodeOpBlock } from '../lib/presence';
+  import { duration } from '../lib/time';
+  import { fromEntry, fromHeader, newestFirst, type MailRow } from '../lib/mailrows';
+  import type { ArchiveResponse, InboxResponse } from '../lib/types';
+  import StateBadge from './StateBadge.svelte';
+  import Transcript from './Transcript.svelte';
+  import MailList from './MailList.svelte';
+
+  let { name }: { name: string } = $props();
+
+  type Tab = 'mirror' | 'inbox' | 'sent';
+  let tab = $state<Tab>('mirror');
+  let rows = $state.raw<MailRow[]>([]);
+  let mailError = $state<string | null>(null);
+  let opMsg = $state<string | null>(null);
+  let opBusy = $state(false);
+  let copied = $state(false);
+
+  const seat = $derived(store.seatMap.get(name));
+  const now = $derived(ui.now);
+  const p = $derived(seat ? freshPresence(seat.presence, now) : undefined);
+  const seatState = $derived(seat ? effectiveState(seat, now) : 'offline');
+  const age = $derived(seat ? stateAge(seat, now) : undefined);
+  const children = $derived(store.seats.filter((s) => s.parent === name).map((s) => s.name));
+  const block = $derived(seat ? nodeOpBlock(seat, now) : 'noPresence');
+  const seq = $derived(store.counts.get(name)?.seq ?? 0);
+  const attachCmd = $derived(`amail attach ${name}`);
+
+  // Reload the mail tab when the seat's mailbox changes.
+  $effect(() => {
+    void seq;
+    if (tab === 'mirror') return;
+    const which = tab;
+    mailError = null;
+    const load =
+      which === 'inbox'
+        ? get<InboxResponse>(`/v1/inbox${qs({ seat: name, before_seq: Number.MAX_SAFE_INTEGER, limit: 100 })}`).then((r) =>
+            newestFirst(r.entries.map(fromEntry)),
+          )
+        : get<ArchiveResponse>(`/v1/sent${qs({ seat: name, limit: 100 })}`).then((r) => r.messages.map(fromHeader));
+    load
+      .then((r) => {
+        if (tab === which) rows = r;
+      })
+      .catch((e) => (mailError = e instanceof Error ? e.message : String(e)));
+  });
+
+  async function op(kind: 'sleep' | 'wake') {
+    opBusy = true;
+    opMsg = null;
+    try {
+      const r = await store.seatOp(name, kind);
+      opMsg = t('seat.opSent', { op: t(kind === 'sleep' ? 'seat.sleep' : 'seat.wake'), n: r.nodes });
+    } catch (e) {
+      opMsg = e instanceof ApiError && e.code === 'node_offline' ? t('seat.disabled.noNode') : e instanceof Error ? e.message : String(e);
+    } finally {
+      opBusy = false;
+    }
+  }
+
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(attachCmd);
+      copied = true;
+      setTimeout(() => (copied = false), 1500);
+    } catch {
+      // Clipboard unavailable: the command is selectable text.
+    }
+  }
+
+  const blockReason = $derived(block ? t(`seat.disabled.${block}`) : '');
+  const attnText = $derived.by(() => {
+    const a = p?.attention;
+    if (!a) return null;
+    const k = `attn.${a}`;
+    return ['attn.trust-prompt', 'attn.login', 'attn.permission', 'attn.failed', 'attn.wake-failed', 'attn.no-activity'].includes(k) ? t(k as 'attn.login') : a;
+  });
+</script>
+
+{#if !seat}
+  <div class="empty">{store.seats.length ? t('seat.notFound', { name }) : t('app.loading')}</div>
+{:else}
+  <div class="detail">
+    <div class="head">
+      <div class="title">
+        <h1 class="mono">{seat.name}</h1>
+        {#if seat.display_name}<span class="muted">{seat.display_name}</span>{/if}
+        {#if seat.kind === 'agent'}<StateBadge state={seatState} {age} />{:else}<span class="chip neutral">{t('org.you')}</span>{/if}
+      </div>
+      <div class="actions row wrap">
+        {#if seat.kind === 'agent'}
+          <a class="btnlike primary" href={href(['compose'], { to: seat.name })}>{t('seat.write')}</a>
+          <button disabled={!!block || opBusy} title={blockReason} onclick={() => op('sleep')}>{t('seat.sleep')}</button>
+          <button disabled={!!block || opBusy} title={blockReason} onclick={() => op('wake')}>{t('seat.wake')}</button>
+        {/if}
+        <button class="ghost small close" aria-label="close" onclick={() => go(['org'])}>✕</button>
+      </div>
+    </div>
+    {#if block && seat.kind === 'agent'}<p class="faint reason">{blockReason}</p>{/if}
+    {#if opMsg}<p class="opmsg" role="status">{opMsg}</p>{/if}
+
+    {#if attnText || p?.wake_failed}
+      <div class="alert" role="alert">
+        <strong>⚠ {t('seat.attention')}{attnText ? `: ${attnText}` : ''}</strong>
+        {#if p?.attention_hint}<span>{p.attention_hint}</span>{:else if p?.wake_failed}<span>{t('seat.wakeFailed')}</span>{/if}
+      </div>
+    {/if}
+
+    <dl class="facts">
+      <dt>{t('seat.parent')}</dt>
+      <dd>{#if seat.parent}<a class="mono" href={href(['org', seat.parent])}>{seat.parent}</a>{:else}<span class="faint">{t('seat.none')}</span>{/if}</dd>
+      <dt>{t('seat.children')}</dt>
+      <dd class="kids">
+        {#if children.length === 0}<span class="faint">{t('seat.none')}</span>{/if}
+        {#each children.slice(0, 40) as c}<a class="mono" href={href(['org', c])}>{c}</a>{/each}
+        {#if children.length > 40}<span class="faint">+{children.length - 40}</span>{/if}
+      </dd>
+      {#if seat.kind === 'agent'}
+        <dt>{t('seat.state')}</dt>
+        <dd>{t(`state.${seatState}.long`)}{#if age !== undefined} · {t('seat.for', { d: duration(age, ui.lang) })}{/if}</dd>
+        <dt>{t('seat.harness')}</dt>
+        <dd>{[seat.harness ?? p?.harness, seat.model].filter(Boolean).join(' · ') || '—'}{#if seat.permission_mode} · <span class="faint">{seat.permission_mode}</span>{/if}</dd>
+        <dt>{t('seat.node')}</dt>
+        <dd>{#if p?.node}<span class="mono">{p.node}</span>{:else if p}<span class="faint">—</span>{:else}<span class="faint">{t('seat.noNode')}</span>{/if}</dd>
+        {#if seat.group}<dt>{t('seat.group')}</dt><dd class="mono">{seat.group}</dd>{/if}
+        <dt>{t('seat.terminal')}</dt>
+        <dd>
+          {#if p?.terminal_url}
+            <a href={p.terminal_url} target="_blank" rel="noopener noreferrer">{t('seat.openTerminal')} ↗</a>
+          {:else}
+            <span class="faint">{t('seat.attachCmd')}</span>
+            <code class="cmd">{attachCmd}</code>
+            <button class="small ghost" onclick={copy}>{copied ? t('seat.copied') : t('seat.copy')}</button>
+          {/if}
+        </dd>
+      {/if}
+    </dl>
+    <details class="role" open={!!seat.role && seat.role.length < 400}>
+      <summary>{t('seat.role')}</summary>
+      {#if seat.role}<pre>{seat.role}</pre>{:else}<p class="faint">{t('seat.noRole')}</p>{/if}
+    </details>
+
+    <div class="tabs" role="tablist">
+      {#if seat.kind === 'agent'}
+        <button role="tab" aria-selected={tab === 'mirror'} onclick={() => (tab = 'mirror')}>{t('seat.mirror')}</button>
+      {/if}
+      <button role="tab" aria-selected={tab === 'inbox'} onclick={() => (tab = 'inbox')}>
+        {t('seat.inbox')}{#if store.counts.get(name)?.unread}<span class="count hot">{store.counts.get(name)?.unread}</span>{/if}
+      </button>
+      <button role="tab" aria-selected={tab === 'sent'} onclick={() => (tab = 'sent')}>{t('seat.sent')}</button>
+    </div>
+    <div class="tabbody">
+      {#if tab === 'mirror' && seat.kind === 'agent'}
+        <Transcript seat={seat.name} />
+      {:else if tab === 'mirror'}
+        <div class="empty">—</div>
+      {:else if mailError}
+        <p class="error">{mailError}</p>
+      {:else if rows.length === 0}
+        <div class="empty">{t('mail.empty')}</div>
+      {:else}
+        <div class="mail card">
+          <MailList
+            {rows}
+            showTo={tab === 'sent'}
+            label={tab === 'sent' ? t('seat.sent') : t('seat.inbox')}
+            onselect={(r) => go(['thread', r.thread_id], { m: r.id })}
+          />
+        </div>
+      {/if}
+    </div>
+  </div>
+{/if}
+
+<style>
+  .detail {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px 16px;
+    height: 100%;
+    min-height: 0;
+    overflow: hidden;
+  }
+  .head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .title {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 1;
+    min-width: 0;
+  }
+  h1 {
+    font-size: 17px;
+  }
+  .btnlike {
+    display: inline-block;
+    border-radius: var(--radius);
+    padding: 3px 10px;
+    line-height: 20px;
+    border: 1px solid var(--accent);
+  }
+  .btnlike.primary {
+    background: var(--accent);
+    color: var(--accent-text);
+    font-weight: 600;
+  }
+  .btnlike:hover {
+    text-decoration: none;
+    filter: brightness(1.08);
+  }
+  .reason,
+  .opmsg {
+    margin: 0;
+    font-size: 12px;
+  }
+  .alert {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 7px 10px;
+    border-radius: var(--radius);
+    background: var(--danger-weak);
+    color: var(--danger);
+  }
+  .alert span {
+    color: var(--text);
+  }
+  .facts {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 3px 14px;
+    margin: 0;
+  }
+  dt {
+    color: var(--muted);
+  }
+  dd {
+    margin: 0;
+    min-width: 0;
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  .kids {
+    gap: 4px 10px;
+  }
+  .cmd {
+    padding: 1px 6px;
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    user-select: all;
+  }
+  .role summary {
+    cursor: pointer;
+    color: var(--muted);
+  }
+  .role pre {
+    margin-top: 4px;
+    padding: 8px 10px;
+    background: var(--surface-2);
+    border-radius: var(--radius);
+    font-family: var(--font);
+    max-height: 180px;
+    overflow: auto;
+  }
+  .role p {
+    margin: 4px 0;
+  }
+  .tabs .count {
+    margin-left: 5px;
+  }
+  .tabbody {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .mail {
+    overflow: auto;
+    min-height: 0;
+  }
+</style>
