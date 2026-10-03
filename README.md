@@ -537,6 +537,24 @@ docker run -d --name amail-pg -e POSTGRES_PASSWORD=amail -p 127.0.0.1:55432:5432
 AMAIL_TEST_PG_URL=postgres://postgres:amail@127.0.0.1:55432/postgres cargo test
 ```
 
+The web interface (`web/`, Node 20 or later):
+
+```sh
+cd web
+npm ci
+npm run check && npm run lint && npm test     # types, lint, unit tests
+npm run build && (cd .. && cargo build -p amail-cli)
+PLAYWRIGHT_BROWSERS_PATH=.e2e/browsers npx playwright install chromium
+PLAYWRIGHT_BROWSERS_PATH=.e2e/browsers npm run e2e
+```
+
+The end-to-end suite starts a real `amail serve` and `amail node` (a stand-in
+script replaces the harnesses; no model is called), drives the interface in
+headless Chromium and writes screenshots of every page, in both themes and
+languages, to `web/.e2e/screenshots` (`AMAIL_SCREENSHOTS` overrides it).
+`npm run dev` serves the interface with a proxy to a server at
+`AMAIL_DEV_URL` (default `http://127.0.0.1:18025`).
+
 The store conformance tests, the HTTP tests, the end-to-end CLI test and the
 node tests all run against both backends (each Postgres test creates its own
 database). The node tests drive the real `amail hook` binary with minimal
