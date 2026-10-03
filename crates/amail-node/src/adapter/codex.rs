@@ -290,10 +290,11 @@ impl Codex {
         Ok(out)
     }
 
-    async fn daemon_up(&self) -> bool {
-        tokio::net::UnixStream::connect(self.control_socket())
+    /// Whether the daemon answers on its control socket (`Err`: why not).
+    async fn daemon_up(&self) -> std::io::Result<()> {
+        crate::paths::connect_unix(&self.control_socket())
             .await
-            .is_ok()
+            .map(drop)
     }
 
     /// Start the home's app-server daemon if it is not running. The daemon
@@ -301,7 +302,7 @@ impl Codex {
     /// the node socket and server URL and none of a seat's variables.
     pub async fn ensure_daemon(&self) -> Result<()> {
         let _g = self.lock.lock().await;
-        if self.daemon_up().await {
+        if self.daemon_up().await.is_ok() {
             return Ok(());
         }
         let out = tokio::process::Command::new(&self.env.codex_bin)
@@ -327,16 +328,26 @@ impl Codex {
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
+        let mut last = None;
         for _ in 0..100 {
-            if self.daemon_up().await {
-                return Ok(());
+            match self.daemon_up().await {
+                Ok(()) => return Ok(()),
+                Err(e) => last = Some(e),
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        bail!(
-            "codex daemon did not come up at {}",
-            self.control_socket().display()
-        )
+        let path = self.control_socket();
+        match last {
+            Some(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
+                "the codex daemon started but its control socket {} did not appear",
+                path.display()
+            ),
+            Some(e) => bail!(
+                "cannot connect to the codex daemon's control socket {}: {e}",
+                path.display()
+            ),
+            None => bail!("codex daemon is not reachable at {}", path.display()),
+        }
     }
 
     /// Mark `cwd` as a trusted project so the TUI starts without asking.

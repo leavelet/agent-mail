@@ -408,6 +408,7 @@ impl<'a> Resolver<'a> {
         .relative_to(&self.org.name);
         let local = target.id == self.org.id;
 
+        let mut wakes = None;
         let count = if let Some(seat) = self.seat(target.id, &addr.name).await? {
             self.add(
                 seat.id,
@@ -433,6 +434,7 @@ impl<'a> Resolver<'a> {
                 return Ok(());
             }
             let mut n = 0;
+            let mut immediate = 0;
             for m in members {
                 // Local members carry their seat id (memberships are removed
                 // when a seat is deleted); external ones are looked up.
@@ -446,7 +448,13 @@ impl<'a> Resolver<'a> {
                 if seat_id != self.sender.id {
                     self.add(seat_id, org_id, &name, class, m.mode);
                     n += 1;
+                    if m.mode == DeliveryMode::Immediate {
+                        immediate += 1;
+                    }
                 }
+            }
+            if class == DeliveryClass::To {
+                wakes = Some(immediate);
             }
             n
         } else {
@@ -464,6 +472,7 @@ impl<'a> Resolver<'a> {
             self.results.push(AddressResult {
                 address: shown,
                 seats: count,
+                wakes,
             });
         }
         Ok(())

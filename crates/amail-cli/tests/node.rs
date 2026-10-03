@@ -993,7 +993,10 @@ async fn inlined_mail_is_read(b: Backend) {
     assert_eq!(injected_ids(&t), vec![short, long]);
     assert!(t.contains("  > body of short"), "{t}");
     assert!(
-        t.contains("\"long\" · thread") && t.contains(" · 1 line"),
+        t.contains("\"long\" · thread")
+            && t.contains(&format!(
+                " · body not shown (1 line): run amail read {long}"
+            )),
         "{t}"
     );
     let state = |id: i64| {

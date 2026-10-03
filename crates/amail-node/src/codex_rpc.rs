@@ -127,7 +127,7 @@ struct Ws {
 
 impl Ws {
     async fn connect(path: &Path) -> Result<Ws> {
-        let mut s = tokio::net::UnixStream::connect(path)
+        let mut s = crate::paths::connect_unix(path)
             .await
             .with_context(|| format!("connecting to {}", path.display()))?;
         let key = {

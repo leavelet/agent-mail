@@ -94,7 +94,7 @@ fn staged_merge(team: &Team, seat: &str, main_branch: &str) -> String {
         let how = if pos == Position::Root {
             format!(
                 "merge it into `{int}` in the main checkout (`git -C {repo} merge --no-ff \
-                 <branch>`), run the tests"
+                 <commit>`), run the tests"
             )
         } else {
             let up = parent
@@ -102,7 +102,7 @@ fn staged_merge(team: &Team, seat: &str, main_branch: &str) -> String {
                 .map(|p| team.integration_branch(p, main_branch))
                 .unwrap_or_else(|| main_branch.to_string());
             format!(
-                "`git switch {int}`, `git merge --no-ff <branch>`, run the tests, then \
+                "`git switch {int}`, `git merge --no-ff <commit>`, run the tests, then \
                  `git switch {branch}`. Never rebase `{int}`: your team builds on it and the \
                  commits named in their requests must stay reachable; to catch up with \
                  `{up}`, merge it into `{int}`"
@@ -116,8 +116,11 @@ fn staged_merge(team: &Team, seat: &str, main_branch: &str) -> String {
             .unwrap_or_default();
         out.push(format!(
             "You maintain {}: they mail you merge requests (meta repo, branch, commit). \
-             Review with `git log -p {int}..<branch>`; to accept, {how}. Reply to each request \
-             with \"merged as <commit>\", \"changes needed: ...\" or \"rejected: ...\". \
+             Read each request in full (`amail read <id>`). Merge exactly the commit named in \
+             its `commit` meta, not the branch tip (the branch may have moved since); if that \
+             commit does not exist, reply \"changes needed: resubmit\". \
+             Review with `git log -p {int}..<commit>`; to accept, {how}. Reply to each request \
+             with \"merged as <merge commit>\", \"changes needed: ...\" or \"rejected: ...\". \
              When you get a requirement or interface change, forward it to every member of \
              your team it affects{list} and wait until each has confirmed; let them make \
              the changes in their own branches.",
@@ -214,7 +217,10 @@ workers = { count = 2, prefix = "be" }
         assert!(root.contains("/wt/root on branch `amail/root`"), "{root}");
         assert!(root.contains("You maintain `be-lead`"), "{root}");
         assert!(root.contains("merge it into `main`"), "{root}");
-        assert!(root.contains("git -C /repo merge --no-ff"), "{root}");
+        assert!(
+            root.contains("git -C /repo merge --no-ff <commit>"),
+            "{root}"
+        );
         assert!(!root.contains("Your maintainer"), "{root}");
         assert!(root.ends_with("\n\nOverall technical lead."), "{root}");
 
@@ -229,7 +235,10 @@ workers = { count = 2, prefix = "be" }
         assert!(lead.contains("to catch up with `main`, merge it"), "{lead}");
         assert!(lead.contains("forward it to every member"), "{lead}");
         assert!(lead.contains("(or the list `backend`)"), "{lead}");
-        assert!(lead.contains("merged as <commit>"), "{lead}");
+        assert!(lead.contains("merged as <merge commit>"), "{lead}");
+        assert!(lead.contains("git merge --no-ff <commit>"), "{lead}");
+        assert!(lead.contains("not the branch tip"), "{lead}");
+        assert!(lead.contains("changes needed: resubmit"), "{lead}");
         assert!(lead.contains("Your maintainer is `root`"), "{lead}");
         assert!(
             lead.contains("merge `main` into `amail/be-lead-next` (do not rebase it)"),

@@ -187,7 +187,12 @@ pub fn send_result(r: &p::SendResponse) -> String {
     let parts: Vec<String> = r
         .recipients
         .iter()
-        .map(|a| format!("{}={}", a.address, a.seats))
+        .map(|a| match a.wakes {
+            // A list in To wakes its (immediate) members: say so, since
+            // information that needs no action belongs in Cc.
+            Some(w) => format!("{}={} (list in To: wakes {w})", a.address, a.seats),
+            None => format!("{}={}", a.address, a.seats),
+        })
         .collect();
     let mut out = format!(
         "sent #{} thread {} to {} seat{}: {}",

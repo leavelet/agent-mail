@@ -316,14 +316,20 @@ runs one `amail node`, which connects those sessions to the server:
   2 ms end to end, p99, with 1,000 seats). The hook client never fails: if the
   node is down or slow (300 ms, `AMAIL_HOOK_TIMEOUT_MS`), it prints nothing.
   One hook claims at most a few messages (8 for Claude Code, 5 for Codex) and
-  shows each in full; the rest follows with the next hook.
+  shows each one's header, with the body when it has at most 400 characters;
+  a longer message is marked `body not shown (N lines): run amail read <id>`
+  and stays unread until the agent reads it. The rest follows with the next
+  hook.
 - **Idle agent**: when an idle seat gets `to` or urgent mail, the node wakes the
   session with a one-line nudge (`[amail] You have new mail (wake #n).`) after a
   3 s coalescing window (urgent: at once). The nudge starts a turn whose
   `UserPromptSubmit` hook injects the mail, so mail reaches the model through
   hooks only, and the server's atomic claim means each delivery is shown once.
   `cc` mail never wakes anyone; it comes along with the next turn. Mail to a
-  list in `To` wakes every member, like mail to each of them.
+  list in `To` wakes every member, like mail to each of them; `amail send`
+  says how many (`backend=3 (list in To: wakes 3)`), and the mail
+  instructions tell agents to put a list in `Cc` for information that needs
+  no action.
   Claude Code is woken through its inbox socket; Codex with `codex queue`.
   An unanswered wake-up is retried once after 10 s, then the seat is reported
   as `wake_failed` and tried again after 1 minute, doubling up to 10 minutes,
@@ -514,8 +520,9 @@ checks trust only at start, so after answering once, run `amail wake <seat>`
   answer for you (see "Teams").
 - Codex permissions are per host, not per seat: every Codex session on a
   host may write the git directories of all Codex seats' repositories on that
-  host. Paths of the dedicated Codex home must stay short (Unix socket paths
-  are limited to 107 bytes).
+  host. The dedicated Codex home may lie deep in the state directory: when
+  its control socket's path is longer than a Unix socket path may be (107
+  bytes), the node reaches it through `/proc/self/fd` (Linux).
 - State reflects hooks: Claude Code refuses a long foreground `sleep`, runs it
   in the background and ends its turn, so a seat can show `idle` while a
   background task it started still runs.

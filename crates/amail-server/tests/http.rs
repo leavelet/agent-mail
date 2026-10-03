@@ -301,7 +301,7 @@ async fn recipient_resolution(srv: Server) {
     assert_eq!(v["deliveries"], 3);
     assert_eq!(
         v["recipients"],
-        json!([{ "address": "a", "seats": 1 }, { "address": "team", "seats": 3 }, { "address": "a", "seats": 1 }])
+        json!([{ "address": "a", "seats": 1 }, { "address": "team", "seats": 3, "wakes": 1 }, { "address": "a", "seats": 1 }])
     );
     assert_eq!(
         v["rejected"],
@@ -364,7 +364,11 @@ async fn recipient_resolution(srv: Server) {
         .send(json!({ "to": ["team"], "subject": "from a", "body": "" }))
         .await;
     assert_eq!(v["deliveries"], 2);
-    assert_eq!(v["recipients"], json!([{ "address": "team", "seats": 2 }]));
+    // Only immediate members are woken by a list in To.
+    assert_eq!(
+        v["recipients"],
+        json!([{ "address": "team", "seats": 2, "wakes": 0 }])
+    );
     assert!(
         a.inbox("unread=1")
             .await

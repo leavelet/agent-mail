@@ -210,6 +210,11 @@ pub struct SendResponse {
 pub struct AddressResult {
     pub address: String,
     pub seats: u32,
+    /// For a list in `To`: how many of its members are notified at once,
+    /// which wakes them when they are idle (members with `digest` or
+    /// `archive` mode are not).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wakes: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
