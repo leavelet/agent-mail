@@ -83,6 +83,9 @@ struct SeatRaw {
     role_file: Option<PathBuf>,
     cwd: Option<PathBuf>,
     display_name: Option<String>,
+    /// `[[seat]]` only: join this group (as a worker of its lead, unless
+    /// `parent` says otherwise).
+    group: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,7 +94,8 @@ struct GroupRaw {
     name: String,
     parent: Option<String>,
     lead: SeatRaw,
-    workers: Option<WorkersRaw>,
+    /// `{ count, prefix, ... }`, or an array of seat tables.
+    workers: Option<toml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -426,8 +430,15 @@ pub fn parse(text: &str, base: &Path) -> Result<Team, TeamError> {
         Ok(())
     };
 
+    // Seats that join a group are added after the groups (their lead must
+    // be known).
+    let mut joining = Vec::new();
     for (i, s) in raw.seat.iter().enumerate() {
         let what = format!("[[seat]] #{} {:?}", i + 1, s.name);
+        if s.group.is_some() {
+            joining.push((what, s));
+            continue;
+        }
         add(
             what,
             s,
@@ -459,6 +470,11 @@ pub fn parse(text: &str, base: &Path) -> Result<Team, TeamError> {
                 "{what}: set the group's parent, not the lead's (lead.parent)"
             ));
         }
+        if g.lead.group.is_some() {
+            return err(format!(
+                "{what}: lead.group is not allowed (the lead is in this group)"
+            ));
+        }
         add(
             format!("{what} lead"),
             &g.lead,
@@ -468,35 +484,71 @@ pub fn parse(text: &str, base: &Path) -> Result<Team, TeamError> {
             &mut seats,
         )?;
         let mut workers = Vec::new();
-        if let Some(w) = &g.workers {
-            if w.count > MAX_WORKERS {
-                return err(format!(
-                    "{what}: workers.count {} is more than {MAX_WORKERS}",
-                    w.count
-                ));
-            }
-            let prefix = w.prefix.clone().unwrap_or_else(|| g.name.clone());
-            let inherit = SeatOpts {
-                harness: w.harness.clone(),
-                model: w.model.clone(),
-                permission_mode: w.permission_mode.clone(),
-            };
-            for n in 1..=w.count {
-                let s = SeatRaw {
-                    name: format!("{prefix}-{n}"),
-                    role: w.role.clone(),
-                    role_file: w.role_file.clone(),
-                    ..Default::default()
+        match &g.workers {
+            None => {}
+            Some(toml::Value::Table(t)) => {
+                let w: WorkersRaw = toml::Value::Table(t.clone())
+                    .try_into()
+                    .map_err(|e| TeamError(format!("{what} workers: {e}")))?;
+                if w.count > MAX_WORKERS {
+                    return err(format!(
+                        "{what}: workers.count {} is more than {MAX_WORKERS}",
+                        w.count
+                    ));
+                }
+                let prefix = w.prefix.clone().unwrap_or_else(|| g.name.clone());
+                let inherit = SeatOpts {
+                    harness: w.harness.clone(),
+                    model: w.model.clone(),
+                    permission_mode: w.permission_mode.clone(),
                 };
-                add(
-                    format!("{what} worker {:?}", s.name),
-                    &s,
-                    Some(g.lead.name.clone()),
-                    Some(g.name.clone()),
-                    &inherit,
-                    &mut seats,
-                )?;
-                workers.push(s.name);
+                for n in 1..=w.count {
+                    let s = SeatRaw {
+                        name: format!("{prefix}-{n}"),
+                        role: w.role.clone(),
+                        role_file: w.role_file.clone(),
+                        ..Default::default()
+                    };
+                    add(
+                        format!("{what} worker {:?}", s.name),
+                        &s,
+                        Some(g.lead.name.clone()),
+                        Some(g.name.clone()),
+                        &inherit,
+                        &mut seats,
+                    )?;
+                    workers.push(s.name);
+                }
+            }
+            Some(toml::Value::Array(items)) => {
+                if items.len() > MAX_WORKERS as usize {
+                    return err(format!("{what}: more than {MAX_WORKERS} workers"));
+                }
+                for (j, item) in items.iter().enumerate() {
+                    let s: SeatRaw = item
+                        .clone()
+                        .try_into()
+                        .map_err(|e| TeamError(format!("{what} workers[{j}]: {e}")))?;
+                    let wwhat = format!("{what} workers[{j}] {:?}", s.name);
+                    if s.group.is_some() {
+                        return err(format!("{wwhat}: group is not allowed here"));
+                    }
+                    let parent = s.parent.clone().unwrap_or_else(|| g.lead.name.clone());
+                    add(
+                        wwhat,
+                        &s,
+                        Some(parent),
+                        Some(g.name.clone()),
+                        &SeatOpts::default(),
+                        &mut seats,
+                    )?;
+                    workers.push(s.name);
+                }
+            }
+            Some(_) => {
+                return err(format!(
+                    "{what}: workers must be {{ count = N, ... }} or an array of seat tables"
+                ));
             }
         }
         groups.push(GroupPlan {
@@ -504,6 +556,22 @@ pub fn parse(text: &str, base: &Path) -> Result<Team, TeamError> {
             lead: g.lead.name.clone(),
             workers,
         });
+    }
+    for (what, s) in joining {
+        let gname = s.group.clone().expect("joining seats have a group");
+        let Some(g) = groups.iter_mut().find(|g| g.name == gname) else {
+            return err(format!("{what}: unknown group {gname:?}"));
+        };
+        let parent = s.parent.clone().unwrap_or_else(|| g.lead.clone());
+        add(
+            what,
+            s,
+            Some(parent),
+            Some(gname),
+            &SeatOpts::default(),
+            &mut seats,
+        )?;
+        g.workers.push(s.name.clone());
     }
     for g in &groups {
         if where_.contains_key(&g.name) {
@@ -890,6 +958,70 @@ cwd = "docs"
     }
 
     #[test]
+    fn mixed_groups_two_ways() {
+        let t = team(
+            r#"
+[team]
+workroot = "/w"
+[defaults]
+harness = "claude"
+model = "sonnet"
+[[seat]]
+name = "root"
+[[group]]
+name = "core"
+parent = "root"
+lead = { name = "core-lead" }
+workers = [
+  { name = "core-1" },
+  { name = "core-2", harness = "codex", model = "gpt-6.1-sol" },
+]
+[[group]]
+name = "app"
+parent = "root"
+lead = { name = "app-lead", harness = "codex" }
+[[seat]]
+name = "app-1"
+group = "app"
+[[seat]]
+name = "app-2"
+group = "app"
+harness = "codex"
+"#,
+        )
+        .unwrap();
+        let c2 = t.seat("core-2").unwrap();
+        assert_eq!(
+            (
+                c2.harness.as_str(),
+                c2.parent.as_deref(),
+                c2.group.as_deref()
+            ),
+            ("codex", Some("core-lead"), Some("core"))
+        );
+        assert_eq!(t.seat("core-1").unwrap().harness, "claude");
+        let a2 = t.seat("app-2").unwrap();
+        assert_eq!(
+            (
+                a2.harness.as_str(),
+                a2.parent.as_deref(),
+                a2.group.as_deref()
+            ),
+            ("codex", Some("app-lead"), Some("app"))
+        );
+        let lists = t.lists();
+        let members = |n: &str| lists.iter().find(|l| l.0 == n).unwrap().1.clone();
+        assert_eq!(members("core"), vec!["core-lead", "core-1", "core-2"]);
+        assert_eq!(members("app"), vec!["app-lead", "app-1", "app-2"]);
+        assert_eq!(t.session_group("app-1"), "app");
+        assert_eq!(t.session_group("root"), "main");
+        // Parents come first.
+        let pos = |n: &str| t.seats.iter().position(|s| s.name == n).unwrap();
+        assert!(pos("app-lead") < pos("app-1"));
+        assert!(pos("root") < pos("core-lead"));
+    }
+
+    #[test]
     fn errors_point_at_the_entry() {
         let cases: &[(&str, &str)] = &[
             (
@@ -953,6 +1085,20 @@ cwd = "docs"
                  [[seat]]\nname = \"a\"\n[[seat]]\nname = \"b\"\nparent = \"a\"\n[[seat]]\nname = \"c\"\nparent = \"b\"\n\
                  [[seat]]\nname = \"b-next\"\nparent = \"a\"\n",
                 "collide with the integration branch of \"b\"",
+            ),
+            (
+                "[team]\nworkroot = \"/w\"\n[defaults]\nharness = \"claude\"\n[[seat]]\nname = \"a\"\ngroup = \"nope\"\n",
+                "[[seat]] #1 \"a\": unknown group \"nope\"",
+            ),
+            (
+                "[team]\nworkroot = \"/w\"\n[defaults]\nharness = \"claude\"\n[[group]]\nname = \"g\"\n\
+                 lead = { name = \"l\" }\nworkers = [{ name = \"w\", harnes = \"x\" }]\n",
+                "[[group]] #1 \"g\" workers[0]: unknown field `harnes`",
+            ),
+            (
+                "[team]\nworkroot = \"/w\"\n[defaults]\nharness = \"claude\"\n[[group]]\nname = \"g\"\n\
+                 lead = { name = \"l\" }\nworkers = 3\n",
+                "workers must be",
             ),
             ("[team]\n", "defines no seats"),
         ];
