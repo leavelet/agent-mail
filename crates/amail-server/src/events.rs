@@ -1,8 +1,10 @@
 //! Mailbox change notifications for `GET /v1/events`.
 //!
 //! [`EventBus`] is the seam for multi-instance deployments: the in-process
-//! [`Hub`] is enough for a single server; a Postgres `LISTEN/NOTIFY`
-//! implementation can replace it without touching the handlers.
+//! [`Hub`] is enough for a single server; with several instances on one
+//! Postgres database, [`crate::cluster::ClusterBus`] also forwards every
+//! event to the other instances (`LISTEN/NOTIFY`), which feed it into their
+//! own hub.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
@@ -28,10 +30,17 @@ pub struct Subscription {
 }
 
 pub trait EventBus: Send + Sync + 'static {
-    /// Publish `(seat name, seq)` changes for one org.
+    /// Publish `(seat name, seq)` changes for one org (to every instance).
     fn publish(&self, org_id: i64, events: &[(String, i64)]);
     /// Subscribe to an org's events, replaying from `last_event_id`.
     fn subscribe(&self, org_id: i64, last_event_id: Option<&str>) -> Subscription;
+    /// Hand events that another instance published to this instance's
+    /// subscribers.
+    fn deliver(&self, org_id: i64, events: &[(String, i64)]) {
+        self.publish(org_id, events)
+    }
+    /// Events may have been missed: make subscribers reconnect and resync.
+    fn lost_events(&self) {}
 }
 
 const RECENT: usize = 4096;
@@ -41,8 +50,12 @@ const CHANNEL: usize = 1024;
 /// recent events for `Last-Event-ID` replay. Event ids are
 /// `<epoch>-<counter>`; an id from another server run triggers a snapshot.
 pub struct Hub {
+    inner: Mutex<Inner>,
+}
+
+struct Inner {
     epoch: String,
-    orgs: Mutex<HashMap<i64, OrgChannel>>,
+    orgs: HashMap<i64, OrgChannel>,
 }
 
 struct OrgChannel {
@@ -67,22 +80,36 @@ impl Default for Hub {
     }
 }
 
+fn new_epoch() -> String {
+    format!("{:x}{:04x}", amail_store::now_ms(), rand::random::<u16>())
+}
+
 impl Hub {
     pub fn new() -> Self {
-        let epoch = format!("{:x}", amail_store::now_ms());
         Hub {
-            epoch,
-            orgs: Mutex::new(HashMap::new()),
+            inner: Mutex::new(Inner {
+                epoch: new_epoch(),
+                orgs: HashMap::new(),
+            }),
         }
     }
 
-    fn parse_id(&self, id: &str) -> Option<u64> {
-        let (epoch, n) = id.rsplit_once('-')?;
-        if epoch != self.epoch {
-            return None;
-        }
-        n.parse().ok()
+    /// Events may have been missed (the instance lost its connection to the
+    /// other instances): end every subscription and start a new epoch, so
+    /// that reconnecting clients get a snapshot instead of a replay.
+    pub fn reset(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.epoch = new_epoch();
+        inner.orgs.clear();
     }
+}
+
+fn parse_id(epoch: &str, id: &str) -> Option<u64> {
+    let (e, n) = id.rsplit_once('-')?;
+    if e != epoch {
+        return None;
+    }
+    n.parse().ok()
 }
 
 impl EventBus for Hub {
@@ -90,13 +117,14 @@ impl EventBus for Hub {
         if events.is_empty() {
             return;
         }
-        let mut orgs = self.orgs.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        let Inner { epoch, orgs } = &mut *inner;
         let ch = orgs.entry(org_id).or_insert_with(OrgChannel::new);
         for (seat, seq) in events {
             let n = ch.next;
             ch.next += 1;
             let ev = BusEvent {
-                id: format!("{}-{n}", self.epoch),
+                id: format!("{epoch}-{n}"),
                 seat: seat.clone(),
                 seq: *seq,
             };
@@ -109,13 +137,14 @@ impl EventBus for Hub {
     }
 
     fn subscribe(&self, org_id: i64, last_event_id: Option<&str>) -> Subscription {
-        let mut orgs = self.orgs.lock().unwrap();
+        let mut inner = self.inner.lock().unwrap();
+        let Inner { epoch, orgs } = &mut *inner;
         let ch = orgs.entry(org_id).or_insert_with(OrgChannel::new);
         let rx = ch.tx.subscribe();
         let latest_id = ch.recent.back().map(|(_, e)| e.id.clone());
         let replay = match last_event_id {
             None => Some(Vec::new()),
-            Some(id) => match self.parse_id(id) {
+            Some(id) => match parse_id(epoch, id) {
                 // Replayable if nothing after `n` has been evicted.
                 Some(n)
                     if n < ch.next
@@ -157,8 +186,9 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert_eq!((r[0].seat.as_str(), r[0].seq), ("a", 2));
         assert!(hub.subscribe(1, Some("bogus-1")).replay.is_none());
+        let epoch = hub.inner.lock().unwrap().epoch.clone();
         assert!(
-            hub.subscribe(1, Some(&format!("{}-999", hub.epoch)))
+            hub.subscribe(1, Some(&format!("{epoch}-999")))
                 .replay
                 .is_none()
         );
@@ -169,5 +199,15 @@ mod tests {
             hub.publish(1, &[("a".into(), 10 + i)]);
         }
         assert!(hub.subscribe(1, Some(&first)).replay.is_none());
+
+        // A reset ends subscriptions and makes every old id unreplayable.
+        let mut s = hub.subscribe(1, None);
+        let last = hub.subscribe(1, None).latest_id.unwrap();
+        hub.reset();
+        assert!(matches!(
+            s.rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Closed)
+        ));
+        assert!(hub.subscribe(1, Some(&last)).replay.is_none());
     }
 }

@@ -49,6 +49,9 @@ pub async fn patch_org(
     check(patch.send_burst, 1, "send_burst")?;
     check(patch.max_recipients, 1, "max_recipients")?;
     check(patch.max_thread_depth, 1, "max_thread_depth")?;
+    check(patch.ack_timeout_min, 1, "ack_timeout_min")?;
+    check(patch.focus_max_min, 1, "focus_max_min")?;
+    check(patch.digest_interval_min, 1, "digest_interval_min")?;
     if let Some(Some(url)) = &patch.webhook_url
         && !crate::webhook::valid_url(url)
     {
@@ -63,22 +66,23 @@ pub async fn patch_org(
 
 // --- seats -------------------------------------------------------------------
 
-fn seat_out(st: &AppState, auth: &Auth, s: &amail_store::Seat) -> p::Seat {
-    let presence = st.presence.get(auth.org.id, &s.name).map(|mut p| {
+async fn seat_out(st: &AppState, auth: &Auth, s: &amail_store::Seat) -> ApiResult<p::Seat> {
+    let presence = st.presence.get(auth.org.id, &s.name).await?.map(|mut p| {
         p.node_connected = st.nodes.connected(auth.org.id) > 0;
         p
     });
-    render::seat(s, presence)
+    Ok(render::seat(s, presence))
 }
 
 pub async fn list_seats(State(st): State<AppState>, auth: Auth) -> ApiResult<Json<Vec<p::Seat>>> {
     auth.require_directory()?;
+    let mut presence = crate::ui::presences(&st, auth.org.id).await?;
     Ok(Json(
         st.store
             .seats(auth.org.id)
             .await?
             .iter()
-            .map(|s| seat_out(&st, &auth, s))
+            .map(|s| render::seat(s, presence.remove(&s.name)))
             .collect(),
     ))
 }
@@ -94,7 +98,7 @@ pub async fn create_seat(
         check_name(g)?;
     }
     let s = st.store.create_seat(auth.org.id, &seat).await?;
-    Ok((StatusCode::CREATED, Json(seat_out(&st, &auth, &s))))
+    Ok((StatusCode::CREATED, Json(seat_out(&st, &auth, &s).await?)))
 }
 
 pub async fn get_seat(
@@ -108,7 +112,7 @@ pub async fn get_seat(
         .seat_by_name(auth.org.id, &name)
         .await?
         .ok_or_else(|| ApiError::not_found(format!("no seat {name:?}")))?;
-    Ok(Json(seat_out(&st, &auth, &s)))
+    Ok(Json(seat_out(&st, &auth, &s).await?))
 }
 
 pub async fn patch_seat(
@@ -122,7 +126,7 @@ pub async fn patch_seat(
         check_name(g)?;
     }
     let s = st.store.update_seat(auth.org.id, &name, &patch).await?;
-    Ok(Json(seat_out(&st, &auth, &s)))
+    Ok(Json(seat_out(&st, &auth, &s).await?))
 }
 
 pub async fn delete_seat(

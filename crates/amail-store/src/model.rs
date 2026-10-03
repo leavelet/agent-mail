@@ -20,6 +20,9 @@ pub struct Org {
     pub max_recipients: i64,
     pub max_thread_depth: i64,
     pub webhook_url: Option<String>,
+    pub ack_timeout_min: i64,
+    pub focus_max_min: i64,
+    pub digest_interval_min: i64,
     pub created_at: i64,
 }
 
@@ -40,6 +43,8 @@ pub struct Seat {
     pub last_seq: i64,
     pub created_at: i64,
     pub deleted_at: Option<i64>,
+    /// Focus mode (only urgent mail is shown) until then.
+    pub focus_until: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +112,9 @@ pub struct NewMessage {
     pub meta: Meta,
     /// One per distinct recipient seat. Must not be empty.
     pub deliveries: Vec<NewDelivery>,
+    /// With `ack_required`: when the sender is told about recipients that
+    /// have not acknowledged.
+    pub ack_due: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,6 +210,11 @@ pub struct ClaimFilter {
     /// Mark read, in the same change, the claimed deliveries whose message
     /// body has at most this many characters.
     pub read_body_max: Option<i64>,
+    /// Claim `digest` deliveries only (instead of `immediate` ones).
+    pub digest_only: bool,
+    /// Idempotency key: a claim with a key the seat used before returns the
+    /// deliveries that claim took (see [`crate::Store::claim`]).
+    pub key: Option<String>,
 }
 
 impl ClaimFilter {
@@ -245,6 +258,72 @@ pub struct PendingRec {
     pub cc: i64,
     pub list: i64,
     pub urgent: i64,
+    /// Pending `digest` deliveries, and the creation time of the oldest.
+    pub digest: i64,
+    pub digest_since: Option<i64>,
+    pub focus_until: Option<i64>,
+}
+
+/// A seat's presence as reported by a node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresenceRec {
+    pub seat: String,
+    pub state: amail_proto::SeatState,
+    pub wake_failed: bool,
+    pub harness: Option<String>,
+    pub node: Option<String>,
+    /// When the state last changed.
+    pub since: i64,
+    /// When the node last reported the seat.
+    pub updated_at: i64,
+    pub attention: Option<String>,
+    pub attention_hint: Option<String>,
+    pub terminal_url: Option<String>,
+}
+
+impl PresenceRec {
+    /// Whether `next` (a new report) differs from `self` in anything but
+    /// its timestamps.
+    pub fn same_as(&self, next: &PresenceRec) -> bool {
+        self.state == next.state
+            && self.wake_failed == next.wake_failed
+            && self.harness == next.harness
+            && self.attention == next.attention
+            && self.attention_hint == next.attention_hint
+            && self.terminal_url == next.terminal_url
+    }
+}
+
+/// What a sender should know about a recipient seat (see
+/// [`crate::Store::recipient_states`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecipientState {
+    pub seat_id: i64,
+    pub name: String,
+    pub kind: SeatKind,
+    pub focus_until: Option<i64>,
+    pub presence: Option<PresenceRec>,
+}
+
+/// An acknowledgement-requiring message whose next escalation step is due.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AckDue {
+    pub message_id: i64,
+    pub org_id: i64,
+    pub sender_seat_id: i64,
+    /// Escalation steps already taken (0: none).
+    pub stage: i64,
+    pub created_at: i64,
+    pub due: i64,
+}
+
+/// A recipient that has not acknowledged a message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Laggard {
+    pub seat_id: i64,
+    pub org_id: i64,
+    pub name: String,
+    pub parent_id: Option<i64>,
 }
 
 /// A full-text search (`Store::search`). Every term must occur in the

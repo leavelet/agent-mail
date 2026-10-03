@@ -20,7 +20,7 @@
 
 use crate::adapter::{Adapter, AdapterEnv, Event, Harness, Hook, LaunchCtx, Output};
 use crate::persist::{self, LiveSession, Reservation, Saved, SessionReg};
-use crate::server::ServerClient;
+use crate::server::{ClaimSpec, ServerClient};
 use crate::wire::{Credentials, LaunchPlan, Request};
 use amail_proto::{
     DeliveryClass, InboxEntry, MailboxEvent, PendingCounts, PresenceReport, PresenceUpdate,
@@ -149,6 +149,8 @@ impl Config {
 
 const RESERVATION_TTL_MS: i64 = 15 * 60 * 1000;
 const SUMMARY_LIMIT: u32 = 20;
+/// Digest mail one hook takes at most (shown one line per thread).
+const DIGEST_LIMIT: u32 = 100;
 /// An answer that would reach the hook client less than this before its
 /// deadline is kept for the next hook instead of being sent.
 const LATE_MARGIN: Duration = Duration::from_millis(30);
@@ -186,6 +188,12 @@ struct SeatRt {
     last_activity: i64,
     /// What the server was last told about the seat needing a person.
     reported_attention: Option<(String, String)>,
+    /// When the oldest pending digest mail was sent (Unix ms).
+    digest_since: Option<i64>,
+    /// Focus mode (only urgent mail) until then (Unix ms).
+    focus_until: Option<i64>,
+    /// Last wake-up for digest mail alone (Unix ms).
+    last_digest_wake: i64,
 }
 
 impl SeatRt {
@@ -210,11 +218,36 @@ impl SeatRt {
             stash: Vec::new(),
             last_activity: 0,
             reported_attention: None,
+            digest_since: None,
+            focus_until: None,
+            last_digest_wake: 0,
         }
     }
 
-    fn wants_wake(&self) -> bool {
-        self.pending.to > 0 || self.pending.urgent > 0 || !self.stash.is_empty()
+    fn focused(&self, now: i64) -> bool {
+        self.focus_until.is_some_and(|t| t > now)
+    }
+
+    /// Digest mail has waited a full interval, and the seat was not woken
+    /// for a digest within the last one.
+    fn digest_due(&self, now: i64, every: i64) -> bool {
+        !self.focused(now)
+            && self.pending.digest > 0
+            && self.digest_since.is_some_and(|t| now - t >= every)
+            && now - self.last_digest_wake >= every
+    }
+
+    /// Whether the seat should be woken (or started): `to` or urgent mail,
+    /// mail kept from a lost answer, or a due digest. In focus, only urgent
+    /// mail (and kept mail) counts.
+    fn wants_wake(&self, now: i64, digest_every: i64) -> bool {
+        if !self.stash.is_empty() || self.pending.urgent > 0 {
+            return true;
+        }
+        if self.focused(now) {
+            return false;
+        }
+        self.pending.to > 0 || self.digest_due(now, digest_every)
     }
 
     fn clear_wake_failure(&mut self) {
@@ -224,7 +257,6 @@ impl SeatRt {
     }
 }
 
-#[derive(Default)]
 struct State {
     connected: bool,
     seats: HashMap<String, SeatRt>,
@@ -239,7 +271,31 @@ struct State {
     start_queue: std::collections::VecDeque<String>,
     /// Transcripts being forwarded to the server, by seat.
     mirrors: HashMap<String, mirror::MirrorRt>,
+    /// The org's digest interval (ms), from the server.
+    digest_every: i64,
 }
+
+impl Default for State {
+    fn default() -> Self {
+        State {
+            connected: false,
+            seats: HashMap::new(),
+            saved: Saved::default(),
+            dirty_pending: HashSet::new(),
+            dirty_presence: HashSet::new(),
+            save_dirty: false,
+            sup: HashMap::new(),
+            start_queue: Default::default(),
+            mirrors: HashMap::new(),
+            digest_every: DIGEST_EVERY_DEFAULT,
+        }
+    }
+}
+
+/// Digest interval until the server says otherwise.
+const DIGEST_EVERY_DEFAULT: i64 = 30 * 60 * 1000;
+/// Full pending-count resync, to pick up anything an event stream missed.
+const RESYNC: Duration = Duration::from_secs(30);
 
 impl State {
     fn seat(&mut self, name: &str) -> &mut SeatRt {
@@ -381,6 +437,10 @@ struct Plan {
     claim_to: bool,
     /// Claim urgent `cc`/`list`.
     claim_urgent: bool,
+    /// Claim urgent mail of every class (in focus).
+    claim_urgent_all: bool,
+    /// Claim digest mail and show it as a digest.
+    digest: bool,
     /// Show unread headers (nothing claimed).
     summary: bool,
     /// Mail claimed earlier whose injection was lost.
@@ -389,9 +449,26 @@ struct Plan {
 
 impl Plan {
     fn none(&self) -> bool {
-        !(self.claim_all || self.claim_to || self.claim_urgent || self.summary)
+        !(self.claim_all
+            || self.claim_to
+            || self.claim_urgent
+            || self.claim_urgent_all
+            || self.digest
+            || self.summary)
             && self.stash.is_empty()
     }
+}
+
+/// A new idempotency key for one claim.
+fn claim_key() -> String {
+    hex::encode(rand::random::<[u8; 12]>())
+}
+
+/// RFC 3339 to Unix ms.
+fn parse_ts(s: &str) -> Option<i64> {
+    s.parse::<jiff::Timestamp>()
+        .ok()
+        .map(|t| t.as_millisecond())
 }
 
 pub struct Node {
@@ -408,6 +485,7 @@ pub struct Node {
     wake_kick: Notify,
     presence_kick: Notify,
     refresh_kick: Notify,
+    retry_kick: Notify,
     started: Instant,
 }
 
@@ -541,6 +619,7 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
         wake_kick: Notify::new(),
         presence_kick: Notify::new(),
         refresh_kick: Notify::new(),
+        retry_kick: Notify::new(),
         started: Instant::now(),
     });
 
@@ -567,6 +646,8 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
     tasks.push(tokio::spawn(async move { n.save_loop().await }));
     let n = node.clone();
     tasks.push(tokio::spawn(async move { n.supervise_loop().await }));
+    let n = node.clone();
+    tasks.push(tokio::spawn(async move { n.retry_loop().await }));
     Ok(NodeHandle { node, tasks })
 }
 
@@ -945,6 +1026,7 @@ impl Node {
                 }
             }
             let mut plan = Plan::default();
+            let now = now_ms();
             match &hook.event {
                 Event::SessionStart { source } => {
                     if let Some(s) = adapter.session_start_state(source) {
@@ -959,22 +1041,42 @@ impl Node {
                     s.wake_out = None;
                     s.clear_wake_failure();
                     plan.stash = std::mem::take(&mut s.stash);
-                    plan.claim_all = connected && s.pending.total() > 0;
+                    if s.focused(now) {
+                        plan.claim_urgent_all = connected && s.pending.urgent > 0;
+                    } else {
+                        plan.claim_all = connected && s.pending.total() > 0;
+                        plan.digest = connected && s.pending.digest > 0;
+                    }
                     plan.summary = connected && registered;
                 }
                 Event::PostToolUse => {
                     st.set_state(seat, SeatState::Busy);
                     let s = st.seat(seat);
                     plan.stash = std::mem::take(&mut s.stash);
-                    plan.claim_to = connected && s.pending.to > 0;
-                    plan.claim_urgent = connected && s.pending.urgent > 0;
+                    if s.focused(now) {
+                        plan.claim_urgent_all = connected && s.pending.urgent > 0;
+                    } else {
+                        plan.claim_to = connected && s.pending.to > 0;
+                        plan.claim_urgent = connected && s.pending.urgent > 0;
+                    }
                 }
                 Event::Stop => {
                     let s = st.seat(seat);
-                    let pending = connected && s.pending.total() > 0;
+                    let focused = s.focused(now);
+                    let pending = connected
+                        && if focused {
+                            s.pending.urgent > 0
+                        } else {
+                            s.pending.total() > 0 || s.pending.digest > 0
+                        };
                     if (pending || !s.stash.is_empty()) && s.stop_blocks < cap {
                         plan.stash = std::mem::take(&mut s.stash);
-                        plan.claim_all = pending;
+                        if focused {
+                            plan.claim_urgent_all = pending;
+                        } else {
+                            plan.claim_all = pending && s.pending.total() > 0;
+                            plan.digest = pending && s.pending.digest > 0;
+                        }
                     } else {
                         st.set_state(seat, SeatState::Idle);
                     }
@@ -1007,35 +1109,55 @@ impl Node {
         let via = format!("hook:{}", hook.name);
         let stashed = plan.stash.len();
         let mut claimed: Vec<InboxEntry> = plan.stash;
+        let mut digest: Vec<InboxEntry> = Vec::new();
         let mut failed = false;
         let mut more = false;
         use DeliveryClass::*;
-        let mut calls: Vec<(&'static [DeliveryClass], bool)> = Vec::new();
+        let spec = |classes: &[DeliveryClass], urgent_only: bool, digest: bool| ClaimSpec {
+            classes: classes.to_vec(),
+            urgent_only,
+            digest,
+            via: via.clone(),
+            limit: if digest { DIGEST_LIMIT } else { limit },
+        };
+        let mut calls: Vec<ClaimSpec> = Vec::new();
         if plan.claim_all {
-            calls.push((&[To, Cc, List], false));
+            calls.push(spec(&[To, Cc, List], false, false));
+        } else if plan.claim_urgent_all {
+            calls.push(spec(&[To, Cc, List], true, false));
         } else {
             if plan.claim_to {
-                calls.push((&[To], false));
+                calls.push(spec(&[To], false, false));
             }
             if plan.claim_urgent {
-                calls.push((&[Cc, List], true));
+                calls.push(spec(&[Cc, List], true, false));
             }
         }
-        for (classes, urgent) in calls {
-            let call = self.server.claim(seat, classes, urgent, &via, limit);
-            match tokio::time::timeout_at(deadline.into(), call).await {
+        if plan.digest {
+            calls.push(spec(&[To, Cc, List], false, true));
+        }
+        for spec in calls {
+            let key = claim_key();
+            let call = self.server.claim(seat, &spec, &key, None);
+            let err = match tokio::time::timeout_at(deadline.into(), call).await {
                 Ok(Ok(r)) => {
-                    more |= r.entries.len() as u32 >= limit;
-                    claimed.extend(r.entries);
+                    if spec.digest {
+                        digest.extend(r.entries);
+                    } else {
+                        more |= r.entries.len() as u32 >= limit;
+                        claimed.extend(r.entries);
+                    }
+                    continue;
                 }
-                Ok(Err(e)) => {
-                    tracing::debug!("claim for {seat}: {e:#}");
-                    failed = true;
-                }
-                Err(_) => {
-                    tracing::debug!("claim for {seat}: hook deadline passed");
-                    failed = true;
-                }
+                Ok(Err(e)) => e,
+                Err(_) => anyhow::anyhow!("hook deadline passed"),
+            };
+            tracing::debug!("claim for {seat}: {err:#}");
+            failed = true;
+            // The server may have made the claim: ask again with the same key
+            // (it then answers with what it took) and keep the result.
+            if !crate::server::is_permanent(&err) {
+                self.retry_claim(seat, spec, key);
             }
         }
         let summary = if plan.summary && !failed {
@@ -1063,17 +1185,21 @@ impl Node {
         // 3. Apply the outcome.
         {
             let mut st = self.lock();
-            if claimed.len() > stashed {
+            if claimed.len() > stashed || !digest.is_empty() {
                 let s = st.seat(seat);
-                for e in &claimed[stashed..] {
+                for e in claimed[stashed..].iter().chain(&digest) {
                     let p = &mut s.pending;
-                    match e.delivery.class {
-                        To => p.to = (p.to - 1).max(0),
-                        Cc => p.cc = (p.cc - 1).max(0),
-                        List => p.list = (p.list - 1).max(0),
-                    }
-                    if e.message.priority == Priority::Urgent {
-                        p.urgent = (p.urgent - 1).max(0);
+                    if e.delivery.mode == amail_proto::DeliveryMode::Digest {
+                        p.digest = (p.digest - 1).max(0);
+                    } else {
+                        match e.delivery.class {
+                            To => p.to = (p.to - 1).max(0),
+                            Cc => p.cc = (p.cc - 1).max(0),
+                            List => p.list = (p.list - 1).max(0),
+                        }
+                        if e.message.priority == Priority::Urgent {
+                            p.urgent = (p.urgent - 1).max(0);
+                        }
                     }
                     p.seq = p.seq.max(e.delivery.mod_seq);
                 }
@@ -1081,7 +1207,7 @@ impl Node {
                 self.refresh_kick.notify_one();
             }
             if hook.event == Event::Stop {
-                if claimed.is_empty() {
+                if claimed.is_empty() && digest.is_empty() {
                     st.set_state(seat, SeatState::Idle);
                 } else {
                     st.seat(seat).stop_blocks += 1;
@@ -1094,6 +1220,13 @@ impl Node {
         let mut text = String::new();
         if !claimed.is_empty() {
             text = crate::inject::new_mail(seat, &claimed, more);
+        }
+        if !digest.is_empty() {
+            let rest = adapter.inject_budget().saturating_sub(text.len()).max(1000);
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&crate::inject::digest(seat, &digest, rest));
         }
         if !summary.is_empty() {
             let rest = adapter.inject_budget().saturating_sub(text.len()).max(500);
@@ -1109,7 +1242,86 @@ impl Node {
         } else {
             Output::Context(text)
         };
+        claimed.extend(digest);
         (out, claimed)
+    }
+
+    /// Retry a claim whose answer did not arrive, with the same key, in the
+    /// background; what it took is shown with the seat's next hook.
+    fn retry_claim(&self, seat: &str, spec: ClaimSpec, key: String) {
+        let mut st = self.lock();
+        st.saved.claim_retries.insert(
+            key,
+            crate::persist::ClaimRetry {
+                seat: seat.to_string(),
+                spec,
+                since: now_ms(),
+            },
+        );
+        st.save_dirty = true;
+        drop(st);
+        self.retry_kick.notify_one();
+    }
+
+    async fn retry_loop(self: Arc<Self>) {
+        let mut backoff = Duration::from_millis(100);
+        loop {
+            let todo: Vec<(String, crate::persist::ClaimRetry)> = self
+                .lock()
+                .saved
+                .claim_retries
+                .iter()
+                .map(|(k, r)| (k.clone(), r.clone()))
+                .collect();
+            if todo.is_empty() {
+                backoff = Duration::from_millis(100);
+                self.retry_kick.notified().await;
+                continue;
+            }
+            tokio::time::sleep(backoff).await;
+            let mut failed = false;
+            for (key, r) in todo {
+                let res = self
+                    .server
+                    .claim(&r.seat, &r.spec, &key, Some(Duration::from_secs(10)))
+                    .await;
+                let done = match res {
+                    Ok(resp) => {
+                        if !resp.entries.is_empty() {
+                            tracing::info!(
+                                "seat {}: a claim whose answer was lost took {} message(s); \
+                                 keeping them for the next hook",
+                                r.seat,
+                                resp.entries.len()
+                            );
+                            self.stash(&r.seat, resp.entries, false);
+                            self.lock().dirty_pending.insert(r.seat.clone());
+                            self.refresh_kick.notify_one();
+                        }
+                        true
+                    }
+                    Err(e) if crate::server::is_permanent(&e) => {
+                        tracing::warn!("seat {}: giving up a claim retry: {e:#}", r.seat);
+                        true
+                    }
+                    Err(e) => {
+                        tracing::debug!("seat {}: claim retry: {e:#}", r.seat);
+                        failed = true;
+                        false
+                    }
+                };
+                if done {
+                    let mut st = self.lock();
+                    st.saved.claim_retries.remove(&key);
+                    st.save_dirty = true;
+                }
+            }
+            backoff = if failed {
+                (backoff * 2).min(Duration::from_secs(10))
+            } else {
+                Duration::from_millis(100)
+            };
+        }
     }
 
     // --- launch and credentials ---------------------------------------------
@@ -1262,8 +1474,11 @@ impl Node {
 
     // --- server sync ----------------------------------------------------------
 
-    fn apply_pending(&self, st: &mut State, counts: Vec<PendingCounts>) {
-        for c in counts {
+    fn apply_pending(&self, st: &mut State, resp: amail_proto::PendingResponse) {
+        if let Some(ms) = resp.digest_interval_ms {
+            st.digest_every = ms as i64;
+        }
+        for c in resp.seats {
             let name = c.seat.clone();
             let seat = st.seat(&name);
             if c.seq < seat.pending.seq {
@@ -1271,6 +1486,8 @@ impl Node {
             }
             // New mail that could wake the seat ends a wake-up failure.
             let arrived = c.to > seat.pending.to || c.urgent > seat.pending.urgent;
+            seat.digest_since = c.digest_since.as_deref().and_then(parse_ts);
+            seat.focus_until = c.focus_until.as_deref().and_then(parse_ts);
             seat.pending = c;
             if arrived && seat.wake_failed {
                 seat.clear_wake_failure();
@@ -1290,7 +1507,7 @@ impl Node {
                     match self.server.pending(None).await {
                         Ok(p) => {
                             let mut st = self.lock();
-                            self.apply_pending(&mut st, p.seats);
+                            self.apply_pending(&mut st, p);
                             st.connected = true;
                             backoff = Duration::from_millis(250);
                             tracing::info!("connected to {}", self.cfg.url);
@@ -1338,32 +1555,61 @@ impl Node {
         }
     }
 
+    /// Refresh the pending counts of seats whose mailbox changed, and every
+    /// [`RESYNC`] all of them (an event stream can miss events: a server
+    /// instance that died before telling the others, a dropped connection).
+    /// Seats whose refresh failed are tried again.
     async fn refresh_loop(self: Arc<Self>) {
+        let mut backoff = Duration::from_millis(200);
         loop {
-            self.refresh_kick.notified().await;
+            let full = tokio::select! {
+                _ = self.refresh_kick.notified() => false,
+                _ = tokio::time::sleep(RESYNC) => true,
+            };
+            let connected = self.lock().connected;
+            if full && !connected {
+                continue;
+            }
+            let mut first = true;
             loop {
                 let dirty: Vec<String> = std::mem::take(&mut self.lock().dirty_pending)
                     .into_iter()
                     .collect();
-                if dirty.is_empty() {
+                if dirty.is_empty() && !(full && first) {
                     break;
                 }
-                let results: Vec<Result<amail_proto::PendingResponse>> = if dirty.len() > 32 {
+                let whole = (full && first) || dirty.len() > 32;
+                first = false;
+                let results: Vec<Result<amail_proto::PendingResponse>> = if whole {
                     vec![self.server.pending(None).await]
                 } else {
                     futures::future::join_all(dirty.iter().map(|s| self.server.pending(Some(s))))
                         .await
                 };
-                let mut st = self.lock();
-                for r in results {
-                    match r {
-                        Ok(p) => self.apply_pending(&mut st, p.seats),
-                        Err(e) => tracing::debug!("refreshing pending counts: {e:#}"),
+                let mut failed = false;
+                {
+                    let mut st = self.lock();
+                    for r in results {
+                        match r {
+                            Ok(p) => self.apply_pending(&mut st, p),
+                            Err(e) => {
+                                tracing::debug!("refreshing pending counts: {e:#}");
+                                failed = true;
+                            }
+                        }
+                    }
+                    if failed {
+                        st.dirty_pending.extend(dirty);
                     }
                 }
-                drop(st);
                 self.wake_kick.notify_one();
                 self.presence_kick.notify_one();
+                if failed {
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(5));
+                } else {
+                    backoff = Duration::from_millis(200);
+                }
             }
         }
     }
@@ -1397,14 +1643,35 @@ impl Node {
         let mut fire: Vec<(Harness, String, String, u64)> = Vec::new();
         let mut st = self.lock();
         let connected = st.connected;
+        let digest_every = st.digest_every;
+        let now_wall = now_ms();
         let mut counter = st.saved.wake_counter;
         let mut changed = Vec::new();
         let (confirm, window) = (self.cfg.wake_confirm, self.cfg.wake_window);
         let (backoff0, backoff_max) = (self.cfg.wake_backoff, self.cfg.wake_backoff_max);
         for (name, s) in st.seats.iter_mut() {
             let target = s.session.as_ref().and_then(|x| x.target.clone());
-            let eligible =
-                connected && s.state == SeatState::Idle && target.is_some() && s.wants_wake();
+            // Mail held by focus is due when the focus ends; digest mail
+            // when it has waited an interval.
+            if connected && s.state == SeatState::Idle {
+                if let Some(t) = s.focus_until.filter(|t| *t > now_wall)
+                    && (s.pending.to > 0 || s.pending.digest > 0)
+                {
+                    soonest(now + Duration::from_millis((t - now_wall) as u64 + 50));
+                }
+                if s.pending.digest > 0
+                    && let Some(since) = s.digest_since
+                {
+                    let at = (since + digest_every).max(s.last_digest_wake + digest_every);
+                    if at > now_wall {
+                        soonest(now + Duration::from_millis((at - now_wall) as u64 + 50));
+                    }
+                }
+            }
+            let eligible = connected
+                && s.state == SeatState::Idle
+                && target.is_some()
+                && s.wants_wake(now_wall, digest_every);
             let (Some(h), Some(target)) = (s.harness, target.filter(|_| eligible)) else {
                 s.wake_out = None;
                 s.wake_due = None;
@@ -1464,6 +1731,9 @@ impl Node {
             if now >= *due {
                 counter += 1;
                 fire.push((h, name.clone(), target, counter));
+                if s.digest_due(now_wall, digest_every) {
+                    s.last_digest_wake = now_wall;
+                }
                 s.wake_due = None;
                 s.wake_out = Some((now, 1));
                 s.wakes += 1;

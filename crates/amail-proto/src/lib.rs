@@ -46,8 +46,10 @@ macro_rules! string_enum {
 }
 
 string_enum!(
-    /// Kind of seat. Every org has exactly one `user` seat.
-    SeatKind { Agent => "agent", User => "user" }
+    /// Kind of seat. Every org has exactly one `user` seat, and one hidden
+    /// `system` seat that sends system mail (it is never in the directory,
+    /// has no tokens and cannot be addressed).
+    SeatKind { Agent => "agent", User => "user", System => "system" }
 );
 
 string_enum!(
@@ -87,8 +89,10 @@ string_enum!(Priority { Normal => "normal", Urgent => "urgent" });
 
 string_enum!(
     /// Where a message comes from, relative to the reader's org. Only `user`
-    /// mail carries the authority of the org's owner.
-    Source { User => "user", Agent => "agent", External => "external" }
+    /// mail carries the authority of the org's owner. `system` mail is
+    /// written by the mail server itself (e.g. an acknowledgement that did
+    /// not come); no client can send it.
+    Source { User => "user", Agent => "agent", External => "external", System => "system" }
 );
 
 string_enum!(
@@ -171,6 +175,10 @@ pub struct SendRequest {
     pub priority: Option<Priority>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ack_required: Option<bool>,
+    /// With `ack_required`: seconds until the sender is told who has not
+    /// acknowledged (default: the org's `ack_timeout_min`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_timeout_s: Option<u64>,
     /// Free-form string key/value pairs stored with the message and shown to
     /// recipients. The server does not interpret them.
     #[serde(default, skip_serializing_if = "Meta::is_empty")]
@@ -204,6 +212,26 @@ pub struct SendResponse {
     pub rejected: Vec<Rejected>,
     /// Number of distinct seats that received a delivery.
     pub deliveries: u32,
+    /// Recipients of the sender's org that will not see the message at
+    /// once: asleep, offline, focused, or not answering wake-ups.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<RecipientNote>,
+}
+
+/// Why a recipient will not see a message at once (see
+/// [`SendResponse::notes`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecipientNote {
+    pub seat: String,
+    /// `dormant` (asleep; `to` and urgent mail start it), `offline` (no
+    /// session), `focus` (only urgent mail until `until`), `wake_failed`
+    /// (its session does not answer wake-ups).
+    pub state: String,
+    /// Mail of this class and priority starts or wakes the seat now.
+    pub wakes: bool,
+    /// `focus`: when it ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -281,6 +309,10 @@ pub struct InboxEntry {
     /// Present on `claim` responses when the body is short enough to inline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
+    /// On `claim` responses with `preview_chars`: the body's first non-empty
+    /// line, cut to that many characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -341,6 +373,17 @@ pub struct ClaimRequest {
     /// inline (the caller shows them in full).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mark_inlined_read: bool,
+    /// Claim only `digest` deliveries (of the given classes).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub digest_only: bool,
+    /// Idempotency key chosen by the caller: a retried claim with the same
+    /// key (for the same seat, within a few minutes) returns the deliveries
+    /// the first one took, instead of claiming again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// Fill `preview` of each returned entry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview_chars: Option<u32>,
 }
 
 fn all_classes() -> Vec<DeliveryClass> {
@@ -406,6 +449,9 @@ pub struct Seat {
     /// node has reported the seat recently (treat as offline).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presence: Option<Presence>,
+    /// The seat is in focus mode (only urgent mail reaches it) until then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus_until: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -556,6 +602,12 @@ pub struct OrgInfo {
     pub send_burst: i64,
     pub max_recipients: i64,
     pub max_thread_depth: i64,
+    /// Default time for recipients to acknowledge before the sender is told.
+    pub ack_timeout_min: i64,
+    /// Longest focus a seat may declare.
+    pub focus_max_min: i64,
+    /// An idle seat with digest mail is woken at most this often for it.
+    pub digest_interval_min: i64,
     /// Every new message to the org's user is announced here (POST, headers
     /// only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -572,6 +624,12 @@ pub struct OrgPatch {
     pub max_recipients: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_thread_depth: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_timeout_min: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus_max_min: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest_interval_min: Option<i64>,
     /// `null` clears it.
     #[serde(
         default,
@@ -604,6 +662,15 @@ pub struct PendingCounts {
     pub urgent: i64,
     /// The seat's sequence counter when the counts were taken.
     pub seq: i64,
+    /// Pending `digest` deliveries (not counted above), and when the oldest
+    /// of them was sent.
+    #[serde(default)]
+    pub digest: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest_since: Option<String>,
+    /// The seat is in focus mode until then: only urgent mail is shown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus_until: Option<String>,
 }
 
 impl PendingCounts {
@@ -617,6 +684,32 @@ impl PendingCounts {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PendingResponse {
     pub seats: Vec<PendingCounts>,
+    /// The org's digest interval: an idle seat whose oldest pending digest
+    /// mail is older than this is woken for it (at most once per interval).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub digest_interval_ms: Option<u64>,
+}
+
+/// Body of `PUT /v1/focus`: focus for `for_s` seconds, or until `until`
+/// (RFC 3339); with neither, for the org's maximum.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FocusRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub for_s: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<String>,
+}
+
+/// Response of `PUT` and `DELETE /v1/focus`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FocusResponse {
+    pub seat: String,
+    /// `None`: not in focus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus_until: Option<String>,
+    /// The requested time was longer than the org allows and was cut.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub capped: bool,
 }
 
 /// A seat's session state as shown in the directory and the event stream.

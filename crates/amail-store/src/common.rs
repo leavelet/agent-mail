@@ -24,7 +24,7 @@ macro_rules! seat_select {
     () => {
         "SELECT s.id, s.org_id, s.name, s.kind, s.parent_id, p.name AS parent_name, \
          s.display_name, s.role, s.harness, s.model, s.permission_mode, s.group_name, s.last_seq, \
-         s.created_at, s.deleted_at \
+         s.created_at, s.deleted_at, s.focus_until \
          FROM seats s LEFT JOIN seats p ON p.id = s.parent_id"
     };
 }
@@ -98,14 +98,18 @@ macro_rules! entry_select_body {
 }
 
 /// Candidate deliveries for a claim. Postgres appends a row-locking clause.
-/// Binds: seat_id, include_digest, to, cc, list, urgent_only, limit.
+/// Binds: seat_id, mode mask (1 immediate, 2 digest), to, cc, list,
+/// urgent_only, limit, and an idempotency key: when the seat already used
+/// that key, nothing is a candidate (SQLite; Postgres binds NULL and checks
+/// the key first).
 macro_rules! claim_select {
     () => {
         "SELECT d.id FROM deliveries d JOIN messages m ON m.id = d.message_id \
          WHERE d.seat_id = $1 AND d.notified_at IS NULL \
-         AND (d.mode = 'immediate' OR ($2 AND d.mode = 'digest')) \
+         AND ((($2 & 1) <> 0 AND d.mode = 'immediate') OR (($2 & 2) <> 0 AND d.mode = 'digest')) \
          AND (($3 AND d.class = 'to') OR ($4 AND d.class = 'cc') OR ($5 AND d.class = 'list')) \
          AND (NOT $6 OR m.priority = 'urgent') \
+         AND NOT EXISTS (SELECT 1 FROM claim_keys k WHERE k.seat_id = $1 AND k.key = $8) \
          ORDER BY d.seq LIMIT $7"
     };
 }
@@ -114,13 +118,14 @@ macro_rules! claim_select {
 macro_rules! auth_select {
     () => {
         "SELECT t.id AS token_id, t.scope, t.seat_id, o.id, o.name, o.send_rate_per_min, o.send_burst, \
-         o.max_recipients, o.max_thread_depth, o.webhook_url, o.created_at, s.id AS s_id, \
+         o.max_recipients, o.max_thread_depth, o.webhook_url, o.ack_timeout_min, o.focus_max_min, \
+         o.digest_interval_min, o.created_at, s.id AS s_id, \
          s.org_id AS s_org_id, s.name AS s_name, \
          s.kind AS s_kind, s.parent_id AS s_parent_id, p.name AS s_parent_name, \
          s.display_name AS s_display_name, s.role AS s_role, s.harness AS s_harness, \
          s.model AS s_model, s.permission_mode AS s_permission_mode, s.group_name AS s_group_name, \
          s.last_seq AS s_last_seq, s.created_at AS s_created_at, \
-         s.deleted_at AS s_deleted_at \
+         s.deleted_at AS s_deleted_at, s.focus_until AS s_focus_until \
          FROM tokens t JOIN orgs o ON o.id = t.org_id \
          LEFT JOIN seats s ON s.id = t.seat_id LEFT JOIN seats p ON p.id = s.parent_id"
     };
@@ -228,6 +233,9 @@ pub(crate) struct OrgRow {
     max_recipients: i64,
     max_thread_depth: i64,
     webhook_url: Option<String>,
+    ack_timeout_min: i64,
+    focus_max_min: i64,
+    digest_interval_min: i64,
     created_at: i64,
 }
 
@@ -241,6 +249,9 @@ impl From<OrgRow> for Org {
             max_recipients: r.max_recipients,
             max_thread_depth: r.max_thread_depth,
             webhook_url: r.webhook_url,
+            ack_timeout_min: r.ack_timeout_min,
+            focus_max_min: r.focus_max_min,
+            digest_interval_min: r.digest_interval_min,
             created_at: r.created_at,
         }
     }
@@ -263,6 +274,7 @@ pub(crate) struct SeatRow {
     last_seq: i64,
     created_at: i64,
     deleted_at: Option<i64>,
+    focus_until: Option<i64>,
 }
 
 impl SeatRow {
@@ -283,6 +295,7 @@ impl SeatRow {
             last_seq: self.last_seq,
             created_at: self.created_at,
             deleted_at: self.deleted_at,
+            focus_until: self.focus_until,
         })
     }
 }
@@ -309,6 +322,7 @@ pub(crate) struct AuthRow {
     s_last_seq: Option<i64>,
     s_created_at: Option<i64>,
     s_deleted_at: Option<i64>,
+    s_focus_until: Option<i64>,
 }
 
 impl AuthRow {
@@ -332,6 +346,7 @@ impl AuthRow {
                 last_seq: self.s_last_seq.unwrap_or_default(),
                 created_at: self.s_created_at.unwrap_or_default(),
                 deleted_at: None,
+                focus_until: self.s_focus_until,
             }),
             (Some(_), _) => return Ok(None),
         };
@@ -538,6 +553,9 @@ pub(crate) struct PendingRow {
     cc_n: i64,
     list_n: i64,
     urgent_n: i64,
+    digest_n: i64,
+    digest_since: Option<i64>,
+    focus_until: Option<i64>,
 }
 
 impl From<PendingRow> for PendingRec {
@@ -550,7 +568,63 @@ impl From<PendingRow> for PendingRec {
             cc: r.cc_n,
             list: r.list_n,
             urgent: r.urgent_n,
+            digest: r.digest_n,
+            digest_since: r.digest_since,
+            focus_until: r.focus_until,
         }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+pub(crate) struct PresenceRow {
+    seat: String,
+    state: String,
+    wake_failed: bool,
+    harness: Option<String>,
+    node: Option<String>,
+    since: i64,
+    updated_at: i64,
+    attention: Option<String>,
+    attention_hint: Option<String>,
+    terminal_url: Option<String>,
+}
+
+impl PresenceRow {
+    pub(crate) fn into_rec(self) -> Result<PresenceRec> {
+        Ok(PresenceRec {
+            seat: self.seat,
+            state: parse(&self.state)?,
+            wake_failed: self.wake_failed,
+            harness: self.harness,
+            node: self.node,
+            since: self.since,
+            updated_at: self.updated_at,
+            attention: self.attention,
+            attention_hint: self.attention_hint,
+            terminal_url: self.terminal_url,
+        })
+    }
+}
+
+/// Comma-separated ids (as stored in `claim_keys.ids`).
+pub(crate) fn parse_ids(s: &str) -> Vec<i64> {
+    s.split(',').filter_map(|x| x.trim().parse().ok()).collect()
+}
+
+/// `$first, $first+1, ...` for `n` values.
+pub(crate) fn placeholders(first: usize, n: usize) -> String {
+    (0..n)
+        .map(|i| format!("${}", first + i))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The `claim_select!` mode mask of a filter.
+pub(crate) fn mode_mask(f: &ClaimFilter) -> i64 {
+    match (f.digest_only, f.include_digest) {
+        (true, _) => 2,
+        (false, true) => 3,
+        (false, false) => 1,
     }
 }
 
@@ -719,7 +793,10 @@ macro_rules! impl_store_common {
                     "UPDATE orgs SET send_rate_per_min = COALESCE($1, send_rate_per_min), \
                      send_burst = COALESCE($2, send_burst), max_recipients = COALESCE($3, max_recipients), \
                      max_thread_depth = COALESCE($4, max_thread_depth), \
-                     webhook_url = CASE WHEN $6 THEN $7 ELSE webhook_url END WHERE id = $5",
+                     webhook_url = CASE WHEN $6 THEN $7 ELSE webhook_url END, \
+                     ack_timeout_min = COALESCE($8, ack_timeout_min), \
+                     focus_max_min = COALESCE($9, focus_max_min), \
+                     digest_interval_min = COALESCE($10, digest_interval_min) WHERE id = $5",
                 )
                 .bind(p.send_rate_per_min)
                 .bind(p.send_burst)
@@ -728,6 +805,9 @@ macro_rules! impl_store_common {
                 .bind(org_id)
                 .bind(p.webhook_url.is_some())
                 .bind(p.webhook_url.clone().flatten())
+                .bind(p.ack_timeout_min)
+                .bind(p.focus_max_min)
+                .bind(p.digest_interval_min)
                 .execute(&mut *c)
                 .await?;
                 org_by_id(c, org_id).await?.ok_or_else(|| StoreError::NotFound("org".into()))
@@ -1378,16 +1458,19 @@ macro_rules! impl_store_common {
 
             pub async fn pending(c: &mut Conn, org_id: i64, seat_id: Option<i64>) -> Result<Vec<PendingRec>> {
                 let rows: Vec<PendingRow> = sqlx::query_as(
-                    "SELECT s.id AS seat_id, s.name AS seat_name, s.last_seq, \
-                     COALESCE(SUM(CASE WHEN d.class = 'to' THEN 1 ELSE 0 END), 0) AS to_n, \
-                     COALESCE(SUM(CASE WHEN d.class = 'cc' THEN 1 ELSE 0 END), 0) AS cc_n, \
-                     COALESCE(SUM(CASE WHEN d.class = 'list' THEN 1 ELSE 0 END), 0) AS list_n, \
-                     COALESCE(SUM(CASE WHEN m.priority = 'urgent' THEN 1 ELSE 0 END), 0) AS urgent_n \
+                    "SELECT s.id AS seat_id, s.name AS seat_name, s.last_seq, s.focus_until, \
+                     COALESCE(SUM(CASE WHEN d.mode = 'immediate' AND d.class = 'to' THEN 1 ELSE 0 END), 0) AS to_n, \
+                     COALESCE(SUM(CASE WHEN d.mode = 'immediate' AND d.class = 'cc' THEN 1 ELSE 0 END), 0) AS cc_n, \
+                     COALESCE(SUM(CASE WHEN d.mode = 'immediate' AND d.class = 'list' THEN 1 ELSE 0 END), 0) AS list_n, \
+                     COALESCE(SUM(CASE WHEN d.mode = 'immediate' AND m.priority = 'urgent' THEN 1 ELSE 0 END), 0) AS urgent_n, \
+                     COALESCE(SUM(CASE WHEN d.mode = 'digest' THEN 1 ELSE 0 END), 0) AS digest_n, \
+                     MIN(CASE WHEN d.mode = 'digest' THEN m.created_at END) AS digest_since \
                      FROM seats s \
-                     LEFT JOIN deliveries d ON d.seat_id = s.id AND d.notified_at IS NULL AND d.mode = 'immediate' \
+                     LEFT JOIN deliveries d ON d.seat_id = s.id AND d.notified_at IS NULL \
+                       AND d.mode IN ('immediate', 'digest') \
                      LEFT JOIN messages m ON m.id = d.message_id \
                      WHERE s.org_id = $1 AND s.deleted_at IS NULL AND ($2 IS NULL OR s.id = $2) \
-                     GROUP BY s.id, s.name, s.last_seq ORDER BY s.name",
+                     GROUP BY s.id, s.name, s.last_seq, s.focus_until ORDER BY s.name",
                 )
                 .bind(org_id)
                 .bind(seat_id)
@@ -1397,19 +1480,359 @@ macro_rules! impl_store_common {
             }
 
             /// Ids of claimable deliveries. `sql` is `claim_select!()`,
-            /// possibly with a locking suffix.
-            pub async fn claim_candidates(c: &mut Conn, sql: &'static str, seat_id: i64, f: &ClaimFilter) -> Result<Vec<i64>> {
+            /// possibly with a locking suffix. `key`: see `claim_select!`.
+            pub async fn claim_candidates(c: &mut Conn, sql: &'static str, seat_id: i64, f: &ClaimFilter, key: Option<&str>) -> Result<Vec<i64>> {
                 use amail_proto::DeliveryClass as C;
                 Ok(sqlx::query_scalar(sql)
                     .bind(seat_id)
-                    .bind(f.include_digest)
+                    .bind(mode_mask(f))
                     .bind(f.has(C::To))
                     .bind(f.has(C::Cc))
                     .bind(f.has(C::List))
                     .bind(f.urgent_only)
                     .bind(f.limit)
+                    .bind(key)
                     .fetch_all(&mut *c)
                     .await?)
+            }
+
+            /// The deliveries an earlier claim with `key` took, if there was one.
+            pub async fn claimed_with_key(c: &mut Conn, seat_id: i64, key: &str) -> Result<Option<Vec<i64>>> {
+                let ids: Option<String> = sqlx::query_scalar("SELECT ids FROM claim_keys WHERE seat_id = $1 AND key = $2")
+                    .bind(seat_id)
+                    .bind(key)
+                    .fetch_optional(&mut *c)
+                    .await?;
+                Ok(ids.map(|s| parse_ids(&s)))
+            }
+
+            /// Entries (with bodies) of the seat's deliveries with these ids, by seq.
+            pub async fn entries_by_ids(c: &mut Conn, seat_id: i64, ids: &[i64]) -> Result<Vec<Entry>> {
+                if ids.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let sql = format!(
+                    "{} WHERE d.seat_id = $1 AND d.id IN ({}) ORDER BY d.seq",
+                    entry_select_body!(),
+                    placeholders(2, ids.len())
+                );
+                let mut q = sqlx::query_as::<_, EntryRow>(&sql).bind(seat_id);
+                for id in ids {
+                    q = q.bind(*id);
+                }
+                collect(q.fetch_all(&mut *c).await?, EntryRow::into_entry)
+            }
+
+            // --- presence ----------------------------------------------------
+
+            pub async fn presence(c: &mut Conn, org_id: i64, seat: Option<&str>) -> Result<Vec<PresenceRec>> {
+                let rows: Vec<PresenceRow> = sqlx::query_as(
+                    "SELECT s.name AS seat, p.state, p.wake_failed, p.harness, p.node, p.since, p.updated_at, \
+                     p.attention, p.attention_hint, p.terminal_url \
+                     FROM presence p JOIN seats s ON s.id = p.seat_id \
+                     WHERE p.org_id = $1 AND s.deleted_at IS NULL AND ($2 IS NULL OR s.name = $2) ORDER BY s.name",
+                )
+                .bind(org_id)
+                .bind(seat)
+                .fetch_all(&mut *c)
+                .await?;
+                collect(rows, PresenceRow::into_rec)
+            }
+
+            /// Store reports (`since` of an unchanged state is kept); returns
+            /// the entries whose state changed or that were absent (no row,
+            /// or older than `ttl_ms`), as stored.
+            pub async fn put_presence(c: &mut Conn, org_id: i64, recs: &[PresenceRec], ttl_ms: i64) -> Result<Vec<PresenceRec>> {
+                let now = now_ms();
+                let names: Vec<String> = recs.iter().map(|r| r.seat.clone()).collect();
+                let ids: std::collections::HashMap<String, i64> = seats_by_names(c, org_id, &names)
+                    .await?
+                    .into_iter()
+                    .map(|s| (s.name, s.id))
+                    .collect();
+                if ids.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let prev: std::collections::HashMap<String, PresenceRec> = presence(c, org_id, None)
+                    .await?
+                    .into_iter()
+                    .filter(|p| ids.contains_key(&p.seat))
+                    .map(|p| (p.seat.clone(), p))
+                    .collect();
+                let mut stored = Vec::new();
+                let mut changed = Vec::new();
+                for r in recs {
+                    let Some(&seat_id) = ids.get(&r.seat) else { continue };
+                    let old = prev.get(&r.seat).filter(|p| now - p.updated_at <= ttl_ms);
+                    let mut rec = r.clone();
+                    rec.updated_at = now;
+                    rec.since = match old {
+                        Some(o) if o.state == r.state => o.since,
+                        _ => r.since.min(now),
+                    };
+                    if old.is_none_or(|o| !o.same_as(&rec)) {
+                        changed.push(rec.clone());
+                    }
+                    stored.push((seat_id, rec));
+                }
+                for chunk in stored.chunks(500) {
+                    let rows: Vec<String> = (0..chunk.len()).map(|i| format!("({})", placeholders(i * 11 + 1, 11))).collect();
+                    let sql = format!(
+                        "INSERT INTO presence (seat_id, org_id, state, wake_failed, harness, node, since, updated_at, \
+                         attention, attention_hint, terminal_url) VALUES {} \
+                         ON CONFLICT (seat_id) DO UPDATE SET state = excluded.state, wake_failed = excluded.wake_failed, \
+                         harness = excluded.harness, node = excluded.node, since = excluded.since, \
+                         updated_at = excluded.updated_at, attention = excluded.attention, \
+                         attention_hint = excluded.attention_hint, terminal_url = excluded.terminal_url",
+                        rows.join(", ")
+                    );
+                    let mut q = sqlx::query(&sql);
+                    for (seat_id, r) in chunk {
+                        q = q
+                            .bind(*seat_id)
+                            .bind(org_id)
+                            .bind(r.state.as_str())
+                            .bind(r.wake_failed)
+                            .bind(r.harness.clone())
+                            .bind(r.node.clone())
+                            .bind(r.since)
+                            .bind(r.updated_at)
+                            .bind(r.attention.clone())
+                            .bind(r.attention_hint.clone())
+                            .bind(r.terminal_url.clone());
+                    }
+                    q.execute(&mut *c).await?;
+                }
+                Ok(changed)
+            }
+
+            // --- instances ---------------------------------------------------
+
+            pub async fn heartbeat_instance(c: &mut Conn, id: &str, url: Option<&str>, now: i64) -> Result<()> {
+                sqlx::query(
+                    "INSERT INTO server_instances (id, url, started_at, heartbeat_at) VALUES ($1, $2, $3, $3) \
+                     ON CONFLICT (id) DO UPDATE SET url = excluded.url, heartbeat_at = excluded.heartbeat_at",
+                )
+                .bind(id)
+                .bind(url)
+                .bind(now)
+                .execute(&mut *c)
+                .await?;
+                Ok(())
+            }
+
+            pub async fn remove_instance(c: &mut Conn, id: &str) -> Result<()> {
+                for sql in [
+                    "DELETE FROM node_streams WHERE instance_id = $1",
+                    "DELETE FROM mirror_watch WHERE instance_id = $1",
+                    "DELETE FROM server_instances WHERE id = $1",
+                ] {
+                    sqlx::query(sql).bind(id).execute(&mut *c).await?;
+                }
+                Ok(())
+            }
+
+            pub async fn set_node_streams(c: &mut Conn, instance: &str, counts: &[(i64, i64)]) -> Result<()> {
+                sqlx::query("DELETE FROM node_streams WHERE instance_id = $1")
+                    .bind(instance)
+                    .execute(&mut *c)
+                    .await?;
+                for chunk in counts.chunks(500) {
+                    let rows: Vec<String> = (0..chunk.len()).map(|i| format!("($1, ${}, ${})", i * 2 + 2, i * 2 + 3)).collect();
+                    let sql = format!("INSERT INTO node_streams (instance_id, org_id, streams) VALUES {}", rows.join(", "));
+                    let mut q = sqlx::query(&sql).bind(instance);
+                    for (org, n) in chunk {
+                        q = q.bind(*org).bind(*n);
+                    }
+                    q.execute(&mut *c).await?;
+                }
+                Ok(())
+            }
+
+            pub async fn node_streams(c: &mut Conn, except: &str, fresh_since: i64) -> Result<Vec<(i64, i64)>> {
+                Ok(sqlx::query_as(
+                    "SELECT n.org_id, CAST(SUM(n.streams) AS BIGINT) FROM node_streams n \
+                     JOIN server_instances i ON i.id = n.instance_id \
+                     WHERE n.instance_id <> $1 AND i.heartbeat_at >= $2 GROUP BY n.org_id",
+                )
+                .bind(except)
+                .bind(fresh_since)
+                .fetch_all(&mut *c)
+                .await?)
+            }
+
+            pub async fn watch_mirror(c: &mut Conn, org_id: i64, seat: &str, instance: &str, expires_at: Option<i64>) -> Result<()> {
+                match expires_at {
+                    Some(t) => sqlx::query(
+                        "INSERT INTO mirror_watch (org_id, seat, instance_id, expires_at) VALUES ($1, $2, $3, $4) \
+                         ON CONFLICT (org_id, seat, instance_id) DO UPDATE SET expires_at = excluded.expires_at",
+                    )
+                    .bind(org_id)
+                    .bind(seat)
+                    .bind(instance)
+                    .bind(t),
+                    None => sqlx::query("DELETE FROM mirror_watch WHERE org_id = $1 AND seat = $2 AND instance_id = $3")
+                        .bind(org_id)
+                        .bind(seat)
+                        .bind(instance),
+                }
+                .execute(&mut *c)
+                .await?;
+                Ok(())
+            }
+
+            pub async fn mirror_watchers(c: &mut Conn, org_id: i64, seat: &str, now: i64) -> Result<Vec<(String, Option<String>)>> {
+                Ok(sqlx::query_as(
+                    "SELECT w.instance_id, i.url FROM mirror_watch w JOIN server_instances i ON i.id = w.instance_id \
+                     WHERE w.org_id = $1 AND w.seat = $2 AND w.expires_at > $3",
+                )
+                .bind(org_id)
+                .bind(seat)
+                .bind(now)
+                .fetch_all(&mut *c)
+                .await?)
+            }
+
+            /// Drop expired claim keys, watches and instances.
+            pub async fn cleanup(c: &mut Conn, now: i64) -> Result<()> {
+                sqlx::query("DELETE FROM claim_keys WHERE created_at < $1").bind(now - 600_000).execute(&mut *c).await?;
+                sqlx::query("DELETE FROM mirror_watch WHERE expires_at < $1").bind(now).execute(&mut *c).await?;
+                sqlx::query(
+                    "DELETE FROM node_streams WHERE instance_id IN \
+                     (SELECT id FROM server_instances WHERE heartbeat_at < $1)",
+                )
+                .bind(now - 300_000)
+                .execute(&mut *c)
+                .await?;
+                sqlx::query("DELETE FROM server_instances WHERE heartbeat_at < $1").bind(now - 300_000).execute(&mut *c).await?;
+                Ok(())
+            }
+
+            // --- attention ---------------------------------------------------
+
+            /// Set or clear a seat's focus; bumps its counter so that event
+            /// subscribers (nodes) notice.
+            pub async fn set_focus(c: &mut Conn, seat_id: i64, until: Option<i64>) -> Result<SeqBump> {
+                let (org_id, seq): (i64, i64) = sqlx::query_as(
+                    "UPDATE seats SET focus_until = $2, last_seq = last_seq + 1 WHERE id = $1 RETURNING org_id, last_seq",
+                )
+                .bind(seat_id)
+                .bind(until)
+                .fetch_one(&mut *c)
+                .await?;
+                Ok(SeqBump { org_id, seat_id, seq })
+            }
+
+            pub async fn system_seat_get(c: &mut Conn, org_id: i64) -> Result<Option<Seat>> {
+                let r: Option<SeatRow> = sqlx::query_as(concat!(seat_select!(), " WHERE s.org_id = $1 AND s.kind = 'system'"))
+                    .bind(org_id)
+                    .fetch_optional(&mut *c)
+                    .await?;
+                r.map(SeatRow::into_seat).transpose()
+            }
+
+            /// The org's system seat, created (deleted, see the migration) if needed.
+            pub async fn system_seat(c: &mut Conn, org_id: i64) -> Result<Seat> {
+                if let Some(s) = system_seat_get(c, org_id).await? {
+                    return Ok(s);
+                }
+                let now = now_ms();
+                sqlx::query(
+                    "INSERT INTO seats (org_id, name, kind, created_at, deleted_at) VALUES ($1, 'amail', 'system', $2, $2) \
+                     ON CONFLICT DO NOTHING",
+                )
+                .bind(org_id)
+                .bind(now)
+                .execute(&mut *c)
+                .await?;
+                system_seat_get(c, org_id).await?.ok_or_else(|| StoreError::NotFound("system seat".into()))
+            }
+
+            pub async fn recipient_states(c: &mut Conn, ids: &[i64]) -> Result<Vec<RecipientState>> {
+                if ids.is_empty() {
+                    return Ok(Vec::new());
+                }
+                #[derive(sqlx::FromRow)]
+                struct Row {
+                    seat_id: i64,
+                    kind: String,
+                    focus_until: Option<i64>,
+                    has: Option<i64>,
+                    #[sqlx(flatten)]
+                    p: PresenceRow,
+                }
+                let sql = format!(
+                    "SELECT s.id AS seat_id, s.name AS seat, s.kind, s.focus_until, p.seat_id AS has, \
+                     COALESCE(p.state, 'offline') AS state, COALESCE(p.wake_failed, FALSE) AS wake_failed, \
+                     p.harness, p.node, COALESCE(p.since, 0) AS since, COALESCE(p.updated_at, 0) AS updated_at, \
+                     p.attention, p.attention_hint, p.terminal_url \
+                     FROM seats s LEFT JOIN presence p ON p.seat_id = s.id WHERE s.id IN ({})",
+                    placeholders(1, ids.len())
+                );
+                let mut q = sqlx::query_as::<_, Row>(&sql);
+                for id in ids {
+                    q = q.bind(*id);
+                }
+                let mut out = Vec::new();
+                for r in q.fetch_all(&mut *c).await? {
+                    let has = r.has.is_some();
+                    let p = r.p.into_rec()?;
+                    out.push(RecipientState {
+                        seat_id: r.seat_id,
+                        name: p.seat.clone(),
+                        kind: parse(&r.kind)?,
+                        focus_until: r.focus_until,
+                        presence: has.then_some(p),
+                    });
+                }
+                Ok(out)
+            }
+
+            pub async fn due_acks(c: &mut Conn, now: i64, limit: i64) -> Result<Vec<AckDue>> {
+                let rows: Vec<(i64, i64, i64, i64, i64, i64)> = sqlx::query_as(
+                    "SELECT id, org_id, sender_seat_id, ack_stage, created_at, ack_due FROM messages \
+                     WHERE ack_due IS NOT NULL AND ack_due <= $1 ORDER BY ack_due LIMIT $2",
+                )
+                .bind(now)
+                .bind(limit)
+                .fetch_all(&mut *c)
+                .await?;
+                Ok(rows
+                    .into_iter()
+                    .map(|(message_id, org_id, sender_seat_id, stage, created_at, due)| AckDue {
+                        message_id, org_id, sender_seat_id, stage, created_at, due,
+                    })
+                    .collect())
+            }
+
+            pub async fn advance_ack(c: &mut Conn, message_id: i64, from_stage: i64, to_stage: i64, next_due: Option<i64>) -> Result<bool> {
+                let r: Option<i64> = sqlx::query_scalar(
+                    "UPDATE messages SET ack_stage = $3, ack_due = $4 \
+                     WHERE id = $1 AND ack_stage = $2 AND ack_due IS NOT NULL RETURNING id",
+                )
+                .bind(message_id)
+                .bind(from_stage)
+                .bind(to_stage)
+                .bind(next_due)
+                .fetch_optional(&mut *c)
+                .await?;
+                Ok(r.is_some())
+            }
+
+            pub async fn laggards(c: &mut Conn, message_id: i64) -> Result<Vec<Laggard>> {
+                let rows: Vec<(i64, i64, String, Option<i64>)> = sqlx::query_as(
+                    "SELECT s.id, s.org_id, s.name, s.parent_id FROM deliveries d \
+                     JOIN seats s ON s.id = d.seat_id JOIN messages m ON m.id = d.message_id \
+                     WHERE d.message_id = $1 AND d.acked_at IS NULL AND d.seat_id <> m.sender_seat_id \
+                     AND d.mode <> 'archive' ORDER BY s.name",
+                )
+                .bind(message_id)
+                .fetch_all(&mut *c)
+                .await?;
+                Ok(rows
+                    .into_iter()
+                    .map(|(seat_id, org_id, name, parent_id)| Laggard { seat_id, org_id, name, parent_id })
+                    .collect())
             }
 
             /// Entries (with bodies) whose mod_seq is in `(lo, hi]`, by seq.
@@ -1591,9 +2014,19 @@ macro_rules! impl_store_common {
                 if f.classes.is_empty() || f.limit <= 0 {
                     return Ok((Vec::new(), None));
                 }
+                // A retry of a keyed claim that went through.
+                if let Some(key) = f.key.clone() {
+                    let done = run!(self.read, |c| match q::claimed_with_key(c, seat_id, &key).await? {
+                        Some(ids) => Ok(Some(q::entries_by_ids(c, seat_id, &ids).await?)),
+                        None => Ok(None),
+                    })?;
+                    if let Some(entries) = done {
+                        return Ok((entries, None));
+                    }
+                }
                 // Cheap unlocked check first: most periodic claims find nothing.
                 let f2 = f.clone();
-                let any = run!(self.read, |c| q::claim_candidates(c, claim_select!(), seat_id, &f2).await)?;
+                let any = run!(self.read, |c| q::claim_candidates(c, claim_select!(), seat_id, &f2, None).await)?;
                 if any.is_empty() {
                     return Ok((Vec::new(), None));
                 }
@@ -1678,6 +2111,89 @@ macro_rules! impl_store_common {
                 }
                 let messages = self.search_impl(org_id, query, scanned_to).await?;
                 Ok($crate::SearchResult { messages, scanned_to, scan_exhausted: exhausted })
+            }
+
+            async fn presence(&self, org_id: i64, seat: Option<&str>) -> $crate::Result<Vec<$crate::PresenceRec>> {
+                let seat = seat.map(str::to_string);
+                run!(self.read, |c| q::presence(c, org_id, seat.as_deref()).await)
+            }
+
+            async fn put_presence(&self, org_id: i64, recs: &[$crate::PresenceRec], ttl_ms: i64) -> $crate::Result<Vec<$crate::PresenceRec>> {
+                let recs = recs.to_vec();
+                run!(self.write, |c| q::put_presence(c, org_id, &recs, ttl_ms).await)
+            }
+
+            async fn take_send_token(&self, seat_id: i64, per_min: i64, burst: i64) -> $crate::Result<std::result::Result<(), u64>> {
+                self.take_send_token_impl(seat_id, per_min, burst).await
+            }
+
+            async fn refund_send_token(&self, seat_id: i64, burst: i64) -> $crate::Result<()> {
+                self.refund_send_token_impl(seat_id, burst).await
+            }
+
+            async fn heartbeat_instance(&self, id: &str, url: Option<&str>) -> $crate::Result<()> {
+                let (id, url) = (id.to_string(), url.map(str::to_string));
+                let now = now_ms();
+                run!(self.write, |c| q::heartbeat_instance(c, &id, url.as_deref(), now).await)
+            }
+
+            async fn remove_instance(&self, id: &str) -> $crate::Result<()> {
+                let id = id.to_string();
+                run!(self.write, |c| q::remove_instance(c, &id).await)
+            }
+
+            async fn set_node_streams(&self, instance: &str, counts: &[(i64, i64)]) -> $crate::Result<()> {
+                let (instance, counts) = (instance.to_string(), counts.to_vec());
+                run!(self.write, |c| q::set_node_streams(c, &instance, &counts).await)
+            }
+
+            async fn node_streams(&self, except: &str, fresh_since: i64) -> $crate::Result<Vec<(i64, i64)>> {
+                let except = except.to_string();
+                run!(self.read, |c| q::node_streams(c, &except, fresh_since).await)
+            }
+
+            async fn watch_mirror(&self, org_id: i64, seat: &str, instance: &str, expires_at: Option<i64>) -> $crate::Result<()> {
+                let (seat, instance) = (seat.to_string(), instance.to_string());
+                run!(self.write, |c| q::watch_mirror(c, org_id, &seat, &instance, expires_at).await)
+            }
+
+            async fn mirror_watchers(&self, org_id: i64, seat: &str) -> $crate::Result<Vec<(String, Option<String>)>> {
+                let seat = seat.to_string();
+                let now = now_ms();
+                run!(self.read, |c| q::mirror_watchers(c, org_id, &seat, now).await)
+            }
+
+            async fn cleanup(&self) -> $crate::Result<()> {
+                let now = now_ms();
+                run!(self.write, |c| q::cleanup(c, now).await)
+            }
+
+            async fn set_focus(&self, seat_id: i64, until: Option<i64>) -> $crate::Result<$crate::SeqBump> {
+                run!(self.write, |c| q::set_focus(c, seat_id, until).await)
+            }
+
+            async fn system_seat(&self, org_id: i64) -> $crate::Result<$crate::Seat> {
+                if let Some(s) = run!(self.read, |c| q::system_seat_get(c, org_id).await)? {
+                    return Ok(s);
+                }
+                run!(self.write, |c| q::system_seat(c, org_id).await)
+            }
+
+            async fn recipient_states(&self, seat_ids: &[i64]) -> $crate::Result<Vec<$crate::RecipientState>> {
+                let ids = seat_ids.to_vec();
+                run!(self.read, |c| q::recipient_states(c, &ids).await)
+            }
+
+            async fn due_acks(&self, now: i64, limit: i64) -> $crate::Result<Vec<$crate::AckDue>> {
+                run!(self.read, |c| q::due_acks(c, now, limit).await)
+            }
+
+            async fn advance_ack(&self, message_id: i64, from: i64, to: i64, next_due: Option<i64>) -> $crate::Result<bool> {
+                run!(self.write, |c| q::advance_ack(c, message_id, from, to, next_due).await)
+            }
+
+            async fn laggards(&self, message_id: i64) -> $crate::Result<Vec<$crate::Laggard>> {
+                run!(self.read, |c| q::laggards(c, message_id).await)
             }
         }
     };

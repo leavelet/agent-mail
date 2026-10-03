@@ -1,11 +1,12 @@
 //! The agent-mail HTTP API (`/v1`).
 
+pub mod attention;
 pub mod auth;
+pub mod cluster;
 pub mod commands;
 mod directory;
 pub mod error;
 pub mod events;
-pub mod limits;
 mod mail;
 mod nodes;
 pub mod presence;
@@ -28,7 +29,6 @@ pub use events::{EventBus, Hub};
 pub struct AppState {
     pub store: Arc<dyn Store>,
     pub bus: Arc<dyn EventBus>,
-    pub limiter: Arc<limits::RateLimiter>,
     pub presence: Arc<presence::PresenceBoard>,
     /// Commands for nodes (sleep, wake, transcript leases).
     pub nodes: Arc<commands::NodeHub>,
@@ -38,15 +38,18 @@ pub struct AppState {
     /// Client for notification webhooks.
     pub http: reqwest::Client,
     pub webhook_config: webhook::WebhookConfig,
+    /// Set when several instances share the database (Postgres).
+    pub cluster: Option<Arc<cluster::Cluster>>,
+    pub attention: attention::Config,
 }
 
 impl AppState {
+    /// A single server instance.
     pub fn new(store: Arc<dyn Store>) -> Self {
         AppState {
+            presence: Arc::new(presence::PresenceBoard::new(store.clone())),
             store,
             bus: Arc::new(Hub::new()),
-            limiter: Arc::new(limits::RateLimiter::default()),
-            presence: Arc::new(presence::PresenceBoard::new()),
             nodes: Arc::new(commands::NodeHub::new()),
             mirror: Arc::new(transcript::MirrorHub::new()),
             mirror_config: transcript::MirrorConfig::default(),
@@ -56,8 +59,44 @@ impl AppState {
                 .build()
                 .expect("building the HTTP client"),
             webhook_config: webhook::WebhookConfig::default(),
+            cluster: None,
+            attention: attention::Config::default(),
         }
     }
+
+    /// An instance of possibly several sharing one Postgres database at
+    /// `db_url`; `url` is where the other instances can reach this one.
+    pub fn clustered(store: Arc<dyn Store>, db_url: &str, url: Option<String>) -> Self {
+        let c = cluster::Cluster::new(db_url, url);
+        let mut st = AppState::new(store);
+        st.bus = Arc::new(cluster::ClusterBus {
+            hub: Hub::new(),
+            cluster: c.clone(),
+        });
+        st.cluster = Some(c);
+        st
+    }
+
+    /// Tell other instances that the presence of these seats changed.
+    pub(crate) fn presence_changed(&self, org_id: i64, seats: Vec<String>) {
+        if let (Some(c), false) = (&self.cluster, seats.is_empty()) {
+            c.notify(cluster::Wire::Presence {
+                o: org_id,
+                s: seats,
+            });
+        }
+    }
+}
+
+/// Start the background work of an instance: cluster membership (when
+/// clustered), acknowledgement escalation and cleanup.
+pub fn start_background(state: &AppState) -> Vec<tokio::task::JoinHandle<()>> {
+    let mut tasks = Vec::new();
+    if let Some(c) = &state.cluster {
+        tasks.extend(c.start(state));
+    }
+    tasks.push(tokio::spawn(attention::run(state.clone())));
+    tasks
 }
 
 pub fn router(state: AppState) -> Router {
@@ -74,6 +113,10 @@ pub fn router(state: AppState) -> Router {
         .route("/attention", get(ui::attention))
         .route("/sent", get(ui::sent))
         .route("/archive/search", get(ui::search))
+        .route(
+            "/focus",
+            put(attention::put_focus).delete(attention::delete_focus),
+        )
         .route("/seats/{name}/sleep", post(ui::sleep))
         .route("/seats/{name}/wake", post(ui::wake))
         .route(
@@ -131,7 +174,15 @@ pub async fn serve(
     state: AppState,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    axum::serve(listener, router(state))
+    let tasks = start_background(&state);
+    let r = axum::serve(listener, router(state.clone()))
         .with_graceful_shutdown(shutdown)
-        .await
+        .await;
+    for t in tasks {
+        t.abort();
+    }
+    if let Some(c) = &state.cluster {
+        c.leave(&*state.store).await;
+    }
+    r
 }

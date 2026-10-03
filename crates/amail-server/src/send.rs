@@ -22,8 +22,8 @@ use crate::AppState;
 use crate::auth::Auth;
 use crate::error::{ApiError, ApiResult};
 use amail_proto::{
-    Address, AddressResult, DeliveryClass, DeliveryMode, PostPolicy, Priority, Rejected, SeatKind,
-    SendRequest, SendResponse,
+    Address, AddressResult, DeliveryClass, DeliveryMode, PostPolicy, Priority, RecipientNote,
+    Rejected, SeatKind, SeatState, SendRequest, SendResponse,
 };
 use amail_store::{NewDelivery, NewMessage, Org, Seat};
 use std::collections::HashMap;
@@ -35,15 +35,26 @@ pub async fn send(st: &AppState, auth: &Auth, req: SendRequest) -> ApiResult<Sen
         return Err(ApiError::bad_request("at least one recipient is required"));
     }
     check_sizes(&req)?;
+    if let Some(t) = req.ack_timeout_s
+        && !(1..=30 * 86_400).contains(&t)
+    {
+        return Err(ApiError::bad_request(
+            "ack_timeout_s must be between 1 and 2592000 (30 days)",
+        ));
+    }
     let limited = sender.kind != SeatKind::User;
     if limited {
-        st.limiter
-            .try_acquire(sender.id, org.send_rate_per_min, org.send_burst)
-            .map_err(|wait| ApiError::rate_limited(wait.as_millis().max(1) as u64))?;
+        st.store
+            .take_send_token(sender.id, org.send_rate_per_min, org.send_burst)
+            .await?
+            .map_err(ApiError::rate_limited)?;
     }
     let result = send_inner(st, auth, &sender, req).await;
-    if result.is_err() && limited {
-        st.limiter.refund(sender.id, org.send_burst);
+    if result.is_err()
+        && limited
+        && let Err(e) = st.store.refund_send_token(sender.id, org.send_burst).await
+    {
+        tracing::warn!("refunding a send token: {e}");
     }
     result
 }
@@ -171,6 +182,15 @@ async fn send_inner(
     }
 
     let deliveries: Vec<NewDelivery> = r.order.iter().map(|id| r.seats[id].0.clone()).collect();
+    let ack_required = req.ack_required.unwrap_or(false);
+    let priority = req.priority.unwrap_or(Priority::Normal);
+    let ack_due = ack_required.then(|| {
+        let ms = match req.ack_timeout_s {
+            Some(s) => s as i64 * 1000,
+            None => org.ack_timeout_min.max(1) * 60_000,
+        };
+        amail_store::now_ms() + ms
+    });
     let msg = NewMessage {
         org_id: org.id,
         sender_seat_id: sender.id,
@@ -181,10 +201,11 @@ async fn send_inner(
         body: req.body,
         to_addrs: r.to_addrs,
         cc_addrs: r.cc_addrs,
-        priority: req.priority.unwrap_or(Priority::Normal),
-        ack_required: req.ack_required.unwrap_or(false),
+        priority,
+        ack_required,
         meta: req.meta,
         deliveries,
+        ack_due,
     };
     let sent = st.store.send(&msg).await?;
 
@@ -197,6 +218,7 @@ async fn send_inner(
         st.bus.publish(*org_id, events);
     }
     notify_users(st, org, &r.orgs, &sent).await;
+    let notes = notes(st, org, sender, &msg.deliveries, priority).await;
 
     Ok(SendResponse {
         id: sent.message_id,
@@ -204,7 +226,70 @@ async fn send_inner(
         recipients: r.results,
         rejected: r.rejected,
         deliveries: sent.seqs.len() as u32,
+        notes,
     })
+}
+
+/// Recipients in the sender's org that will not see the message at once.
+/// Agent seats only; `archive` deliveries are never shown, so not noted.
+async fn notes(
+    st: &AppState,
+    org: &Org,
+    sender: &Seat,
+    deliveries: &[NewDelivery],
+    priority: Priority,
+) -> Vec<RecipientNote> {
+    let local: Vec<&NewDelivery> = deliveries
+        .iter()
+        .filter(|d| d.org_id == org.id && d.seat_id != sender.id && d.mode != DeliveryMode::Archive)
+        .collect();
+    if local.is_empty() {
+        return Vec::new();
+    }
+    let ids: Vec<i64> = local.iter().map(|d| d.seat_id).collect();
+    let states = match st.store.recipient_states(&ids).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("reading recipient states: {e}");
+            return Vec::new();
+        }
+    };
+    let now = amail_store::now_ms();
+    let ttl = crate::presence::TTL.as_millis() as i64;
+    let urgent = priority == Priority::Urgent;
+    let mut out = Vec::new();
+    for s in states.iter().filter(|s| s.kind == SeatKind::Agent) {
+        let Some(d) = local.iter().find(|d| d.seat_id == s.seat_id) else {
+            continue;
+        };
+        // Mail that wakes an idle seat (and starts a sleeping one).
+        let wakes = d.mode == DeliveryMode::Immediate && (d.class == DeliveryClass::To || urgent);
+        if let Some(until) = s.focus_until.filter(|u| *u > now) {
+            out.push(RecipientNote {
+                seat: s.name.clone(),
+                state: "focus".into(),
+                wakes: urgent,
+                until: Some(crate::render::ts(until)),
+            });
+            continue;
+        }
+        let p = s.presence.as_ref().filter(|p| now - p.updated_at <= ttl);
+        let state = match p {
+            None => "offline",
+            Some(p) if p.state == SeatState::Offline => "offline",
+            Some(p) if p.state == SeatState::Dormant => "dormant",
+            Some(p) if p.wake_failed => "wake_failed",
+            Some(_) => continue,
+        };
+        out.push(RecipientNote {
+            seat: s.name.clone(),
+            state: state.into(),
+            wakes: wakes && state == "dormant",
+            until: None,
+        });
+    }
+    out.sort_by(|a, b| a.seat.cmp(&b.seat));
+    out
 }
 
 /// Webhook notices for the orgs whose user seat got the message.

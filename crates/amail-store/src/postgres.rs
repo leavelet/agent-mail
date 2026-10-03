@@ -93,8 +93,8 @@ impl PgStore {
                 let thread_id = m.thread_id.unwrap_or(id);
                 sqlx::query(
                     "INSERT INTO messages (id, org_id, sender_seat_id, thread_id, parent_id, depth, subject, body, \
-                     lines, to_addrs, cc_addrs, priority, ack_required, created_at, meta) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+                     lines, to_addrs, cc_addrs, priority, ack_required, created_at, meta, ack_due) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
                 )
                 .bind(id)
                 .bind(m.org_id)
@@ -111,6 +111,7 @@ impl PgStore {
                 .bind(m.ack_required)
                 .bind(now)
                 .bind(meta_to_db(&m.meta))
+                .bind(m.ack_due)
                 .execute(&mut *c)
                 .await?;
 
@@ -184,8 +185,35 @@ impl PgStore {
         let f = f.clone();
         self.write(move |c| {
             Box::pin(async move {
+                // A keyed claim first takes its key: a concurrent claim with
+                // the same key waits here until this one commits, then
+                // returns what this one took.
+                if let Some(key) = &f.key {
+                    let fresh: Option<i64> = sqlx::query_scalar(
+                        "INSERT INTO claim_keys (seat_id, key, ids, created_at) VALUES ($1, $2, '', $3) \
+                         ON CONFLICT DO NOTHING RETURNING seat_id",
+                    )
+                    .bind(seat_id)
+                    .bind(key)
+                    .bind(now_ms())
+                    .fetch_optional(&mut *c)
+                    .await?;
+                    if fresh.is_none() {
+                        let ids = q::claimed_with_key(c, seat_id, key).await?.unwrap_or_default();
+                        return Ok((q::entries_by_ids(c, seat_id, &ids).await?, None));
+                    }
+                }
                 let ids =
-                    q::claim_candidates(c, concat!(claim_select!(), " FOR NO KEY UPDATE OF d SKIP LOCKED"), seat_id, &f).await?;
+                    q::claim_candidates(c, concat!(claim_select!(), " FOR NO KEY UPDATE OF d SKIP LOCKED"), seat_id, &f, None).await?;
+                if let Some(key) = &f.key {
+                    let list: Vec<String> = ids.iter().map(i64::to_string).collect();
+                    sqlx::query("UPDATE claim_keys SET ids = $3 WHERE seat_id = $1 AND key = $2")
+                        .bind(seat_id)
+                        .bind(key)
+                        .bind(list.join(","))
+                        .execute(&mut *c)
+                        .await?;
+                }
                 if ids.is_empty() {
                     return Ok((Vec::new(), None));
                 }
@@ -212,6 +240,63 @@ impl PgStore {
             })
         })
         .await
+    }
+}
+
+impl PgStore {
+    /// Token bucket in `send_budget`, on the database's clock, so that every
+    /// server instance draws from the same bucket.
+    async fn take_send_token_impl(
+        &self,
+        seat_id: i64,
+        per_min: i64,
+        burst: i64,
+    ) -> Result<std::result::Result<(), u64>> {
+        let burst = burst.max(1) as f64;
+        let per_ms = per_min.max(0) as f64 / 60_000.0;
+        let mut c = self.pool.acquire().await?;
+        let left: Option<f64> = sqlx::query_scalar(
+            "INSERT INTO send_budget AS b (seat_id, tokens, updated_at) \
+             SELECT $1, $2::float8 - 1, (extract(epoch FROM clock_timestamp()) * 1000)::bigint \
+             ON CONFLICT (seat_id) DO UPDATE SET \
+               tokens = LEAST($2::float8, b.tokens + GREATEST(0, excluded.updated_at - b.updated_at) * $3::float8) - 1, \
+               updated_at = excluded.updated_at \
+             WHERE LEAST($2::float8, b.tokens + GREATEST(0, excluded.updated_at - b.updated_at) * $3::float8) >= 1 \
+             RETURNING tokens",
+        )
+        .bind(seat_id)
+        .bind(burst)
+        .bind(per_ms)
+        .fetch_optional(&mut *c)
+        .await?;
+        if left.is_some() {
+            return Ok(Ok(()));
+        }
+        if per_ms == 0.0 {
+            return Ok(Err(3_600_000));
+        }
+        let have: f64 = sqlx::query_scalar(
+            "SELECT LEAST($2::float8, tokens + GREATEST(0, (extract(epoch FROM clock_timestamp()) * 1000)::bigint \
+             - updated_at) * $3::float8) FROM send_budget WHERE seat_id = $1",
+        )
+        .bind(seat_id)
+        .bind(burst)
+        .bind(per_ms)
+        .fetch_optional(&mut *c)
+        .await?
+        .unwrap_or(0.0);
+        Ok(Err((((1.0 - have) / per_ms).ceil() as u64).max(1)))
+    }
+
+    async fn refund_send_token_impl(&self, seat_id: i64, burst: i64) -> Result<()> {
+        sqlx::query(
+            "UPDATE send_budget SET tokens = LEAST($2::float8, tokens + 1) WHERE seat_id = $1",
+        )
+        .bind(seat_id)
+        .bind(burst.max(1) as f64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 }
 

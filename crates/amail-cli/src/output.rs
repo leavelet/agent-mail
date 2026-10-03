@@ -19,6 +19,7 @@ fn source(s: Source) -> &'static str {
         Source::User => "user",
         Source::Agent => "agent",
         Source::External => "external",
+        Source::System => "system",
     }
 }
 
@@ -159,6 +160,9 @@ pub fn seat_line(s: &p::Seat) -> String {
             out.push_str(" wake_failed");
         }
     }
+    if let Some(t) = &s.focus_until {
+        out.push_str(&format!(" focus_until={}", short_time(t)));
+    }
     out.push_str(&quoted("name", &s.display_name));
     out.push_str(&quoted("role", &s.role));
     out
@@ -205,7 +209,33 @@ pub fn send_result(r: &p::SendResponse) -> String {
     for rej in &r.rejected {
         out.push_str(&format!("\nrejected {}: {}", rej.address, rej.reason));
     }
+    if !r.notes.is_empty() {
+        let notes: Vec<String> = r.notes.iter().map(note).collect();
+        out.push_str(&format!("\nnot seen at once: {}", notes.join("; ")));
+    }
     out
+}
+
+/// Why a recipient will not see the mail at once, in a few words.
+fn note(n: &p::RecipientNote) -> String {
+    let what = match n.state.as_str() {
+        "dormant" if n.wakes => "asleep; this mail starts it (takes a while)".to_string(),
+        "dormant" => "asleep; sees it when next started".to_string(),
+        "offline" => "offline (no session); sees it when one starts".to_string(),
+        "focus" => {
+            let until = n.until.as_deref().map(short_time).unwrap_or_default();
+            if n.wakes {
+                format!("in focus until {until}; urgent mail still reaches it")
+            } else {
+                format!(
+                    "in focus until {until}; sees it then (use --urgent only if it cannot wait)"
+                )
+            }
+        }
+        "wake_failed" => "does not answer wake-ups; a person may need to look".to_string(),
+        other => other.to_string(),
+    };
+    format!("{} {what}", n.seat)
 }
 
 pub fn class_list(s: &str) -> Result<Vec<DeliveryClass>, String> {

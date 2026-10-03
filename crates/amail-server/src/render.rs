@@ -35,11 +35,31 @@ fn rel(stored: &str, viewer: &Org) -> String {
 pub fn source(m: &MessageRec, viewer: &Org) -> Source {
     if m.org_id != viewer.id {
         Source::External
-    } else if m.sender_kind == SeatKind::User {
-        Source::User
     } else {
-        Source::Agent
+        match m.sender_kind {
+            SeatKind::User => Source::User,
+            SeatKind::System => Source::System,
+            SeatKind::Agent => Source::Agent,
+        }
     }
+}
+
+/// The first non-empty line of `body`, on one line, cut to `max` characters.
+pub fn preview(body: &str, max: usize) -> String {
+    let line = body
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let mut out: String = line
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(max)
+        .collect();
+    if line.chars().count() > max {
+        out.push('…');
+    }
+    out
 }
 
 pub fn header(m: &MessageRec, viewer: &Org) -> p::MessageHeader {
@@ -86,6 +106,7 @@ pub fn entry(e: &Entry, viewer: &Org) -> p::InboxEntry {
         delivery: delivery(&e.delivery, viewer),
         message: header(&e.message, viewer),
         body: None,
+        preview: None,
     }
 }
 
@@ -102,6 +123,7 @@ pub fn seat(s: &Seat, presence: Option<p::Presence>) -> p::Seat {
         group: s.group.clone(),
         created_at: ts(s.created_at),
         presence,
+        focus_until: s.focus_until.filter(|t| *t > amail_store::now_ms()).map(ts),
     }
 }
 
@@ -123,6 +145,9 @@ pub fn org(o: &Org) -> p::OrgInfo {
         send_burst: o.send_burst,
         max_recipients: o.max_recipients,
         max_thread_depth: o.max_thread_depth,
+        ack_timeout_min: o.ack_timeout_min,
+        focus_max_min: o.focus_max_min,
+        digest_interval_min: o.digest_interval_min,
         webhook_url: o.webhook_url.clone(),
     }
 }

@@ -1,13 +1,14 @@
-//! Per-seat send budget: a token bucket refilled at the org's
-//! `send_rate_per_min`, holding at most `send_burst` tokens. In memory, per
-//! server process.
+//! Per-seat send budget in memory (SQLite: one server process per
+//! database): a token bucket refilled at the org's `send_rate_per_min`,
+//! holding at most `send_burst` tokens. Postgres keeps the same bucket in
+//! the `send_budget` table, shared by all server instances.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 #[derive(Default)]
-pub struct RateLimiter {
+pub struct Budget {
     buckets: Mutex<HashMap<i64, Bucket>>,
 }
 
@@ -16,10 +17,11 @@ struct Bucket {
     last: Instant,
 }
 
-impl RateLimiter {
-    /// Take one token for `seat_id`, or return how long to wait.
-    pub fn try_acquire(&self, seat_id: i64, per_min: i64, burst: i64) -> Result<(), Duration> {
+impl Budget {
+    /// Take one token for `seat_id`, or return how many milliseconds to wait.
+    pub fn take(&self, seat_id: i64, per_min: i64, burst: i64) -> Result<(), u64> {
         self.try_acquire_at(seat_id, per_min, burst, Instant::now())
+            .map_err(|d| (d.as_millis() as u64).max(1))
     }
 
     fn try_acquire_at(
@@ -63,7 +65,7 @@ mod tests {
 
     #[test]
     fn bucket() {
-        let l = RateLimiter::default();
+        let l = Budget::default();
         let t0 = Instant::now();
         for _ in 0..3 {
             assert!(l.try_acquire_at(1, 60, 3, t0).is_ok());

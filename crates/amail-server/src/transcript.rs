@@ -8,6 +8,11 @@
 //! starts with context, and renews the node's lease (a `transcript` command)
 //! every third of the lease. When the last watcher leaves the buffer is
 //! dropped and renewals stop; the node stops when its lease runs out.
+//!
+//! With several instances, the browser and the node may talk to different
+//! ones: the watching instance records the watch in the database (renewed
+//! with the lease), and an instance that receives a node's post forwards it
+//! to the watching instances over HTTP (see [`crate::cluster`]).
 
 use crate::AppState;
 use crate::auth::Auth;
@@ -182,12 +187,29 @@ async fn renew(st: AppState, key: (i64, String)) {
     // still forwarding from an earlier watch sends it again); renewals don't.
     let mut need_backfill = true;
     loop {
+        if let Some(c) = &st.cluster {
+            let expires = amail_store::now_ms() + cfg.lease.as_millis() as i64;
+            if let Err(e) = st
+                .store
+                .watch_mirror(key.0, &key.1, &c.id, Some(expires))
+                .await
+            {
+                tracing::warn!("recording a mirror watch: {e}");
+            }
+        }
+        let node = match st.presence.get(key.0, &key.1).await {
+            Ok(p) => p.and_then(|p| p.node),
+            Err(e) => {
+                tracing::debug!("reading presence: {e}");
+                None
+            }
+        };
         let cmd = NodeCommand {
             op: "transcript".into(),
             seat: key.1.clone(),
             lease_ms: Some(cfg.lease.as_millis() as u64),
             backfill: need_backfill.then_some(cfg.backfill),
-            node: st.presence.get(key.0, &key.1).and_then(|p| p.node),
+            node,
         };
         if st.nodes.send(key.0, cmd) == 0 {
             need_backfill = true;
@@ -297,16 +319,31 @@ fn sse(m: Msg) -> Event {
     }
 }
 
-/// `POST /v1/seats/{name}/transcript` (node tokens).
+/// `POST /v1/seats/{name}/transcript` (node tokens). Forwarded to the other
+/// instances whose browsers watch the seat, unless it was relayed here.
 pub async fn post(
     State(st): State<AppState>,
     auth: Auth,
     Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<TranscriptPost>,
 ) -> ApiResult<Json<TranscriptPostResponse>> {
     if auth.scope != TokenScope::Node {
         return Err(ApiError::forbidden("requires a node token"));
     }
-    let subscribers = st.mirror.post(&(auth.org.id, name), body);
+    let relayed = headers.contains_key(crate::cluster::RELAY_HEADER);
+    let remote = match (&st.cluster, relayed) {
+        (Some(c), false) => {
+            let authorization = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            c.relay_transcript(&*st.store, auth.org.id, &name, &authorization, &body)
+                .await
+        }
+        _ => 0,
+    };
+    let subscribers = st.mirror.post(&(auth.org.id, name), body) + remote;
     Ok(Json(TranscriptPostResponse { subscribers }))
 }

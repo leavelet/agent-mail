@@ -35,6 +35,9 @@ const MAX_BATCH: usize = 256;
 pub struct SqliteStore {
     read: SqlitePool,
     jobs: mpsc::Sender<Job>,
+    /// Send budgets. A SQLite database has one server process (`amail serve`
+    /// refuses to share it), so the budget can live in memory.
+    budget: crate::budget::Budget,
 }
 
 fn boxed_run<F>(f: F) -> RunFn
@@ -85,7 +88,11 @@ impl SqliteStore {
         let (jobs, rx) = mpsc::channel(4096);
         tokio::spawn(writer_loop(writer, rx));
         tokio::spawn(checkpoint_loop(read.clone(), jobs.downgrade()));
-        Ok(SqliteStore { read, jobs })
+        Ok(SqliteStore {
+            read,
+            jobs,
+            budget: Default::default(),
+        })
     }
 
     async fn read<T, F>(&self, f: F) -> Result<T>
@@ -151,6 +158,7 @@ impl SqliteStore {
                         .bind(now)
                         .bind(deliveries)
                         .bind(meta_to_db(&m.meta))
+                        .bind(m.ack_due)
                         .fetch_all(&mut *c)
                         .await?)
                 })
@@ -239,12 +247,13 @@ impl SqliteStore {
                 Box::pin(async move {
                     Ok(sqlx::query_as(CLAIM_SQL)
                         .bind(seat_id)
-                        .bind(f.include_digest)
+                        .bind(crate::common::mode_mask(&f))
                         .bind(f.has(C::To))
                         .bind(f.has(C::Cc))
                         .bind(f.has(C::List))
                         .bind(f.urgent_only)
                         .bind(f.limit)
+                        .bind(f.key.clone())
                         .bind(now_ms())
                         .bind(&f.via)
                         .bind(f.read_body_max.unwrap_or(-1))
@@ -275,12 +284,12 @@ impl SqliteStore {
 
 /// Binds: $1 org, $2 sender, $3 thread (NULL for a new thread), $4 parent,
 /// $5 depth, $6 subject, $7 body, $8 lines, $9 to, $10 cc, $11 priority,
-/// $12 ack_required, $13 now, $14 deliveries JSON, $15 meta.
+/// $12 ack_required, $13 now, $14 deliveries JSON, $15 meta, $16 ack_due.
 /// Returns `(message_id, thread_id, seat_id, org_id, seq)` per delivery.
 const SEND_SQL: &str = "
 INSERT INTO messages (org_id, sender_seat_id, thread_id, parent_id, depth, subject, body, lines,
-                      to_addrs, cc_addrs, priority, ack_required, created_at, meta)
-VALUES ($1, $2, COALESCE($3, 0), $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $15);
+                      to_addrs, cc_addrs, priority, ack_required, created_at, meta, ack_due)
+VALUES ($1, $2, COALESCE($3, 0), $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $15, $16);
 UPDATE messages SET thread_id = id WHERE id = last_insert_rowid() AND $3 IS NULL;
 UPDATE seats SET last_seq = last_seq + 1
  WHERE id IN (SELECT json_extract(value, '$.s') FROM json_each($14));
@@ -293,24 +302,31 @@ SELECT m.id, m.thread_id, d.seat_id, d.org_id, d.seq
  WHERE d.message_id = (SELECT MAX(id) FROM messages)
  ORDER BY d.seat_id";
 
-/// Binds: $1..$7 as `claim_select!`, $8 now, $9 via, $10 read_body_max (-1:
-/// none). The candidates are numbered 1..n in `temp.claim_ids` (seq order)
-/// and get mod_seq lo+1..lo+n.
+/// Binds: $1..$8 as `claim_select!` ($8: the idempotency key or NULL), $9
+/// now, $10 via, $11 read_body_max (-1: none). The candidates are numbered
+/// 1..n in `temp.claim_ids` (seq order) and get mod_seq lo+1..lo+n. With a
+/// key the seat used before, nothing is claimed and that claim's deliveries
+/// are returned (the writer is the only one, so the check cannot race).
 const CLAIM_SQL: &str = concat!(
     "DELETE FROM temp.claim_ids;
 INSERT INTO temp.claim_ids (id) ",
     claim_select!(),
     ";
 UPDATE seats SET last_seq = last_seq + (SELECT COUNT(*) FROM temp.claim_ids) WHERE id = $1;
-UPDATE deliveries SET notified_at = $8, notified_via = $9,
-       read_at = CASE WHEN $10 >= 0
-                       AND (SELECT length(m.body) FROM messages m WHERE m.id = deliveries.message_id) <= $10
-                      THEN COALESCE(read_at, $8) ELSE read_at END,
+UPDATE deliveries SET notified_at = $9, notified_via = $10,
+       read_at = CASE WHEN $11 >= 0
+                       AND (SELECT length(m.body) FROM messages m WHERE m.id = deliveries.message_id) <= $11
+                      THEN COALESCE(read_at, $9) ELSE read_at END,
        mod_seq = (SELECT last_seq FROM seats WHERE id = $1) - (SELECT COUNT(*) FROM temp.claim_ids) + c.ord
   FROM temp.claim_ids c WHERE deliveries.id = c.id;
+INSERT INTO claim_keys (seat_id, key, ids, created_at)
+SELECT $1, $8, COALESCE((SELECT group_concat(id) FROM temp.claim_ids), ''), $9
+ WHERE $8 IS NOT NULL AND NOT EXISTS (SELECT 1 FROM claim_keys WHERE seat_id = $1 AND key = $8);
 ",
     entry_select_body!(),
-    " WHERE d.id IN (SELECT id FROM temp.claim_ids) ORDER BY d.seq"
+    " WHERE d.seat_id = $1 AND (d.id IN (SELECT id FROM temp.claim_ids) \
+      OR d.id IN (SELECT j.value FROM claim_keys k, json_each('[' || k.ids || ']') j \
+                  WHERE k.seat_id = $1 AND k.key = $8)) ORDER BY d.seq"
 );
 
 const WRITER_CHECKPOINT_EVERY: Duration = Duration::from_secs(1);
@@ -395,6 +411,22 @@ async fn run_batch(conn: &mut SqliteConnection, batch: &mut Vec<Job>) {
                 let _ = reply.send(r.and(Err(StoreError::Commit(msg.clone()))));
             }
         }
+    }
+}
+
+impl SqliteStore {
+    async fn take_send_token_impl(
+        &self,
+        seat_id: i64,
+        per_min: i64,
+        burst: i64,
+    ) -> Result<std::result::Result<(), u64>> {
+        Ok(self.budget.take(seat_id, per_min, burst))
+    }
+
+    async fn refund_send_token_impl(&self, seat_id: i64, burst: i64) -> Result<()> {
+        self.budget.refund(seat_id, burst);
+        Ok(())
     }
 }
 

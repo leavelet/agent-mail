@@ -12,6 +12,43 @@ use std::time::Duration;
 /// hook client's 300 ms wait (see [`crate::hook_client`]).
 pub const HOOK_SERVER_TIMEOUT: Duration = Duration::from_millis(150);
 
+/// An HTTP error answer from the server.
+#[derive(Debug)]
+pub struct HttpError {
+    pub status: reqwest::StatusCode,
+    pub body: String,
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HTTP {}: {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for HttpError {}
+
+/// Whether retrying cannot help: the server refused the request itself
+/// (4xx other than timeouts and rate limits).
+pub fn is_permanent(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<HttpError>().is_some_and(|h| {
+        h.status.is_client_error()
+            && h.status != reqwest::StatusCode::REQUEST_TIMEOUT
+            && h.status != reqwest::StatusCode::TOO_MANY_REQUESTS
+    })
+}
+
+/// What a claim asks for (kept to retry it with the same key).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ClaimSpec {
+    pub classes: Vec<DeliveryClass>,
+    pub urgent_only: bool,
+    /// Digest deliveries (shown as a digest: previews, not bodies).
+    #[serde(default)]
+    pub digest: bool,
+    pub via: String,
+    pub limit: u32,
+}
+
 #[derive(Clone)]
 pub struct ServerClient {
     base: String,
@@ -62,8 +99,8 @@ impl ServerClient {
         let resp = rb.send().await?;
         let status = resp.status();
         if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            bail!("HTTP {status}: {text}");
+            let body = resp.text().await.unwrap_or_default();
+            return Err(HttpError { status, body }.into());
         }
         Ok(resp.json().await?)
     }
@@ -80,30 +117,34 @@ impl ServerClient {
         .await
     }
 
-    /// Claim up to `limit` pending deliveries of `seat` in `classes` (only
-    /// urgent ones if `urgent_only`). Bodies up to
-    /// [`crate::inject::INLINE_BODY_MAX`] characters come inline and those
-    /// deliveries are marked read: the node shows them in full.
+    /// Claim pending deliveries of `seat` as `spec` says, with idempotency
+    /// key `key` (a retry with the same key gets the same deliveries). For
+    /// immediate mail, bodies up to [`crate::inject::INLINE_BODY_MAX`]
+    /// characters come inline and those deliveries are marked read: the
+    /// node shows them in full. Digest mail comes with a one-line preview.
+    /// `timeout`: `None` for the hook deadline.
     pub async fn claim(
         &self,
         seat: &str,
-        classes: &[DeliveryClass],
-        urgent_only: bool,
-        via: &str,
-        limit: u32,
+        spec: &ClaimSpec,
+        key: &str,
+        timeout: Option<Duration>,
     ) -> Result<ClaimResponse> {
         let body = ClaimRequest {
-            classes: classes.to_vec(),
-            min_priority: urgent_only.then_some(Priority::Urgent),
-            via: via.to_string(),
-            limit: Some(limit),
-            inline_body_max: Some(crate::inject::INLINE_BODY_MAX),
+            classes: spec.classes.clone(),
+            min_priority: spec.urgent_only.then_some(Priority::Urgent),
+            via: spec.via.clone(),
+            limit: Some(spec.limit),
+            inline_body_max: (!spec.digest).then_some(crate::inject::INLINE_BODY_MAX),
             include_digest: false,
-            mark_inlined_read: true,
+            mark_inlined_read: !spec.digest,
+            digest_only: spec.digest,
+            key: Some(key.to_string()),
+            preview_chars: spec.digest.then_some(crate::inject::PREVIEW_CHARS),
         };
         Self::json(
             self.req(reqwest::Method::POST, &format!("/claim?seat={}", enc(seat)))
-                .timeout(self.fast)
+                .timeout(timeout.unwrap_or(self.fast))
                 .json(&body),
         )
         .await

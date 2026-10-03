@@ -43,6 +43,11 @@ enum Cmd {
         /// Postgres pool size, or SQLite read pool size.
         #[arg(long, default_value_t = 32)]
         max_connections: u32,
+        /// Postgres with several instances: the URL at which the other
+        /// instances reach this one (for conversation mirrors). Default:
+        /// `http://<listen address>` unless it is a wildcard address.
+        #[arg(long, env = "AMAIL_ADVERTISE_URL")]
+        advertise_url: Option<String>,
     },
     /// Administration that works directly on the database.
     #[command(subcommand)]
@@ -93,6 +98,11 @@ enum Cmd {
     Thread { id: i64 },
     /// Directory: seats, lists and linked orgs.
     Who,
+    /// Focus mode: only urgent mail reaches the seat until it ends.
+    Focus {
+        #[command(subcommand)]
+        cmd: FocusCmd,
+    },
     /// Claim pending notifications (marks them notified).
     Claim {
         #[arg(long)]
@@ -262,6 +272,24 @@ struct NodeArgs {
     web_terminal_url: Option<String>,
 }
 
+#[derive(Subcommand)]
+enum FocusCmd {
+    /// Hold all but urgent mail (held mail arrives when the focus ends).
+    On {
+        /// How long (e.g. 30m, 1h); default and maximum: the org's limit.
+        #[arg(long = "for", value_name = "DURATION")]
+        duration: Option<String>,
+        /// A seat other than your own (user tokens).
+        #[arg(long)]
+        seat: Option<String>,
+    },
+    /// End the focus now.
+    Off {
+        #[arg(long)]
+        seat: Option<String>,
+    },
+}
+
 #[derive(Args)]
 struct SendOpts {
     /// Message body; read from stdin when omitted.
@@ -275,6 +303,25 @@ struct SendOpts {
     /// Ask recipients to acknowledge.
     #[arg(long)]
     ack: bool,
+    /// With --ack: tell me who has not acknowledged after this long (e.g.
+    /// 10m; default: the org's ack_timeout_min).
+    #[arg(long, value_name = "DURATION", requires = "ack")]
+    ack_timeout: Option<String>,
+}
+
+impl SendOpts {
+    fn ack_timeout_s(&self) -> Result<Option<u64>> {
+        match &self.ack_timeout {
+            None => Ok(None),
+            Some(d) => Ok(Some(
+                amail_node::team::parse_duration(d)
+                    .map_err(anyhow::Error::msg)?
+                    .context("--ack-timeout must be longer than 0")?
+                    .as_secs()
+                    .max(1),
+            )),
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -404,6 +451,15 @@ enum OrgCmd {
         max_recipients: Option<i64>,
         #[arg(long)]
         max_thread_depth: Option<i64>,
+        /// Default time to acknowledge before the sender is told.
+        #[arg(long)]
+        ack_timeout_min: Option<i64>,
+        /// Longest focus a seat may declare.
+        #[arg(long)]
+        focus_max_min: Option<i64>,
+        /// An idle seat with digest mail is woken at most this often.
+        #[arg(long)]
+        digest_interval_min: Option<i64>,
         /// POST a notice (message headers only) here for every new message
         /// to the user.
         #[arg(long, value_name = "URL", conflicts_with = "no_webhook")]
@@ -502,7 +558,8 @@ async fn run(cli: Cli) -> Result<()> {
             db,
             listen,
             max_connections,
-        } => return serve(&db, &listen, max_connections).await,
+            advertise_url,
+        } => return serve(&db, &listen, max_connections, advertise_url).await,
         Cmd::Admin(AdminCmd::CreateOrg { org, user_name, db }) => {
             return create_org(&db, &org, &user_name, &out).await;
         }
@@ -605,8 +662,8 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             let body = json!({
                 "to": to, "cc": cc, "subject": subject, "meta": parse_meta(&opts.meta)?,
-                "body": read_body(opts.body)?,
                 "priority": if opts.urgent { "urgent" } else { "normal" }, "ack_required": opts.ack,
+                "ack_timeout_s": opts.ack_timeout_s()?, "body": read_body(opts.body)?,
             });
             let v = c.raw(Method::POST, "/messages", Some(&body)).await?;
             out.show(&v, || Ok(output::send_result(&parse(&v)?)))
@@ -672,8 +729,9 @@ async fn run(cli: Cli) -> Result<()> {
             };
             let body = json!({
                 "to": to, "cc": cc, "subject": subject, "meta": parse_meta(&opts.meta)?,
-                "body": read_body(opts.body)?, "in_reply_to": id,
+                "in_reply_to": id, "ack_timeout_s": opts.ack_timeout_s()?,
                 "priority": if opts.urgent { "urgent" } else { "normal" }, "ack_required": opts.ack,
+                "body": read_body(opts.body)?,
             });
             let v = c.raw(Method::POST, "/messages", Some(&body)).await?;
             out.show(&v, || Ok(output::send_result(&parse(&v)?)))
@@ -727,6 +785,41 @@ async fn run(cli: Cli) -> Result<()> {
                 text.extend(parse::<Vec<p::List>>(&lists)?.iter().map(output::list_line));
                 text.extend(parse::<Vec<p::Link>>(&links)?.iter().map(output::link_line));
                 Ok(text.join("\n"))
+            })
+        }
+        Cmd::Focus { cmd } => {
+            let (method, seat, body) = match cmd {
+                FocusCmd::On { duration, seat } => {
+                    let for_s = match duration {
+                        None => None,
+                        Some(d) => Some(
+                            amail_node::team::parse_duration(&d)
+                                .map_err(anyhow::Error::msg)?
+                                .context("--for must be longer than 0")?
+                                .as_secs()
+                                .max(1),
+                        ),
+                    };
+                    (Method::PUT, seat, Some(json!({ "for_s": for_s })))
+                }
+                FocusCmd::Off { seat } => (Method::DELETE, seat, None),
+            };
+            let path = match &seat {
+                Some(s) => format!("/focus?seat={}", enc(s)),
+                None => "/focus".to_string(),
+            };
+            let v = c.raw(method, &path, body.as_ref()).await?;
+            out.show(&v, || {
+                let r: p::FocusResponse = parse(&v)?;
+                Ok(match r.focus_until {
+                    Some(t) => format!(
+                        "{} in focus until {}{}: only urgent mail reaches it",
+                        r.seat,
+                        output::short_time(&t),
+                        if r.capped { " (the org's maximum)" } else { "" }
+                    ),
+                    None => format!("{} not in focus; held mail arrives now", r.seat),
+                })
             })
         }
         Cmd::Claim {
@@ -817,12 +910,17 @@ async fn run(cli: Cli) -> Result<()> {
             send_burst,
             max_recipients,
             max_thread_depth,
+            ack_timeout_min,
+            focus_max_min,
+            digest_interval_min,
             webhook_url,
             no_webhook,
         }) => {
             let mut body = json!({
                 "send_rate_per_min": send_rate_per_min, "send_burst": send_burst,
                 "max_recipients": max_recipients, "max_thread_depth": max_thread_depth,
+                "ack_timeout_min": ack_timeout_min, "focus_max_min": focus_max_min,
+                "digest_interval_min": digest_interval_min,
             });
             // `webhook_url: null` clears it, so the key is only sent when asked.
             if no_webhook {
@@ -839,8 +937,16 @@ async fn run(cli: Cli) -> Result<()> {
 fn org_text(v: &Value) -> Result<String> {
     let o: p::OrgInfo = parse(v)?;
     let mut s = format!(
-        "org {} send_rate_per_min={} send_burst={} max_recipients={} max_thread_depth={}",
-        o.name, o.send_rate_per_min, o.send_burst, o.max_recipients, o.max_thread_depth
+        "org {} send_rate_per_min={} send_burst={} max_recipients={} max_thread_depth={} \
+         ack_timeout_min={} focus_max_min={} digest_interval_min={}",
+        o.name,
+        o.send_rate_per_min,
+        o.send_burst,
+        o.max_recipients,
+        o.max_thread_depth,
+        o.ack_timeout_min,
+        o.focus_max_min,
+        o.digest_interval_min
     );
     if let Some(u) = o.webhook_url {
         s.push_str(&format!(" webhook_url={u}"));
@@ -1035,27 +1141,90 @@ async fn link_cmd(c: &Client, out: &Out, cmd: LinkCmd) -> Result<()> {
     })
 }
 
-async fn serve(db: &str, listen: &str, max_connections: u32) -> Result<()> {
+/// The file of a `sqlite:` URL.
+fn sqlite_path(db: &str) -> Option<PathBuf> {
+    let rest = db
+        .strip_prefix("sqlite://")
+        .or_else(|| db.strip_prefix("sqlite:"))?;
+    let path = rest.split('?').next().unwrap_or(rest);
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
+/// SQLite serves one process: hold an exclusive lock on `<db>.serve.lock`
+/// for as long as the server runs, so a second `amail serve` on the same
+/// file stops with a clear message.
+fn lock_sqlite(db: &str) -> Result<Option<std::fs::File>> {
+    let Some(path) = sqlite_path(db) else {
+        return Ok(None);
+    };
+    let mut lock = path.clone().into_os_string();
+    lock.push(".serve.lock");
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock)
+        .with_context(|| format!("opening {}", PathBuf::from(&lock).display()))?;
+    use std::os::fd::AsRawFd;
+    // SAFETY: flock on a descriptor we own.
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        bail!(
+            "another amail serve is using {} (a SQLite database serves one process; \
+             use Postgres to run several instances)",
+            path.display()
+        );
+    }
+    Ok(Some(f))
+}
+
+async fn serve(
+    db: &str,
+    listen: &str,
+    max_connections: u32,
+    advertise_url: Option<String>,
+) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    let _lock = lock_sqlite(db)?;
     let store = amail_store::open(db, &amail_store::OpenOptions { max_connections })
         .await
         .with_context(|| format!("opening {db}"))?;
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("binding {listen}"))?;
-    tracing::info!(
-        "amail listening on http://{} ({} backend)",
-        listener.local_addr()?,
-        store.backend()
-    );
-    let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
+    let addr = listener.local_addr()?;
+    let state = if store.backend() == "postgres" {
+        let url = advertise_url
+            .or_else(|| (!addr.ip().is_unspecified()).then(|| format!("http://{addr}")));
+        if url.is_none() {
+            tracing::warn!(
+                "no --advertise-url: other instances cannot forward conversation mirrors here"
+            );
+        }
+        amail_server::AppState::clustered(store, db, url)
+    } else {
+        amail_server::AppState::new(store)
     };
-    amail_server::serve(listener, amail_server::AppState::new(store), shutdown).await?;
+    tracing::info!(
+        "amail listening on http://{addr} ({} backend{})",
+        state.store.backend(),
+        state
+            .cluster
+            .as_ref()
+            .map(|c| format!(", instance {}", c.id))
+            .unwrap_or_default()
+    );
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let shutdown = async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    };
+    amail_server::serve(listener, state, shutdown).await?;
     Ok(())
 }
 

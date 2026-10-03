@@ -367,12 +367,16 @@ impl Node {
             let mut st = self.lock();
             let connected = st.connected;
             let settings = st.saved.settings.clone();
+            let (wall, digest_every) = (now_ms(), st.digest_every);
             // Team order: parents (leads) start before their subordinates.
             let mut names: Vec<String> = st.saved.managed.keys().cloned().collect();
             names.sort_by_key(|n| st.saved.managed[n].order);
             for name in &names {
                 let m = st.saved.managed[name].clone();
-                let wants_mail = st.seats.get(name).is_some_and(|s| s.wants_wake());
+                let wants_mail = st
+                    .seats
+                    .get(name)
+                    .is_some_and(|s| s.wants_wake(wall, digest_every));
                 let rt = st.sup.entry(name.clone()).or_default();
                 if let Some(pid) = m.pid {
                     if !alive(pid, m.pid_start) {
@@ -445,7 +449,7 @@ impl Node {
                     && s.state == SeatState::Idle
                     // Pending cc and list mail never wakes a seat, so it must
                     // not keep one awake either; it is shown at the next turn.
-                    && !s.wants_wake()
+                    && !s.wants_wake(now_ms(), st.digest_every)
                     && s.wake_out.is_none()
                     && rt.is_none_or(|r| r.stopping.is_none() && r.starting_since.is_none())
             };

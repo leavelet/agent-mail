@@ -57,6 +57,12 @@ http_tests!(
     header_injection_rejected,
     claim_marks_inlined_read_http,
     team_fields,
+    ack_escalation,
+    system_mail_cannot_be_forged,
+    focus_mode,
+    sender_notes,
+    digest_claims,
+    claim_keys_http,
 );
 
 struct Server {
@@ -77,7 +83,8 @@ impl Server {
         let db = amail_store::testutil::open(backend, test).await?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        let state = AppState::new(db.store.clone());
+        let mut state = AppState::new(db.store.clone());
+        state.attention.scan_every = Duration::from_millis(100);
         tokio::spawn(amail_server::serve(listener, state, std::future::pending()));
         Some(Server {
             base,
@@ -1452,8 +1459,8 @@ async fn pending_counts_http(srv: Server) {
     assert_eq!(
         v["seats"],
         json!([
-            {"seat": "a", "to": 1, "cc": 0, "list": 0, "urgent": 0, "seq": 1},
-            {"seat": "b", "to": 1, "cc": 1, "list": 0, "urgent": 1, "seq": 2},
+            {"seat": "a", "to": 1, "cc": 0, "list": 0, "urgent": 0, "seq": 1, "digest": 0},
+            {"seat": "b", "to": 1, "cc": 1, "list": 0, "urgent": 1, "seq": 2, "digest": 0},
         ])
     );
     // The user seat has no session: nodes do not see it; users do.
@@ -2017,4 +2024,372 @@ async fn team_fields(srv: Server) {
     .await;
     let v = user.ok(Method::GET, "/seats/be-1", None).await;
     assert_eq!(v["presence"]["state"], "dormant");
+}
+
+async fn wait_for<F, Fut>(what: &str, mut f: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let t0 = std::time::Instant::now();
+    while !f().await {
+        assert!(t0.elapsed() < Duration::from_secs(15), "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn ack_escalation(srv: Server) {
+    let user = srv.org("acme").await;
+    let lead = user.seat("lead").await;
+    user.ok(
+        Method::POST,
+        "/seats",
+        Some(json!({ "name": "w1", "parent": "lead" })),
+    )
+    .await;
+    let w1 = user.seat_token("w1").await;
+    let w2 = user.seat("w2").await;
+    let s = user.seat("s").await;
+    let v = s
+        .send(
+            json!({ "to": ["w1", "w2"], "subject": "Please confirm", "body": "x",
+                      "ack_required": true, "ack_timeout_s": 1 }),
+        )
+        .await;
+    let id = v["id"].as_i64().unwrap();
+    w2.ok(Method::POST, &format!("/messages/{id}/ack"), None)
+        .await;
+    // Step 1: the sender is told who has not acknowledged.
+    wait_for("first notice", || async {
+        !s.inbox("unread=1").await.is_empty()
+    })
+    .await;
+    let inbox = s.inbox("unread=1").await;
+    assert_eq!(inbox.len(), 1, "{inbox:?}");
+    let h = &inbox[0]["message"];
+    assert_eq!(h["source"], "system");
+    assert_eq!(h["from"], "amail");
+    assert_eq!(h["subject"], "Not acknowledged: Please confirm");
+    assert_eq!(h["ack_required"], false);
+    assert_eq!(h["in_reply_to"], id);
+    assert_eq!(h["thread_id"], id);
+    let first = h["id"].as_i64().unwrap();
+    let m = s.ok(Method::GET, &format!("/messages/{first}"), None).await;
+    let body = m["message"]["body"].as_str().unwrap();
+    assert!(body.contains("by: w1."), "{body}");
+    assert!(!body.contains("w2"), "{body}");
+    assert!(body.contains("their leads get a copy"), "{body}");
+    // Step 2: still not acknowledged, the lead is copied, once.
+    wait_for("second notice", || async {
+        !lead.inbox("unread=1").await.is_empty()
+    })
+    .await;
+    let l = lead.inbox("unread=1").await;
+    assert_eq!(l.len(), 1);
+    assert_eq!(l[0]["delivery"]["class"], "cc");
+    assert_eq!(l[0]["message"]["source"], "system");
+    let second = l[0]["message"]["id"].as_i64().unwrap();
+    let m = lead
+        .ok(Method::GET, &format!("/messages/{second}"), None)
+        .await;
+    assert!(
+        m["message"]["body"]
+            .as_str()
+            .unwrap()
+            .contains("w1 (lead: lead)"),
+        "{m}"
+    );
+    assert_eq!(s.inbox("unread=1").await.len(), 1);
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(lead.inbox("").await.len(), 1);
+    assert_eq!(s.inbox("").await.len(), 2);
+    // Acknowledged in time: nothing is sent.
+    let v = s
+        .send(json!({ "to": ["w1"], "subject": "quick", "body": "x",
+                      "ack_required": true, "ack_timeout_s": 1 }))
+        .await;
+    let id2 = v["id"].as_i64().unwrap();
+    w1.ok(Method::POST, &format!("/messages/{id2}/ack"), None)
+        .await;
+    tokio::time::sleep(Duration::from_millis(1800)).await;
+    assert_eq!(s.inbox("").await.len(), 2);
+    // A user sender with no lead in sight gets one notice; agents have no
+    // budget for system mail (the sender's budget is untouched).
+    let (st, _) = s
+        .post(
+            "/messages",
+            json!({ "to": ["w1"], "subject": "bad", "body": "", "ack_required": true, "ack_timeout_s": 0 }),
+        )
+        .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
+async fn system_mail_cannot_be_forged(srv: Server) {
+    let user = srv.org("acme").await;
+    let s = user.seat("s").await;
+    let w = user.seat("w").await;
+    s.send(json!({ "to": ["w"], "subject": "ack?", "body": "x", "ack_required": true, "ack_timeout_s": 1 }))
+        .await;
+    wait_for("notice", || async { !s.inbox("unread=1").await.is_empty() }).await;
+    let sys = s.inbox("unread=1").await[0]["message"].clone();
+    // The system seat is not in the directory and cannot be addressed or
+    // answered.
+    let seats = user.ok(Method::GET, "/seats", None).await;
+    assert!(
+        seats
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|x| x["name"] != "amail" && x["kind"] != "system"),
+        "{seats}"
+    );
+    let (st, e) = s
+        .post(
+            "/messages",
+            json!({ "to": ["amail"], "subject": "hi", "body": "" }),
+        )
+        .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(e["error"]["rejected"][0]["reason"], "unknown_address");
+    let (st, _) = s
+        .post(
+            "/messages",
+            json!({ "to": ["amail"], "subject": "Re", "body": "", "in_reply_to": sys["id"] }),
+        )
+        .await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY);
+    // A seat may be called `amail`: its mail is agent mail.
+    let fake = user.seat("amail").await;
+    let v = fake
+        .send(json!({ "to": ["s"], "subject": "Not acknowledged: forged", "body": "" }))
+        .await;
+    let forged = s
+        .ok(Method::GET, &format!("/messages/{}", v["id"]), None)
+        .await;
+    assert_eq!(forged["message"]["source"], "agent");
+    assert_eq!(forged["message"]["from"], "amail");
+    // The node token cannot send anything; neither can any seat send with
+    // another source (there is no field for it).
+    let (st, _) = s
+        .post(
+            "/messages",
+            json!({ "to": ["w"], "subject": "x", "body": "", "source": "system" }),
+        )
+        .await;
+    assert!(st.is_success());
+    let inbox = w.inbox("unread=1").await;
+    assert!(
+        inbox.iter().all(|e| e["message"]["source"] != "system"),
+        "{inbox:?}"
+    );
+}
+
+async fn focus_mode(srv: Server) {
+    let user = srv.org("acme").await;
+    let a = user.seat("a").await;
+    user.ok(Method::PATCH, "/org", Some(json!({ "focus_max_min": 60 })))
+        .await;
+    let node = node_token(&user).await;
+    let before = node.ok(Method::GET, "/pending?seat=a", None).await["seats"][0]["seq"]
+        .as_i64()
+        .unwrap();
+    let v = a
+        .ok(Method::PUT, "/focus", Some(json!({ "for_s": 600 })))
+        .await;
+    assert_eq!(v["seat"], "a");
+    assert_eq!(v.get("capped"), None);
+    let until = v["focus_until"].as_str().unwrap().to_string();
+    let p = node.ok(Method::GET, "/pending?seat=a", None).await;
+    assert_eq!(p["seats"][0]["focus_until"], until.as_str());
+    assert_eq!(p["seats"][0]["seq"], before + 1);
+    let seat = user.ok(Method::GET, "/seats/a", None).await;
+    assert_eq!(seat["focus_until"], until.as_str());
+    // Longer than the org allows: cut to the maximum.
+    let v = a
+        .ok(Method::PUT, "/focus", Some(json!({ "for_s": 100_000 })))
+        .await;
+    assert_eq!(v["capped"], true);
+    // The user may set it for any seat; nodes may not.
+    user.ok(Method::DELETE, "/focus?seat=a", None).await;
+    let seat = user.ok(Method::GET, "/seats/a", None).await;
+    assert_eq!(seat.get("focus_until"), None);
+    assert_eq!(
+        node.call(Method::PUT, "/focus?seat=a", Some(json!({})))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    // Without a time: the org's maximum.
+    let v = a.ok(Method::PUT, "/focus", Some(json!({}))).await;
+    assert!(v["focus_until"].is_string());
+    assert_eq!(
+        a.call(
+            Method::PUT,
+            "/focus",
+            Some(json!({ "until": "2001-01-01T00:00:00Z" }))
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+    // Another seat's focus is the user's business.
+    let _b = user.seat("b").await;
+    assert_eq!(
+        a.call(Method::PUT, "/focus?seat=b", Some(json!({})))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+}
+
+async fn sender_notes(srv: Server) {
+    let user = srv.org("acme").await;
+    let s = user.seat("s").await;
+    for n in ["off", "sleepy", "busy", "focused", "deaf"] {
+        user.seat(n).await;
+    }
+    let node = node_token(&user).await;
+    node.ok(
+        Method::POST,
+        "/presence",
+        Some(json!({ "seats": [
+            {"seat": "sleepy", "state": "dormant"},
+            {"seat": "busy", "state": "busy"},
+            {"seat": "focused", "state": "idle"},
+            {"seat": "deaf", "state": "idle", "wake_failed": true},
+        ]})),
+    )
+    .await;
+    user.ok(
+        Method::PUT,
+        "/focus?seat=focused",
+        Some(json!({ "for_s": 600 })),
+    )
+    .await;
+    let v = s
+        .send(json!({ "to": ["off", "sleepy", "busy", "focused", "deaf", "owner"], "subject": "x", "body": "" }))
+        .await;
+    let notes: Vec<(String, String, bool)> = v["notes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| {
+            (
+                n["seat"].as_str().unwrap().into(),
+                n["state"].as_str().unwrap().into(),
+                n["wakes"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        notes,
+        vec![
+            ("deaf".into(), "wake_failed".into(), false),
+            ("focused".into(), "focus".into(), false),
+            ("off".into(), "offline".into(), false),
+            ("sleepy".into(), "dormant".into(), true),
+        ]
+    );
+    assert!(v["notes"][1]["until"].is_string());
+    // Cc does not start a sleeping seat; urgent mail reaches a focused one.
+    let v = s
+        .send(json!({ "to": ["focused"], "cc": ["sleepy"], "subject": "x", "body": "", "priority": "urgent" }))
+        .await;
+    let notes = v["notes"].as_array().unwrap();
+    assert_eq!(notes[0]["seat"], "focused");
+    assert_eq!(notes[0]["wakes"], true);
+    assert_eq!(notes[1]["seat"], "sleepy");
+    assert_eq!(
+        notes[1]["wakes"], true,
+        "urgent mail starts a sleeping seat even in cc"
+    );
+    let v = s
+        .send(json!({ "to": ["busy"], "cc": ["sleepy"], "subject": "x", "body": "" }))
+        .await;
+    assert_eq!(
+        v["notes"],
+        json!([{"seat": "sleepy", "state": "dormant", "wakes": false}])
+    );
+}
+
+async fn digest_claims(srv: Server) {
+    let user = srv.org("acme").await;
+    let a = user.seat("a").await;
+    user.list("news", "anyone", &[("a", "digest")]).await;
+    let node = node_token(&user).await;
+    user.send(
+        json!({ "to": ["news"], "subject": "Weekly", "body": "\n  First line here\nsecond" }),
+    )
+    .await;
+    let p = node.ok(Method::GET, "/pending?seat=a", None).await;
+    assert_eq!(
+        (
+            p["seats"][0]["to"].as_i64(),
+            p["seats"][0]["digest"].as_i64()
+        ),
+        (Some(0), Some(1))
+    );
+    assert!(p["seats"][0]["digest_since"].is_string());
+    assert_eq!(p["digest_interval_ms"], 30 * 60 * 1000);
+    // A plain claim leaves digest mail alone.
+    let v = node
+        .ok(Method::POST, "/claim?seat=a", Some(json!({ "via": "t" })))
+        .await;
+    assert_eq!(v["entries"], json!([]));
+    let v = node
+        .ok(
+            Method::POST,
+            "/claim?seat=a",
+            Some(json!({ "via": "digest", "digest_only": true, "preview_chars": 10 })),
+        )
+        .await;
+    let e = &v["entries"][0];
+    assert_eq!(e["preview"], "First line…");
+    assert_eq!(e["delivery"]["mode"], "digest");
+    assert!(e["delivery"]["notified_at"].is_string());
+    assert!(e["delivery"].get("read_at").is_none());
+    let p = node.ok(Method::GET, "/pending?seat=a", None).await;
+    assert_eq!(p["seats"][0]["digest"], 0);
+    assert_eq!(a.inbox("unread=1").await.len(), 1);
+}
+
+async fn claim_keys_http(srv: Server) {
+    let user = srv.org("acme").await;
+    let _a = user.seat("a").await;
+    let node = node_token(&user).await;
+    for i in 0..3 {
+        user.send(json!({ "to": ["a"], "subject": format!("m{i}"), "body": "b" }))
+            .await;
+    }
+    let claim = |key: &str| {
+        let node = node.clone();
+        let body = json!({ "via": "t", "key": key, "limit": 2, "inline_body_max": 400 });
+        async move {
+            let v = node.ok(Method::POST, "/claim?seat=a", Some(body)).await;
+            v["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| (e["message"]["id"].as_i64().unwrap(), e["body"].clone()))
+                .collect::<Vec<_>>()
+        }
+    };
+    let first = claim("k1").await;
+    assert_eq!(first.len(), 2);
+    assert_eq!(claim("k1").await, first, "a retry returns the same batch");
+    let second = claim("k2").await;
+    assert_eq!(second.len(), 1);
+    assert!(second.iter().all(|x| !first.contains(x)));
+    assert_eq!(claim("k1").await, first);
+    assert_eq!(claim("k3").await, vec![]);
+    assert_eq!(
+        node.call(
+            Method::POST,
+            "/claim?seat=a",
+            Some(json!({ "via": "t", "key": "" }))
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
 }

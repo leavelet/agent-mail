@@ -65,8 +65,15 @@ pub async fn pending(
                 list: r.list,
                 urgent: r.urgent,
                 seq: r.last_seq,
+                digest: r.digest,
+                digest_since: r.digest_since.map(crate::render::ts),
+                focus_until: r
+                    .focus_until
+                    .filter(|t| *t > amail_store::now_ms())
+                    .map(crate::render::ts),
             })
             .collect(),
+        digest_interval_ms: Some(auth.org.digest_interval_min.max(1) as u64 * 60_000),
     }))
 }
 
@@ -101,12 +108,19 @@ pub async fn presence(
         .into_iter()
         .map(|(_, name, _)| name)
         .collect();
-    let accepted = st
+    let seats: Vec<p::PresenceUpdate> = report
+        .seats
+        .into_iter()
+        .filter(|u| live.contains(&u.seat))
+        .collect();
+    let changed = st
         .presence
-        .update(auth.org.id, report.node.as_deref(), &report.seats, |s| {
-            live.contains(s)
-        });
-    Ok(Json(PresenceAccepted { accepted }))
+        .update(auth.org.id, report.node.as_deref(), &seats)
+        .await?;
+    st.presence_changed(auth.org.id, changed);
+    Ok(Json(PresenceAccepted {
+        accepted: seats.len(),
+    }))
 }
 
 /// `GET /v1/seats/{name}/launch` (node and user tokens): what a node needs to

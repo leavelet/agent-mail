@@ -56,6 +56,12 @@ conformance!(
     token_list_and_revoke,
     seat_permission_mode,
     claim_marks_inlined_read,
+    claim_keys_concurrent,
+    presence_store,
+    send_budget_exact,
+    ack_steps_taken_once,
+    system_seat_hidden,
+    focus_and_digest_pending,
 );
 
 async fn org(s: &S, name: &str) -> (Org, Seat) {
@@ -99,6 +105,7 @@ fn msg(org_id: i64, from: i64, subject: &str, to: &[(&Seat, C)]) -> NewMessage {
                 mode: M::Immediate,
             })
             .collect(),
+        ack_due: None,
     }
 }
 
@@ -110,6 +117,8 @@ fn filter(classes: &[C]) -> ClaimFilter {
         via: "test".into(),
         limit: 100,
         read_body_max: None,
+        digest_only: false,
+        key: None,
     }
 }
 
@@ -1448,4 +1457,256 @@ async fn claim_marks_inlined_read(s: S) {
             .read_at
             .is_none()
     );
+}
+
+async fn claim_keys_concurrent(s: S) {
+    let (o, user) = org(&s, "acme").await;
+    let a = seat(&s, o.id, "a").await;
+    for i in 0..20 {
+        s.send(&msg(o.id, user.id, &format!("m{i}"), &[(&a, C::To)]))
+            .await
+            .unwrap();
+    }
+    // Eight concurrent claims with one key, eight with another: each key's
+    // claims all return the same batch, and the batches do not overlap.
+    let mut tasks = Vec::new();
+    for i in 0..16 {
+        let s = s.clone();
+        let mut f = filter(&[C::To]);
+        f.limit = 5;
+        f.key = Some(if i % 2 == 0 { "k-even" } else { "k-odd" }.into());
+        tasks.push(tokio::spawn(async move {
+            let (e, _) = s.claim(a.id, &f).await.unwrap();
+            (i % 2, e.iter().map(|e| e.delivery.id).collect::<Vec<_>>())
+        }));
+    }
+    let mut by_key: BTreeMap<i32, HashSet<Vec<i64>>> = BTreeMap::new();
+    for t in tasks {
+        let (k, ids) = t.await.unwrap();
+        by_key.entry(k).or_default().insert(ids);
+    }
+    let even: Vec<_> = by_key[&0].iter().collect();
+    let odd: Vec<_> = by_key[&1].iter().collect();
+    assert_eq!((even.len(), odd.len()), (1, 1), "{by_key:?}");
+    assert_eq!((even[0].len(), odd[0].len()), (5, 5));
+    assert!(even[0].iter().all(|x| !odd[0].contains(x)));
+    // Ten left; a keyed claim after the fact still returns its batch.
+    let mut f = filter(&[C::To]);
+    f.key = Some("k-even".into());
+    let (e, bump) = s.claim(a.id, &f).await.unwrap();
+    assert_eq!(
+        &e.iter().map(|e| e.delivery.id).collect::<Vec<_>>(),
+        even[0]
+    );
+    assert!(bump.is_none());
+    assert!(e.iter().all(|e| e.delivery.notified_at.is_some()));
+    let f = filter(&[C::To]);
+    assert_eq!(s.claim(a.id, &f).await.unwrap().0.len(), 10);
+    // A key used by one seat means nothing for another.
+    let b = seat(&s, o.id, "b").await;
+    s.send(&msg(o.id, user.id, "for b", &[(&b, C::To)]))
+        .await
+        .unwrap();
+    let mut f = filter(&[C::To]);
+    f.key = Some("k-even".into());
+    assert_eq!(s.claim(b.id, &f).await.unwrap().0.len(), 1);
+}
+
+async fn presence_store(s: S) {
+    use amail_proto::SeatState;
+    let (o, _) = org(&s, "acme").await;
+    let _a = seat(&s, o.id, "a").await;
+    let rec = |seat: &str, state: SeatState, since: i64| PresenceRec {
+        seat: seat.into(),
+        state,
+        wake_failed: false,
+        harness: Some("claude".into()),
+        node: Some("h1".into()),
+        since,
+        updated_at: 0,
+        attention: None,
+        attention_hint: None,
+        terminal_url: None,
+    };
+    let now = now_ms();
+    let changed = s
+        .put_presence(
+            o.id,
+            &[
+                rec("a", SeatState::Busy, now - 5000),
+                rec("ghost", SeatState::Idle, now),
+            ],
+            90_000,
+        )
+        .await
+        .unwrap();
+    assert_eq!(changed.len(), 1);
+    assert_eq!(changed[0].since, now - 5000);
+    // Same state again: no change, `since` kept, `updated_at` refreshed.
+    let changed = s
+        .put_presence(o.id, &[rec("a", SeatState::Busy, now)], 90_000)
+        .await
+        .unwrap();
+    assert!(changed.is_empty());
+    let p = s.presence(o.id, Some("a")).await.unwrap();
+    assert_eq!(p.len(), 1);
+    assert_eq!(p[0].since, now - 5000);
+    assert!(p[0].updated_at >= now);
+    let changed = s
+        .put_presence(o.id, &[rec("a", SeatState::Idle, now)], 90_000)
+        .await
+        .unwrap();
+    assert_eq!(changed[0].state, SeatState::Idle);
+    // A stale entry counts as absent: the same state is a change again.
+    let changed = s
+        .put_presence(o.id, &[rec("a", SeatState::Idle, now)], 0)
+        .await
+        .unwrap();
+    assert_eq!(changed.len(), 1);
+    // Deleted seats have no presence; the system seat never shows.
+    s.delete_seat(o.id, "a").await.unwrap();
+    assert!(s.presence(o.id, None).await.unwrap().is_empty());
+}
+
+async fn send_budget_exact(s: S) {
+    let (o, _) = org(&s, "acme").await;
+    let a = seat(&s, o.id, "a").await;
+    let mut tasks = Vec::new();
+    for _ in 0..40 {
+        let s = s.clone();
+        tasks.push(tokio::spawn(async move {
+            s.take_send_token(a.id, 0, 10).await.unwrap()
+        }));
+    }
+    let mut ok = 0;
+    for t in tasks {
+        match t.await.unwrap() {
+            Ok(()) => ok += 1,
+            Err(wait) => assert!(wait > 0),
+        }
+    }
+    assert_eq!(ok, 10);
+    s.refund_send_token(a.id, 10).await.unwrap();
+    assert!(s.take_send_token(a.id, 0, 10).await.unwrap().is_ok());
+    assert!(s.take_send_token(a.id, 0, 10).await.unwrap().is_err());
+    // Refill: 600 per minute is one per 100 ms.
+    let b = seat(&s, o.id, "b").await;
+    assert!(s.take_send_token(b.id, 600, 1).await.unwrap().is_ok());
+    let wait = s.take_send_token(b.id, 600, 1).await.unwrap().unwrap_err();
+    assert!((1..=100).contains(&wait), "{wait}");
+    tokio::time::sleep(std::time::Duration::from_millis(wait + 20)).await;
+    assert!(s.take_send_token(b.id, 600, 1).await.unwrap().is_ok());
+}
+
+async fn ack_steps_taken_once(s: S) {
+    let (o, user) = org(&s, "acme").await;
+    let a = seat(&s, o.id, "a").await;
+    let b = seat(&s, o.id, "b").await;
+    let mut m = msg(o.id, user.id, "ack me", &[(&a, C::To), (&b, C::Cc)]);
+    m.ack_required = true;
+    m.ack_due = Some(now_ms() - 1);
+    let sent = s.send(&m).await.unwrap();
+    let due = s.due_acks(now_ms(), 10).await.unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!((due[0].message_id, due[0].stage), (sent.message_id, 0));
+    let names: Vec<String> = s
+        .laggards(sent.message_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|l| l.name)
+        .collect();
+    assert_eq!(names, vec!["a", "b"]);
+    s.ack(sent.message_id, b.id).await.unwrap();
+    assert_eq!(s.laggards(sent.message_id).await.unwrap().len(), 1);
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let s = s.clone();
+        let id = sent.message_id;
+        tasks.push(tokio::spawn(async move {
+            s.advance_ack(id, 0, 1, Some(now_ms() + 60_000))
+                .await
+                .unwrap()
+        }));
+    }
+    let mut won = 0;
+    for t in tasks {
+        won += t.await.unwrap() as i32;
+    }
+    assert_eq!(won, 1);
+    assert!(s.due_acks(now_ms(), 10).await.unwrap().is_empty());
+    assert!(s.advance_ack(sent.message_id, 1, 2, None).await.unwrap());
+    assert!(!s.advance_ack(sent.message_id, 2, 3, None).await.unwrap());
+}
+
+async fn system_seat_hidden(s: S) {
+    let (o, _) = org(&s, "acme").await;
+    let sys = s.system_seat(o.id).await.unwrap();
+    assert_eq!(sys.kind, SeatKind::System);
+    assert_eq!(s.system_seat(o.id).await.unwrap().id, sys.id);
+    // Concurrent first use creates one.
+    let (o2, _) = org(&s, "beta").await;
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let s = s.clone();
+        tasks.push(tokio::spawn(async move {
+            s.system_seat(o2.id).await.unwrap().id
+        }));
+    }
+    let ids: HashSet<i64> = futures_ids(tasks).await;
+    assert_eq!(ids.len(), 1);
+    assert!(
+        s.seats(o.id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|x| x.kind != SeatKind::System)
+    );
+    assert!(s.seat_by_name(o.id, "amail").await.unwrap().is_none());
+    // A real seat may take the name.
+    let real = seat(&s, o.id, "amail").await;
+    assert_eq!(real.kind, SeatKind::Agent);
+}
+
+async fn futures_ids(tasks: Vec<tokio::task::JoinHandle<i64>>) -> HashSet<i64> {
+    let mut out = HashSet::new();
+    for t in tasks {
+        out.insert(t.await.unwrap());
+    }
+    out
+}
+
+async fn focus_and_digest_pending(s: S) {
+    let (o, user) = org(&s, "acme").await;
+    let a = seat(&s, o.id, "a").await;
+    let before = s.pending(o.id, Some(a.id)).await.unwrap()[0].last_seq;
+    let bump = s.set_focus(a.id, Some(now_ms() + 60_000)).await.unwrap();
+    assert_eq!(bump.seq, before + 1);
+    let p = &s.pending(o.id, Some(a.id)).await.unwrap()[0];
+    assert!(p.focus_until.is_some());
+    assert_eq!(
+        s.seat_by_name(o.id, "a")
+            .await
+            .unwrap()
+            .unwrap()
+            .focus_until,
+        p.focus_until
+    );
+    s.set_focus(a.id, None).await.unwrap();
+    assert!(
+        s.pending(o.id, Some(a.id)).await.unwrap()[0]
+            .focus_until
+            .is_none()
+    );
+    let mut m = msg(o.id, user.id, "digest me", &[(&a, C::To)]);
+    m.deliveries[0].mode = M::Digest;
+    s.send(&m).await.unwrap();
+    let p = &s.pending(o.id, Some(a.id)).await.unwrap()[0];
+    assert_eq!((p.to, p.digest), (0, 1));
+    assert!(p.digest_since.is_some());
+    let mut f = filter(&[C::To, C::Cc, C::List]);
+    assert!(s.claim(a.id, &f).await.unwrap().0.is_empty());
+    f.digest_only = true;
+    assert_eq!(s.claim(a.id, &f).await.unwrap().0.len(), 1);
+    assert_eq!(s.pending(o.id, Some(a.id)).await.unwrap()[0].digest, 0);
 }

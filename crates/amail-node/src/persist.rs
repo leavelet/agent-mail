@@ -40,6 +40,19 @@ pub struct Saved {
     /// conversation mirror; kept while the seat sleeps).
     #[serde(default)]
     pub transcripts: BTreeMap<String, TranscriptRef>,
+    /// Claims whose answer did not arrive, to be retried with the same key
+    /// (the server then returns what they took), by key.
+    #[serde(default)]
+    pub claim_retries: BTreeMap<String, ClaimRetry>,
+}
+
+/// A claim to retry (see [`Saved::claim_retries`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimRetry {
+    pub seat: String,
+    pub spec: crate::server::ClaimSpec,
+    /// Unix ms of the first attempt.
+    pub since: i64,
 }
 
 /// Where a seat's conversation is recorded.

@@ -207,6 +207,13 @@ pub async fn claim(
     if req.via.is_empty() || req.via.len() > 100 {
         return Err(ApiError::bad_request("via must be 1..=100 characters"));
     }
+    if req
+        .key
+        .as_ref()
+        .is_some_and(|k| k.is_empty() || k.len() > 100)
+    {
+        return Err(ApiError::bad_request("key must be 1..=100 characters"));
+    }
     let filter = ClaimFilter {
         classes: req.classes,
         urgent_only: req.min_priority == Some(Priority::Urgent),
@@ -217,6 +224,8 @@ pub async fn claim(
             Some(max) if req.mark_inlined_read && max > 0 => Some(max as i64),
             _ => None,
         },
+        digest_only: req.digest_only,
+        key: req.key,
     };
     let (entries, bump) = st.store.claim(seat.id, &filter).await?;
     publish(&st, &seat.name, bump);
@@ -227,6 +236,9 @@ pub async fn claim(
             let mut out = render::entry(e, &auth.org);
             if max > 0 && e.message.body.chars().count() <= max {
                 out.body = Some(e.message.body.clone());
+            }
+            if let Some(n) = req.preview_chars {
+                out.preview = Some(render::preview(&e.message.body, n as usize));
             }
             out
         })

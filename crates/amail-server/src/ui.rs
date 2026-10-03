@@ -22,16 +22,18 @@ const ATTENTION_LIMIT: i64 = 500;
 
 /// Presence of every seat of the org that a node reports, with
 /// `node_connected` filled in.
-pub fn presences(st: &AppState, org_id: i64) -> HashMap<String, Presence> {
+pub async fn presences(st: &AppState, org_id: i64) -> ApiResult<HashMap<String, Presence>> {
     let connected = st.nodes.connected(org_id) > 0;
-    st.presence
+    Ok(st
+        .presence
         .snapshot(org_id)
+        .await?
         .into_iter()
         .map(|(n, mut p)| {
             p.node_connected = connected;
             (n, p)
         })
-        .collect()
+        .collect())
 }
 
 /// Seats that need a person, as attention items.
@@ -85,7 +87,7 @@ async fn attention_items(st: &AppState, auth: &Auth) -> ApiResult<Vec<AttentionI
             normal.push(item);
         }
     }
-    let mut seats = seat_items(&presences(st, auth.org.id));
+    let mut seats = seat_items(&presences(st, auth.org.id).await?);
     // Timestamps are RFC 3339 in UTC with a fixed format, so they sort as
     // strings.
     seats.sort_by(|a, b| (&a.since, &a.seat).cmp(&(&b.since, &b.seat)));
@@ -110,7 +112,7 @@ pub async fn attention(
 pub async fn overview(State(st): State<AppState>, auth: Auth) -> ApiResult<Json<p::Overview>> {
     auth.require_user()?;
     let seats = st.store.seats(auth.org.id).await?;
-    let presence = presences(&st, auth.org.id);
+    let presence = presences(&st, auth.org.id).await?;
     let mut out = p::Overview::default();
     for s in [
         SeatState::Busy,
@@ -365,6 +367,7 @@ async fn seat_op(
         node: st
             .presence
             .get(auth.org.id, &seat.name)
+            .await?
             .and_then(|p| p.node),
     };
     let nodes = st.nodes.send(auth.org.id, cmd);

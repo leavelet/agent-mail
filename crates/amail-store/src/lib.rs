@@ -8,6 +8,7 @@
 //! numbers, atomic sends, exclusive claims). Policy (who may send to whom,
 //! rate limits, address resolution) lives in the server.
 
+mod budget;
 #[macro_use]
 mod common;
 mod model;
@@ -173,6 +174,12 @@ pub trait Store: Send + Sync + 'static {
     ) -> Result<Option<(DeliveryRec, Option<SeqBump>)>>;
     /// Atomically mark matching unnotified deliveries as notified and return
     /// them with bodies. Concurrent claims never return the same delivery.
+    ///
+    /// With `f.key`: if the seat made a claim with that key before (within
+    /// about ten minutes), nothing new is claimed and that claim's
+    /// deliveries are returned again (with their current state), also when
+    /// the two claims run concurrently. A retry after a lost response thus
+    /// gets the same batch.
     async fn claim(&self, seat_id: i64, f: &ClaimFilter) -> Result<(Vec<Entry>, Option<SeqBump>)>;
     /// Deliveries created or changed after `since` (by `mod_seq`), ascending.
     async fn changes(&self, seat_id: i64, since: i64, limit: i64) -> Result<Vec<Entry>>;
@@ -211,4 +218,75 @@ pub trait Store: Send + Sync + 'static {
     /// Full-text search over messages visible to the org, newest first, with
     /// bodies.
     async fn search(&self, org_id: i64, q: &SearchQuery) -> Result<SearchResult>;
+
+    // --- presence and server instances ------------------------------------
+
+    /// Presence rows of the org's live seats (or of one seat), stale ones
+    /// included.
+    async fn presence(&self, org_id: i64, seat: Option<&str>) -> Result<Vec<PresenceRec>>;
+    /// Store a node's report (seats that are not live seats of the org are
+    /// ignored); returns the entries that changed, as stored. An entry
+    /// older than `ttl_ms` counts as absent.
+    async fn put_presence(
+        &self,
+        org_id: i64,
+        recs: &[PresenceRec],
+        ttl_ms: i64,
+    ) -> Result<Vec<PresenceRec>>;
+    /// Take one token from the seat's send budget, or say how many
+    /// milliseconds until one is available. Exact across server instances.
+    async fn take_send_token(
+        &self,
+        seat_id: i64,
+        per_min: i64,
+        burst: i64,
+    ) -> Result<Result<(), u64>>;
+    /// Give back a token taken for a send that then failed.
+    async fn refund_send_token(&self, seat_id: i64, burst: i64) -> Result<()>;
+    async fn heartbeat_instance(&self, id: &str, url: Option<&str>) -> Result<()>;
+    async fn remove_instance(&self, id: &str) -> Result<()>;
+    /// Replace the instance's per-org counts of open node event streams.
+    async fn set_node_streams(&self, instance: &str, counts: &[(i64, i64)]) -> Result<()>;
+    /// Open node event streams per org on the other live instances.
+    async fn node_streams(&self, except: &str, fresh_since: i64) -> Result<Vec<(i64, i64)>>;
+    /// Record (`Some(expiry)`) or drop (`None`) that `instance` has browsers
+    /// watching the seat's conversation.
+    async fn watch_mirror(
+        &self,
+        org_id: i64,
+        seat: &str,
+        instance: &str,
+        expires_at: Option<i64>,
+    ) -> Result<()>;
+    /// `(instance id, url)` of the instances watching the seat.
+    async fn mirror_watchers(
+        &self,
+        org_id: i64,
+        seat: &str,
+    ) -> Result<Vec<(String, Option<String>)>>;
+    /// Drop expired claim keys, watches and server instances.
+    async fn cleanup(&self) -> Result<()>;
+
+    // --- attention -------------------------------------------------------------
+
+    /// Set (or with `None` clear) the seat's focus; the seat's counter moves.
+    async fn set_focus(&self, seat_id: i64, until: Option<i64>) -> Result<SeqBump>;
+    /// The org's hidden `system` seat (created on first use).
+    async fn system_seat(&self, org_id: i64) -> Result<Seat>;
+    /// Kind, focus and presence of the given seats.
+    async fn recipient_states(&self, seat_ids: &[i64]) -> Result<Vec<RecipientState>>;
+    /// Acknowledgement-requiring messages whose next escalation step is due.
+    async fn due_acks(&self, now: i64, limit: i64) -> Result<Vec<AckDue>>;
+    /// Move a message from escalation step `from` to `to`, with the next
+    /// due time; false if another instance did it first.
+    async fn advance_ack(
+        &self,
+        message_id: i64,
+        from: i64,
+        to: i64,
+        next_due: Option<i64>,
+    ) -> Result<bool>;
+    /// Recipients that have not acknowledged the message (not the sender,
+    /// not `archive` members).
+    async fn laggards(&self, message_id: i64) -> Result<Vec<Laggard>>;
 }
