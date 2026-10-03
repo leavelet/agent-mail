@@ -1,0 +1,19 @@
+[package]
+name = "amail-store"
+description = "Storage layer for agent-mail: the Store trait with SQLite and Postgres backends"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+amail-proto.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+rand.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# Used by the `testutil` module, which other crates' tests share.
+tempfile.workspace = true

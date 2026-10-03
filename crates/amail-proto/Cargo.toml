@@ -1,0 +1,11 @@
+[package]
+name = "amail-proto"
+description = "Wire types and address parsing for agent-mail"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

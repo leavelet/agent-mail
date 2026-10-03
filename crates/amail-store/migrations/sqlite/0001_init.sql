@@ -1,0 +1,115 @@
+-- agent-mail schema (SQLite). Keep in sync with migrations/postgres.
+-- Timestamps are milliseconds since the Unix epoch.
+
+CREATE TABLE orgs (
+    id                 INTEGER PRIMARY KEY,
+    name               TEXT    NOT NULL UNIQUE,
+    send_rate_per_min  BIGINT  NOT NULL DEFAULT 30,
+    send_burst         BIGINT  NOT NULL DEFAULT 30,
+    max_recipients     BIGINT  NOT NULL DEFAULT 200,
+    max_thread_depth   BIGINT  NOT NULL DEFAULT 50,
+    -- Bumped to serialize name allocation (seats and lists share a namespace).
+    name_version       BIGINT  NOT NULL DEFAULT 0,
+    created_at         BIGINT  NOT NULL
+);
+
+CREATE TABLE seats (
+    id            INTEGER PRIMARY KEY,
+    org_id        BIGINT  NOT NULL REFERENCES orgs(id),
+    name          TEXT    NOT NULL,
+    kind          TEXT    NOT NULL,
+    parent_id     BIGINT  REFERENCES seats(id),
+    display_name  TEXT,
+    role          TEXT,
+    harness       TEXT,
+    model         TEXT,
+    -- Per-seat sequence counter: every new or changed delivery takes the next value.
+    last_seq      BIGINT  NOT NULL DEFAULT 0,
+    created_at    BIGINT  NOT NULL,
+    deleted_at    BIGINT
+);
+CREATE UNIQUE INDEX seats_org_name ON seats(org_id, name) WHERE deleted_at IS NULL;
+
+CREATE TABLE tokens (
+    id          INTEGER PRIMARY KEY,
+    org_id      BIGINT  NOT NULL REFERENCES orgs(id),
+    scope       TEXT    NOT NULL,
+    seat_id     BIGINT  REFERENCES seats(id),
+    hash        TEXT    NOT NULL UNIQUE,
+    label       TEXT,
+    created_at  BIGINT  NOT NULL,
+    revoked_at  BIGINT
+);
+
+CREATE TABLE lists (
+    id           INTEGER PRIMARY KEY,
+    org_id       BIGINT  NOT NULL REFERENCES orgs(id),
+    name         TEXT    NOT NULL,
+    description  TEXT,
+    post_policy  TEXT    NOT NULL,
+    created_at   BIGINT  NOT NULL
+);
+CREATE UNIQUE INDEX lists_org_name ON lists(org_id, name);
+
+CREATE TABLE list_members (
+    org_id      BIGINT  NOT NULL REFERENCES orgs(id),
+    list_id     BIGINT  NOT NULL REFERENCES lists(id) ON DELETE CASCADE,
+    -- `name` for a local seat, `name@org` for an external address.
+    address     TEXT    NOT NULL,
+    seat_id     BIGINT  REFERENCES seats(id),
+    mode        TEXT    NOT NULL,
+    created_at  BIGINT  NOT NULL,
+    PRIMARY KEY (list_id, address)
+);
+CREATE INDEX list_members_seat ON list_members(seat_id);
+
+-- One row per direction: (org_id, peer_org_id) is how org_id sees the link.
+CREATE TABLE links (
+    org_id       BIGINT  NOT NULL REFERENCES orgs(id),
+    peer_org_id  BIGINT  NOT NULL REFERENCES orgs(id),
+    state        TEXT    NOT NULL,
+    created_at   BIGINT  NOT NULL,
+    PRIMARY KEY (org_id, peer_org_id)
+);
+
+CREATE TABLE messages (
+    id              INTEGER PRIMARY KEY,
+    org_id          BIGINT  NOT NULL REFERENCES orgs(id),
+    sender_seat_id  BIGINT  NOT NULL REFERENCES seats(id),
+    thread_id       BIGINT  NOT NULL,
+    parent_id       BIGINT  REFERENCES messages(id),
+    depth           BIGINT  NOT NULL,
+    subject         TEXT    NOT NULL,
+    body            TEXT    NOT NULL,
+    lines           BIGINT  NOT NULL,
+    -- Comma-separated fully qualified addresses (`name@org`) as written by the sender.
+    to_addrs        TEXT    NOT NULL,
+    cc_addrs        TEXT    NOT NULL,
+    priority        TEXT    NOT NULL,
+    ack_required    BOOLEAN NOT NULL,
+    created_at      BIGINT  NOT NULL
+);
+CREATE INDEX messages_thread ON messages(thread_id);
+CREATE INDEX messages_org ON messages(org_id, id);
+CREATE INDEX messages_sender ON messages(sender_seat_id);
+
+CREATE TABLE deliveries (
+    id            INTEGER PRIMARY KEY,
+    org_id        BIGINT  NOT NULL REFERENCES orgs(id),
+    message_id    BIGINT  NOT NULL REFERENCES messages(id),
+    seat_id       BIGINT  NOT NULL REFERENCES seats(id),
+    class         TEXT    NOT NULL,
+    mode          TEXT    NOT NULL,
+    seq           BIGINT  NOT NULL,
+    mod_seq       BIGINT  NOT NULL,
+    notified_at   BIGINT,
+    notified_via  TEXT,
+    read_at       BIGINT,
+    acked_at      BIGINT
+);
+CREATE UNIQUE INDEX deliveries_message_seat ON deliveries(message_id, seat_id);
+CREATE UNIQUE INDEX deliveries_seat_seq ON deliveries(seat_id, seq);
+CREATE UNIQUE INDEX deliveries_seat_mod_seq ON deliveries(seat_id, mod_seq);
+CREATE INDEX deliveries_pending ON deliveries(seat_id, seq) WHERE notified_at IS NULL;
+CREATE INDEX deliveries_unread ON deliveries(seat_id, seq) WHERE read_at IS NULL;
+CREATE INDEX deliveries_org_message ON deliveries(org_id, message_id);
