@@ -199,6 +199,7 @@ pub(super) fn launched(
         // Such a session fires no hook until a turn runs; it is ready to
         // be woken (its wake target is the session id) once launched.
         rt.holds_slot = false;
+        rt.starting_since = None;
     }
     let s = st.seat(seat);
     s.harness = Some(h);
@@ -220,17 +221,19 @@ pub(super) fn launched(
 }
 
 impl State {
-    /// Seats with a process, or about to have one.
+    /// Seats with a process, or about to have one (not counting those
+    /// already on their way out).
     fn live_count(&self) -> usize {
         self.saved
             .managed
             .iter()
             .filter(|(n, m)| {
+                let rt = self.sup.get(*n);
+                if rt.is_some_and(|r| r.stopping.is_some()) {
+                    return false;
+                }
                 m.pid.is_some()
-                    || self
-                        .sup
-                        .get(*n)
-                        .is_some_and(|r| r.queued || r.opening || r.starting_since.is_some())
+                    || rt.is_some_and(|r| r.queued || r.opening || r.starting_since.is_some())
             })
             .count()
     }
@@ -716,12 +719,14 @@ impl Node {
         &self,
         seats: Vec<SeatPlacement>,
         settings: crate::team::Settings,
-        start: bool,
+        start_all: bool,
+        only: Option<Vec<String>>,
     ) -> Value {
         let mut out = Vec::new();
         let mut st = self.lock();
         st.saved.settings = settings;
         for p in seats {
+            let start = start_all && only.as_ref().is_none_or(|o| o.contains(&p.seat));
             let h = Harness::parse(&p.harness);
             let entry = st.saved.managed.get(&p.seat).cloned();
             let mut m = entry.clone().unwrap_or(Managed {
@@ -760,6 +765,8 @@ impl Node {
                 "running"
             } else if m.dormant && m.up {
                 "dormant"
+            } else if !start && m.up {
+                "waiting to start"
             } else if start {
                 m.up = true;
                 m.failed = false;

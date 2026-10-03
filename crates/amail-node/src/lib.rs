@@ -16,4 +16,4 @@ pub mod template;
 pub mod wire;
 pub mod worktree;
 
-pub use node::{Config, Node, NodeHandle, request, start};
+pub use node::{Config, Node, NodeHandle, request, start, start_with_mux};

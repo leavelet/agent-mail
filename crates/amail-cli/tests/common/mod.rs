@@ -137,6 +137,10 @@ pub struct Harness {
     pub sock: PathBuf,
     pub codex_log: PathBuf,
     pub cfg: amail_node::Config,
+    /// Supervised sessions run here (with `Opts::supervise`).
+    pub mux: Option<Arc<amail_node::mux::ProcessMux>>,
+    /// The fake harness directory (with `Opts::supervise`).
+    pub fake: PathBuf,
 }
 
 pub struct Opts {
@@ -145,6 +149,11 @@ pub struct Opts {
     pub wake_backoff: Duration,
     /// Point the node at a server that does not exist.
     pub server_down: bool,
+    /// Run supervised sessions as processes of the fake harness
+    /// (`fake_harness.sh`) instead of in zellij.
+    pub supervise: bool,
+    /// Adjust the node configuration.
+    pub tweak: Option<fn(&mut amail_node::Config)>,
 }
 
 impl Default for Opts {
@@ -154,9 +163,13 @@ impl Default for Opts {
             wake_confirm: Duration::from_millis(1500),
             wake_backoff: Duration::from_secs(60),
             server_down: false,
+            supervise: false,
+            tweak: None,
         }
     }
 }
+
+const FAKE_HARNESS: &str = include_str!("fake_harness.sh");
 
 impl Harness {
     pub async fn start(backend: Backend, test: &str, opts: Opts) -> Option<Harness> {
@@ -222,7 +235,37 @@ impl Harness {
         cfg.heartbeat = Duration::from_secs(2);
         cfg.liveness_interval = Duration::from_millis(200);
         cfg.hook_server_timeout = Duration::from_secs(5);
-        let node = amail_node::start(cfg.clone()).await.unwrap();
+        cfg.supervise_interval = Duration::from_millis(100);
+        cfg.start_timeout = Duration::from_secs(3);
+        cfg.kill_grace = Duration::from_secs(2);
+        cfg.restart_backoff = Duration::from_millis(200);
+        cfg.resume_grace = Duration::from_secs(3);
+        let fake_dir = dir.path().join("fake");
+        let mut mux = None;
+        if opts.supervise {
+            std::fs::create_dir_all(fake_dir.join("sock")).unwrap();
+            for name in ["claude", "codex"] {
+                let p = fake_dir.join(name);
+                std::fs::write(&p, FAKE_HARNESS).unwrap();
+                std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                    .unwrap();
+            }
+            cfg.claude_bin = fake_dir.join("claude").to_string_lossy().into_owned();
+            cfg.codex_bin = fake_dir.join("codex").to_string_lossy().into_owned();
+            mux = Some(Arc::new(amail_node::mux::ProcessMux::new(vec![
+                ("FAKE_AMAIL".into(), BIN.into()),
+                ("AMAIL_HOOK_TIMEOUT_MS".into(), "5000".into()),
+            ])));
+        }
+        if let Some(t) = opts.tweak {
+            t(&mut cfg);
+        }
+        let node = match &mux {
+            Some(m) => amail_node::start_with_mux(cfg.clone(), m.clone())
+                .await
+                .unwrap(),
+            None => amail_node::start(cfg.clone()).await.unwrap(),
+        };
         let h = Harness {
             db,
             api,
@@ -232,6 +275,8 @@ impl Harness {
             sock,
             codex_log,
             cfg,
+            mux,
+            fake: fake_dir,
         };
         if !opts.server_down {
             h.wait("node connected", || async {
@@ -260,7 +305,12 @@ impl Harness {
     /// Stop the node and start a new one on the same state directory.
     pub async fn restart_node(&mut self) {
         self.node.take().unwrap().shutdown();
-        self.node = Some(amail_node::start(self.cfg.clone()).await.unwrap());
+        self.node = Some(match &self.mux {
+            Some(m) => amail_node::start_with_mux(self.cfg.clone(), m.clone())
+                .await
+                .unwrap(),
+            None => amail_node::start(self.cfg.clone()).await.unwrap(),
+        });
         self.wait("node connected", || async {
             self.status().await["connected"].as_bool() == Some(true)
         })
@@ -356,6 +406,13 @@ impl Drop for Harness {
     fn drop(&mut self) {
         if let Some(n) = self.node.take() {
             n.shutdown();
+        }
+        // Leave no fake harness processes behind.
+        if let Some(m) = &self.mux {
+            for pid in m.pids() {
+                // SAFETY: signalling a child process group of this test.
+                unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+            }
         }
     }
 }

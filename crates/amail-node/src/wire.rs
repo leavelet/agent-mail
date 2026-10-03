@@ -49,11 +49,14 @@ pub enum Request {
     /// Node state, for people and tests.
     Status,
     /// `amail up`: supervise these seats (replacing earlier placements of
-    /// the same seats) and, with `start`, start the ones not running.
+    /// the same seats) and, with `start`, start the ones not running (only
+    /// those in `only`, when given).
     Up {
         seats: Vec<SeatPlacement>,
         settings: crate::team::Settings,
         start: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        only: Option<Vec<String>>,
     },
     /// `amail down`: stop the sessions of these seats (all supervised seats
     /// when empty); they stay offline until the next `up`.

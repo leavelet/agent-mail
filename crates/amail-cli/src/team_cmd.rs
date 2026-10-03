@@ -358,7 +358,6 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
     let placements: Vec<SeatPlacement> = t
         .placements()
         .into_iter()
-        .filter(|(s, _, _)| selected.contains(s))
         .map(|(s, g, tab)| {
             let plan = t.seat(&s).expect("placed seats exist");
             SeatPlacement {
@@ -376,6 +375,7 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
             seats: placements,
             settings: t.settings.clone(),
             start: !o.no_start,
+            only: (!o.only.is_empty()).then(|| selected.clone()),
         },
         Duration::from_secs(30),
     )?;
