@@ -377,6 +377,7 @@ pub struct Node {
     server: ServerClient,
     mux: Arc<dyn crate::mux::Mux>,
     sup_kick: Notify,
+    save_lock: Mutex<()>,
     claude: Arc<dyn Adapter>,
     codex: Arc<dyn Adapter>,
     prepared: HashMap<Harness, Arc<OnceCell<Result<(), String>>>>,
@@ -502,6 +503,7 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
         cfg,
         mux,
         sup_kick: Notify::new(),
+        save_lock: Mutex::new(()),
         st: Mutex::new(st),
         state_file,
         wake_kick: Notify::new(),
@@ -569,6 +571,8 @@ impl Node {
 
     /// Write the state file if it changed.
     fn save_now(&self) {
+        // One writer at a time, so an older snapshot never replaces a newer.
+        let _w = self.save_lock.lock().unwrap_or_else(|e| e.into_inner());
         let saved = {
             let mut st = self.lock();
             if !st.save_dirty {
@@ -1194,7 +1198,18 @@ impl Node {
             "connected": st.connected,
             "server": self.cfg.url,
             "uptime_s": self.started.elapsed().as_secs(),
-            "registered_sessions": st.saved.sessions.len(),
+            // Registrations of sessions that are running now (others are
+            // kept only so a sleeping or stopped seat can resume).
+            "registered_sessions": st
+                .saved
+                .sessions
+                .values()
+                .filter(|r| {
+                    st.seats
+                        .get(&r.seat)
+                        .is_some_and(|s| !matches!(s.state, SeatState::Offline | SeatState::Dormant))
+                })
+                .count(),
             "seats": seats,
         })
     }

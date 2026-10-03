@@ -1000,6 +1000,24 @@ impl Node {
                 .any(|m| m.harness == "codex" && m.pid.is_some());
             (close, codex_left)
         };
+        // Forget registrations of earlier sessions of the stopped seats; the
+        // current one is kept so the next start can resume it.
+        {
+            let mut st = self.lock();
+            let keep: HashSet<String> = st
+                .saved
+                .managed
+                .values()
+                .filter_map(|m| m.resume.clone())
+                .collect();
+            let before = st.saved.sessions.len();
+            st.saved
+                .sessions
+                .retain(|id, r| !targets.contains(&r.seat) || keep.contains(id));
+            if st.saved.sessions.len() != before {
+                st.save_dirty = true;
+            }
+        }
         for s in &close {
             if let Err(e) = self.mux.kill_session(s).await {
                 tracing::warn!("closing {s}: {e:#}");

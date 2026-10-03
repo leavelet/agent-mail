@@ -45,6 +45,7 @@ team_tests!(
     crash_restart_backoff_and_resume_fallback,
     seats_needing_a_person_show_in_ps,
     session_without_a_turn_starts_fresh,
+    list_mail_wakes_and_cold_starts,
     staged_merge_worktrees_and_validation,
 );
 
@@ -1022,5 +1023,63 @@ async fn session_without_a_turn_starts_fresh(b: Backend) {
     kill9(row(&h, "n").await.pid.unwrap());
     wait_for("a third launch", || launches(&h, "n").len() == 3).await;
     assert!(launches(&h, "n")[2].contains(&format!("--resume {sid}")));
+    cli(&h, &["down"]).await;
+}
+
+/// Mail `To` a generated list wakes its idle members and starts its
+/// sleeping ones, like direct mail; a list in `Cc` does neither.
+async fn list_mail_wakes_and_cold_starts(b: Backend) {
+    let Some(h) = setup(b, "list_mail_wakes_and_cold_starts", None).await else {
+        return;
+    };
+    let _i: Vec<FakeInbox> = ["l", "a"].iter().map(|s| inbox(&h, s)).collect();
+    let team = r#"
+[team]
+workroot = "@DIR@/work"
+[defaults]
+harness = "claude"
+[[group]]
+name = "g"
+lead = { name = "l" }
+workers = [{ name = "a" }, { name = "b", harness = "codex" }]
+"#;
+    write_team(&h, team);
+    up(&h, &[]).await;
+    for s in ["l", "a", "b"] {
+        wait_state(&h, s, "idle").await;
+    }
+    let members = list_members(&h, "g").await;
+    assert_eq!(members, vec!["a", "b", "l"]);
+    let (ok, out) = cli(&h, &["sleep", "b"]).await;
+    assert!(ok, "{out}");
+
+    // A list in Cc: not shown at once, nobody woken or started.
+    h.api.send(&["l"], &["g"], "fyi", false).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(row(&h, "b").await.state, "dormant");
+    assert_eq!(launches(&h, "b").len(), 1);
+
+    // A list in To: everyone gets it now; the sleeping Codex seat resumes.
+    let id = h.api.send(&["g"], &[], "to the group", false).await;
+    for s in ["l", "a", "b"] {
+        wait_injected(&h, s, id).await;
+    }
+    assert!(
+        injected(&h, "a").contains("via list g"),
+        "{}",
+        injected(&h, "a")
+    );
+    assert!(launches(&h, "b")[1].contains(" resume "));
+
+    // Changed settings are reported (and apply at once).
+    write_team(
+        &h,
+        &team.replace("[defaults]", "idle_sleep = \"1m\"\n[defaults]"),
+    );
+    let out = up(&h, &[]).await;
+    assert!(
+        out.contains("settings changed (in effect now): idle_sleep off -> 60s"),
+        "{out}"
+    );
     cli(&h, &["down"]).await;
 }

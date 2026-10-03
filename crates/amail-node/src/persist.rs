@@ -108,7 +108,10 @@ pub struct Reservation {
 
 /// Write `data` to `path` through a temporary file and rename.
 pub fn write_atomic(path: &Path, data: &[u8], mode: u32) -> Result<()> {
-    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    // Unique per call: concurrent writers must not share a temporary file.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp{}.{n}", std::process::id()));
     {
         let mut f = std::fs::OpenOptions::new()
             .write(true)
