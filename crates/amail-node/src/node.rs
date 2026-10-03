@@ -479,6 +479,9 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
     for (seat, entries) in st.saved.stash.clone() {
         st.seat(&seat).stash = entries;
     }
+    for (seat, n) in st.saved.wakes.clone() {
+        st.seat(&seat).wakes = n;
+    }
     supervise::restore(&mut st, |h| match Harness::parse(h) {
         Some(Harness::Claude) => Some(claude.harness()),
         Some(Harness::Codex) => Some(codex.harness()),
@@ -1392,6 +1395,11 @@ impl Node {
         if counter != st.saved.wake_counter {
             st.saved.wake_counter = counter;
             st.save_dirty = true;
+        }
+        // Per-seat wake counts survive restarts with the sequence.
+        for (_, name, _, _) in &fire {
+            let n = st.seats.get(name).map_or(0, |s| s.wakes);
+            st.saved.wakes.insert(name.clone(), n);
         }
         drop(st);
         for (h, seat, target, n) in fire {

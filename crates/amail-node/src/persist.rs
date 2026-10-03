@@ -21,6 +21,9 @@ pub struct Saved {
     pub tokens: BTreeMap<String, String>,
     #[serde(default)]
     pub wake_counter: u64,
+    /// Seat -> wake-ups sent (shown by `amail node status`).
+    #[serde(default)]
+    pub wakes: BTreeMap<String, u64>,
     /// Seat -> its live session, restored on restart if still running.
     #[serde(default)]
     pub live: BTreeMap<String, LiveSession>,

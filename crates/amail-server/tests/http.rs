@@ -1423,9 +1423,13 @@ async fn pending_counts_http(srv: Server) {
         json!([
             {"seat": "a", "to": 1, "cc": 0, "list": 0, "urgent": 0, "seq": 1},
             {"seat": "b", "to": 1, "cc": 1, "list": 0, "urgent": 1, "seq": 2},
-            {"seat": "owner", "to": 0, "cc": 0, "list": 0, "urgent": 0, "seq": 0},
         ])
     );
+    // The user seat has no session: nodes do not see it; users do.
+    let v = node.ok(Method::GET, "/pending?seat=owner", None).await;
+    assert_eq!(v["seats"], json!([]));
+    let v = user.ok(Method::GET, "/pending", None).await;
+    assert_eq!(v["seats"].as_array().unwrap().len(), 3);
     // One seat; user tokens may ask too.
     let v = user.ok(Method::GET, "/pending?seat=b", None).await;
     assert_eq!(v["seats"].as_array().unwrap().len(), 1);

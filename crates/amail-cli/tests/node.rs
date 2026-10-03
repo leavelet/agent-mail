@@ -360,10 +360,9 @@ async fn codex_registration_and_rows(b: Backend) {
         .await;
     assert!(plan.get("error").is_none(), "{plan}");
     let args: Vec<String> = serde_json::from_value(plan["args"].clone()).unwrap();
-    assert_eq!(
-        &args[..6],
-        ["-m", "test-model", "-a", "never", "-s", "workspace-write"]
-    );
+    // No `-s`: the sandbox comes from the home's `amail` permissions profile.
+    assert_eq!(&args[..4], ["-m", "test-model", "-a", "never"]);
+    assert!(!args.iter().any(|a| a == "-s"), "{args:?}");
     let prompt = args.last().unwrap().clone();
     assert!(prompt.starts_with("[amail:seat=cx launch="), "{prompt}");
     assert!(prompt.contains("You are cx."), "{prompt}");

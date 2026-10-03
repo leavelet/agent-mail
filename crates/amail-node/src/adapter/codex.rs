@@ -36,6 +36,40 @@ const EVENTS: &[(&str, &str)] = &[
 
 const HOOK_TIMEOUT: i64 = 5;
 
+/// The permissions profile Codex sessions run under (see `apply_managed`).
+const PERMISSIONS_PROFILE: &str = "amail";
+
+/// The git directory and common directory of `cwd` (absolute), if it is in
+/// a git repository.
+fn git_dirs(cwd: &str) -> Vec<String> {
+    let out = std::process::Command::new("git")
+        .args([
+            "-C",
+            cwd,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+        ])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    let Ok(out) = out else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let mut v: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
 /// Codex caps the timeout of some events at 3 s (and warns about larger ones).
 fn hook_timeout(snake: &str) -> i64 {
     if matches!(snake, "session_end" | "interrupt") {
@@ -165,6 +199,64 @@ impl Codex {
         if let V::Table(sww) = sww {
             sww.insert("network_access".into(), V::Boolean(true));
         }
+        // Sessions run under the `amail` permissions profile: the workspace
+        // profile plus network access (as above) plus write access to the
+        // git directories of the Codex seats' working directories (added at
+        // launch, see `grant_git_dirs`).
+        t.insert(
+            "default_permissions".into(),
+            V::String(PERMISSIONS_PROFILE.into()),
+        );
+        let perms = t
+            .entry("permissions")
+            .or_insert_with(|| V::Table(toml::Table::new()));
+        if let V::Table(perms) = perms {
+            let prof = perms
+                .entry(PERMISSIONS_PROFILE)
+                .or_insert_with(|| V::Table(toml::Table::new()));
+            if let V::Table(prof) = prof {
+                prof.insert("extends".into(), V::String(":workspace".into()));
+                let mut net = toml::Table::new();
+                net.insert("enabled".into(), V::Boolean(true));
+                prof.insert("network".into(), V::Table(net));
+                prof.entry("filesystem")
+                    .or_insert_with(|| V::Table(toml::Table::new()));
+            }
+        }
+    }
+
+    /// Let sessions write the git directories of `cwd` (its git dir and
+    /// the repository's common dir) so a seat can commit on its branch.
+    ///
+    /// The workspace sandbox keeps `.git` read-only, and a worktree's git
+    /// directory lies outside the worktree. Only these directories are
+    /// added; the rest of the repository and the file system stay as the
+    /// workspace profile has them. For a worktree the grant covers the
+    /// whole repository's refs and objects (every branch), which is what
+    /// committing and rebasing need.
+    fn grant_git_dirs(&self, cwd: &str) -> Result<Vec<String>> {
+        let dirs = git_dirs(cwd);
+        if dirs.is_empty() {
+            return Ok(dirs);
+        }
+        let mut t = self.read_config()?;
+        let mut changed = false;
+        if let Some(toml::Value::Table(fs)) = t
+            .get_mut("permissions")
+            .and_then(|p| p.get_mut(PERMISSIONS_PROFILE))
+            .and_then(|p| p.get_mut("filesystem"))
+        {
+            for d in &dirs {
+                if fs.get(d).and_then(|v| v.as_str()) != Some("write") {
+                    fs.insert(d.clone(), toml::Value::String("write".into()));
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.write_config(&t)?;
+        }
+        Ok(dirs)
     }
 
     /// Ask a throwaway app-server which of our hooks it trusts. Returns the
@@ -448,6 +540,7 @@ impl Adapter for Codex {
         {
             let _g = self.lock.lock().await;
             self.trust_project(ctx.cwd)?;
+            self.grant_git_dirs(ctx.cwd)?;
         }
         if let Err(e) = self.ensure_daemon().await {
             // The TUI starts a daemon itself; it inherits the launch
@@ -464,7 +557,9 @@ impl Adapter for Codex {
             args.extend(["-m".to_string(), m.clone()]);
         }
         if info.permission_mode == Some(PermissionMode::Unattended) {
-            args.extend(["-a", "never", "-s", "workspace-write"].map(String::from));
+            // No `-s`: the sandbox comes from the `amail` permissions profile
+            // (workspace + network + the seat's git directories).
+            args.extend(["-a", "never"].map(String::from));
         }
         args.extend(ctx.extra.iter().cloned());
         if let Some(id) = ctx.resume {
