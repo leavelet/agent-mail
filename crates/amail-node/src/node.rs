@@ -76,6 +76,9 @@ pub struct Config {
     /// A session without a hook this long after launch is checked for a
     /// prompt that needs a person (and stops holding a start slot).
     pub start_timeout: Duration,
+    /// How often a starting session's screen is checked for prompts that
+    /// need a person (less often once `start_timeout` has passed).
+    pub probe_interval: Duration,
     /// SIGTERM, then SIGKILL after this long.
     pub kill_grace: Duration,
     /// First restart delay after a crash; doubles per consecutive crash.
@@ -116,6 +119,7 @@ impl Config {
             pane_rows: 60,
             start_limit: 4,
             start_timeout: Duration::from_secs(60),
+            probe_interval: Duration::from_secs(3),
             kill_grace: Duration::from_secs(10),
             restart_backoff: Duration::from_secs(2),
             max_restarts: 3,

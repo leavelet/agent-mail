@@ -379,6 +379,11 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
         },
         Duration::from_secs(30),
     )?;
+    for c in v["settings_changed"].as_array().into_iter().flatten() {
+        if let Some(c) = c.as_str() {
+            report.push(format!("settings changed (in effect now): {c}"));
+        }
+    }
     let mut by_action: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for s in v["seats"].as_array().into_iter().flatten() {
         by_action

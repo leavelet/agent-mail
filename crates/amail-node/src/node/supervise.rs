@@ -32,6 +32,8 @@ use crate::wire::{PsRow, SeatPlacement};
 pub(super) enum Intent {
     Sleep,
     Down,
+    /// Stop and start again at once (a seat stuck at a prompt).
+    Restart,
 }
 
 /// Runtime state of a supervised seat.
@@ -99,8 +101,9 @@ pub(super) fn classify_screen(screen: &str, seat: &str, cwd: &str) -> Option<(St
         return Some((
             "trust-prompt".into(),
             format!(
-                "Claude Code asks whether to trust {cwd}: answer it in the pane \
-                 (amail attach {seat}); amail does not answer it for you"
+                "Claude Code asks whether to trust {cwd}: answer it once in any pane of \
+                 this repository (amail attach {seat}), then run amail wake on the other \
+                 seats stuck at this prompt; amail does not answer it for you"
             ),
         ));
     }
@@ -327,7 +330,9 @@ impl Node {
             let mut st = self.lock();
             let connected = st.connected;
             let settings = st.saved.settings.clone();
-            let names: Vec<String> = st.saved.managed.keys().cloned().collect();
+            // Team order: parents (leads) start before their subordinates.
+            let mut names: Vec<String> = st.saved.managed.keys().cloned().collect();
+            names.sort_by_key(|n| st.saved.managed[n].order);
             for name in &names {
                 let m = st.saved.managed[name].clone();
                 let wants_mail = st.seats.get(name).is_some_and(|s| s.wants_wake());
@@ -354,13 +359,18 @@ impl Node {
                     && !rt.probing
                 {
                     let elapsed = now - since;
+                    // Look at the screen early and often while starting (a
+                    // prompt that needs a person should not hold a start
+                    // slot), then less often while still stuck.
+                    let every = if elapsed < self.cfg.start_timeout {
+                        self.cfg.probe_interval
+                    } else {
+                        self.cfg.probe_interval.max(Duration::from_secs(10))
+                    };
                     let due = rt
                         .probed_at
-                        .is_none_or(|t| now - t > Duration::from_secs(10));
-                    // Without a pid the pane may have failed before launching.
-                    if (m.pid.is_none() && elapsed > Duration::from_secs(2) && due)
-                        || (elapsed >= self.cfg.start_timeout && due)
-                    {
+                        .map_or(elapsed >= self.cfg.probe_interval, |t| now - t >= every);
+                    if due {
                         rt.probing = true;
                         rt.probed_at = Some(now);
                         if elapsed >= self.cfg.start_timeout {
@@ -467,6 +477,18 @@ impl Node {
         }
     }
 
+    /// A running seat that never got going: blocked at a prompt, or still
+    /// without a hook after the start timeout.
+    fn is_stuck(&self, st: &State, seat: &str) -> bool {
+        st.sup.get(seat).is_some_and(|r| {
+            r.stopping.is_none()
+                && !r.hooked
+                && (r.blocked.is_some()
+                    || r.starting_since
+                        .is_some_and(|t| t.elapsed() >= self.cfg.start_timeout))
+        })
+    }
+
     /// Ask the process of `seat` to end; the exit is handled when it is gone.
     fn begin_stop(&self, st: &mut State, seat: &str, intent: Intent) {
         let Some(m) = st.saved.managed.get(seat).cloned() else {
@@ -481,7 +503,7 @@ impl Node {
                     rt.stopping = Some((intent, Instant::now(), false));
                     signal(pid, libc::SIGTERM);
                 } else if let Some((i, since, k)) = rt.stopping
-                    && i == Intent::Sleep
+                    && i != Intent::Down
                     && intent == Intent::Down
                 {
                     rt.stopping = Some((Intent::Down, since, k));
@@ -501,6 +523,10 @@ impl Node {
                         m.up = false;
                         m.dormant = false;
                         st.set_state(seat, SeatState::Offline);
+                    }
+                    Intent::Restart => {
+                        m.up = true;
+                        m.dormant = false;
                     }
                 }
                 st.save_dirty = true;
@@ -615,8 +641,15 @@ impl Node {
             return;
         }
         if let Some(b) = blocked {
-            tracing::warn!("seat {seat}: needs a person: {}", b.0);
+            if rt.blocked.as_ref().map(|x| &x.0) != Some(&b.0) {
+                tracing::warn!("seat {seat}: needs a person: {}", b.0);
+            }
             rt.blocked = Some(b);
+            // Waiting for a person: do not hold up other starts.
+            if std::mem::take(&mut rt.holds_slot) {
+                drop(st);
+                self.sup_kick.notify_one();
+            }
         } else if timed_out && !lazy {
             rt.blocked = Some((
                 "no-activity".into(),
@@ -626,6 +659,9 @@ impl Node {
                     self.cfg.start_timeout.as_secs()
                 ),
             ));
+        } else {
+            // The prompt is gone (answered, or the session moved on).
+            rt.blocked = None;
         }
     }
 
@@ -678,6 +714,16 @@ impl Node {
                 mm.last_exit = Some("put to sleep".into());
                 st.set_state(seat, SeatState::Dormant);
                 st.seat(seat).session = None;
+            }
+            Some(Intent::Restart) => {
+                tracing::info!("seat {seat}: restarting");
+                let mm = st.saved.managed.get_mut(seat).expect("present");
+                mm.up = true;
+                mm.dormant = false;
+                mm.failed = false;
+                mm.last_exit = Some("restarted".into());
+                st.set_state(seat, SeatState::Offline);
+                st.sup.entry(seat.to_string()).or_default().retry_at = None;
             }
             Some(Intent::Down) => {
                 tracing::info!("seat {seat}: stopped");
@@ -769,8 +815,32 @@ impl Node {
     ) -> Value {
         let mut out = Vec::new();
         let mut st = self.lock();
-        st.saved.settings = settings;
-        for p in seats {
+        let old = std::mem::replace(&mut st.saved.settings, settings.clone());
+        let mut changed = Vec::new();
+        let show_ms = |v: Option<u64>| v.map_or("off".to_string(), |ms| format!("{}s", ms / 1000));
+        if old.idle_sleep_ms != settings.idle_sleep_ms {
+            changed.push(format!(
+                "idle_sleep {} -> {}",
+                show_ms(old.idle_sleep_ms),
+                show_ms(settings.idle_sleep_ms)
+            ));
+        }
+        if old.max_live != settings.max_live {
+            let show = |v: Option<u32>| v.map_or("none".to_string(), |n| n.to_string());
+            changed.push(format!(
+                "max_live {} -> {}",
+                show(old.max_live),
+                show(settings.max_live)
+            ));
+        }
+        if old.restart != settings.restart {
+            changed.push(format!(
+                "restart {:?} -> {:?}",
+                old.restart, settings.restart
+            ));
+        }
+        let mut restart = Vec::new();
+        for (order, p) in seats.into_iter().enumerate() {
             let start = start_all && only.as_ref().is_none_or(|o| o.contains(&p.seat));
             let h = Harness::parse(&p.harness);
             let entry = st.saved.managed.get(&p.seat).cloned();
@@ -790,7 +860,9 @@ impl Node {
                 pid: None,
                 pid_start: None,
                 last_exit: None,
+                order: 0,
             });
+            m.order = order as u32;
             if m.harness != p.harness {
                 // A session cannot move to another harness.
                 if m.resume.take().is_some() {
@@ -806,7 +878,11 @@ impl Node {
             m.mux_session = p.mux_session.clone();
             m.tab = p.tab.clone();
             let running = m.pid.is_some_and(|pid| alive(pid, m.pid_start));
-            let action = if running {
+            let stuck = running && start && self.is_stuck(&st, &p.seat);
+            let action = if stuck {
+                restart.push(p.seat.clone());
+                "restarting (was stuck at a prompt)"
+            } else if running {
                 "running"
             } else if m.dormant && m.up {
                 "dormant"
@@ -831,11 +907,14 @@ impl Node {
                 st.sup.entry(name).or_default().retry_at = None;
             }
         }
+        for seat in &restart {
+            self.begin_stop(&mut st, seat, Intent::Restart);
+        }
         st.save_dirty = true;
         drop(st);
         self.save_now();
         self.sup_kick.notify_one();
-        json!({"seats": out})
+        json!({"seats": out, "settings_changed": changed})
     }
 
     fn targets(&self, seats: &[String]) -> Result<Vec<String>, String> {
@@ -986,9 +1065,19 @@ impl Node {
             rt.retry_at = None;
         }
         st.save_dirty = true;
+        // A seat stuck at a prompt (e.g. one answered in another pane) is
+        // started again; a working one is left alone.
+        let action = if running && self.is_stuck(&st, seat) {
+            self.begin_stop(&mut st, seat, Intent::Restart);
+            "restarting"
+        } else if running {
+            "running"
+        } else {
+            "starting"
+        };
         drop(st);
         self.sup_kick.notify_one();
-        json!({"seat": seat, "action": if running { "running" } else { "starting" }})
+        json!({"seat": seat, "action": action})
     }
 
     pub(super) fn sup_ps(&self) -> Value {
