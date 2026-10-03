@@ -1,5 +1,7 @@
 <script lang="ts">
   import { store } from '../lib/store.svelte';
+  // Lists of the org, to say through which one mail arrived.
+  const isList = (a: string) => store.lists.some((l) => l.name === a);
   import { t, ui } from '../lib/ui.svelte';
   import { href, go } from '../lib/router.svelte';
   import { get, qs, ApiError } from '../lib/api';
@@ -40,7 +42,7 @@
     const load =
       which === 'inbox'
         ? get<InboxResponse>(`/v1/inbox${qs({ seat: name, before_seq: Number.MAX_SAFE_INTEGER, limit: 100 })}`).then((r) =>
-            newestFirst(r.entries.map(fromEntry)),
+            newestFirst(r.entries.map((e) => fromEntry(e, isList))),
           )
         : get<ArchiveResponse>(`/v1/sent${qs({ seat: name, limit: 100 })}`).then((r) => r.messages.map(fromHeader));
     load

@@ -22,3 +22,26 @@ export function viaLabel(via: string | undefined): string {
   const m = /^hook:(.+)$/.exec(via);
   return m ? `${m[1]} hook` : via;
 }
+
+/** How a message reached a seat: the header field (`to` or `cc`) and, when
+ * the seat is not named there itself, the list it came through. The class
+ * of a delivery follows the header field (a list in To gives `to`); older
+ * deliveries may carry class `list`, which is shown like `cc`. */
+export interface Reach {
+  cls: 'to' | 'cc';
+  via?: string;
+}
+
+export function reachedBy(
+  seat: string,
+  cls: string,
+  m: { to: string[]; cc: string[] },
+  isList: (address: string) => boolean,
+): Reach {
+  if (m.to.includes(seat)) return { cls: 'to' };
+  if (m.cc.includes(seat)) return { cls: 'cc' };
+  const field = cls === 'to' ? m.to : cls === 'cc' ? m.cc : [...m.to, ...m.cc];
+  const lists = field.filter(isList);
+  const via = lists[0] ?? field.find((a) => a !== seat);
+  return { cls: cls === 'to' ? 'to' : 'cc', via };
+}

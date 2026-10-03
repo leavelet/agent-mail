@@ -54,7 +54,7 @@
       </button>
     {/if}
   </footer>
-  {#if showDelivery}<DeliveryTable id={message.id} />{/if}
+  {#if showDelivery}<DeliveryTable id={message.id} {message} />{/if}
 </article>
 
 <style>

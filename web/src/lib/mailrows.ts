@@ -1,6 +1,7 @@
 // Rows of message lists, from the different list endpoints.
 
-import type { DeliveryClass, InboxEntry, MessageHeader, Priority, SearchHit, Source } from './types';
+import { reachedBy } from './delivery';
+import type { InboxEntry, MessageHeader, Priority, SearchHit, Source } from './types';
 
 export interface MailRow {
   id: number;
@@ -17,7 +18,9 @@ export interface MailRow {
   meta?: Record<string, string>;
   unread?: boolean;
   acked?: boolean;
-  cls?: DeliveryClass;
+  /** How the mail reached the mailbox's seat. */
+  cls?: 'to' | 'cc';
+  via?: string;
   snippet?: string;
 }
 
@@ -25,12 +28,14 @@ export function fromHeader(m: MessageHeader): MailRow {
   return { ...m };
 }
 
-export function fromEntry(e: InboxEntry): MailRow {
+export function fromEntry(e: InboxEntry, isList: (address: string) => boolean = () => false): MailRow {
+  const reach = reachedBy(e.delivery.seat, e.delivery.class, e.message, isList);
   return {
     ...e.message,
     unread: !e.delivery.read_at,
     acked: !!e.delivery.acked_at,
-    cls: e.delivery.class,
+    cls: reach.cls,
+    via: reach.via,
   };
 }
 

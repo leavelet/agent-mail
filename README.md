@@ -254,8 +254,9 @@ queue), urgent mail first, then seats, then other mail, each oldest first:
 
 - `ack`: a message to the user that asks for an acknowledgement the user has
   not given (until acknowledged).
-- `reply`: an unread message addressed `to` the user (not cc, not a list)
-  from someone else, in a thread where the user has sent nothing since.
+- `reply`: an unread message that reached the user through `To` (directly,
+  or through a list in `To` of which the user is an immediate member; not
+  `Cc`) from someone else, in a thread where the user has sent nothing since.
   It leaves the queue when the user replies in the thread or marks it read.
 - `seat`: a seat whose node reports that it needs a person, or whose
   wake-ups go unanswered.

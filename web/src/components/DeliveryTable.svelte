@@ -1,11 +1,13 @@
 <script lang="ts">
   import { get, enc } from '../lib/api';
   import type { StatusResponse } from '../lib/types';
-  import { deliveryState, deliveryStep, viaLabel } from '../lib/delivery';
+  import { deliveryState, deliveryStep, reachedBy, viaLabel } from '../lib/delivery';
+  import { store } from '../lib/store.svelte';
   import { t, ui } from '../lib/ui.svelte';
   import { shortTime } from '../lib/time';
 
-  let { id }: { id: number } = $props();
+  let { id, message }: { id: number; message?: { to: string[]; cc: string[] } } = $props();
+  const isList = (a: string) => store.lists.some((l) => l.name === a);
   let data = $state.raw<StatusResponse | null>(null);
   let error = $state<string | null>(null);
 
@@ -28,9 +30,10 @@
       <tbody>
         {#each data.recipients as r}
           {@const st = deliveryState(r)}
+          {@const reach = reachedBy(r.address, r.class, message ?? { to: [], cc: [] }, isList)}
           <tr>
             <td class="mono">{r.address}</td>
-            <td class="faint">{r.class}{r.mode !== 'immediate' ? ` · ${r.mode}` : ''}</td>
+            <td class="faint">{reach.cls}{reach.via ? ` · ${t('mail.viaList', { list: reach.via })}` : ''}{r.mode !== 'immediate' ? ` · ${r.mode}` : ''}</td>
             <td>
               <span class="steps" aria-label={t(`dlv.${st}`)}>
                 {#each [0, 1, 2, 3] as i}<span class="step" class:on={i <= deliveryStep(st)}></span>{/each}

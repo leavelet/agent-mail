@@ -145,7 +145,7 @@ const en = {
   'needs.kind.ack.long': 'Asks you to acknowledge',
   'needs.kind.reply.long': 'Addressed to you, unread and unanswered',
   'needs.kind.seat.long': 'A seat needs a person',
-  'needs.rule': 'Rules: “confirm” = sent to you with “acknowledge” requested and not yet acknowledged. “answer” = sent to you directly (To), unread, and you have not written in that thread since. Marking it read or replying removes it.',
+  'needs.rule': 'Rules: “confirm” = sent to you with “acknowledge” requested and not yet acknowledged. “answer” = reached you through To (directly or via a list you receive at once), unread, and you have not written in that thread since. Marking it read or replying removes it.',
   'needs.waiting': 'waiting {d}',
 
   'mail.inbox': 'Inbox',
@@ -179,6 +179,8 @@ const en = {
   'mail.hideDelivery': 'Hide delivery',
   'mail.inReplyTo': 'in reply to #{id}',
   'mail.list': 'list',
+  'mail.viaList': 'via {list}',
+  'mail.viaList.long': 'Reached this mailbox through list {list}',
 
   'dlv.queued': 'queued',
   'dlv.notified': 'notified',
@@ -453,9 +455,9 @@ const zh: Record<Key, string> = {
   'needs.kind.reply': '待答复',
   'needs.kind.seat': '席位',
   'needs.kind.ack.long': '要求你确认收到',
-  'needs.kind.reply.long': '直接发给你，未读且未答复',
+  'needs.kind.reply.long': '经收件人一栏发给你，未读且未答复',
   'needs.kind.seat.long': '席位需要人工处理',
-  'needs.rule': '规则：“待确认”= 发给你、要求确认且尚未确认的邮件。“待答复”= 直接（收件人一栏）发给你、未读、且你此后没有在该线程里发过信的邮件。标为已读或回复后移出队列。',
+  'needs.rule': '规则：“待确认”= 发给你、要求确认且尚未确认的邮件。“待答复”= 经收件人一栏（直接或通过你即时接收的列表）发给你、未读、且你此后没有在该线程里发过信的邮件。标为已读或回复后移出队列。',
   'needs.waiting': '已等待 {d}',
 
   'mail.inbox': '收件箱',
@@ -489,6 +491,8 @@ const zh: Record<Key, string> = {
   'mail.hideDelivery': '收起投递状态',
   'mail.inReplyTo': '回复 #{id}',
   'mail.list': '列表',
+  'mail.viaList': '经由 {list}',
+  'mail.viaList.long': '通过列表 {list} 送达',
 
   'dlv.queued': '已排队',
   'dlv.notified': '已通知',

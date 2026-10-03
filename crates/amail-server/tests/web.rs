@@ -737,6 +737,27 @@ async fn attention_overview_counts(srv: Server) {
         3
     );
 
+    // Through a list in To: in the queue for an immediate member, not for
+    // a digest member.
+    for (list, mode) in [("now", "immediate"), ("later", "digest")] {
+        user.ok(Method::POST, "/lists", Some(json!({ "name": list })))
+            .await;
+        user.ok(
+            Method::PUT,
+            &format!("/lists/{list}/members/owner"),
+            Some(json!({ "mode": mode })),
+        )
+        .await;
+        let id = a
+            .send(json!({ "to": [list], "subject": format!("via {list}"), "body": "" }))
+            .await;
+        let v = user.ok(Method::GET, "/attention", None).await;
+        let listed = items(&v).iter().any(|x| x.1 == format!("via {list}"));
+        assert_eq!(listed, mode == "immediate", "{list}");
+        user.ok(Method::POST, &format!("/messages/{id}/read"), None)
+            .await;
+    }
+
     // Overview: states (seats without presence are offline), recent mail,
     // the user's unread count, the queue size.
     user.seat("c").await;
@@ -748,8 +769,8 @@ async fn attention_overview_counts(srv: Server) {
     );
     assert_eq!(o["needs_person"], 1);
     assert_eq!(o["wake_failed"], 1);
-    assert_eq!(o["mail_last_hour"], 7);
-    assert_eq!(o["mail_last_day"], 7);
+    assert_eq!(o["mail_last_hour"], 9);
+    assert_eq!(o["mail_last_day"], 9);
     assert_eq!(o["attention"], 3);
     assert_eq!(o["user_unread"], 3);
 

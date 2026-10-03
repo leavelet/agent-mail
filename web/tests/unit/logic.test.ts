@@ -134,3 +134,18 @@ describe('durations', () => {
     expect(duration(3 * 3600_000 + 5 * 60_000, 'zh')).toBe('3小时5分');
   });
 });
+
+import { reachedBy } from '../../src/lib/delivery';
+
+describe('how mail reached a seat', () => {
+  const isList = (a: string) => a === 'backend' || a === 'leads';
+  it('names the field, and the list when the seat is not named itself', () => {
+    expect(reachedBy('a', 'to', { to: ['a'], cc: [] }, isList)).toEqual({ cls: 'to' });
+    expect(reachedBy('a', 'cc', { to: ['b'], cc: ['a'] }, isList)).toEqual({ cls: 'cc' });
+    expect(reachedBy('a', 'to', { to: ['b', 'backend'], cc: ['leads'] }, isList)).toEqual({ cls: 'to', via: 'backend' });
+    expect(reachedBy('a', 'cc', { to: ['backend'], cc: ['leads'] }, isList)).toEqual({ cls: 'cc', via: 'leads' });
+  });
+  it('shows old list deliveries like cc', () => {
+    expect(reachedBy('a', 'list', { to: ['backend'], cc: [] }, isList)).toEqual({ cls: 'cc', via: 'backend' });
+  });
+});

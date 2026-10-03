@@ -1,5 +1,7 @@
 <script lang="ts">
   import { store } from '../lib/store.svelte';
+  // Lists of the org, to say through which one mail arrived.
+  const isList = (a: string) => store.lists.some((l) => l.name === a);
   import { t, ui } from '../lib/ui.svelte';
   import { go } from '../lib/router.svelte';
   import { get, qs } from '../lib/api';
@@ -22,7 +24,7 @@
 
   const me = $derived(store.me?.seat);
   const seq = $derived(me ? (store.counts.get(me)?.seq ?? 0) : 0);
-  const rows = $derived(tab === 'inbox' ? newestFirst(entries.map(fromEntry)) : sent);
+  const rows = $derived(tab === 'inbox' ? newestFirst(entries.map((e) => fromEntry(e, isList))) : sent);
   const index = $derived(rows.findIndex((r) => r.id === selected));
 
   // (Re)load the newest page when the tab or the mailbox changes, keeping

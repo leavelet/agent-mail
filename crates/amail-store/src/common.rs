@@ -816,14 +816,15 @@ macro_rules! impl_store_common {
             }
 
             /// Deliveries to the user seat that wait for the user: ack
-            /// requested and not given, or unread `to` mail the user has not
+            /// requested and not given, or unread `to` mail (directly or
+            /// through a list in To, immediate mode) the user has not
             /// answered (sent nothing later in the thread).
             pub async fn attention(c: &mut Conn, user_seat_id: i64, limit: i64) -> Result<Vec<Entry>> {
                 let rows: Vec<EntryRow> = sqlx::query_as(concat!(
                     entry_select!(),
                     " WHERE d.seat_id = $1 AND d.mode <> 'archive' AND m.sender_seat_id <> $1 AND ( \
                        (m.ack_required AND d.acked_at IS NULL) \
-                       OR (d.class = 'to' AND d.read_at IS NULL AND NOT EXISTS ( \
+                       OR (d.class = 'to' AND d.mode = 'immediate' AND d.read_at IS NULL AND NOT EXISTS ( \
                            SELECT 1 FROM messages r WHERE r.thread_id = m.thread_id \
                            AND r.sender_seat_id = $1 AND r.id > m.id))) \
                      ORDER BY d.seq LIMIT $2"
