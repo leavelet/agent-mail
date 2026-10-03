@@ -817,15 +817,17 @@ impl Node {
         let mut st = self.lock();
         let old = std::mem::replace(&mut st.saved.settings, settings.clone());
         let mut changed = Vec::new();
+        // Nothing ran under the old settings on a first `up`.
+        let first = st.saved.managed.is_empty();
         let show_ms = |v: Option<u64>| v.map_or("off".to_string(), |ms| format!("{}s", ms / 1000));
-        if old.idle_sleep_ms != settings.idle_sleep_ms {
+        if !first && old.idle_sleep_ms != settings.idle_sleep_ms {
             changed.push(format!(
                 "idle_sleep {} -> {}",
                 show_ms(old.idle_sleep_ms),
                 show_ms(settings.idle_sleep_ms)
             ));
         }
-        if old.max_live != settings.max_live {
+        if !first && old.max_live != settings.max_live {
             let show = |v: Option<u32>| v.map_or("none".to_string(), |n| n.to_string());
             changed.push(format!(
                 "max_live {} -> {}",
@@ -833,7 +835,7 @@ impl Node {
                 show(settings.max_live)
             ));
         }
-        if old.restart != settings.restart {
+        if !first && old.restart != settings.restart {
             changed.push(format!(
                 "restart {:?} -> {:?}",
                 old.restart, settings.restart
