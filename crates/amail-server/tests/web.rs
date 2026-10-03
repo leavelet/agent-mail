@@ -42,6 +42,7 @@ web_tests!(
     webhook_on_user_mail,
     attention_overview_counts,
     sent_and_mark_read,
+    archive_by_recipient,
     seat_commands_reach_nodes,
     transcript_relay,
     embedded_app_and_headers,
@@ -774,6 +775,46 @@ async fn attention_overview_counts(srv: Server) {
         assert_eq!(a.get(p).await.0, StatusCode::FORBIDDEN, "{p}");
         assert_eq!(node.get(p).await.0, StatusCode::FORBIDDEN, "{p}");
     }
+}
+
+async fn archive_by_recipient(srv: Server) {
+    let acme = srv.org("acme").await;
+    let beta = srv.org("beta").await;
+    let a = acme.seat("a").await;
+    acme.seat("b").await;
+    let x = beta.seat("x").await;
+    acme.send(json!({ "to": ["a"], "subject": "to a", "body": "" }))
+        .await;
+    acme.send(json!({ "to": ["b"], "cc": ["a"], "subject": "cc a", "body": "" }))
+        .await;
+    a.send(json!({ "to": ["b"], "subject": "from a", "body": "" }))
+        .await;
+    acme.ok(Method::POST, "/links", Some(json!({ "org": "beta" })))
+        .await;
+    beta.ok(Method::POST, "/links/acme/accept", None).await;
+    a.send(json!({ "to": ["x@beta"], "subject": "to x", "body": "" }))
+        .await;
+    x.send(json!({ "to": ["a@acme"], "subject": "x to a", "body": "" }))
+        .await;
+    let get = |q: &'static str| {
+        let acme = acme.clone();
+        async move {
+            subjects(
+                &acme
+                    .ok(Method::GET, &format!("/archive/messages?{q}"), None)
+                    .await,
+            )
+        }
+    };
+    assert_eq!(get("to=a").await, vec!["x to a", "cc a", "to a"]);
+    assert_eq!(get("to=b").await, vec!["from a", "cc a"]);
+    assert_eq!(get("to=x@beta").await, vec!["to x"]);
+    assert_eq!(get("to=a&from=x@beta").await, vec!["x to a"]);
+    assert!(get("to=nobody").await.is_empty());
+    assert_eq!(
+        acme.get("/archive/messages?to=bad%20address").await.0,
+        StatusCode::BAD_REQUEST
+    );
 }
 
 async fn sent_and_mark_read(srv: Server) {

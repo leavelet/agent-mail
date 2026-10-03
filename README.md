@@ -227,7 +227,7 @@ header `X-Amail-Csrf: 1`, and an `Origin` header must name the server.
 | `GET, POST /seats`; `GET, PATCH, DELETE /seats/{name}`; `POST /seats/{name}/tokens` | seats |
 | `GET, POST /lists`; `GET, DELETE /lists/{name}`; `PUT, DELETE /lists/{name}/members/{address}` | lists |
 | `GET, POST /links`; `POST /links/{org}/accept`; `DELETE /links/{org}` | links |
-| `GET /archive/messages` | `since`, `until`, `from`, `thread`, `before_id`, `limit` (user tokens) |
+| `GET /archive/messages` | `since`, `until`, `from`, `to` (a recipient seat), `thread`, `before_id`, `limit` (user tokens) |
 | `GET, PATCH /org`; `GET, POST /tokens`; `DELETE /tokens/{id}`; `GET /whoami` | org settings (including `webhook_url`; `null` clears it), tokens, caller identity |
 | `GET /pending` | node and user tokens: per seat, pending (unnotified, immediate) deliveries by class, urgent count, and the seat's counter |
 | `POST /presence` | node tokens: `{node?, seats: [{seat, state, wake_failed?, harness?, since?, attention?, attention_hint?, terminal_url?}]}`; states `offline`, `busy`, `idle`, `awaiting`, `dormant`; `attention` tags a seat that needs a person (`trust-prompt`, `login`, `permission`, `failed`, `wake-failed`). Kept in memory for 90 s (an expired entry produces no event: treat `updated_at` older than 90 s as offline); shown as `presence` on seats (with `node_connected`) and as `presence` events on `/events` |

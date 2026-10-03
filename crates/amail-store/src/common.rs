@@ -1321,6 +1321,9 @@ macro_rules! impl_store_common {
                      AND ($4 IS NULL OR (mo.name = $4 AND ms.name = $5)) \
                      AND ($6 IS NULL OR m.thread_id = $6) \
                      AND ($7 IS NULL OR m.id < $7) \
+                     AND ($9 IS NULL OR EXISTS (SELECT 1 FROM deliveries td \
+                       JOIN seats ts ON ts.id = td.seat_id JOIN orgs tor ON tor.id = ts.org_id \
+                       WHERE td.message_id = m.id AND tor.name = $9 AND ts.name = $10)) \
                      ORDER BY m.id DESC LIMIT $8"
                 ))
                 .bind(org_id)
@@ -1331,6 +1334,8 @@ macro_rules! impl_store_common {
                 .bind(q.thread_id)
                 .bind(q.before_id)
                 .bind(q.limit)
+                .bind(q.to.as_ref().map(|t| t.0.clone()))
+                .bind(q.to.as_ref().map(|t| t.1.clone()))
                 .fetch_all(&mut *c)
                 .await?;
                 collect(rows, MsgRow::into_message)

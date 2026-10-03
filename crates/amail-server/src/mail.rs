@@ -392,6 +392,7 @@ pub struct ArchiveParams {
     since: Option<String>,
     until: Option<String>,
     from: Option<String>,
+    to: Option<String>,
     thread: Option<i64>,
     before_id: Option<i64>,
     limit: Option<i64>,
@@ -420,8 +421,18 @@ pub async fn archive(
             Some((a.org_or(&auth.org.name).to_string(), a.name))
         }
     };
+    let to = match &q.to {
+        None => None,
+        Some(a) => {
+            let a: Address = a
+                .parse()
+                .map_err(|e| ApiError::bad_request(format!("to: {e}")))?;
+            Some((a.org_or(&auth.org.name).to_string(), a.name))
+        }
+    };
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
     let query = ArchiveQuery {
+        to,
         since: time(&q.since, "since")?,
         until: time(&q.until, "until")?,
         from,

@@ -216,6 +216,8 @@ pub struct ArchiveQuery {
     pub until: Option<i64>,
     /// Sender as `(org name, seat name)`.
     pub from: Option<(String, String)>,
+    /// A recipient seat as `(org name, seat name)`: messages delivered to it.
+    pub to: Option<(String, String)>,
     pub thread_id: Option<i64>,
     pub before_id: Option<i64>,
     pub limit: i64,
