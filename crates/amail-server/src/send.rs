@@ -3,8 +3,12 @@
 //!
 //! Resolution rules:
 //! - `name` resolves in the sender's org to a live seat (class `to`/`cc`,
-//!   mode `immediate`) or a list (members get class `list` and their member
-//!   mode). The sender never receives its own list mail.
+//!   mode `immediate`) or a list. The delivery class follows the header
+//!   field, not whether a list was involved: members of a list in `To` get
+//!   class `to`, of a list in `Cc` class `cc`, each with their member mode
+//!   (a `digest` or `archive` member is not notified at once). The sender
+//!   never receives its own list mail. Class `list` is no longer produced;
+//!   older deliveries may still carry it.
 //! - `name@org` for another org requires an active link. It resolves to a
 //!   seat, or to a list whose `post_policy` is `anyone`.
 //! - List members are seats: local ones, or external `name@org` seats. An
@@ -12,7 +16,7 @@
 //!   linked to the sender's org, so mail never crosses between unlinked orgs.
 //!   Expansion is one level deep; there are no nested lists.
 //! - A seat reached through several addresses gets one delivery with the
-//!   highest class (`to` > `cc` > `list`) and the most immediate mode.
+//!   highest class (`to` > `cc`) and the most immediate mode.
 
 use crate::AppState;
 use crate::auth::Auth;
@@ -397,7 +401,7 @@ impl<'a> Resolver<'a> {
                     },
                 };
                 if seat_id != self.sender.id {
-                    self.add(seat_id, org_id, &name, DeliveryClass::List, m.mode);
+                    self.add(seat_id, org_id, &name, class, m.mode);
                     n += 1;
                 }
             }

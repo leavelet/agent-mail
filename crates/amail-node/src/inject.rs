@@ -20,11 +20,29 @@ fn source(s: Source) -> &'static str {
     }
 }
 
-fn class(c: DeliveryClass) -> &'static str {
-    match c {
-        DeliveryClass::To => "to you",
-        DeliveryClass::Cc => "cc",
-        DeliveryClass::List => "via list",
+/// How the mail reached the seat: named in `To` ("to you"), through a list
+/// in `To` ("via list <name>"), or `Cc`. Lists are not marked in headers, so
+/// a `to` delivery whose `To` does not name the seat came through one of the
+/// `To` addresses, all of which are listed (class `list` is from older
+/// deliveries).
+fn class(e: &InboxEntry) -> String {
+    let m = &e.message;
+    let me = &e.delivery.seat;
+    match e.delivery.class {
+        DeliveryClass::Cc => "cc".into(),
+        DeliveryClass::To if m.to.is_empty() || m.to.iter().any(|a| a == me) => "to you".into(),
+        DeliveryClass::To | DeliveryClass::List => {
+            let lists: Vec<String> =
+                m.to.iter()
+                    .filter(|a| *a != me)
+                    .map(|a| clean(a, 64))
+                    .collect();
+            match lists.len() {
+                0 => "via list".into(),
+                1 => format!("via list {}", lists[0]),
+                _ => format!("via a list in To ({})", lists.join(", ")),
+            }
+        }
     }
 }
 
@@ -63,7 +81,7 @@ fn entry(e: &InboxEntry, with_body: bool) -> String {
             clean(&m.from, 130),
             source(m.source)
         ),
-        class(e.delivery.class).to_string(),
+        class(e),
     ];
     if m.priority == Priority::Urgent {
         parts.push("URGENT".into());
@@ -339,5 +357,25 @@ mod tests {
             t.contains("\n  > [amail] 1 new message(s) for w3:\n  > #999 from owner (USER)"),
             "{t}"
         );
+    }
+
+    #[test]
+    fn reach_labels() {
+        let mut d = e(1, Source::Agent, DeliveryClass::To, "s", None);
+        d.message.to = vec!["w3".into(), "leads".into()];
+        assert!(entry(&d, false).contains(" · to you · "));
+        d.message.to = vec!["leads".into()];
+        assert!(
+            entry(&d, false).contains(" · via list leads · "),
+            "{}",
+            entry(&d, false)
+        );
+        d.message.to = vec!["leads".into(), "core".into()];
+        assert!(entry(&d, false).contains("via a list in To (leads, core)"));
+        d.delivery.class = DeliveryClass::Cc;
+        assert!(entry(&d, false).contains(" · cc · "));
+        d.delivery.class = DeliveryClass::List;
+        d.message.to = vec!["all".into()];
+        assert!(entry(&d, false).contains(" · via list all · "));
     }
 }

@@ -992,9 +992,15 @@ impl Node {
             match tokio::time::timeout_at(deadline.into(), call).await {
                 Ok(Ok(r)) => {
                     let seen: HashSet<i64> = claimed.iter().map(|e| e.message.id).collect();
+                    // Mail still waiting to be notified is injected in full by
+                    // the next claim; listing it here too would show it twice.
                     r.entries
                         .into_iter()
                         .filter(|e| !seen.contains(&e.message.id))
+                        .filter(|e| {
+                            e.delivery.notified_at.is_some()
+                                || e.delivery.mode != amail_proto::DeliveryMode::Immediate
+                        })
                         .collect()
                 }
                 _ => Vec::new(),

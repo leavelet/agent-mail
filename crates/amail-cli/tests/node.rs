@@ -88,7 +88,8 @@ async fn claude_state_machine(b: Backend) {
     let m_cc = h.api.send(&[], &["w1"], "cc mail", false).await;
     h.wait_pending("w1", 1, 1, 0).await;
 
-    // SessionStart (resume) lists unread mail without claiming it.
+    // SessionStart (resume) lists unread mail without claiming it, except
+    // mail still waiting to be notified: the next claim shows that in full.
     let v = h
         .hook(
             "claude",
@@ -96,13 +97,7 @@ async fn claude_state_machine(b: Backend) {
             with(claude("SessionStart"), &[("source", json!("resume"))]),
         )
         .await;
-    assert_eq!(v["hookSpecificOutput"]["hookEventName"], "SessionStart");
-    let text = hook_text(&v).unwrap();
-    assert!(
-        text.starts_with("[amail] w1 has 2 unread message(s):"),
-        "{text}"
-    );
-    assert_eq!(injected_ids(&text), vec![m_to, m_cc]);
+    assert_eq!(v, Value::Null);
     h.wait_pending("w1", 1, 1, 0).await;
     // UserPromptSubmit claims every class.
     let v = h
@@ -110,6 +105,36 @@ async fn claude_state_machine(b: Backend) {
         .await;
     assert_eq!(injected_ids(&hook_text(&v).unwrap()), vec![m_to, m_cc]);
     h.wait_pending("w1", 0, 0, 0).await;
+    // Mail shown before but still unread is listed at the next start.
+    let long = h
+        .api
+        .post(
+            "/messages",
+            json!({"to": ["w1"], "subject": "long one", "body": "x".repeat(1000)}),
+        )
+        .await["id"]
+        .as_i64()
+        .unwrap();
+    h.wait_pending("w1", 1, 0, 0).await;
+    let v = h
+        .hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    assert_eq!(injected_ids(&hook_text(&v).unwrap()), vec![long]);
+    let v = h
+        .hook(
+            "claude",
+            env.clone(),
+            with(claude("SessionStart"), &[("source", json!("resume"))]),
+        )
+        .await;
+    let text = hook_text(&v).unwrap();
+    assert!(
+        text.starts_with("[amail] w1 has 1 unread message(s):"),
+        "{text}"
+    );
+    assert_eq!(injected_ids(&text), vec![long]);
+    h.hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
     let m_to = h.api.send(&["w1"], &[], "to mail 2", false).await;
     let m_cc = h.api.send(&[], &["w1"], "cc mail 2", false).await;
     h.wait_pending("w1", 1, 1, 0).await;
