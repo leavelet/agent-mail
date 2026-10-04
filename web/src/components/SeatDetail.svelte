@@ -106,7 +106,7 @@
       <div class="title">
         <h1 class="mono">{seat.name}</h1>
         {#if seat.display_name}<span class="muted"><Vis text={seat.display_name} /></span>{/if}
-        {#if seat.kind === 'agent'}<StateBadge state={seatState} {age} {starting} failing={!!tf} />{:else}<span class="chip neutral">{t('org.you')}</span>{/if}
+        {#if seat.kind === 'agent'}<StateBadge state={seatState} {age} {starting} failing={!!tf} long />{:else}<span class="chip neutral">{t('org.you')}</span>{/if}
         {#if focus}<span class="chip focus" title={t('flag.focus.long')}>◐ {t('flag.focus', { time: shortTime(focus, now, ui.lang) })}</span>{/if}
       </div>
       <div class="actions row wrap">

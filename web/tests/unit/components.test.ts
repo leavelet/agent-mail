@@ -81,7 +81,8 @@ describe('TreeRow', () => {
       },
       now,
     });
-    expect(starting.querySelector('[data-starting]')?.textContent).toContain('starting – waiting for a person');
+    expect(starting.querySelector('[data-starting]')?.textContent).toContain('starting');
+    expect(starting.querySelector('[data-starting]')?.getAttribute('title')).toContain('a person must answer');
     expect(starting.textContent).toContain('trust prompt');
   });
   it('shows a stale seat as offline', () => {

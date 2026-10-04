@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { untrack } from 'svelte';
   import { get, enc } from '../lib/api';
   import type { Delivery, Message, MessageResponse } from '../lib/types';
   import { t } from '../lib/ui.svelte';
@@ -25,9 +24,17 @@
         if (mid !== id) return;
         message = r.message;
         delivery = r.delivery;
-        if (untrack(() => markOnOpen) && r.delivery && !r.delivery.read_at) void run(() => markRead(mid));
       })
       .catch((e) => (error = e instanceof Error ? e.message : String(e)));
+  });
+
+  // Mark it read once a person opened it (once per message: "Mark unread"
+  // is not undone).
+  let autoMarked: number | null = null;
+  $effect(() => {
+    if (!markOnOpen || !message || message.id !== id || !delivery || autoMarked === id) return;
+    autoMarked = id;
+    if (!delivery.read_at) void run(() => markRead(id));
   });
 
   async function run(f: () => Promise<Delivery>) {

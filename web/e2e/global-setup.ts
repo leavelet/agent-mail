@@ -19,7 +19,12 @@ function env(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   return { ...e, ...extra };
 }
 
+// AMAIL_E2E_PORT_BASE: take ports from there on instead of free ones the
+// system picks (to keep to a range).
+let nextPort = Number(process.env.AMAIL_E2E_PORT_BASE ?? 0);
+
 async function freePort(): Promise<number> {
+  if (nextPort) return nextPort++;
   return new Promise((resolve, reject) => {
     const s = net.createServer();
     s.listen(0, '127.0.0.1', () => {

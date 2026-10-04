@@ -4,12 +4,12 @@
   import { href } from '../lib/router.svelte';
   import { shortTime } from '../lib/time';
   import { noteKey } from '../lib/receipt';
-  import type { SendResponse } from '../lib/types';
+  import type { RecipientNote, SendResponse } from '../lib/types';
 
   /** What happened to a message just sent. */
   let { r, onagain }: { r: SendResponse; onagain?: () => void } = $props();
 
-  function note(n: SendResponse['notes'] extends (infer N)[] | undefined ? N : never): string {
+  function note(n: RecipientNote): string {
     const { key, params } = noteKey(n);
     if (params.until !== undefined) params.until = shortTime(params.until, ui.now, ui.lang);
     return t(key, params);

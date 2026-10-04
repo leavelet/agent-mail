@@ -126,7 +126,7 @@
     {#if current?.kind === 'seat' && current.seat}
       {@const seat = store.seatMap.get(current.seat)}
       <div class="seatcard card">
-        <div class="row"><h2 class="mono">{current.seat}</h2>{#if current.state}<StateBadge state={current.state} starting={startingItem(current)} failing={!!current.turn_failed} />{/if}</div>
+        <div class="row"><h2 class="mono">{current.seat}</h2>{#if current.state}<StateBadge state={current.state} starting={startingItem(current)} failing={!!current.turn_failed} long />{/if}</div>
         <p class="error"><strong>⚠ {current.attention ? attnLabel(current.attention) : t('flag.wakeFailed')}</strong></p>
         {#if current.turn_failed}
           {@const tf = current.turn_failed}

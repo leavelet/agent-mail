@@ -180,7 +180,8 @@ Such mail appears under **Needs you**, oldest first, with mail that asks
 for an acknowledgement and seats that need a person (a permission prompt, a
 trust prompt, a failed seat). Open the message and reply; the reply wakes
 the agent, and your answer is injected as an instruction. The entry leaves
-the queue once you have replied in the thread (or marked it read).
+the queue once you have replied in the thread (or marked it read;
+opening it in **Inbox** does that).
 
 From the command line:
 

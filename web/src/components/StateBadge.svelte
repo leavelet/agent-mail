@@ -5,23 +5,24 @@
 
   /** `starting`: the node reports the seat offline while its session waits
    * at a prompt for a person; it is shown as starting. `failing`: its turns
-   * fail. */
+   * fail (shown in red). `long`: say both in words (where there is room). */
   let {
     state,
     age,
     compact = false,
     starting = false,
     failing = false,
-  }: { state: SeatState; age?: number; compact?: boolean; starting?: boolean; failing?: boolean } = $props();
+    long = false,
+  }: { state: SeatState; age?: number; compact?: boolean; starting?: boolean; failing?: boolean; long?: boolean } = $props();
   const cls = $derived(starting ? 'starting' : state);
-  const label = $derived(starting ? t('state.starting') : t(`state.${state}`));
+  const label = $derived(starting ? t(long ? 'state.startingFull' : 'state.starting') : t(`state.${state}`));
   const title = $derived(
     [starting ? t('state.starting.long') : t(`state.${state}.long`), failing ? t('state.failing.long') : ''].filter(Boolean).join('. '),
   );
 </script>
 
 <span class="badge st-{cls}" class:failing {title} data-state={state} data-starting={starting || undefined}>
-  <span class="dot" aria-hidden="true"></span>{label}{#if failing}<span class="fail">· {t('state.failing')}</span>{/if}{#if age !== undefined && !compact}<span class="age">{duration(age, ui.lang)}</span>{/if}
+  <span class="dot" aria-hidden="true"></span>{label}{#if failing && long}<span class="fail">· {t('state.failing')}</span>{/if}{#if age !== undefined && !compact}<span class="age">{duration(age, ui.lang)}</span>{/if}
 </span>
 
 <style>
