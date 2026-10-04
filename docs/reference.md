@@ -140,7 +140,7 @@ session cookie; with the cookie, everything but `GET` needs the header
 | `POST /tokens/rotate` | user tokens, `{label?}`: a new user token (answered once); the calling token is revoked, its browser sessions end and its open streams close; a browser that rotated gets a new session |
 | `GET /whoami` | the caller's org, scope and seat |
 | `GET /info` | no authentication: `version`, `public`, `registration`, `retention_days` |
-| `POST /register` | no authentication, public mode: `{invite, org, user_name?}` → `{org, user_seat, token}` (201); 403 `invalid_invite`, 409 `org_exists`, 422 `invalid_name`/`reserved_name`, 429 when the client address is over its limit |
+| `POST /register` | no authentication, public mode: `{invite, org, user_name?}` → `{org, user_seat, token}` (201); 403 `invalid_invite`, 409 `org_exists` (at most 3 times per invite; then the invite is spent and gets 403), 422 `invalid_name`/`reserved_name`, 429 when the client address is over its limit |
 
 ### Web interface and nodes
 

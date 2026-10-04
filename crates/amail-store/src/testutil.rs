@@ -84,6 +84,22 @@ pub async fn open(backend: Backend, test: &str) -> Option<TestDb> {
 }
 
 impl TestDb {
+    /// Run one SQL statement directly on the database (for tests that must
+    /// change what the store does not let them change, such as timestamps).
+    pub async fn exec(&self, sql: &str) {
+        if self.url.starts_with("sqlite:") {
+            let mut c = sqlx::SqliteConnection::connect(&self.url)
+                .await
+                .expect("connect");
+            sqlx::query(sql).execute(&mut c).await.expect("exec");
+        } else {
+            let mut c = sqlx::PgConnection::connect(&self.url)
+                .await
+                .expect("connect");
+            sqlx::query(sql).execute(&mut c).await.expect("exec");
+        }
+    }
+
     /// Store `n` messages from seat `seat_id` of org `org_id` directly in
     /// the database, each its own thread with subject `filler <i>` and the
     /// given body, without deliveries (for tests that need much mail).

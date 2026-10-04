@@ -261,6 +261,8 @@ async fn invite(cmd: InviteCmd, out: &Out) -> Result<()> {
                         "used"
                     } else if i.revoked_at.is_some() {
                         "revoked"
+                    } else if i.name_conflicts >= amail_proto::limits::MAX_INVITE_NAME_CONFLICTS {
+                        "spent"
                     } else if i.expires_at.is_some_and(|e| e <= now) {
                         "expired"
                     } else {

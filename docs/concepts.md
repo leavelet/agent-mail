@@ -110,6 +110,7 @@ Orgs are isolated until one user requests a **link** (`amail link request
 <org>`) and the other user accepts (`amail link accept <org>`). Then seats
 of both orgs can write to each other as `name@org`, and lists may contain
 members of the other org. Either side can end the link (`amail link revoke`).
+A request that is not accepted within 30 days is dropped.
 Without an active link, mail to `name@org` is refused. Each user sees only
 the mail of their own org, which includes the mail exchanged with linked
 orgs, never the other org's internal mail, conversations or terminals.

@@ -36,6 +36,8 @@ macro_rules! public_tests {
 
 public_tests!(
     registration_with_invites,
+    invite_name_conflicts_are_counted,
+    link_requests_expire,
     register_then_first_mail,
     registration_rate_limit_by_client_address,
     registration_rate_limit_per_ipv6_48,
@@ -397,7 +399,8 @@ async fn registration_with_invites(b: Backend, t: &str) {
     assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
     assert_eq!(v["error"]["code"], "invalid_invite");
 
-    // A taken name does not use up the invite.
+    // A taken name does not use up the invite (up to a few times; see
+    // invite_name_conflicts_are_counted).
     let code2 = srv.invite(None).await;
     let (s, v) = srv
         .register(json!({ "invite": code2, "org": "acme" }))
@@ -1897,7 +1900,9 @@ async fn cross_org_node_commands_and_presence(b: Backend, t: &str) {
 /// A link request, its listing, withdrawing it and accepting look the same
 /// whether or not an org of that name exists.
 async fn link_requests_do_not_reveal_org_names(b: Backend, t: &str) {
-    let srv = start!(b, t, public());
+    let mut cfg = public();
+    cfg.limits.link_requests_per_hour = None;
+    let srv = start!(b, t, cfg);
     let acme = srv.org("acme").await;
     let _beta = srv.org("beta").await;
     for name in ["beta", "nosuchorg"] {
@@ -1940,12 +1945,128 @@ async fn link_requests_do_not_reveal_org_names(b: Backend, t: &str) {
         assert_eq!(v["error"]["message"], format!("no link with {name:?}"));
     }
     assert_eq!(acme.ok(Method::GET, "/links", None).await, json!([]));
-    // A request to a name that is registered later does not carry over.
+    // A request to a name that is registered later does not carry over,
+    // and it stays in the requesting org's list, so that org cannot watch
+    // for the name being registered.
     acme.ok(Method::POST, "/links", Some(json!({ "org": "later" })))
         .await;
     let later = srv.org("later").await;
     assert_eq!(later.ok(Method::GET, "/links", None).await, json!([]));
-    assert_eq!(acme.ok(Method::GET, "/links", None).await, json!([]));
+    let requested = json!([{ "org": "later", "state": "requested" }]);
+    assert_eq!(acme.ok(Method::GET, "/links", None).await, requested);
+    // Asking again answers the same, and now reaches the org.
+    assert_eq!(
+        acme.ok(Method::POST, "/links", Some(json!({ "org": "later" })))
+            .await,
+        json!({ "org": "later", "state": "requested" })
+    );
+    assert_eq!(acme.ok(Method::GET, "/links", None).await, requested);
+    assert_eq!(
+        later.ok(Method::GET, "/links", None).await,
+        json!([{ "org": "acme", "state": "invited" }])
+    );
+    later.ok(Method::POST, "/links/acme/accept", None).await;
+    assert_eq!(
+        acme.ok(Method::GET, "/links", None).await,
+        json!([{ "org": "later", "state": "active" }])
+    );
+    // A request to a name registered later, where the new org asks first:
+    // one entry, the invitation.
+    acme.ok(Method::POST, "/links", Some(json!({ "org": "later2" })))
+        .await;
+    let later2 = srv.org("later2").await;
+    later2
+        .ok(Method::POST, "/links", Some(json!({ "org": "acme" })))
+        .await;
+    assert_eq!(
+        acme.ok(Method::GET, "/links", None).await,
+        json!([
+            { "org": "later", "state": "active" },
+            { "org": "later2", "state": "invited" },
+        ])
+    );
+    acme.ok(Method::POST, "/links/later2/accept", None).await;
+    assert_eq!(
+        acme.ok(Method::GET, "/links", None).await,
+        json!([
+            { "org": "later", "state": "active" },
+            { "org": "later2", "state": "active" },
+        ])
+    );
+}
+
+/// An invite can be refused with `org_exists` only a few times; then it is
+/// spent, so one invite cannot be used to test many org names.
+async fn invite_name_conflicts_are_counted(b: Backend, t: &str) {
+    let mut cfg = public();
+    cfg.limits.registrations_per_hour = None;
+    let srv = start!(b, t, cfg);
+    let _taken = srv.org("taken").await;
+    let code = srv.invite(None).await;
+    let max = amail_proto::limits::MAX_INVITE_NAME_CONFLICTS;
+    for _ in 0..max {
+        let (s, v) = srv
+            .register(json!({ "invite": code, "org": "taken" }))
+            .await;
+        assert_eq!(s, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["error"]["code"], "org_exists");
+    }
+    // Spent: taken and free names get the answer of an unknown code.
+    for org in ["taken", "free"] {
+        let (s, v) = srv.register(json!({ "invite": code, "org": org })).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{org}: {v}");
+        assert_eq!(v["error"]["code"], "invalid_invite");
+    }
+    let inv = srv.db.store.invites().await.unwrap();
+    assert_eq!(inv[0].name_conflicts, max);
+    assert_eq!(inv[0].used_at, None);
+    // Fewer conflicts leave the invite usable.
+    let code2 = srv.invite(None).await;
+    for _ in 1..max {
+        assert_eq!(
+            srv.register(json!({ "invite": code2, "org": "taken" }))
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+    }
+    assert_eq!(
+        srv.register(json!({ "invite": code2, "org": "free" }))
+            .await
+            .0,
+        StatusCode::CREATED
+    );
+}
+
+/// Link requests that were not accepted are dropped after
+/// `LINK_REQUEST_DAYS`, to existing orgs and to unknown names alike.
+async fn link_requests_expire(b: Backend, t: &str) {
+    let srv = start!(b, t, public());
+    let acme = srv.org("acme").await;
+    let beta = srv.org("beta").await;
+    let gamma = srv.org("gamma").await;
+    for name in ["beta", "nosuchorg", "gamma"] {
+        acme.ok(Method::POST, "/links", Some(json!({ "org": name })))
+            .await;
+    }
+    gamma.ok(Method::POST, "/links/acme/accept", None).await;
+    // Everything was made more than LINK_REQUEST_DAYS ago.
+    let age = (amail_proto::limits::LINK_REQUEST_DAYS + 1) * 86_400_000;
+    srv.db
+        .exec(&format!("UPDATE links SET created_at = created_at - {age}"))
+        .await;
+    srv.db
+        .exec(&format!(
+            "UPDATE link_requests SET created_at = created_at - {age}"
+        ))
+        .await;
+    srv.db.store.cleanup().await.unwrap();
+    // The active link stays; both pending requests are gone.
+    assert_eq!(
+        acme.ok(Method::GET, "/links", None).await,
+        json!([{ "org": "gamma", "state": "active" }])
+    );
+    assert_eq!(beta.ok(Method::GET, "/links", None).await, json!([]));
 }
 
 /// An org has a bounded number of webhook notices in flight; further ones

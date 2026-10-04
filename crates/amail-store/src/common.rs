@@ -935,11 +935,9 @@ macro_rules! impl_store_common {
                         StoreError::Conflict(_) => StoreError::Conflict(format!("org {name:?} already exists")),
                         other => other,
                     })?;
-                // Requests made while no org had this name do not carry over.
-                sqlx::query("DELETE FROM link_requests WHERE peer_name = $1")
-                    .bind(name)
-                    .execute(&mut *c)
-                    .await?;
+                // Requests made while no org had this name do not carry
+                // over, and are kept (until they expire) so that the org that
+                // made them cannot tell that the name was registered.
                 let seat = NewSeat { name: user_seat.to_string(), ..Default::default() };
                 let seat = insert_seat(c, id, SeatKind::User, None, &seat).await?;
                 let token = NewToken {
@@ -1417,10 +1415,25 @@ macro_rules! impl_store_common {
                 Ok(())
             }
 
+            /// Drop `org_id`'s request to the name of `peer_id` made while no
+            /// org had that name: a link with the org itself replaces it.
+            async fn drop_unknown_link(c: &mut Conn, org_id: i64, peer_id: i64) -> Result<()> {
+                sqlx::query(
+                    "DELETE FROM link_requests WHERE org_id = $1 \
+                     AND peer_name = (SELECT name FROM orgs WHERE id = $2)",
+                )
+                .bind(org_id)
+                .bind(peer_id)
+                .execute(&mut *c)
+                .await?;
+                Ok(())
+            }
+
             pub async fn request_link(c: &mut Conn, org_id: i64, peer_id: i64) -> Result<LinkState> {
                 if org_id == peer_id {
                     return Err(StoreError::Invalid("an org cannot link to itself".into()));
                 }
+                drop_unknown_link(c, org_id, peer_id).await?;
                 match link_state(c, org_id, peer_id).await? {
                     None => {
                         set_link(c, org_id, peer_id, LinkState::Requested).await?;
@@ -1439,6 +1452,7 @@ macro_rules! impl_store_common {
             pub async fn accept_link(c: &mut Conn, org_id: i64, peer_id: i64) -> Result<()> {
                 match link_state(c, org_id, peer_id).await? {
                     Some(LinkState::Invited) => {
+                        drop_unknown_link(c, org_id, peer_id).await?;
                         set_link(c, org_id, peer_id, LinkState::Active).await?;
                         set_link(c, peer_id, org_id, LinkState::Active).await
                     }
@@ -1464,7 +1478,9 @@ macro_rules! impl_store_common {
                     "SELECT l.peer_org_id, o.name AS peer_name, l.state FROM links l \
                      JOIN orgs o ON o.id = l.peer_org_id WHERE l.org_id = $1 \
                      UNION ALL SELECT CAST(0 AS BIGINT), r.peer_name, 'requested' \
-                     FROM link_requests r WHERE r.org_id = $1 ORDER BY 2",
+                     FROM link_requests r WHERE r.org_id = $1 AND NOT EXISTS (SELECT 1 FROM links l2 \
+                     JOIN orgs o2 ON o2.id = l2.peer_org_id WHERE l2.org_id = $1 AND o2.name = r.peer_name) \
+                     ORDER BY 2",
                 )
                 .bind(org_id)
                 .fetch_all(&mut *c)
@@ -2190,6 +2206,14 @@ macro_rules! impl_store_common {
                 .execute(&mut *c)
                 .await?;
                 sqlx::query("DELETE FROM server_instances WHERE heartbeat_at < $1").bind(now - 300_000).execute(&mut *c).await?;
+                // Link requests that were not accepted in time, to existing
+                // orgs (both rows of the pair) and to unknown names alike.
+                let cutoff = now - amail_proto::limits::LINK_REQUEST_DAYS * 86_400_000;
+                sqlx::query("DELETE FROM link_requests WHERE created_at < $1").bind(cutoff).execute(&mut *c).await?;
+                sqlx::query("DELETE FROM links WHERE state IN ('requested', 'invited') AND created_at < $1")
+                    .bind(cutoff)
+                    .execute(&mut *c)
+                    .await?;
                 Ok(())
             }
 
@@ -2359,16 +2383,17 @@ macro_rules! impl_store_common {
 
             pub async fn invites(c: &mut Conn) -> Result<Vec<InviteRec>> {
                 #[allow(clippy::type_complexity)]
-                let rows: Vec<(i64, Option<String>, i64, Option<i64>, Option<i64>, Option<String>, Option<i64>)> =
+                let rows: Vec<(i64, Option<String>, i64, Option<i64>, Option<i64>, Option<String>, Option<i64>, i64)> =
                     sqlx::query_as(
-                        "SELECT id, note, created_at, expires_at, used_at, used_by, revoked_at FROM invites ORDER BY id",
+                        "SELECT id, note, created_at, expires_at, used_at, used_by, revoked_at, name_conflicts \
+                         FROM invites ORDER BY id",
                     )
                     .fetch_all(&mut *c)
                     .await?;
                 Ok(rows
                     .into_iter()
-                    .map(|(id, note, created_at, expires_at, used_at, used_by, revoked_at)| InviteRec {
-                        id, note, created_at, expires_at, used_at, used_by, revoked_at,
+                    .map(|(id, note, created_at, expires_at, used_at, used_by, revoked_at, name_conflicts)| InviteRec {
+                        id, note, created_at, expires_at, used_at, used_by, revoked_at, name_conflicts,
                     })
                     .collect())
             }
@@ -2401,16 +2426,23 @@ macro_rules! impl_store_common {
                 // nobody learns which org names are taken.
                 let valid: Option<i64> = sqlx::query_scalar(
                     "SELECT id FROM invites WHERE hash = $1 AND used_at IS NULL \
-                     AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > $2)",
+                     AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > $2) \
+                     AND name_conflicts < $3",
                 )
                 .bind(invite_hash)
                 .bind(now)
+                .bind(amail_proto::limits::MAX_INVITE_NAME_CONFLICTS)
                 .fetch_optional(&mut *c)
                 .await?;
-                if valid.is_none() {
+                let Some(invite_id) = valid else {
                     return Ok(Err(InviteError::Invalid));
-                }
+                };
                 if org_by_name(c, org).await?.is_some() {
+                    // Counted, so that one invite can test only a few names.
+                    sqlx::query("UPDATE invites SET name_conflicts = name_conflicts + 1 WHERE id = $1")
+                        .bind(invite_id)
+                        .execute(&mut *c)
+                        .await?;
                     return Ok(Err(InviteError::OrgExists));
                 }
                 let used: Option<i64> = sqlx::query_scalar(

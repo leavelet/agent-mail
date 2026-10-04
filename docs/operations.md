@@ -213,7 +213,7 @@ All operator commands work directly on the database (`--db` or
 ```sh
 export AMAIL_DB=postgres://...
 amail admin invite create --count 5 --note "beta testers" --expires 7d
-amail admin invite ls
+amail admin invite ls                  # open, used, revoked, expired or spent (3 taken names tried)
 amail admin invite revoke 3
 amail admin stats                      # orgs, seats, mail volume, busiest orgs
 amail admin org ls

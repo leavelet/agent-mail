@@ -297,8 +297,8 @@ pub trait Store: Send + Sync + 'static {
         org_id: i64,
         seat: &str,
     ) -> Result<Vec<(String, Option<String>)>>;
-    /// Drop expired claim keys, watches, server instances and browser
-    /// sessions, and revoked tokens (with their sessions).
+    /// Drop expired claim keys, watches, server instances, browser sessions
+    /// and link requests, and revoked tokens (with their sessions).
     async fn cleanup(&self) -> Result<()>;
     /// Which of these token ids are live, and which of these browser
     /// sessions (by hash) are live and belong to a live token.

@@ -589,8 +589,12 @@ pub async fn request_link(
         return Err(ApiError::bad_request("an org cannot link to itself"));
     }
     let links = st.store.links(auth.org.id).await?;
+    let peer = find_peer(&st, name).await?;
     if let Some(l) = links.iter().find(|l| l.peer_name == name) {
-        if l.state != p::LinkState::Invited {
+        // A request made while no org had the name is replaced by a request
+        // to the org that has it now; the answer is the same.
+        let stale = l.peer_org_id == 0 && peer.is_some();
+        if l.state != p::LinkState::Invited && !stale {
             return Ok(Json(p::Link {
                 org: name.to_string(),
                 state: l.state,
@@ -609,7 +613,7 @@ pub async fn request_link(
             ),
         ));
     }
-    let state = match find_peer(&st, name).await? {
+    let state = match peer {
         Some(peer) => st.store.request_link(auth.org.id, peer.id).await?,
         None => {
             st.store.request_unknown_link(auth.org.id, name).await?;
@@ -649,7 +653,8 @@ pub async fn revoke_link(
         None => false,
     };
     // A request made to the name while no (active) org had it.
-    if removed || st.store.revoke_unknown_link(auth.org.id, &org).await? {
+    let unknown = st.store.revoke_unknown_link(auth.org.id, &org).await?;
+    if removed || unknown {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found(format!("no link with {org:?}")))

@@ -267,6 +267,13 @@ pub mod limits {
     /// per-address limit (`registrations_per_hour`, which keys IPv6 clients
     /// by /64). A request this limit refuses creates no per-/64 entry.
     pub const REGISTRATION_NET48_FACTOR: f64 = 4.0;
+    /// Registrations refused with `org_exists` that one invite may get;
+    /// after that many the invite is no longer valid, so that one invite
+    /// cannot be used to test many org names.
+    pub const MAX_INVITE_NAME_CONFLICTS: i64 = 3;
+    /// Days after which a link request that was not accepted is dropped,
+    /// whether or not an org of that name exists.
+    pub const LINK_REQUEST_DAYS: i64 = 30;
 
     // --- what the node reads (so a server cannot exhaust its memory) ---
 

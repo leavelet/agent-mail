@@ -421,6 +421,9 @@ pub struct InviteRec {
     /// The org registered with it.
     pub used_by: Option<String>,
     pub revoked_at: Option<i64>,
+    /// Registrations refused with `org_exists`; at
+    /// `amail_proto::limits::MAX_INVITE_NAME_CONFLICTS` the invite is spent.
+    pub name_conflicts: i64,
 }
 
 /// An operator token (no secret).

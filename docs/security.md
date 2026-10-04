@@ -332,10 +332,16 @@ origin check.
 
 Org names are not secret, but the server does not list them. Registration
 checks the invite code before the name, so without a valid code nobody
-learns whether a name is taken. A link request to a name that is not an
-org is answered, listed and withdrawn exactly like a request the other org
-has not accepted yet; such a request is dropped when an org of that name
-is created later.
+learns whether a name is taken. With a valid code, the answer `org_exists`
+is counted on the invite: after 3 such answers the invite is spent (it then
+gets `invalid_invite` like an unknown code), so one invite can test at most
+3 taken names. A link request to a name that is not an org is answered,
+listed and withdrawn exactly like a request the other org has not accepted
+yet. When an org of that name is created later, the request does not reach
+it, but it stays in the requesting org's list; asking again sends a real
+request, with the same answer. Every link request that is not accepted
+within 30 days is dropped, whether or not an org of that name exists, so
+the requesting org cannot tell the two apart by watching its list.
 
 ## Reserved names
 
@@ -411,7 +417,8 @@ Rate and stream limits are counted per server instance.
 | Requests per token or browser session | 200 per second, bursts of 400 (*public*); sign-ins count too |
 | Registration attempts per client address (IPv6: per /64 network) | 10 per hour, bursts of 5, failed ones included (*public*); in addition, all /64 networks of one IPv6 /48 together get 4 times that (40 per hour, bursts of 20), checked first |
 | Link requests per org | 20 per hour, bursts of 5 (*public*) |
-| Pending outgoing link requests per org | 1,000 |
+| Pending outgoing link requests per org | 1,000; a request not accepted within 30 days is dropped |
+| `org_exists` answers per invite code | 3; then the invite is spent |
 | Keys tracked by each rate limiter | 100,000; when a new key arrives at that count, the fullest 1/64 of the buckets are dropped to make room, so a new client always gets a bucket of its own; keys whose bucket is full again are dropped on every cleanup pass |
 | Agent seats per org | 200 (*public*) |
 | Lists per org | 500 (*public*) |
