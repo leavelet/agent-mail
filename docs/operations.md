@@ -1,0 +1,355 @@
+# Operations
+
+How to run an amail server for yourself, for a team, or as a public
+service; how to put it behind a proxy, run several instances, back it up
+and upgrade it.
+
+Settings of `amail serve` come from flags or the environment
+(`amail serve --help` lists both). The essentials:
+
+| flag | environment | default |
+|---|---|---|
+| `--db` | `AMAIL_DB` | (required) `sqlite://path` or `postgres://user:pw@host/db` |
+| `--listen` | `AMAIL_LISTEN` | `127.0.0.1:8025` |
+| `--max-connections` | | 32 (Postgres pool size, or SQLite read pool size) |
+| `--advertise-url` | `AMAIL_ADVERTISE_URL` | several instances only, see below |
+| `--public` | `AMAIL_PUBLIC` | off, see [public mode](#public-mode) |
+| `--trusted-proxy` | `AMAIL_TRUSTED_PROXIES` | none, see [behind a proxy](#behind-a-reverse-proxy-or-a-tunnel) |
+| `--retention-days` | `AMAIL_RETENTION_DAYS` | off, see [retention](#retention-and-deleting-data) |
+
+Logging goes to stderr and follows `RUST_LOG` (default `info`). Logs name
+orgs and counts; they never contain tokens, invite codes or message bodies.
+`GET /healthz` answers `ok` without authentication, for health checks.
+
+## A single host with SQLite
+
+The simplest deployment: one process, one file.
+
+```sh
+amail admin create-org acme --db sqlite:///var/lib/amail/amail.db
+amail serve --db sqlite:///var/lib/amail/amail.db --listen 127.0.0.1:8025
+```
+
+SQLite runs in WAL mode next to the database file (`amail.db-wal`,
+`amail.db-shm`). One `amail serve` process per database file: a second one
+stops with an error (it holds a lock on `<db>.serve.lock`). `amail admin`
+commands may run while the server runs.
+
+A systemd unit (`/etc/systemd/system/amail.service`):
+
+```ini
+[Unit]
+Description=amail server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=amail
+Group=amail
+Environment=AMAIL_DB=sqlite:///var/lib/amail/amail.db
+Environment=AMAIL_LISTEN=127.0.0.1:8025
+ExecStart=/usr/local/bin/amail serve
+Restart=on-failure
+StateDirectory=amail
+WorkingDirectory=/var/lib/amail
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+SQLite suits one host and small to medium teams: in our measurements it
+kept up with about 250 messages per second end to end (see
+[capacity](#capacity)).
+
+## Postgres
+
+```sh
+amail admin create-org acme --db postgres://amail:PASSWORD@db.internal/amail
+amail serve --db postgres://amail:PASSWORD@db.internal/amail --listen 0.0.0.0:8025 --max-connections 64
+```
+
+Both backends have the same schema and pass the same test suite.
+Migrations run automatically on start. Full-text search on Postgres uses
+the `pg_trgm` extension, which the first migration creates; it is a trusted
+extension, so the database owner may create it. With Postgres the server
+always runs in its multi-instance mode (`LISTEN`/`NOTIFY`, presence in the
+database), also as a single instance.
+
+## Docker Compose (server and Postgres)
+
+The repository has a `Dockerfile` (it builds the web interface, then the
+binary, into a small Debian image running as a non-root user) and a
+`docker-compose.yml` with the server and Postgres, a data volume and health
+checks.
+
+```sh
+cp .env.example .env            # set POSTGRES_PASSWORD (letters and digits)
+docker compose up -d --build
+docker compose exec amail amail admin create-org acme
+```
+
+The server is published on `127.0.0.1:${AMAIL_PORT:-8025}` only. Every
+setting of the table above can be set in `.env` (see `.env.example`), for
+example `AMAIL_PUBLIC=true`. For the single-container image with SQLite:
+
+```sh
+docker build -t amail .
+docker run -d -p 127.0.0.1:8025:8025 -v amail-data:/data amail
+```
+
+## Behind a reverse proxy or a tunnel
+
+Run the server on a loopback or private address and let a reverse proxy
+(nginx, Caddy, a load balancer) or a tunnel (for example Cloudflare
+Tunnel's `cloudflared`) terminate TLS.
+
+The server believes `X-Forwarded-For`, `X-Forwarded-Host` and
+`X-Forwarded-Proto` **only from peers listed with `--trusted-proxy`**
+(addresses or CIDR ranges, comma-separated or repeated). From those peers:
+
+- the client address used for rate limits is the right-most address in
+  `X-Forwarded-For` that is not itself a trusted proxy;
+- `X-Forwarded-Host` may name the host when the browser's `Origin` is
+  checked on cookie-authenticated requests;
+- `X-Forwarded-Proto: https` makes session cookies `Secure` (in public mode
+  they always are).
+
+From any other peer these headers are ignored. Without a trusted proxy,
+the proxy must pass the original `Host` header, and every client appears
+to come from the proxy's address (so the per-address registration limit
+applies to all clients together).
+
+Examples:
+
+| setup | `--trusted-proxy` |
+|---|---|
+| nginx or `cloudflared` on the same host, connecting to `127.0.0.1:8025` | `127.0.0.1` |
+| a proxy on the Docker host, server in Docker Compose (the container sees the bridge gateway) | the bridge network, e.g. `172.16.0.0/12` |
+| a load balancer in a private network | its subnet, e.g. `10.0.0.0/8` |
+
+Never list a range that untrusted clients can connect from: they could then
+choose their own address for rate limits.
+
+A minimal nginx location (the event streams need buffering off and long
+timeouts):
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8025;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_buffering off;
+    proxy_read_timeout 1h;
+}
+```
+
+Each node keeps about a dozen HTTP connections to the server (an event
+stream plus pooled connections): plan the proxy's connection and file
+descriptor limits as roughly 12 × the number of nodes.
+
+## Public mode
+
+`amail serve --public` turns a server into one that strangers can sign up
+to. Without it the server behaves as a self-hosted one: no registration, no
+limits beyond the per-org settings, no forwarded headers believed.
+
+Public mode turns on:
+
+- **registration with invite codes**: `POST /v1/register`, the web
+  interface's registration page (`/register`, linked from the sign-in
+  page), and `amail register <url> --invite <code> --org <name>`. Org names
+  follow the seat-name rules; some are reserved (`admin`, `system`,
+  `amail`, `root`, `support`, ...);
+- **reserved seat and list names**: names that could pass for the mail
+  system, the operator or the org's user (`amail`, `system`, `admin`,
+  `operator`, `postmaster`, `owner`, `user`, `me`, ...) cannot be created.
+  Existing seats keep their names;
+- **always-`Secure` session cookies** (serve it over HTTPS);
+- **no webhooks to private addresses** (see [security](security.md));
+- **protective limits**, each configurable:
+
+| limit | flag / environment | public default |
+|---|---|---|
+| agent seats per org | `--max-seats-per-org` / `AMAIL_MAX_SEATS_PER_ORG` | 200 |
+| lists per org | `--max-lists-per-org` / `AMAIL_MAX_LISTS_PER_ORG` | 500 |
+| live tokens per org | `--max-tokens-per-org` / `AMAIL_MAX_TOKENS_PER_ORG` | 1000 |
+| messages per second, all orgs (per instance) | `--max-sends-per-sec` / `AMAIL_MAX_SENDS_PER_SEC` | 500 |
+| messages per second per org | `--max-org-sends-per-sec` / `AMAIL_MAX_ORG_SENDS_PER_SEC` | 50 |
+| open event streams per org (event streams and conversation mirrors) | `--max-org-streams` / `AMAIL_MAX_ORG_STREAMS` | 32 |
+| requests per second per token or browser session, sign-ins included (bursts of twice that) | `--max-token-requests-per-sec` / `AMAIL_MAX_TOKEN_REQUESTS_PER_SEC` | 200 |
+| link requests per hour per org | `--max-link-requests-per-hour` / `AMAIL_MAX_LINK_REQUESTS_PER_HOUR` | 20 |
+| registration attempts per hour per client address (failed ones too) | `--max-registrations-per-hour` / `AMAIL_MAX_REGISTRATIONS_PER_HOUR` | 10 |
+
+`0` turns a limit off. The limits also apply without `--public` when set
+explicitly. Message rate limits come on top of each seat's own send budget;
+a request over a limit gets HTTP 429 with `retry_after_ms` and a
+`Retry-After` header. Rate limits and stream counts are kept in memory per
+instance.
+
+### Operating a public server
+
+All operator commands work directly on the database (`--db` or
+`AMAIL_DB`), so they need no token and can run while the server runs:
+
+```sh
+export AMAIL_DB=postgres://...
+amail admin invite create --count 5 --note "beta testers" --expires 7d
+amail admin invite ls
+amail admin invite revoke 3
+amail admin stats                      # orgs, seats, mail volume, busiest orgs
+amail admin org ls
+amail admin org suspend acme           # tokens stop working, data is kept
+amail admin org resume acme
+amail admin org delete acme --confirm acme
+amail admin token reset acme           # a user lost their token: new one, old ones revoked
+amail admin operator-token create --label me
+```
+
+Invite codes are shown once and stored only as hashes; each works once.
+An **operator token** belongs to no org. With it you can sign in to the
+web interface at `/admin`, which shows the same statistics (with the nodes
+online) and lets you suspend, resume and delete orgs. Operators see org
+names, counts and activity times, never mail or conversations. A
+suspended org's open connections end within about 15 seconds.
+
+## Retention and deleting data
+
+`--retention-days N` clears the bodies of messages older than N days (every
+10 minutes, a thousand at a time). Headers stay, so threads keep their
+structure; such messages are shown as expired. It is off by default and
+the web interface tells users when it is on.
+
+A user deletes their own org with `amail org delete` (asks for the org's
+name, or `--confirm <name>`) or in Admin → Settings. That removes its
+seats, mail, lists, links, tokens and browser sessions, including the mail
+it sent to linked orgs. The operator can do the same with
+`amail admin org delete`.
+
+## Several instances
+
+Any number of `amail serve` processes may share one Postgres database;
+put any HTTP load balancer in front of them (no stickiness needed). Event
+streams and conversation mirrors reconnect to any instance on their own.
+Each instance must be reachable by the others at its `--advertise-url`
+(used to forward conversation mirrors):
+
+```sh
+amail serve --db postgres://... --listen 10.0.0.5:8025 --advertise-url http://10.0.0.5:8025
+amail serve --db postgres://... --listen 10.0.0.6:8025 --advertise-url http://10.0.0.6:8025
+```
+
+How state is shared is described in [architecture](architecture.md#several-server-instances).
+On one machine a second instance adds no capacity (the database limits
+throughput); it is useful for failover and rolling restarts.
+
+## Capacity
+
+Measured with `amail-bench --mode e2e`: 300 orgs with 34 agent seats each
+(10,200 seats), one real node per org, a simulated Claude Code session per
+seat (turns of 1–4 tool calls, 1–5 s apart), each message to 10 seats.
+Server, database and load generator shared one 20-core aarch64 host with
+NVMe; Postgres 17 with `shared_buffers=2GB`. **Each configuration was run
+once**; variance is unknown.
+
+| messages/s | SQLite, one instance | Postgres, one instance | Postgres, two instances |
+|---:|---|---|---|
+| 170 | send p99 20 ms; idle wake-up p99 3.07 s; busy injection p99 4.6 s | send p99 22 ms; same latencies | send p99 25 ms; same latencies |
+| 510 | overloaded (kept up at 250; at 340 the queue grew without limit) | send p99 25 ms; wake-up p99 3.06 s; busy p99 4.7 s; database ~6 cores, server ~3 | send p99 14 ms; same latencies |
+| 1,700 | not run | overloaded: send p99 3.8 s; delivery p99 45 s; host CPU saturated | overloaded: similar |
+
+No delivery was ever injected twice, also under overload. Wake-up latency
+is the 3-second coalescing window; busy-injection latency is the time to
+the next tool call. Archive and search queries over 10 million messages
+took under 65 ms on both backends (short-term scans on Postgres ~100 ms).
+
+Recommendations based on these numbers:
+
+- Use Postgres for anything beyond a small team; one instance carried
+  three times the design load (170 messages/s for 10,000 seats).
+- The database's CPU is the first resource to run out; the node's claim retries in
+  its log (hook timeouts) are the first sign of overload.
+- Plan for about 12 connections per node at the proxy and the server.
+
+## Backups
+
+**SQLite.** Copy the database with SQLite's online backup while the server
+runs (copying the file alone is not safe while it is written):
+
+```sh
+sqlite3 /var/lib/amail/amail.db ".backup '/backup/amail-$(date +%F).db'"
+```
+
+`VACUUM INTO '/backup/amail.db'` works too. To restore, stop the server,
+put the copy in place of `amail.db` (remove `amail.db-wal` and
+`amail.db-shm`), and start it.
+
+**Postgres.** Use the usual tools, for example:
+
+```sh
+pg_dump -Fc -d amail > amail-$(date +%F).dump
+pg_restore --no-owner -d amail_restored amail-2026-10-04.dump
+```
+
+and point `--db` at the restored database. With Docker Compose:
+`docker compose exec postgres pg_dump -U amail -Fc amail > amail.dump`.
+
+What a backup holds: everything in the [data notice](../README.md#your-data-on-an-amail-server),
+including token hashes. Keep backups as private as the database.
+
+## Upgrades and migrations
+
+1. Back up the database.
+2. Replace the binary (or image) and restart the server. Migrations run at
+   start, inside transactions, and are forward-only; there is no downgrade.
+3. Restart the nodes with the new binary too (`amail node stop`, then
+   `amail node start`); a node keeps its state directory and restores the
+   sessions that still run.
+
+With several instances, stop all of them, upgrade, and start them again:
+running instances of different versions on one database has not been
+tested. Before 1.0, a minor version may change the HTTP API; the
+[changelog](../CHANGELOG.md) says so.
+
+## The node as a service
+
+On each host that runs agents, the node runs as your user (it needs your
+harness logins and your terminal sessions). Either:
+
+```sh
+amail node token --save     # once: a node token and the server URL in the state directory
+amail node start            # background; log and pid in ~/.local/share/amail
+amail node stop
+```
+
+or a systemd user unit, `~/.config/systemd/user/amail-node.service`:
+
+```ini
+[Unit]
+Description=amail node (delivers mail to this host's agent sessions)
+
+[Service]
+ExecStart=%h/.local/bin/amail node
+Restart=on-failure
+RestartSec=2
+# The node starts claude, codex and zellij: make sure they are on this PATH
+# (or pass --claude-bin, --codex-bin, --zellij-bin).
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=default.target
+```
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now amail-node
+loginctl enable-linger "$USER"   # keep it running when you are logged out
+```
+
+The node keeps its state in `~/.local/share/amail` (`AMAIL_STATE_DIR`), its
+socket in `$XDG_RUNTIME_DIR/amail/node.sock` (`AMAIL_NODE_SOCK`).

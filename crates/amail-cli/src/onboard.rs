@@ -127,7 +127,7 @@ pub async fn register(
     )?;
     out.show(&v, || {
         eprintln!(
-            "registered org {} with your seat {}; logged in as profile {name} ({}).
+            "registered org {} with your seat {}; logged in as profile {name} ({}).\n\
              Your user token, shown once (keep it somewhere safe; it is also in that file):",
             r.org,
             r.user_seat,
