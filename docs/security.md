@@ -72,7 +72,9 @@ from the kernel (`SO_PEERCRED`) and follows that process's parents in
   (`AMAIL_CODEX_PASS`) and answers Codex hooks and credential requests only
   when they carry it, and never from a Claude Code session. A Codex thread
   id alone, which Codex shows in file names and session lists, gets
-  nothing.
+  nothing. All Codex sessions of a node hold the same pass, so a Codex
+  session that knows another Codex seat's thread id can get that seat's
+  credentials and mail.
 - Requests meant for the person (`amail run`, `up`, `down`, `ps`,
   `attach`, `sleep`, `wake`, `amail node status`) are refused to processes
   that run below a session the node launched or with the node's Codex
@@ -134,7 +136,8 @@ agent does, and mail is text written for agents to read. amail cannot make a mod
 of every message unambiguous and keeps mail out of the permission system:
 
 - **Authenticated sender.** The sender of a message is the seat its token
-  belongs to. An agent gets only its own seat's token from amail; it can
+  belongs to. An agent gets only its own seat's token from amail (Codex
+  seats of one node excepted: they can get each other's); otherwise it can
   send as the user or as another seat only by reading their tokens from
   files or processes of the same operating-system user (see
   [trust boundaries](#trust-boundaries) for when that is possible and what
