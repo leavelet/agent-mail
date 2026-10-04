@@ -10,13 +10,15 @@
 //! 2. The seat's session is created (or, with `--resume`, loaded) through
 //!    the host's API, and the first prompt is queued for a new session.
 //! 3. The session log is followed: a `turn/end` that is not `completed`
-//!    (cancelled in the GUI, failed) fires no hook, so it is reported to the
-//!    node as an `Interrupt` event.
+//!    fires no hook, so it is reported to the node: a failed turn (reason
+//!    `error`, with dsh's error message, or `interrupted`, a turn whose host
+//!    ended during it) as a `TurnFailed` event, any other (cancelled in the
+//!    GUI, ...) as an `Interrupt` event.
 //!
 //! Signals are passed to the host; the host gets SIGTERM if the wrapper
 //! dies. The wrapper exits with the host's status.
 
-use crate::adapter::dsh::{Api, ENDPOINT_ENV, Endpoint, INTERRUPT, transcript_path};
+use crate::adapter::dsh::{Api, ENDPOINT_ENV, Endpoint, INTERRUPT, TURN_FAILED, transcript_path};
 use anyhow::{Context, Result, bail};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -181,15 +183,37 @@ pub fn parse_url_line(line: &str) -> Option<(String, String)> {
     Some((origin, token))
 }
 
+/// How a turn that did not complete ended (see [`unfinished_turn`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unfinished {
+    /// Reason `error` (with dsh's message) or `interrupted`.
+    Failed(String),
+    /// Any other reason (`aborted`: cancelled; `blocked`, ...).
+    Other,
+}
+
 /// A `turn/end` record whose reason is not `completed`.
-pub fn is_unfinished_turn(line: &str) -> bool {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-        return false;
-    };
-    v["type"] == "turn/end"
-        && v["data"]["reason"]["kind"]
-            .as_str()
-            .is_some_and(|k| k != "completed")
+pub fn unfinished_turn(line: &str) -> Option<Unfinished> {
+    let v = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if v["type"] != "turn/end" {
+        return None;
+    }
+    let reason = &v["data"]["reason"];
+    match reason["kind"].as_str()? {
+        "completed" => None,
+        "error" => {
+            let e = &reason["error"];
+            let msg = e["message"].as_str().unwrap_or("the turn failed");
+            Some(Unfinished::Failed(match e["code"].as_str() {
+                Some(code) if !code.is_empty() && code != "UNKNOWN" => format!("{msg} ({code})"),
+                _ => msg.to_string(),
+            }))
+        }
+        "interrupted" => Some(Unfinished::Failed(
+            "the turn ended without finishing (its host stopped during it)".to_string(),
+        )),
+        _ => Some(Unfinished::Other),
+    }
 }
 
 pub async fn run(a: HostArgs) -> i32 {
@@ -411,17 +435,23 @@ async fn follow_turns(a: &HostArgs, cwd: &str, session: &str) {
         partial.push_str(&String::from_utf8_lossy(&buf));
         while let Some(i) = partial.find('\n') {
             let line: String = partial.drain(..=i).collect();
-            if is_unfinished_turn(&line) {
-                report_interrupt(a, cwd, session).await;
+            if let Some(u) = unfinished_turn(&line) {
+                report_turn_end(a, cwd, session, u).await;
             }
         }
     }
 }
 
-async fn report_interrupt(a: &HostArgs, cwd: &str, session: &str) {
-    let input = serde_json::json!({
-        "hook_event_name": INTERRUPT, "session_id": session, "cwd": cwd,
-    });
+async fn report_turn_end(a: &HostArgs, cwd: &str, session: &str, how: Unfinished) {
+    let input = match how {
+        Unfinished::Failed(reason) => serde_json::json!({
+            "hook_event_name": TURN_FAILED, "session_id": session, "cwd": cwd,
+            "reason": reason,
+        }),
+        Unfinished::Other => serde_json::json!({
+            "hook_event_name": INTERRUPT, "session_id": session, "cwd": cwd,
+        }),
+    };
     let env = std::collections::BTreeMap::from([
         ("AMAIL_SEAT".to_string(), a.seat.clone()),
         (
@@ -441,7 +471,7 @@ async fn report_interrupt(a: &HostArgs, cwd: &str, session: &str) {
     })
     .await;
     if !matches!(r, Ok(Ok(_))) {
-        eprintln!("amail dsh-host: could not report an interrupted turn to the node");
+        eprintln!("amail dsh-host: could not report the end of a turn to the node");
     }
 }
 
@@ -461,17 +491,32 @@ mod tests {
 
     #[test]
     fn unfinished_turns() {
-        assert!(is_unfinished_turn(
-            r#"{"type":"turn/end","data":{"reason":{"kind":"aborted"}}}"#
+        assert_eq!(
+            unfinished_turn(r#"{"type":"turn/end","data":{"reason":{"kind":"aborted"}}}"#),
+            Some(Unfinished::Other)
+        );
+        assert_eq!(
+            unfinished_turn(r#"{"type":"turn/end","data":{"reason":{"kind":"error"}}}"#),
+            Some(Unfinished::Failed("the turn failed".into()))
+        );
+        assert_eq!(
+            unfinished_turn(
+                r#"{"type":"turn/end","seq":5,"data":{"turn":3,"reason":{"kind":"error","error":{"message":"no API key for provider route","code":"AUTH"}},"new":1}}"#
+            ),
+            Some(Unfinished::Failed(
+                "no API key for provider route (AUTH)".into()
+            ))
+        );
+        assert!(matches!(
+            unfinished_turn(r#"{"type":"turn/end","data":{"reason":{"kind":"interrupted"}}}"#),
+            Some(Unfinished::Failed(_))
         ));
-        assert!(is_unfinished_turn(
-            r#"{"type":"turn/end","data":{"reason":{"kind":"error"}}}"#
-        ));
-        assert!(!is_unfinished_turn(
-            r#"{"type":"turn/end","data":{"reason":{"kind":"completed"}}}"#
-        ));
-        assert!(!is_unfinished_turn(r#"{"type":"turn/start"}"#));
-        assert!(!is_unfinished_turn("garbage"));
+        assert_eq!(
+            unfinished_turn(r#"{"type":"turn/end","data":{"reason":{"kind":"completed"}}}"#),
+            None
+        );
+        assert_eq!(unfinished_turn(r#"{"type":"turn/start"}"#), None);
+        assert_eq!(unfinished_turn("garbage"), None);
     }
 
     #[test]

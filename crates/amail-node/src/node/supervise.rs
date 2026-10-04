@@ -159,6 +159,27 @@ pub(super) fn attention_of(st: &State, name: &str) -> Option<(String, String)> {
             ),
         ));
     }
+    if attention.is_none()
+        && let Some(t) = st.saved.turns.get(name).filter(|t| t.failures > 0)
+    {
+        let reason = t.reason.as_deref().unwrap_or("an error");
+        attention = Some((
+            "turn-failed".into(),
+            if t.failures >= st.turn_fail_limit && !t.manual_retry {
+                format!(
+                    "its last {} turns failed ({reason}); amail stopped delivering their mail \
+                     again: look at the session (amail attach {name}), then amail wake {name}",
+                    t.failures
+                )
+            } else {
+                format!(
+                    "its last turn failed ({reason}); amail delivers that turn's mail again \
+                     ({} failed in a row)",
+                    t.failures
+                )
+            },
+        ));
+    }
     if attention.is_none() && s.is_some_and(|s| s.wake_failed) {
         attention = Some((
             "wake-failed".into(),
@@ -821,6 +842,10 @@ impl Node {
                 st.set_state(seat, SeatState::Offline);
             }
             None => {
+                let busy = st
+                    .seats
+                    .get(seat)
+                    .is_some_and(|s| s.state == SeatState::Busy);
                 st.set_state(seat, SeatState::Offline);
                 let resume_failed =
                     resumed && !hooked && lived.is_some_and(|l| l < self.cfg.resume_grace);
@@ -834,6 +859,7 @@ impl Node {
                 }
                 let code = status.flatten();
                 if code == Some(0) && !resume_failed {
+                    self.turn_ended(&mut st, seat, super::turns::TurnEnd::Person);
                     tracing::info!("seat {seat}: the session ended normally");
                     let mm = st.saved.managed.get_mut(seat).expect("present");
                     mm.up = false;
@@ -846,6 +872,15 @@ impl Node {
                         (false, None) => "was killed or vanished".to_string(),
                     };
                     tracing::warn!("seat {seat}: the session {what}");
+                    if busy {
+                        self.turn_ended(
+                            &mut st,
+                            seat,
+                            super::turns::TurnEnd::Failed(format!(
+                                "the session {what} during the turn"
+                            )),
+                        );
+                    }
                     let stable = lived.is_some_and(|l| l >= self.cfg.stable_after);
                     self.failed_run(&mut st, seat, Some(stable), what);
                 }
@@ -1194,6 +1229,7 @@ impl Node {
             rt.retry_at = None;
         }
         st.save_dirty = true;
+        self.turns_retry(&mut st, seat);
         // A seat stuck at a prompt (e.g. one answered in another pane) is
         // started again; a working one is left alone.
         let action = if running && self.is_stuck(&st, seat) {

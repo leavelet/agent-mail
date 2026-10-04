@@ -18,7 +18,9 @@
 //!   (`AMAIL_DSH_ENDPOINT`) come from the environment. The bridge has no
 //!   `SessionEnd` or permission events, and no hook marks a turn that was
 //!   cancelled or failed: the wrapper watches the session log for such a
-//!   `turn/end` and reports it as an `Interrupt` event.
+//!   `turn/end` and reports a failed one (reason `error`, or `interrupted`)
+//!   as a `TurnFailed` event with the error text, any other as an
+//!   `Interrupt` event.
 //! - Wake-up: `POST /api/session/prompt` with `mode: "queue"`. On an idle
 //!   session that starts a turn (and `UserPromptSubmit`); on a busy one it
 //!   runs as the next turn. A session that is not loaded is resumed by it.
@@ -33,8 +35,14 @@ use std::time::Duration;
 const EVENTS: &[&str] = &["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"];
 
 /// The synthetic event the wrapper sends for a turn that ended without
-/// `Stop` (cancelled, failed).
+/// `Stop` and without an error (cancelled in the GUI, and other endings
+/// that are not failures).
 pub const INTERRUPT: &str = "Interrupt";
+
+/// The synthetic event the wrapper sends for a turn that failed (a
+/// `turn/end` with reason `error`, or `interrupted`: a turn whose host
+/// ended during it). Its `reason` field holds the error text.
+pub const TURN_FAILED: &str = "TurnFailed";
 
 /// Environment variable naming the seat's endpoint file.
 pub const ENDPOINT_ENV: &str = "AMAIL_DSH_ENDPOINT";
@@ -559,6 +567,11 @@ impl Adapter for Dsh {
             "PostToolUse" => Event::PostToolUse,
             "Stop" => Event::Stop,
             INTERRUPT => Event::Interrupt,
+            TURN_FAILED => Event::TurnFailed {
+                reason: str_field(input, "reason")
+                    .unwrap_or("the turn ended with an error")
+                    .to_string(),
+            },
             _ => return None,
         };
         let session_id = str_field(input, "session_id").map(str::to_string);

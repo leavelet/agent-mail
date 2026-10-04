@@ -187,6 +187,42 @@ fn render(n: &NodeNotice, host: &str, seats: &HashSet<String>) -> (String, Strin
             };
             (subject, body)
         }
+        NodeNotice::TurnFailures {
+            seat,
+            count,
+            harness,
+            error,
+        } => {
+            let who = if seats.contains(seat) {
+                format!("seat {seat}")
+            } else {
+                "a seat that is not in this org".to_string()
+            };
+            let harness = harness
+                .as_deref()
+                .filter(|h| matches!(*h, "claude" | "codex" | "dsh"))
+                .map(|h| format!(" ({h})"))
+                .unwrap_or_default();
+            let error: String = amail_proto::text::line(error)
+                .chars()
+                .take(amail_proto::limits::MAX_HINT_CHARS)
+                .collect();
+            let body = format!(
+                "The last {count} turns of {who}{harness} on host {host} failed. The node \
+                 has stopped showing the mail of those turns to the seat again; the mail \
+                 is marked not read, and the seat gets it with its next turn.\n\n\
+                 The harness's last error (as it reported it):\n\n    {error}\n\n\
+                 Look at the seat's session (amail attach {seat}, or the seat's \
+                 conversation in the web interface). When the cause is fixed, wake the \
+                 seat (amail wake {seat}); a turn that ends normally clears the failure.\n",
+            );
+            let subject = if seats.contains(seat) {
+                format!("Turns of seat {seat} are failing on host {host}")
+            } else {
+                format!("Turns of a seat are failing on host {host}")
+            };
+            (subject, body)
+        }
     }
 }
 
@@ -229,6 +265,19 @@ fn check(report: &NodeNotices) -> ApiResult<()> {
                         )));
                     }
                 }
+            }
+            NodeNotice::TurnFailures {
+                seat,
+                harness,
+                error,
+                ..
+            } => {
+                if !amail_proto::valid_name(seat) {
+                    return Err(ApiError::bad_request("not a seat name"));
+                }
+                crate::directory::check_text("harness", harness.as_deref(), 32)?;
+                // Cut when shown; refuse only what is far too long.
+                crate::directory::check_text("error", Some(error), 4000)?;
             }
         }
     }

@@ -1090,6 +1090,17 @@ pub enum NodeNotice {
         seat: Option<String>,
         actions: Vec<AgentAction>,
     },
+    /// The turns of `seat` failed `count` times in a row, so the node
+    /// stopped showing the mail of those turns to it again. `error` is the
+    /// harness's last error text (the server shows it as one line, cut to
+    /// [`limits::MAX_HINT_CHARS`] characters).
+    TurnFailures {
+        seat: String,
+        count: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        harness: Option<String>,
+        error: String,
+    },
 }
 
 /// Body of `POST /v1/node/notices` (node tokens).

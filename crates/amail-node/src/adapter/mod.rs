@@ -52,8 +52,14 @@ pub enum Event {
     },
     PostToolUse,
     Stop,
-    /// The turn was interrupted (ends the turn without `Stop`).
+    /// The turn was interrupted by the person (ends the turn without
+    /// `Stop`).
     Interrupt,
+    /// The turn ended in a failure the harness reported (a model or API
+    /// error); `reason` is its error text.
+    TurnFailed {
+        reason: String,
+    },
     /// The session waits for a permission decision.
     Awaiting,
     SessionEnd,
@@ -238,6 +244,38 @@ pub trait Adapter: Send + Sync + 'static {
     fn resume_is_lazy(&self) -> bool {
         false
     }
+
+    /// Whether the node must ask the harness how a turn ended
+    /// ([`Adapter::last_turn`]) because its hooks do not report failed
+    /// turns.
+    fn checks_turns(&self) -> bool {
+        false
+    }
+
+    /// How the latest turns of the session behind wake target `target`
+    /// ended, newest first (only for adapters whose
+    /// [`Adapter::checks_turns`] is true).
+    async fn last_turns(&self, _target: &str) -> Result<Vec<TurnInfo>> {
+        Ok(Vec::new())
+    }
+}
+
+/// How a turn ended, as the harness reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnStatus {
+    InProgress,
+    Completed,
+    /// Interrupted by the person.
+    Interrupted,
+    Failed(String),
+}
+
+/// One turn of a session (see [`Adapter::last_turns`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnInfo {
+    pub status: TurnStatus,
+    /// Unix seconds, if known.
+    pub started_at: Option<i64>,
 }
 
 pub fn str_field<'a>(v: &'a Value, key: &str) -> Option<&'a str> {

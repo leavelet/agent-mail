@@ -47,6 +47,7 @@ mod caller;
 mod mirror;
 mod notices;
 mod supervise;
+mod turns;
 
 /// Node configuration.
 #[derive(Debug, Clone)]
@@ -75,6 +76,17 @@ pub struct Config {
     pub wake_backoff_max: Duration,
     /// Consecutive `Stop` blocks per turn before leaving mail to the waker.
     pub stop_block_cap: u32,
+    /// Failed turns in a row after which the node stops delivering the
+    /// mail of failed turns again by waking the seat (see [`turns`]).
+    pub turn_fail_limit: u32,
+    /// Wait before waking a seat whose turn failed; doubles per failure
+    /// (up to `wake_backoff_max`).
+    pub turn_retry_backoff: Duration,
+    /// For harnesses whose hooks report no failed turns (Codex): how soon
+    /// after a turn's end the node asks how it ended, and after how long
+    /// without hooks a busy seat's turn is looked at.
+    pub turn_check_delay: Duration,
+    pub turn_quiet: Duration,
     pub heartbeat: Duration,
     pub liveness_interval: Duration,
     /// Total time of the server calls one hook waits for (claims, inbox).
@@ -165,6 +177,10 @@ impl Config {
             wake_backoff: Duration::from_secs(60),
             wake_backoff_max: Duration::from_secs(600),
             stop_block_cap: 3,
+            turn_fail_limit: 3,
+            turn_retry_backoff: Duration::from_secs(30),
+            turn_check_delay: Duration::from_secs(1),
+            turn_quiet: Duration::from_secs(30),
             heartbeat: Duration::from_secs(30),
             liveness_interval: Duration::from_secs(2),
             hook_server_timeout: crate::server::HOOK_SERVER_TIMEOUT,
@@ -243,6 +259,12 @@ struct SeatRt {
     focus_until: Option<i64>,
     /// Last wake-up for digest mail alone (Unix ms).
     last_digest_wake: i64,
+    /// The last turn failed: no wake-up before then (see [`turns`]).
+    turn_retry_at: Option<Instant>,
+    /// A turn whose end is being checked with the harness.
+    turn_check: Option<turns::TurnCheck>,
+    /// When a quiet busy seat's turn was last checked.
+    turn_quiet_checked: Option<Instant>,
 }
 
 impl SeatRt {
@@ -270,6 +292,9 @@ impl SeatRt {
             digest_since: None,
             focus_until: None,
             last_digest_wake: 0,
+            turn_retry_at: None,
+            turn_check: None,
+            turn_quiet_checked: None,
         }
     }
 
@@ -330,6 +355,10 @@ struct State {
     /// The state file existed when the node started (an earlier version
     /// may have run, which always used the restricted policy).
     prior_state: bool,
+    /// Notices about failing turns, not sent yet.
+    turn_notices: Vec<amail_proto::NodeNotice>,
+    /// [`Config::turn_fail_limit`].
+    turn_fail_limit: u32,
 }
 
 impl Default for State {
@@ -348,6 +377,8 @@ impl Default for State {
             notices: BTreeMap::new(),
             settings_due: true,
             prior_state: false,
+            turn_notices: Vec::new(),
+            turn_fail_limit: 3,
         }
     }
 }
@@ -581,6 +612,8 @@ pub struct Node {
     presence_kick: Notify,
     refresh_kick: Notify,
     retry_kick: Notify,
+    release_kick: Notify,
+    check_kick: Notify,
     started: Instant,
 }
 
@@ -654,6 +687,7 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
     let state_file = cfg.state_dir.join("node-state.json");
     let mut st = State {
         prior_state: state_file.exists(),
+        turn_fail_limit: cfg.turn_fail_limit,
         saved: persist::load(&state_file),
         ..Default::default()
     };
@@ -762,6 +796,8 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
         presence_kick: Notify::new(),
         refresh_kick: Notify::new(),
         retry_kick: Notify::new(),
+        release_kick: Notify::new(),
+        check_kick: Notify::new(),
         started: Instant::now(),
     });
 
@@ -790,6 +826,10 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
     tasks.push(tokio::spawn(async move { n.supervise_loop().await }));
     let n = node.clone();
     tasks.push(tokio::spawn(async move { n.retry_loop().await }));
+    let n = node.clone();
+    tasks.push(tokio::spawn(async move { n.release_loop().await }));
+    let n = node.clone();
+    tasks.push(tokio::spawn(async move { n.turn_check_loop().await }));
     if node.cfg.notices {
         let n = node.clone();
         tasks.push(tokio::spawn(async move { n.notice_loop().await }));
@@ -876,6 +916,7 @@ impl Node {
             entries.len()
         );
         let mut st = self.lock();
+        st.unshow(seat, &entries);
         let s = st.seat(seat);
         let mut all = entries;
         all.append(&mut s.stash);
@@ -1464,6 +1505,7 @@ impl Node {
                 }
                 Event::UserPromptSubmit { .. } => {
                     st.set_state(seat, SeatState::Busy);
+                    self.turn_started(&mut st, seat);
                     let s = st.seat(seat);
                     s.stop_blocks = 0;
                     s.wake_out = None;
@@ -1507,10 +1549,16 @@ impl Node {
                         }
                     } else {
                         st.set_state(seat, SeatState::Idle);
+                        self.turn_ended(&mut st, seat, turns::TurnEnd::Normal);
                     }
                 }
                 Event::Interrupt => {
                     st.set_state(seat, SeatState::Idle);
+                    self.turn_ended(&mut st, seat, turns::TurnEnd::Person);
+                }
+                Event::TurnFailed { reason } => {
+                    st.set_state(seat, SeatState::Idle);
+                    self.turn_ended(&mut st, seat, turns::TurnEnd::Failed(reason.clone()));
                 }
                 Event::Awaiting => {
                     st.set_state(seat, SeatState::Awaiting);
@@ -1518,6 +1566,7 @@ impl Node {
                 Event::SessionEnd => {
                     st.set_state(seat, SeatState::Offline);
                     st.seat(seat).session = None;
+                    self.turn_ended(&mut st, seat, turns::TurnEnd::Person);
                 }
             }
             if !plan.stash.is_empty() {
@@ -1568,11 +1617,13 @@ impl Node {
         if plan.digest {
             calls.push(spec(&[To, Cc, List], false, true));
         }
+        let mut keyed: Vec<(String, Vec<InboxEntry>)> = Vec::new();
         for spec in calls {
             let key = claim_key();
             let call = self.server.claim(seat, &spec, &key, None);
             let err = match tokio::time::timeout_at(deadline.into(), call).await {
                 Ok(Ok(r)) => {
+                    keyed.push((key.clone(), r.entries.clone()));
                     if spec.digest {
                         digest.extend(r.entries);
                     } else {
@@ -1617,6 +1668,9 @@ impl Node {
         // 3. Apply the outcome.
         {
             let mut st = self.lock();
+            for (key, entries) in &keyed {
+                st.note_claimed(seat, key, entries);
+            }
             if claimed.len() > stashed || !digest.is_empty() {
                 let s = st.seat(seat);
                 for e in claimed[stashed..].iter().chain(&digest) {
@@ -1641,6 +1695,7 @@ impl Node {
             if hook.event == Event::Stop {
                 if claimed.is_empty() && digest.is_empty() {
                     st.set_state(seat, SeatState::Idle);
+                    self.turn_ended(&mut st, seat, turns::TurnEnd::Normal);
                 } else {
                     st.seat(seat).stop_blocks += 1;
                 }
@@ -1688,6 +1743,9 @@ impl Node {
             self.keep(seat, kept);
         }
         claimed.extend(digest);
+        if out != Output::None {
+            self.lock().note_shown(seat, &claimed);
+        }
         (out, claimed)
     }
 
@@ -1739,6 +1797,7 @@ impl Node {
                                 r.seat,
                                 resp.entries.len()
                             );
+                            self.lock().note_claimed(&r.seat, &key, &resp.entries);
                             self.stash(&r.seat, resp.entries, false);
                             self.lock().dirty_pending.insert(r.seat.clone());
                             self.refresh_kick.notify_one();
@@ -1957,6 +2016,7 @@ impl Node {
                     "wake_failed": s.wake_failed,
                     "wake_retry_ms": s.wake_retry_at.map(|d| d.saturating_duration_since(now).as_millis() as u64),
                     "wakes": s.wakes,
+                    "turn_failed": st.turn_failure(name, self.cfg.turn_fail_limit),
                 })
             })
             .collect();
@@ -2195,6 +2255,14 @@ impl Node {
             .filter_map(|(n, m)| Some((n.clone(), (m.mux_session.clone(), m.pane?))))
             .collect();
         let mut pastes: Vec<(String, String, u32, u64)> = Vec::new();
+        // Seats whose turns failed too often are not woken for mail.
+        let exhausted: HashSet<String> = st
+            .saved
+            .turns
+            .keys()
+            .filter(|n| st.turns_exhausted(n, self.cfg.turn_fail_limit))
+            .cloned()
+            .collect();
         for (name, s) in st.seats.iter_mut() {
             let target = s.session.as_ref().and_then(|x| x.target.clone());
             // Mail held by focus is due when the focus ends; digest mail
@@ -2214,9 +2282,21 @@ impl Node {
                     }
                 }
             }
+            // After a failed turn, wait for its backoff.
+            let held = match s.turn_retry_at {
+                Some(t) if t > now => {
+                    if s.state == SeatState::Idle && s.wants_wake(now_wall, digest_every) {
+                        soonest(t);
+                    }
+                    true
+                }
+                _ => false,
+            };
             let eligible = connected
                 && s.state == SeatState::Idle
                 && target.is_some()
+                && !held
+                && !exhausted.contains(name)
                 && s.wants_wake(now_wall, digest_every);
             let (Some(h), Some(target)) = (s.harness, target.filter(|_| eligible)) else {
                 s.wake_out = None;
@@ -2413,6 +2493,15 @@ impl Node {
                     attention.insert(name, a);
                 }
                 let web = self.cfg.web_terminal.clone();
+                let failures: HashMap<String, amail_proto::TurnFailure> = st
+                    .saved
+                    .turns
+                    .keys()
+                    .filter_map(|n| {
+                        st.turn_failure(n, self.cfg.turn_fail_limit)
+                            .map(|f| (n.clone(), f))
+                    })
+                    .collect();
                 let sessions: HashMap<String, String> = st
                     .saved
                     .managed
@@ -2446,7 +2535,7 @@ impl Node {
                             }
                             _ => None,
                         },
-                        turn_failed: None,
+                        turn_failed: failures.get(name).cloned(),
                     });
                 }
                 (out, names)
@@ -2489,7 +2578,17 @@ impl Node {
                 .collect();
             for name in gone {
                 tracing::info!("seat {name}: session process exited");
+                let busy = st
+                    .seats
+                    .get(&name)
+                    .is_some_and(|s| s.state == SeatState::Busy);
                 st.set_state(&name, SeatState::Offline);
+                let end = if busy {
+                    turns::TurnEnd::Failed("the session process ended during the turn".into())
+                } else {
+                    turns::TurnEnd::Person
+                };
+                self.turn_ended(&mut st, &name, end);
             }
             if !st.dirty_presence.is_empty() {
                 self.presence_kick.notify_one();

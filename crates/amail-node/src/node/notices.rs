@@ -246,7 +246,7 @@ impl Node {
             return;
         }
         let now = Instant::now();
-        let (notices, settings, sessions) = {
+        let (notices, settings, sessions, turn_notices) = {
             let mut st = self.lock();
             let mut notices = Vec::new();
             let mut settings = None;
@@ -265,6 +265,13 @@ impl Node {
                     settings = Some(new);
                 }
             }
+            // Failing turns (at most a few per report; the rest next time).
+            let n = st
+                .turn_notices
+                .len()
+                .min(MAX_NODE_NOTICES.saturating_sub(notices.len()));
+            let turn_notices: Vec<NodeNotice> = st.turn_notices.drain(..n).collect();
+            notices.extend(turn_notices.iter().cloned());
             let mut sessions = Vec::new();
             for (key, p) in st.notices.iter_mut() {
                 if notices.len() >= MAX_NODE_NOTICES {
@@ -290,7 +297,7 @@ impl Node {
                 });
                 sessions.push((key.clone(), actions));
             }
-            (notices, settings, sessions)
+            (notices, settings, sessions, turn_notices)
         };
         if notices.is_empty() {
             return;
@@ -303,6 +310,8 @@ impl Node {
         let mut st = self.lock();
         if let Err(e) = sent {
             tracing::warn!("node notices not sent (will retry): {e:#}");
+            let newer = std::mem::replace(&mut st.turn_notices, turn_notices);
+            st.turn_notices.extend(newer);
             // Put the requests back, with those recorded meanwhile.
             for (key, actions) in sessions {
                 let p = st.notices.entry(key).or_default();
