@@ -406,6 +406,16 @@ fn claude_trusts(dir: &Path) -> Option<bool> {
     )
 }
 
+/// The first few of `names`, and how many more there are.
+fn some(names: &[String]) -> String {
+    const SHOWN: usize = 4;
+    let mut s = names[..names.len().min(SHOWN)].join(", ");
+    if names.len() > SHOWN {
+        s.push_str(&format!(" and {} more", names.len() - SHOWN));
+    }
+    s
+}
+
 /// `amail doctor`: check this host and the configuration; exits non-zero
 /// when something is broken.
 pub async fn doctor(profile: Option<&Path>, team_file: &Path, out: &Out) -> Result<bool> {
@@ -608,7 +618,7 @@ pub async fn doctor(profile: Option<&Path>, team_file: &Path, out: &Out) -> Resu
                 match users {
                     Some(u) => format!(
                         "{name} not found ({whose}); used by {}",
-                        u.join(", ")
+                        some(u)
                     ),
                     None => format!("{name} not found ({whose})"),
                 },
@@ -651,7 +661,7 @@ pub async fn doctor(profile: Option<&Path>, team_file: &Path, out: &Out) -> Resu
                 "dsh key",
                 format!(
                     "the node was started without --dsh-env-file; used by {}",
-                    users.join(", ")
+                    some(users)
                 ),
                 Some(
                     "dsh seats then have a provider key only if it is in the node's own \
