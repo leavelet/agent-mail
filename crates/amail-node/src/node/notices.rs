@@ -430,7 +430,10 @@ mod tests {
             local_policy: "open".into(),
             seats: [
                 ("cx".to_string(), seat("unattended", Some("worktree"), None)),
-                ("d".to_string(), seat("unattended", Some("worktree"), Some("on"))),
+                (
+                    "d".to_string(),
+                    seat("unattended", Some("worktree"), Some("on")),
+                ),
                 ("quiet".to_string(), seat("default", Some("worktree"), None)),
             ]
             .into(),
