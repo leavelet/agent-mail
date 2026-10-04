@@ -348,7 +348,16 @@ async fn notify_users(
             message = st.store.message(sent.message_id).await.ok().flatten();
         }
         let Some(m) = &message else { return };
+        let Some(slot) = st.limiters.webhooks.open(org_id) else {
+            tracing::warn!(
+                "webhook of org {}: notice for message {} dropped, too many in flight",
+                target.name,
+                m.id
+            );
+            continue;
+        };
         crate::webhook::spawn(
+            slot,
             st.http.clone(),
             st.webhook_config.clone(),
             url,

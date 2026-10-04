@@ -60,6 +60,7 @@ public_tests!(
     cross_org_mirrors,
     cross_org_node_commands_and_presence,
     link_requests_do_not_reveal_org_names,
+    webhooks_in_flight_per_org,
 );
 
 /// Start a server; `None` (test skipped) when Postgres is not configured.
@@ -826,6 +827,9 @@ async fn webhook_targets_public_mode(b: Backend, t: &str) {
         "http://[::1]:9/hook".to_string(),
         "http://[::ffff:127.0.0.1]:9/hook".to_string(),
         "http://2130706433/hook".to_string(),
+        // Public addresses, but not a web port.
+        "http://8.8.8.8:22/hook".to_string(),
+        "https://hooks.example.com:8443/hook".to_string(),
     ] {
         let (s, v) = acme
             .call(Method::PATCH, "/org", Some(json!({ "webhook_url": url })))
@@ -838,7 +842,7 @@ async fn webhook_targets_public_mode(b: Backend, t: &str) {
     acme.ok(
         Method::PATCH,
         "/org",
-        Some(json!({ "webhook_url": format!("http://rebind.test:{port}/hook") })),
+        Some(json!({ "webhook_url": "http://rebind.test/hook" })),
     )
     .await;
     a.send(json!({ "to": ["owner"], "subject": "q1", "body": "" }))
@@ -1895,4 +1899,45 @@ async fn link_requests_do_not_reveal_org_names(b: Backend, t: &str) {
     let later = srv.org("later").await;
     assert_eq!(later.ok(Method::GET, "/links", None).await, json!([]));
     assert_eq!(acme.ok(Method::GET, "/links", None).await, json!([]));
+}
+
+/// An org has a bounded number of webhook notices in flight; further ones
+/// are dropped while a slow receiver holds them.
+async fn webhooks_in_flight_per_org(b: Backend, t: &str) {
+    use axum::routing::any;
+    let hits: Arc<Mutex<usize>> = Arc::default();
+    let h = hits.clone();
+    let app = axum::Router::new().fallback(any(move || {
+        let h = h.clone();
+        async move {
+            *h.lock().unwrap() += 1;
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            StatusCode::NO_CONTENT
+        }
+    }));
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    let mut cfg = public();
+    cfg.webhook_private_targets = true;
+    cfg.limits.org_webhooks_in_flight = Some(2);
+    let srv = start!(b, t, cfg);
+    let acme = srv.org("acme").await;
+    let a = acme.seat("a").await;
+    acme.ok(
+        Method::PATCH,
+        "/org",
+        Some(json!({ "webhook_url": format!("http://127.0.0.1:{port}/hook") })),
+    )
+    .await;
+    for i in 0..6 {
+        a.send(json!({ "to": ["owner"], "subject": format!("m{i}"), "body": "" }))
+            .await;
+    }
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(*hits.lock().unwrap(), 2);
+    // Once those are done, notices go out again.
+    a.send(json!({ "to": ["owner"], "subject": "later", "body": "" }))
+        .await;
+    eventually("the next webhook", async || *hits.lock().unwrap() == 3).await;
 }

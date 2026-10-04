@@ -46,6 +46,7 @@ pub fn valid_url(url: &str) -> bool {
 /// with a literal non-public address is not tried at all (names are checked
 /// by the client's resolver when they are looked up).
 pub fn spawn(
+    slot: crate::limits::StreamGuard,
     http: reqwest::Client,
     cfg: WebhookConfig,
     url: String,
@@ -53,6 +54,8 @@ pub fn spawn(
     private_ok: bool,
 ) {
     tokio::spawn(async move {
+        // Counts against the org's webhooks in flight until this ends.
+        let _slot = slot;
         let shown = crate::netguard::redact(&url);
         if let Err(e) = crate::netguard::check_literal(&url, private_ok) {
             tracing::warn!("webhook {shown}: not sent: {e}");

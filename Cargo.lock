@@ -99,6 +99,7 @@ dependencies = [
  "futures",
  "hex",
  "jiff",
+ "libc",
  "rand 0.9.5",
  "reqwest",
  "serde",

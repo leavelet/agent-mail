@@ -171,7 +171,7 @@ Public mode turns on:
   `operator`, `postmaster`, `owner`, `user`, `me`, ...) cannot be created.
   Existing seats keep their names;
 - **always-`Secure` session cookies** (serve it over HTTPS);
-- **no webhooks to private addresses** (see [security](security.md));
+- **no webhooks to private addresses** or to the server's own networks, only to ports 80 and 443, and at most 16 notices of one org in flight (see [security](security.md));
 - **protective limits**, each configurable:
 
 | limit | flag / environment | public default |

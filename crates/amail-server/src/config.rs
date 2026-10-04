@@ -34,6 +34,9 @@ pub struct Limits {
     /// Registrations (`POST /v1/register`, also failed ones) per hour per
     /// client address.
     pub registrations_per_hour: Option<f64>,
+    /// Webhook notices of one org being sent at the same time; further
+    /// notices are dropped while that many are in flight.
+    pub org_webhooks_in_flight: Option<usize>,
 }
 
 impl Limits {
@@ -49,6 +52,7 @@ impl Limits {
             token_requests_per_sec: Some(200.0),
             link_requests_per_hour: Some(20.0),
             registrations_per_hour: Some(10.0),
+            org_webhooks_in_flight: Some(16),
         }
     }
 }

@@ -144,7 +144,10 @@ since such URLs often contain credentials.
 
 In public mode (or with `--webhook-private-targets deny`), webhooks may not
 reach loopback, private, link-local, carrier-grade NAT, multicast or other
-reserved addresses, including IPv4-mapped and NAT64 forms. URLs with such a
+reserved addresses, including IPv4-mapped and NAT64 forms. The server's own
+interface addresses, and the networks they are on, are refused as well
+(an address can be public and still belong to the server, such as a
+global IPv6 address), and only ports 80 and 443 may be used. URLs with such a
 literal address, and `localhost`, are refused when saved. A host name is
 checked every time a webhook request is sent, on the addresses it resolves to, and
 the connection goes to exactly those addresses; so a name that resolved to
@@ -249,4 +252,4 @@ Rate and stream limits are counted per server instance.
 | Presence report | 5,000 seats per request; an entry is valid for 90 s |
 | Conversation mirror | 1,000 events or 4 MiB of text kept per watched seat, in memory only while someone watches; 1,000 events per post; 16,000 characters per event |
 | Browser sessions | 30 days (user), 1 day (operator) |
-| Webhooks | URL at most 2,000 characters; 3 attempts; 5 s to connect, 10 s per attempt; redirects are not followed |
+| Webhooks | URL at most 2,000 characters; 3 attempts; 5 s to connect, 10 s per attempt; redirects are not followed; 16 notices in flight per org, further ones are dropped (*public*) |
