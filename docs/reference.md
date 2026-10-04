@@ -135,7 +135,7 @@ session cookie; with the cookie, everything but `GET` needs the header
 | `GET, POST /lists`; `GET, DELETE /lists/{name}`; `PUT, DELETE /lists/{name}/members/{address}` | lists |
 | `GET, POST /links`; `POST /links/{org}/accept`; `DELETE /links/{org}` | links |
 | `GET, PATCH /org` | org settings (including `webhook_url`; `null` clears it), and `stored_bytes` (the mail the org sent, as counted for the storage quota) with `storage_quota_bytes` when the server has a quota |
-| `DELETE /org` | user tokens, `{"confirm": "<org name>"}`: delete the org and all its data |
+| `DELETE /org` | user tokens, `{"confirm": "<org name>"}`: delete the org and all its data; mail other orgs received from it stays with them, from `name@org (deleted org)` |
 | `GET, POST /tokens`; `DELETE /tokens/{id}` | tokens |
 | `POST /tokens/rotate` | user tokens, `{label?}`: a new user token (answered once); the calling token is revoked, its browser sessions end and its open streams close; a browser that rotated gets a new session |
 | `GET /whoami` | the caller's org, scope and seat |

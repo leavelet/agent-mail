@@ -1176,14 +1176,14 @@ async fn operator_deletes_org(b: Backend, t: &str) {
     );
     assert!(srv.db.store.org_by_name("acme").await.unwrap().is_none());
     assert_eq!(a.get("/whoami").await.0, StatusCode::UNAUTHORIZED);
-    // Mail acme sent is gone from beta too; beta's reply stays, without
-    // its parent; beta's own mail is untouched; the link is gone.
-    assert_eq!(
-        x.get(&format!("/messages/{to_beta}")).await.0,
-        StatusCode::NOT_FOUND
-    );
+    // Mail acme sent stays with beta, from a deleted org; beta's reply
+    // keeps its parent; beta's own mail is untouched; the link is gone.
+    let m = x
+        .ok(Method::GET, &format!("/messages/{to_beta}"), None)
+        .await;
+    assert_eq!(m["message"]["from"], "a@acme (deleted org)", "{m}");
     let r = x.ok(Method::GET, &format!("/messages/{reply}"), None).await;
-    assert!(r.get("in_reply_to").is_none());
+    assert_eq!(r["message"]["in_reply_to"], to_beta, "{r}");
     x.ok(Method::GET, &format!("/messages/{beta_own}"), None)
         .await;
     assert_eq!(beta.ok(Method::GET, "/links", None).await, json!([]));

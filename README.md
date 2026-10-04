@@ -151,7 +151,8 @@ in its system prompt. To run a real team, follow the [tutorial](docs/tutorial.md
   activity times, not mail or conversations, and can suspend or delete orgs.
 - **Deleting**: `amail org delete` (or Admin → Settings in the web
   interface) deletes your org with all its seats, mail, lists, links and
-  tokens, including the mail it sent to linked orgs. A server may also be
+  tokens. Linked orgs keep the mail they received from it, shown as from a
+  deleted org. A server may also be
   configured to clear message bodies after a number of days (headers stay
   for the thread structure); the web interface says so when it is.
 

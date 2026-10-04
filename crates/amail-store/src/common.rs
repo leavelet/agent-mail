@@ -37,9 +37,11 @@ macro_rules! list_select {
     };
 }
 
+/// A deleted org's mail is shown as from `name@<old name> (deleted org)`.
 macro_rules! msg_cols {
     () => {
-        "m.id, m.org_id, mo.name AS org_name, m.sender_seat_id, ms.name AS sender_name, \
+        "m.id, m.org_id, CASE WHEN mo.deleted_at IS NULL THEN mo.name \
+         ELSE mo.deleted_name || ' (deleted org)' END AS org_name, m.sender_seat_id, ms.name AS sender_name, \
          ms.kind AS sender_kind, m.thread_id, m.parent_id, m.depth, m.subject, m.lines, \
          m.to_addrs, m.cc_addrs, m.priority, m.ack_required, m.meta, m.created_at, m.expired_at"
     };
@@ -153,7 +155,7 @@ pub(crate) fn parse<T: FromStr<Err = String>>(s: &str) -> Result<T> {
         .map_err(|e| StoreError::Invalid(format!("corrupt row: {e}")))
 }
 
-fn split_addrs(s: &str) -> Vec<String> {
+pub(crate) fn split_addrs(s: &str) -> Vec<String> {
     if s.is_empty() {
         Vec::new()
     } else {
@@ -699,7 +701,7 @@ macro_rules! impl_store_common {
             pub(crate) type Db = $db;
 
             pub async fn org_by_id(c: &mut Conn, id: i64) -> Result<Option<Org>> {
-                let r: Option<OrgRow> = sqlx::query_as("SELECT * FROM orgs WHERE id = $1")
+                let r: Option<OrgRow> = sqlx::query_as("SELECT * FROM orgs WHERE id = $1 AND deleted_at IS NULL")
                     .bind(id)
                     .fetch_optional(&mut *c)
                     .await?;
@@ -707,7 +709,7 @@ macro_rules! impl_store_common {
             }
 
             pub async fn org_by_name(c: &mut Conn, name: &str) -> Result<Option<Org>> {
-                let r: Option<OrgRow> = sqlx::query_as("SELECT * FROM orgs WHERE name = $1")
+                let r: Option<OrgRow> = sqlx::query_as("SELECT * FROM orgs WHERE name = $1 AND deleted_at IS NULL")
                     .bind(name)
                     .fetch_optional(&mut *c)
                     .await?;
@@ -2172,7 +2174,7 @@ macro_rules! impl_store_common {
             }
 
             pub async fn orgs(c: &mut Conn) -> Result<Vec<Org>> {
-                let rows: Vec<OrgRow> = sqlx::query_as("SELECT * FROM orgs ORDER BY name").fetch_all(&mut *c).await?;
+                let rows: Vec<OrgRow> = sqlx::query_as("SELECT * FROM orgs WHERE deleted_at IS NULL ORDER BY name").fetch_all(&mut *c).await?;
                 Ok(rows.into_iter().map(Org::from).collect())
             }
 
@@ -2187,36 +2189,25 @@ macro_rules! impl_store_common {
             }
 
             /// Delete the org and everything it owns, in one transaction:
-            /// its seats, tokens and browser sessions, lists, links, the
-            /// mail it sent (with every delivery of it, in any org) and its
-            /// deliveries of other orgs' mail. Other orgs' replies to its
-            /// mail lose their parent; external list members naming its
-            /// seats are removed.
+            /// its seats, tokens and browser sessions, lists, links, its
+            /// deliveries (of any org's mail) and the mail it sent that no
+            /// other org received. External list members naming its seats
+            /// are removed.
+            ///
+            /// Mail it sent that other orgs received stays with them. The
+            /// org's row is then kept, marked deleted and renamed
+            /// `deleted:<id>` (so the name is free), with the seats that
+            /// sent such mail (deleted, with only their names); that mail
+            /// shows as from `name@<org> (deleted org)`, and the addresses
+            /// naming the org in the mail it sent or received are rewritten
+            /// the same way, so that a new org of that name is never taken
+            /// for the old one. Its acknowledgement reminders stop. Such
+            /// mail no longer counts against any org's storage.
             pub async fn delete_org(c: &mut Conn, org_id: i64) -> Result<bool> {
                 let Some(org) = org_by_id(c, org_id).await? else {
                     return Ok(false);
                 };
-                const STEPS: &[&str] = &[
-                    "DELETE FROM web_sessions WHERE token_id IN (SELECT id FROM tokens WHERE org_id = $1)",
-                    "DELETE FROM tokens WHERE org_id = $1",
-                    "DELETE FROM claim_keys WHERE seat_id IN (SELECT id FROM seats WHERE org_id = $1)",
-                    "DELETE FROM send_budget WHERE seat_id IN (SELECT id FROM seats WHERE org_id = $1)",
-                    "DELETE FROM presence WHERE org_id = $1",
-                    "DELETE FROM mirror_watch WHERE org_id = $1",
-                    "DELETE FROM node_streams WHERE org_id = $1",
-                    "DELETE FROM deliveries WHERE org_id = $1",
-                    "DELETE FROM deliveries WHERE message_id IN (SELECT id FROM messages WHERE org_id = $1)",
-                    "UPDATE messages SET parent_id = NULL WHERE org_id <> $1 \
-                     AND parent_id IN (SELECT id FROM messages WHERE org_id = $1)",
-                    "DELETE FROM messages WHERE org_id = $1",
-                    "DELETE FROM list_members WHERE org_id = $1",
-                    "DELETE FROM lists WHERE org_id = $1",
-                    "DELETE FROM links WHERE org_id = $1 OR peer_org_id = $1",
-                    "DELETE FROM link_requests WHERE org_id = $1",
-                    "UPDATE seats SET parent_id = NULL WHERE org_id = $1",
-                    "DELETE FROM seats WHERE org_id = $1",
-                    "DELETE FROM orgs WHERE id = $1",
-                ];
+                let now = now_ms();
                 sqlx::query(
                     "DELETE FROM list_members WHERE seat_id IS NULL \
                      AND substr(address, length(address) - length($1)) = '@' || $1",
@@ -2224,8 +2215,102 @@ macro_rules! impl_store_common {
                 .bind(&org.name)
                 .execute(&mut *c)
                 .await?;
-                for sql in STEPS {
+                // Addresses naming the org, in the mail it sent or received
+                // (the only mail that can name it).
+                let pattern = like_pattern(&format!("@{}", org.name));
+                let addrs: Vec<(i64, String, String)> = sqlx::query_as(
+                    "SELECT id, to_addrs, cc_addrs FROM messages \
+                     WHERE (org_id = $1 OR id IN (SELECT message_id FROM deliveries WHERE org_id = $1)) \
+                     AND (to_addrs LIKE $2 ESCAPE '\\' OR cc_addrs LIKE $2 ESCAPE '\\')",
+                )
+                .bind(org_id)
+                .bind(&pattern)
+                .fetch_all(&mut *c)
+                .await?;
+                let suffix = format!("@{}", org.name);
+                let mark = |list: &str| -> String {
+                    let v: Vec<String> = split_addrs(list)
+                        .into_iter()
+                        .map(|a| if a.ends_with(&suffix) { format!("{a} (deleted org)") } else { a })
+                        .collect();
+                    join_addrs(&v)
+                };
+                for (id, to, cc) in addrs {
+                    let (to2, cc2) = (mark(&to), mark(&cc));
+                    if to2 != to || cc2 != cc {
+                        sqlx::query("UPDATE messages SET to_addrs = $1, cc_addrs = $2 WHERE id = $3")
+                            .bind(to2)
+                            .bind(cc2)
+                            .bind(id)
+                            .execute(&mut *c)
+                            .await?;
+                    }
+                }
+                // After its deliveries are gone, the mail it sent that no
+                // other org received has no deliveries left.
+                let steps: [&str; 18] = [
+                    "DELETE FROM web_sessions WHERE token_id IN (SELECT id FROM tokens WHERE org_id = $1)",
+                    "DELETE FROM tokens WHERE org_id = $1",
+                    "DELETE FROM claim_keys WHERE seat_id IN (SELECT id FROM seats WHERE org_id = $1)",
+                    "DELETE FROM send_budget WHERE seat_id IN (SELECT id FROM seats WHERE org_id = $1)",
+                    "DELETE FROM presence WHERE org_id = $1",
+                    "DELETE FROM mirror_watch WHERE org_id = $1",
+                    "DELETE FROM node_streams WHERE org_id = $1",
+                    "UPDATE messages SET ack_due = NULL WHERE org_id = $1 AND ack_due IS NOT NULL",
+                    "DELETE FROM deliveries WHERE org_id = $1",
+                    "UPDATE messages SET parent_id = NULL WHERE parent_id IN (SELECT id FROM messages \
+                     WHERE org_id = $1 AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = messages.id))",
+                    "DELETE FROM messages WHERE org_id = $1 \
+                     AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = messages.id)",
+                    "DELETE FROM list_members WHERE org_id = $1",
+                    "DELETE FROM lists WHERE org_id = $1",
+                    "DELETE FROM links WHERE org_id = $1 OR peer_org_id = $1",
+                    "DELETE FROM link_requests WHERE org_id = $1",
+                    "UPDATE seats SET parent_id = NULL WHERE org_id = $1",
+                    "DELETE FROM seats WHERE org_id = $1 \
+                     AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.sender_seat_id = seats.id)",
+                    "UPDATE seats SET display_name = NULL, role = NULL, harness = NULL, model = NULL, \
+                     permission_mode = NULL, group_name = NULL, focus_until = NULL WHERE org_id = $1",
+                ];
+                for sql in steps {
                     sqlx::query(sql).bind(org_id).execute(&mut *c).await?;
+                }
+                sqlx::query("UPDATE seats SET deleted_at = $1 WHERE org_id = $2 AND deleted_at IS NULL")
+                    .bind(now)
+                    .bind(org_id)
+                    .execute(&mut *c)
+                    .await?;
+                // Mail of orgs deleted earlier that only this org had kept.
+                const GONE: [&str; 4] = [
+                    "UPDATE messages SET parent_id = NULL WHERE parent_id IN (SELECT id FROM messages \
+                     WHERE org_id IN (SELECT id FROM orgs WHERE deleted_at IS NOT NULL) \
+                     AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = messages.id))",
+                    "DELETE FROM messages WHERE org_id IN (SELECT id FROM orgs WHERE deleted_at IS NOT NULL) \
+                     AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = messages.id)",
+                    "DELETE FROM seats WHERE org_id IN (SELECT id FROM orgs WHERE deleted_at IS NOT NULL) \
+                     AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.sender_seat_id = seats.id)",
+                    "DELETE FROM orgs WHERE deleted_at IS NOT NULL \
+                     AND NOT EXISTS (SELECT 1 FROM seats s WHERE s.org_id = orgs.id)",
+                ];
+                for sql in GONE {
+                    sqlx::query(sql).execute(&mut *c).await?;
+                }
+                let kept: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM messages WHERE org_id = $1)")
+                    .bind(org_id)
+                    .fetch_one(&mut *c)
+                    .await?;
+                if kept {
+                    sqlx::query(
+                        "UPDATE orgs SET deleted_at = $1, deleted_name = name, name = $2, \
+                         webhook_url = NULL, stored_bytes = 0 WHERE id = $3",
+                    )
+                    .bind(now)
+                    .bind(format!("deleted:{org_id}"))
+                    .bind(org_id)
+                    .execute(&mut *c)
+                    .await?;
+                } else {
+                    sqlx::query("DELETE FROM orgs WHERE id = $1").bind(org_id).execute(&mut *c).await?;
                 }
                 Ok(true)
             }
@@ -2297,7 +2382,7 @@ macro_rules! impl_store_common {
                      (SELECT COUNT(*) FROM messages m WHERE m.org_id = o.id AND m.id >= $3 AND m.created_at >= $4), \
                      (SELECT m.created_at FROM messages m WHERE m.org_id = o.id ORDER BY m.id DESC LIMIT 1), \
                      o.stored_bytes \
-                     FROM orgs o",
+                     FROM orgs o WHERE o.deleted_at IS NULL",
                 )
                 .bind(hour_lo)
                 .bind(hour)

@@ -240,8 +240,13 @@ the web interface tells users when it is on.
 
 A user deletes their own org with `amail org delete` (asks for the org's
 name, or `--confirm <name>`) or in Admin → Settings. That removes its
-seats, mail, lists, links, tokens and browser sessions, including the mail
-it sent to linked orgs. The operator can do the same with
+seats, mail, lists, links, tokens and browser sessions. Mail it sent that
+linked orgs received stays with them, shown as from `name@org (deleted org)`
+(in the addresses too), so that the receiving org keeps its archive and
+its replies keep their parent; that mail no longer counts against any
+org's storage quota and is removed when the last org holding it is
+deleted. The name is free again at once; a new org of that name sees none
+of the old mail. The operator can do the same with
 `amail admin org delete`.
 
 ## Several instances

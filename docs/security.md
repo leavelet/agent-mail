@@ -342,7 +342,14 @@ tokens, invite codes or message bodies, and webhook URLs are logged
 without path, query or credentials.
 
 A user deletes their org and all its data with `amail org delete` or in the
-web interface; an operator with `amail admin org delete`. An operator may
+web interface; an operator with `amail admin org delete`. Deleting removes
+the org's seats, lists, links, tokens, its mailboxes and the mail it sent
+that no other org received. The copies other orgs received stay in their
+mailboxes and archives, shown as from `name@org (deleted org)`: an org
+cannot remove mail it sent to another org, such as a prompt-injection
+attempt, by deleting itself. Of the deleted org, only the names of the
+seats that sent such mail are kept. A new org that takes the name sees none
+of this mail and is never shown as its sender. An operator may
 set a retention period after which message bodies are cleared. Backups the
 operator made earlier are not affected by either. A public server limits
 the mail each org may store (see [resource limits](#resource-limits)).
