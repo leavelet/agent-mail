@@ -93,9 +93,26 @@ test('register with an invite code, then the first mail', async ({ browser }) =>
 test('settings: notifications, token rotation, deleting the org', async ({ browser }) => {
   const s = state();
   const ctx = await browser.newContext({ viewport: { width: 1280, height: 1100 } });
-  await ctx.grantPermissions(['notifications'], { origin: s.pub.base });
   const page = await ctx.newPage();
-  await page.addInitScript(() => localStorage.setItem('amail.lang', 'en'));
+  // Headless Chromium denies notifications whatever is granted: stand in
+  // for the browser's API (the page asks for permission and remembers the
+  // choice; what the system shows is the browser's business).
+  await page.addInitScript(() => {
+    localStorage.setItem('amail.lang', 'en');
+    class Granted {
+      static permission = 'default';
+      static async requestPermission() {
+        Granted.permission = 'granted';
+        return 'granted';
+      }
+      constructor(title: string) {
+        (window as unknown as { shown: string[] }).shown ??= [];
+        (window as unknown as { shown: string[] }).shown.push(title);
+      }
+      close() {}
+    }
+    Object.defineProperty(window, 'Notification', { value: Granted, configurable: true });
+  });
   await page.goto(`${s.pub.base}/`);
   await page.locator('#token').fill(webToken);
   await page.locator('form button[type=submit]').click();
