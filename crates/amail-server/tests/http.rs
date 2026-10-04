@@ -65,6 +65,7 @@ http_tests!(
     claim_keys_http,
     node_tokens_cannot_use_user_mailbox,
     external_list_members_are_counted,
+    terminal_url_schemes,
 );
 
 struct Server {
@@ -2493,4 +2494,29 @@ async fn external_list_members_are_counted(srv: Server) {
     assert!(body.contains("1 seat of team@bravo"), "{body}");
     assert!(!body.contains("secret-ops"), "{body}");
     drop(ops);
+}
+
+/// The web interface links to a seat's terminal URL: only http(s) URLs
+/// from presence reports are kept.
+async fn terminal_url_schemes(srv: Server) {
+    let user = srv.org("acme").await;
+    user.seat("a").await;
+    let node = node_token(&user).await;
+    for (url, kept) in [
+        ("javascript:alert(1)", false),
+        ("data:text/html,<b>x</b>", false),
+        ("file:///etc/passwd", false),
+        ("http://host:9/x y", false),
+        ("https://host.example/term/a", true),
+    ] {
+        node.ok(
+            Method::POST,
+            "/presence",
+            Some(json!({ "seats": [{"seat": "a", "state": "idle", "terminal_url": url}] })),
+        )
+        .await;
+        let seat = user.ok(Method::GET, "/seats/a", None).await;
+        let got = seat["presence"].get("terminal_url").cloned();
+        assert_eq!(got.is_some(), kept, "{url}: {seat}");
+    }
 }

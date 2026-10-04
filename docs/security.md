@@ -129,6 +129,8 @@ The server stores only their SHA-256 hashes. Each token is shown once.
 - Requests authenticated by the cookie must send `X-Amail-Csrf: 1` for
   anything but `GET`, and their `Origin`, when present, must name the
   server's host (`X-Forwarded-Host` counts only from a trusted proxy).
+- A seat's terminal link, reported by its node, is kept and shown only
+  when it is an `http` or `https` URL.
 - Pages are served with a strict Content Security Policy (scripts only
   from the server itself), `X-Frame-Options: DENY` and
   `X-Content-Type-Options: nosniff`. API responses are not cached.

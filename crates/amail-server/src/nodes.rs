@@ -115,6 +115,16 @@ pub async fn presence(
         .seats
         .into_iter()
         .filter(|u| live.contains(&u.seat))
+        .map(|mut u| {
+            // The web interface links to it: only http(s) URLs are kept.
+            if u.terminal_url
+                .as_deref()
+                .is_some_and(|t| !crate::webhook::valid_url(t))
+            {
+                u.terminal_url = None;
+            }
+            u
+        })
         .collect();
     let changed = st
         .presence
