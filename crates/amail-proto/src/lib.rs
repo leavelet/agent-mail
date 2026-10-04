@@ -211,6 +211,19 @@ pub mod limits {
     /// Maximum total size of `meta` keys and values in bytes.
     pub const MAX_META_BYTES: usize = 4096;
 
+    // --- storage quota accounting ---
+
+    /// Bytes counted against the storage quota for each message, on top of
+    /// its subject, body, `meta` and address lists: the message's row
+    /// without those texts, and its index entries. Measured on Postgres 17
+    /// at about 470 bytes (SQLite: about 100).
+    pub const STORED_BYTES_PER_MESSAGE: i64 = 512;
+    /// Bytes counted against the storage quota for each delivery (one per
+    /// recipient seat): the delivery's row and its index entries. Measured
+    /// on Postgres 17 at about 360 bytes (SQLite: about 130). The
+    /// migration `0013_storage_deliveries.sql` uses the same two values.
+    pub const STORED_BYTES_PER_DELIVERY: i64 = 384;
+
     // --- other stored text, in characters (HTTP 400 when exceeded) ---
 
     /// Token labels.
@@ -778,8 +791,9 @@ pub struct OrgInfo {
     /// only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook_url: Option<String>,
-    /// Bytes of the mail the org sent that the server stores (subject, body
-    /// and meta of each message, counted once).
+    /// Bytes counted against the storage quota: each message the org sent
+    /// (subject, body, meta, addresses and a fixed amount) with a fixed
+    /// amount per delivery, and the same for mail of deleted orgs it keeps.
     #[serde(default)]
     pub stored_bytes: i64,
     /// The server's limit on `stored_bytes`; absent when there is none.

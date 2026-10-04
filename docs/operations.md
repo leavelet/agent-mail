@@ -196,15 +196,24 @@ a request over a limit gets HTTP 429 with `retry_after_ms` and a
 `Retry-After` header. Rate limits and stream counts are kept in memory per
 instance.
 
-The storage quota counts, for each org, the subject, body and `meta` of
-every message the org sent, each message once however many seats or orgs
-received it. Mail an org received is counted for its sender. Retention
-gives back the bytes of the bodies it clears. A send that would go over the
-quota gets HTTP 507 with the code `storage_quota`. Users see their count
-with `amail org show`; `amail admin stats` and `/admin` show it per org.
-The database takes more room than the counted bytes: delivery rows,
-indexes and free space inside the database files are not counted. Plan disk space for the number of orgs times the quota,
-and set a retention period so that old bodies are cleared.
+The storage quota counts, for each org, every message the org sent: its
+subject, body, `meta` and address lists, plus 512 bytes for the message's
+row and index entries, plus 384 bytes for each delivery (one per recipient
+seat, in any org; a list counts once per member). These two amounts are
+what Postgres 17 uses for a message and a delivery (about 470 and 360
+bytes); SQLite uses less (about 100 and 130). Mail an org received is
+counted for its sender while the sender exists; once the sender's org is
+deleted, each org that keeps that mail is charged its full bytes and its
+own deliveries of it. Acknowledgement reminders from the mail system are
+counted for their org but never refused. Retention gives back the bytes of
+the bodies it clears. A send that would go over the quota gets HTTP 507
+with the code `storage_quota`; an org at its quota can send nothing until
+retention frees space. Users see their count with `amail org show`;
+`amail admin stats` and `/admin` show it per org. Free space inside the
+database files is not counted, and the counts were computed again under
+these rules when the server was upgraded (migration 0013). Plan disk space
+for the number of orgs times the quota, and set a retention period so that
+old bodies are cleared.
 
 ### Operating a public server
 
@@ -244,9 +253,9 @@ name, or `--confirm <name>`) or in Admin → Settings. That removes its
 seats, mail, lists, links, tokens and browser sessions. Mail it sent that
 linked orgs received stays with them, shown as from `name@org (deleted org)`
 (in the addresses too), so that the receiving org keeps its archive and
-its replies keep their parent; that mail no longer counts against any
-org's storage quota and is removed when the last org holding it is
-deleted. The name is free again at once; a new org of that name sees none
+its replies keep their parent; that mail now counts against the storage
+quota of each org holding it and is removed when the last org holding it
+is deleted. The name is free again at once; a new org of that name sees none
 of the old mail. The operator can do the same with
 `amail admin org delete`.
 

@@ -324,8 +324,9 @@ struct ServeOpts {
     /// MiB (public default 256).
     #[arg(long, env = "AMAIL_MAX_MIRROR_MB")]
     max_mirror_mb: Option<usize>,
-    /// MiB of mail an org may store: subject, body and meta of each
-    /// message it sent (public default 1024; 0: no limit).
+    /// MiB of mail an org may store: each message it sent with its
+    /// deliveries, and mail of deleted orgs it keeps (public default 1024;
+    /// 0: no limit).
     #[arg(long, env = "AMAIL_MAX_ORG_STORAGE_MB")]
     max_org_storage_mb: Option<i64>,
     /// Search and archive requests per org in progress at the same time

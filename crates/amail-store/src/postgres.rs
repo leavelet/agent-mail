@@ -94,7 +94,9 @@ impl PgStore {
             Box::pin(async move {
                 let now = now_ms();
                 let meta = meta_to_db(&m.meta);
-                let bytes = message_bytes(&m.subject, &m.body, &meta);
+                let (to, cc) = (join_addrs(&m.to_addrs), join_addrs(&m.cc_addrs));
+                let bytes = message_bytes(&m.subject, &m.body, &meta, &to, &cc)
+                    + amail_proto::limits::STORED_BYTES_PER_DELIVERY * m.deliveries.len() as i64;
                 let mut seat_ids: Vec<i64> = m.deliveries.iter().map(|d| d.seat_id).collect();
                 seat_ids.sort_unstable();
                 seat_ids.dedup();
@@ -132,8 +134,8 @@ impl PgStore {
                 .bind(&m.subject)
                 .bind(&m.body)
                 .bind(line_count(&m.body))
-                .bind(join_addrs(&m.to_addrs))
-                .bind(join_addrs(&m.cc_addrs))
+                .bind(&to)
+                .bind(&cc)
                 .bind(m.priority.as_str())
                 .bind(m.ack_required)
                 .bind(now)
@@ -167,9 +169,13 @@ impl PgStore {
                 .execute(&mut *c)
                 .await?;
                 // Last, so the org's row stays locked only until the commit.
+                // The message and every delivery are charged (see
+                // `message_bytes`); refused over the quota, and when the org
+                // was deleted meanwhile.
                 let added: Option<i64> = sqlx::query_scalar(
                     "UPDATE orgs SET stored_bytes = stored_bytes + $1 \
-                     WHERE id = $2 AND ($3::bigint IS NULL OR stored_bytes + $1 <= $3) RETURNING id",
+                     WHERE id = $2 AND deleted_at IS NULL \
+                     AND ($3::bigint IS NULL OR stored_bytes + $1 <= $3) RETURNING id",
                 )
                 .bind(bytes)
                 .bind(m.org_id)

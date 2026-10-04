@@ -146,6 +146,50 @@ impl TestDb {
     }
 }
 
+impl TestDb {
+    /// For every org: `(id, stored_bytes, the same count computed from
+    /// scratch)`. The second count comes from running the storage migration
+    /// (`0013_storage_deliveries.sql`) again in a transaction that is then
+    /// rolled back.
+    pub async fn storage_counts(&self) -> Vec<(i64, i64, i64)> {
+        const SQLITE: &str = include_str!("../migrations/sqlite/0013_storage_deliveries.sql");
+        const PG: &str = include_str!("../migrations/postgres/0013_storage_deliveries.sql");
+        const READ: &str = "SELECT id, stored_bytes FROM orgs ORDER BY id";
+        // Concurrent sends wait until the counts are read: SQLite takes the
+        // write lock at once, Postgres locks `orgs` (a send updates its
+        // org's row last, so its rows are either all visible or none).
+        macro_rules! run {
+            ($c:expr, $begin:expr, $recount:expr) => {{
+                sqlx::raw_sql($begin).execute(&mut $c).await.expect("begin");
+                let now: Vec<(i64, i64)> =
+                    sqlx::query_as(READ).fetch_all(&mut $c).await.expect("read");
+                sqlx::raw_sql($recount)
+                    .execute(&mut $c)
+                    .await
+                    .expect("recount");
+                let new: Vec<(i64, i64)> =
+                    sqlx::query_as(READ).fetch_all(&mut $c).await.expect("read");
+                sqlx::raw_sql("ROLLBACK")
+                    .execute(&mut $c)
+                    .await
+                    .expect("rollback");
+                now.iter().zip(&new).map(|(a, b)| (a.0, a.1, b.1)).collect()
+            }};
+        }
+        if self.url.starts_with("sqlite:") {
+            let mut c = sqlx::SqliteConnection::connect(&self.url)
+                .await
+                .expect("connect");
+            run!(c, "BEGIN IMMEDIATE", SQLITE)
+        } else {
+            let mut c = sqlx::PgConnection::connect(&self.url)
+                .await
+                .expect("connect");
+            run!(c, "BEGIN; LOCK TABLE orgs IN SHARE ROW EXCLUSIVE MODE", PG)
+        }
+    }
+}
+
 /// Replace the database name in a Postgres URL.
 pub fn with_database(url: &str, db: &str) -> String {
     let (base, query) = match url.split_once('?') {

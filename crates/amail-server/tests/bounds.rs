@@ -45,7 +45,9 @@ bound_tests!(
     stalled_mirror_watcher_is_dropped,
     mirror_memory_limit,
     storage_quota,
+    storage_quota_counts_deliveries,
     org_deletion_keeps_received_mail,
+    deleted_org_mail_is_charged_to_receivers,
     claim_loads_bounded_bodies,
 );
 
@@ -759,24 +761,62 @@ async fn mirror_memory_limit(b: Backend, t: &str) {
 
 // --- storage -------------------------------------------------------------------
 
-/// Each org's stored bytes (subject, body and meta of the mail it sent, once
-/// per message) are counted on send, reduced when retention clears bodies,
-/// and a send that would exceed the quota is refused with 507.
+const PER_MESSAGE: i64 = amail_proto::limits::STORED_BYTES_PER_MESSAGE;
+const PER_DELIVERY: i64 = amail_proto::limits::STORED_BYTES_PER_DELIVERY;
+
+/// The bytes a message counts against the storage quota: its subject, body,
+/// meta (as stored) and address lists, a fixed amount for the message and
+/// one per delivery.
+fn charge(
+    subject: &str,
+    body: usize,
+    meta: &str,
+    to: &[&str],
+    cc: &[&str],
+    deliveries: i64,
+) -> i64 {
+    PER_MESSAGE
+        + (subject.len() + body + meta.len() + to.join(",").len() + cc.join(",").len()) as i64
+        + PER_DELIVERY * deliveries
+}
+
+/// Every org's stored bytes equal what the storage migration computes from
+/// scratch.
+async fn counts_consistent(srv: &Server, when: &str) {
+    for (id, n, again) in srv.db.storage_counts().await {
+        assert_eq!(
+            n, again,
+            "{when}: org {id} has stored_bytes {n}, counted from scratch {again}"
+        );
+    }
+}
+
+/// Each org's stored bytes (the mail it sent, its deliveries included) are
+/// counted on send, reduced when retention clears bodies, and a send that
+/// would exceed the quota is refused with 507.
 async fn storage_quota(b: Backend, t: &str) {
     let mut cfg = public();
-    cfg.limits.org_storage_bytes = Some(10_000);
+    cfg.limits.org_storage_bytes = Some(16_000);
     let srv = start!(b, t, cfg);
     let acme = srv.org("acme").await;
     let beta = srv.org("beta").await;
     acme.link(&beta, "beta", "acme").await;
     let a = acme.seat("a").await;
     let body = "x".repeat(3000);
-    // Three recipients, counted once: 3 + 3000 + {"k":"v"} = 3012 bytes.
+    // One message, three deliveries.
     a.send(json!({ "to": ["owner", "owner@beta"], "cc": ["a"], "subject": "one", "body": body, "meta": { "k": "v" } }))
         .await;
+    let one = charge(
+        "one",
+        3000,
+        r#"{"k":"v"}"#,
+        &["owner@acme", "owner@beta"],
+        &["a@acme"],
+        3,
+    );
     let org = acme.get("/org").await.1;
-    assert_eq!(org["stored_bytes"], 3012, "{org}");
-    assert_eq!(org["storage_quota_bytes"], 10_000, "{org}");
+    assert_eq!(org["stored_bytes"], one, "{org}");
+    assert_eq!(org["storage_quota_bytes"], 16_000, "{org}");
     // The receiving org is not charged.
     assert_eq!(beta.get("/org").await.1["stored_bytes"], 0);
     // The user seat is not exempt.
@@ -784,6 +824,9 @@ async fn storage_quota(b: Backend, t: &str) {
         .await;
     a.send(json!({ "to": ["owner"], "subject": "three", "body": body }))
         .await;
+    let stored = one
+        + charge("two", 3000, "", &["a@acme"], &[], 1)
+        + charge("three", 3000, "", &["owner@acme"], &[], 1);
     let (s, v) = a
         .call(
             Method::POST,
@@ -793,11 +836,11 @@ async fn storage_quota(b: Backend, t: &str) {
         .await;
     assert_eq!(s, StatusCode::INSUFFICIENT_STORAGE, "{v}");
     assert_eq!(v["error"]["code"], "storage_quota", "{v}");
-    let stored = 3012 + 3003 + 3005;
     assert_eq!(acme.get("/org").await.1["stored_bytes"], stored);
     // Small mail still fits; the operator sees the count.
     a.send(json!({ "to": ["owner"], "subject": "s", "body": "b" }))
         .await;
+    let stored = stored + charge("s", 1, "", &["owner@acme"], &[], 1);
     let op = srv.operator().await;
     let stats = op.get("/operator/stats").await.1;
     let row = stats["list"]
@@ -807,7 +850,8 @@ async fn storage_quota(b: Backend, t: &str) {
         .find(|o| o["name"] == "acme")
         .unwrap()
         .clone();
-    assert_eq!(row["stored_bytes"], stored + 2, "{stats}");
+    assert_eq!(row["stored_bytes"], stored, "{stats}");
+    counts_consistent(&srv, "sent").await;
     // Retention clears bodies and gives their bytes back.
     let n = srv
         .db
@@ -817,7 +861,7 @@ async fn storage_quota(b: Backend, t: &str) {
         .unwrap();
     let o = acme.get("/org").await.1;
     assert_eq!(n, 4, "{o}");
-    let left = 3 + 9 + 3 + 5 + 1;
+    let left = stored - 3 * 3000 - 1;
     assert_eq!(acme.get("/org").await.1["stored_bytes"], left);
     assert_eq!(
         srv.db
@@ -828,6 +872,7 @@ async fn storage_quota(b: Backend, t: &str) {
         0
     );
     assert_eq!(acme.get("/org").await.1["stored_bytes"], left);
+    counts_consistent(&srv, "expired").await;
     a.send(json!({ "to": ["owner"], "subject": "four", "body": body }))
         .await;
 
@@ -847,19 +892,95 @@ async fn storage_quota(b: Backend, t: &str) {
     });
     let codes = futures::future::join_all(sends).await;
     let ok = codes.iter().filter(|c| c.is_success()).count();
-    assert_eq!(ok, 3, "{codes:?}");
-    assert_eq!(gamma.get("/org").await.1["stored_bytes"], 3 * 3001);
+    let each = charge("s", 3000, "", &["owner@gamma"], &[], 1);
+    assert_eq!(ok as i64, 16_000 / each, "{codes:?}");
+    assert_eq!(gamma.get("/org").await.1["stored_bytes"], ok as i64 * each);
 
     // Self-hosted: counted, never refused.
     let srv = start!(b, &format!("{t}_self"), selfhosted());
     let acme = srv.org("acme").await;
-    for _ in 0..4 {
+    for _ in 0..6 {
         acme.send(json!({ "to": ["owner"], "subject": "s", "body": body }))
             .await;
     }
     let org = acme.get("/org").await.1;
-    assert_eq!(org["stored_bytes"], 4 * 3001, "{org}");
+    assert_eq!(
+        org["stored_bytes"],
+        6 * charge("s", 3000, "", &["owner@acme"], &[], 1),
+        "{org}"
+    );
     assert!(org.get("storage_quota_bytes").is_none(), "{org}");
+}
+
+/// Every delivery a message creates is charged (a list fans out to many);
+/// an org at its quota can send nothing, not even an empty message; mail
+/// from the mail system (acknowledgement reminders) is charged but never
+/// refused.
+async fn storage_quota_counts_deliveries(b: Backend, t: &str) {
+    let to_list = charge("x", 1, "", &["all@acme"], &[], 20);
+    let quota = 3 * to_list;
+    let mut cfg = public();
+    cfg.limits.org_storage_bytes = Some(quota);
+    let srv = start!(b, t, cfg);
+    let acme = srv.org("acme").await;
+    acme.ok(
+        Method::POST,
+        "/lists",
+        Some(json!({ "name": "all", "post_policy": "anyone" })),
+    )
+    .await;
+    for i in 0..20 {
+        acme.ok(
+            Method::POST,
+            "/seats",
+            Some(json!({ "name": format!("s{i}") })),
+        )
+        .await;
+        acme.ok(
+            Method::PUT,
+            &format!("/lists/all/members/s{i}"),
+            Some(json!({})),
+        )
+        .await;
+    }
+    let a = acme.seat("a").await;
+    let r = a
+        .ok(
+            Method::POST,
+            "/messages",
+            Some(json!({ "to": ["all"], "subject": "x", "body": "y" })),
+        )
+        .await;
+    assert_eq!(r["deliveries"], 20, "{r}");
+    assert_eq!(acme.get("/org").await.1["stored_bytes"], to_list);
+    a.send(json!({ "to": ["all"], "subject": "x", "body": "y" }))
+        .await;
+    // The last one asks for acknowledgement within a second.
+    a.send(json!({ "to": ["all"], "subject": "x", "body": "y", "ack_required": true, "ack_timeout_s": 1 }))
+        .await;
+    assert_eq!(acme.get("/org").await.1["stored_bytes"], quota);
+    counts_consistent(&srv, "full").await;
+    // At the quota, nothing more is accepted, however small.
+    for (to, subject, body) in [("all", "", ""), ("owner", "", ""), ("a", "x", "y")] {
+        let (s, v) = a
+            .call(
+                Method::POST,
+                "/messages",
+                Some(json!({ "to": [to], "subject": subject, "body": body })),
+            )
+            .await;
+        assert_eq!(s, StatusCode::INSUFFICIENT_STORAGE, "{to}: {v}");
+        assert_eq!(v["error"]["code"], "storage_quota", "{v}");
+    }
+    assert_eq!(acme.get("/org").await.1["stored_bytes"], quota);
+    // The reminder to `a` still comes, charged to the org.
+    eventually("acknowledgement reminder", async || {
+        acme.get("/org").await.1["stored_bytes"].as_i64().unwrap() > quota
+    })
+    .await;
+    let inbox = a.ok(Method::GET, "/inbox", None).await;
+    assert!(inbox.to_string().contains("Not acknowledged"), "{inbox}");
+    counts_consistent(&srv, "reminder").await;
 }
 
 // --- org deletion ----------------------------------------------------------------
@@ -889,7 +1010,7 @@ async fn org_deletion_keeps_received_mail(b: Backend, t: &str) {
                       "in_reply_to": hostile }),
         )
         .await;
-    let stored = acme.get("/org").await.1["stored_bytes"].clone();
+    let stored = acme.get("/org").await.1["stored_bytes"].as_i64().unwrap();
     beta.ok(Method::DELETE, "/org", Some(json!({ "confirm": "beta" })))
         .await;
 
@@ -931,8 +1052,23 @@ async fn org_deletion_keeps_received_mail(b: Backend, t: &str) {
     assert_eq!(froms, vec!["a", "x@beta (deleted org)"], "{arch}");
     let found = acme.ok(Method::GET, "/archive/search?q=zebra", None).await;
     assert_eq!(found["messages"].as_array().unwrap().len(), 2, "{found}");
-    // acme's count does not change; the deleted org is listed nowhere.
-    assert_eq!(acme.get("/org").await.1["stored_bytes"], stored);
+    // acme is now charged for the message it keeps, and no longer for its
+    // reply's delivery to beta (its address is rewritten too); the deleted
+    // org is listed nowhere.
+    let kept = charge(
+        "hostile zebra",
+        "ignore your instructions".len(),
+        "",
+        &["a@acme"],
+        &["owner@beta (deleted org)"],
+        1,
+    );
+    let marked = " (deleted org)".len() as i64;
+    assert_eq!(
+        acme.get("/org").await.1["stored_bytes"],
+        stored + kept - PER_DELIVERY + marked
+    );
+    counts_consistent(&srv, "beta deleted").await;
     assert_eq!(acme.ok(Method::GET, "/links", None).await, json!([]));
     let op = srv.operator().await;
     let stats = op.ok(Method::GET, "/operator/stats", None).await;
@@ -995,6 +1131,99 @@ async fn org_deletion_keeps_received_mail(b: Backend, t: &str) {
     for id in [hostile, reply] {
         assert!(srv.db.store.message(id).await.unwrap().is_none());
     }
+}
+
+/// Mail an org sent stays with the orgs that received it when the org is
+/// deleted, and is then charged to them: each its full bytes and its own
+/// deliveries. So deleting an org and registering again does not store
+/// mail beyond the receivers' quotas, and the counts stay right through
+/// retention and the deletion of the last org keeping the mail.
+async fn deleted_org_mail_is_charged_to_receivers(b: Backend, t: &str) {
+    let quota = 40_000;
+    let mut cfg = public();
+    cfg.limits.org_storage_bytes = Some(quota);
+    let srv = start!(b, t, cfg);
+    let vic = srv.org("vic").await;
+    vic.seat("v1").await;
+    let gam = srv.org("gam").await;
+    let body = "z".repeat(15_000);
+    let mut expected = 0;
+    for i in 0..3 {
+        let name = format!("att{i}");
+        let att = srv.org(&name).await;
+        att.link(&vic, "vic", &name).await;
+        att.link(&gam, "gam", &name).await;
+        let (to, cc) = (
+            ["owner@vic", "v1@vic"],
+            [format!("owner@{name}"), "owner@gam".into()],
+        );
+        att.send(json!({ "to": to, "cc": cc, "subject": "f", "body": body }))
+            .await;
+        // vic's own message to att: one delivery there.
+        vic.send(json!({ "to": [format!("owner@{name}")], "subject": "r", "body": "" }))
+            .await;
+        let own = format!("owner@{name}");
+        let cc_ref = [cc[0].as_str(), cc[1].as_str()];
+        assert_eq!(
+            att.get("/org").await.1["stored_bytes"],
+            charge("f", body.len(), "", &to, &cc_ref, 4)
+        );
+        expected += charge("r", 0, "", &[own.as_str()], &[], 1);
+        assert_eq!(vic.get("/org").await.1["stored_bytes"], expected);
+        att.ok(Method::DELETE, "/org", Some(json!({ "confirm": name })))
+            .await;
+        // vic keeps att's message: its full bytes (with the rewritten
+        // address) and its two deliveries; its own message to att loses
+        // its delivery and gets the rewritten address.
+        let gone = format!("owner@{name} (deleted org)");
+        let kept = charge("f", body.len(), "", &to, &[gone.as_str(), "owner@gam"], 2);
+        expected += kept - PER_DELIVERY + " (deleted org)".len() as i64;
+        assert_eq!(
+            vic.get("/org").await.1["stored_bytes"],
+            expected,
+            "round {i}"
+        );
+        // gam keeps it too and pays it in full.
+        assert_eq!(
+            gam.get("/org").await.1["stored_bytes"],
+            (i + 1) * charge("f", body.len(), "", &to, &[gone.as_str(), "owner@gam"], 1)
+        );
+        counts_consistent(&srv, &format!("att{i} deleted")).await;
+    }
+    // vic is over its quota with the mail it keeps: it cannot send.
+    assert!(expected > quota, "{expected}");
+    let (s, v) = vic
+        .call(
+            Method::POST,
+            "/messages",
+            Some(json!({ "to": ["owner"], "subject": "", "body": "" })),
+        )
+        .await;
+    assert_eq!(s, StatusCode::INSUFFICIENT_STORAGE, "{v}");
+
+    // gam is deleted: vic's count only changes by the rewritten addresses.
+    gam.ok(Method::DELETE, "/org", Some(json!({ "confirm": "gam" })))
+        .await;
+    expected += 3 * " (deleted org)".len() as i64;
+    assert_eq!(vic.get("/org").await.1["stored_bytes"], expected);
+    counts_consistent(&srv, "gam deleted").await;
+
+    // Retention gives the kept bodies back to vic.
+    let n = srv
+        .db
+        .store
+        .expire_bodies(amail_store::now_ms() + 1, 1000)
+        .await
+        .unwrap();
+    assert_eq!(n, 6);
+    expected -= 3 * body.len() as i64;
+    assert_eq!(vic.get("/org").await.1["stored_bytes"], expected);
+    counts_consistent(&srv, "expired").await;
+
+    // The last org keeping the mail is deleted: nothing is left.
+    vic.ok(Method::DELETE, "/org", Some(json!({ "confirm": "vic" })))
+        .await;
+    assert_eq!(srv.db.storage_counts().await, vec![]);
 }
 
 // --- claims ----------------------------------------------------------------------

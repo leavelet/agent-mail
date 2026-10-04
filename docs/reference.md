@@ -112,7 +112,7 @@ session cookie; with the cookie, everything but `GET` needs the header
 
 | | |
 |---|---|
-| `POST /messages` | send `{to, cc, subject, body, in_reply_to?, priority?, ack_required?, ack_timeout_s?, meta?}`; the answer lists each address with its seat count (and for a list in `To`, `wakes`: its members notified at once) and `notes` on recipients that will not see it at once. 507 `storage_quota` when the message does not fit in the org's storage quota |
+| `POST /messages` | send `{to, cc, subject, body, in_reply_to?, priority?, ack_required?, ack_timeout_s?, meta?}`; the answer lists each address with its seat count (and for a list in `To`, `wakes`: its members notified at once) and `notes` on recipients that will not see it at once. 507 `storage_quota` when the message, with one fixed amount per delivery, does not fit in the org's storage quota (always when the org is at its quota) |
 | `GET /inbox` | `seat`, `unread`, `after_seq`, `before_seq`, `limit` (≤ 1000); headers only. A page is at most 2 MiB: when it was cut, `"truncated": true`, and the next page starts after the last entry (with `before_seq`: before the first) |
 | `GET /messages/{id}` | full message; marks the caller's delivery read unless `peek=1` |
 | `POST /messages/{id}/ack` | acknowledge |
@@ -134,7 +134,7 @@ session cookie; with the cookie, everything but `GET` needs the header
 | `GET, POST /seats`; `GET, PATCH, DELETE /seats/{name}`; `POST /seats/{name}/tokens` | seats; `GET /seats` cuts each role to its first 1,000 characters and sets `role_truncated`, `GET /seats/{name}` has all of it |
 | `GET, POST /lists`; `GET, DELETE /lists/{name}`; `PUT, DELETE /lists/{name}/members/{address}` | lists (at most 1,000 members each) |
 | `GET, POST /links`; `POST /links/{org}/accept`; `DELETE /links/{org}` | links |
-| `GET, PATCH /org` | org settings (including `webhook_url`; `null` clears it), and `stored_bytes` (the mail the org sent, as counted for the storage quota) with `storage_quota_bytes` when the server has a quota |
+| `GET, PATCH /org` | org settings (including `webhook_url`; `null` clears it), and `stored_bytes` (the mail the org sent with its deliveries, and the mail of deleted orgs it keeps, as counted for the storage quota) with `storage_quota_bytes` when the server has a quota |
 | `DELETE /org` | user tokens, `{"confirm": "<org name>"}`: delete the org and all its data; mail other orgs received from it stays with them, from `name@org (deleted org)` |
 | `GET, POST /tokens`; `DELETE /tokens/{id}` | tokens |
 | `POST /tokens/rotate` | user tokens, `{label?}`: a new user token (answered once); the calling token is revoked, its browser sessions end and its open streams close; a browser that rotated gets a new session |

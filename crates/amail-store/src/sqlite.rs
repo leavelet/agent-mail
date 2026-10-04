@@ -166,7 +166,8 @@ impl SqliteStore {
         let m = m.clone();
         let now = now_ms();
         let meta = meta_to_db(&m.meta);
-        let bytes = message_bytes(&m.subject, &m.body, &meta);
+        let (to, cc) = (join_addrs(&m.to_addrs), join_addrs(&m.cc_addrs));
+        let bytes = message_bytes(&m.subject, &m.body, &meta, &to, &cc);
         let rows: Vec<(i64, i64, i64, i64, i64)> = self
             .write(move |c| {
                 Box::pin(async move {
@@ -179,8 +180,8 @@ impl SqliteStore {
                         .bind(&m.subject)
                         .bind(&m.body)
                         .bind(line_count(&m.body))
-                        .bind(join_addrs(&m.to_addrs))
-                        .bind(join_addrs(&m.cc_addrs))
+                        .bind(to)
+                        .bind(cc)
                         .bind(m.priority.as_str())
                         .bind(m.ack_required)
                         .bind(now)
@@ -189,6 +190,7 @@ impl SqliteStore {
                         .bind(m.ack_due)
                         .bind(bytes)
                         .bind(m.storage_quota)
+                        .bind(amail_proto::limits::STORED_BYTES_PER_DELIVERY)
                         .fetch_all(&mut *c)
                         .await;
                     match rows {
@@ -276,11 +278,15 @@ impl SqliteStore {
 /// Binds: $1 org, $2 sender, $3 thread (NULL for a new thread), $4 parent,
 /// $5 depth, $6 subject, $7 body, $8 lines, $9 to, $10 cc, $11 priority,
 /// $12 ack_required, $13 now, $14 deliveries JSON, $15 meta, $16 ack_due,
-/// $17 the message's bytes (added to the org's `stored_bytes`), $18 the
-/// org's storage quota (NULL: none).
+/// $17 the message's bytes without its deliveries (see `message_bytes`),
+/// $18 the org's storage quota (NULL: none), $19 the bytes per delivery.
+/// The org's `stored_bytes` grows by $17 plus $19 per delivery created; the
+/// message is refused when that would exceed $18, and also when the org was
+/// deleted meanwhile.
 /// Returns `(message_id, thread_id, seat_id, org_id, seq)` per delivery.
 const SEND_SQL: &str = "
-UPDATE temp.send_quota SET fits = ($18 IS NULL OR (SELECT stored_bytes FROM orgs WHERE id = $1) + $17 <= $18);
+UPDATE temp.send_quota SET fits = COALESCE((SELECT deleted_at IS NULL
+       AND ($18 IS NULL OR stored_bytes + $17 + $19 * json_array_length($14) <= $18) FROM orgs WHERE id = $1), FALSE);
 INSERT INTO messages (org_id, sender_seat_id, thread_id, parent_id, depth, subject, body, lines,
                       to_addrs, cc_addrs, priority, ack_required, created_at, meta, ack_due)
 VALUES ($1, $2, COALESCE($3, 0), $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $15, $16);
@@ -291,7 +297,9 @@ INSERT INTO deliveries (org_id, message_id, seat_id, class, mode, seq, mod_seq)
 SELECT json_extract(j.value, '$.o'), (SELECT MAX(id) FROM messages), s.id,
        json_extract(j.value, '$.c'), json_extract(j.value, '$.m'), s.last_seq, s.last_seq
   FROM json_each($14) j JOIN seats s ON s.id = json_extract(j.value, '$.s');
-UPDATE orgs SET stored_bytes = stored_bytes + $17 WHERE id = $1;
+UPDATE orgs SET stored_bytes = stored_bytes + $17
+       + $19 * (SELECT COUNT(*) FROM deliveries WHERE message_id = (SELECT MAX(id) FROM messages))
+ WHERE id = $1;
 SELECT m.id, m.thread_id, d.seat_id, d.org_id, d.seq
   FROM deliveries d JOIN messages m ON m.id = d.message_id
  WHERE d.message_id = (SELECT MAX(id) FROM messages)

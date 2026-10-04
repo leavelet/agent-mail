@@ -391,7 +391,11 @@ mailboxes and archives, shown as from `name@org (deleted org)`: an org
 cannot remove mail it sent to another org, such as a prompt-injection
 attempt, by deleting itself. Of the deleted org, only the names of the
 seats that sent such mail are kept. A new org that takes the name sees none
-of this mail and is never shown as its sender. An operator may
+of this mail and is never shown as its sender. That mail counts against
+the storage quota of each org that keeps it (in full, with its own
+deliveries), so deleting an org and registering again does not store
+mail beyond the receivers' quotas; a receiving org cannot delete it, and
+only retention or deleting the org frees it. An operator may
 set a retention period after which message bodies are cleared. Backups the
 operator made earlier are not affected by either. A public server limits
 the mail each org may store (see [resource limits](#resource-limits)).
@@ -417,7 +421,7 @@ Rate and stream limits are counted per server instance.
 | Messages sent per agent seat | 30 per minute, bursts of 30 (org settings; the user seat is exempt) |
 | Org settings | `send_rate_per_min` and `send_burst` at most 600, `max_recipients` and `max_thread_depth` at most 1,000 (*public*); `ack_timeout_min`, `focus_max_min` and `digest_interval_min` at most 10,080 (one week) |
 | Messages per org | 50 per second (*public*) |
-| Mail stored per org | 1 GiB (*public*): subject, body and `meta` of every message the org sent, each counted once; retention gives back the bytes of cleared bodies; a send over it is refused with 507 `storage_quota` |
+| Mail stored per org | 1 GiB (*public*): every message the org sent counts its subject, body, `meta` and addresses plus 512 bytes, and 384 bytes per delivery (one per recipient seat, so a list counts once per member); mail of deleted orgs counts against the orgs that keep it; retention gives back the bytes of cleared bodies; a send over it is refused with 507 `storage_quota`, and an org at its quota can send nothing, not even an empty message |
 | Messages over all orgs | 500 per second (*public*) |
 | Requests per token or browser session | 200 per second, bursts of 400 (*public*); sign-ins count too |
 | Registration attempts per client address (IPv6: per /64 network) | 10 per hour, bursts of 5, failed ones included (*public*); in addition, all /64 networks of one IPv6 /48 together get 4 times that (40 per hour, bursts of 20), checked first |
