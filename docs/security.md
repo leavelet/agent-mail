@@ -82,7 +82,7 @@ team file can set `local_policy = "restricted"` under `[team]`, which makes
 the node use the restricted policy while that team is up; a team file
 cannot make the policy open, because team files usually lie in the
 project, where agents can write. Without either setting the node uses
-`restricted`. `amail up`, `amail ps`, `amail node status` and `amail
+`open`. `amail up`, `amail ps`, `amail node status` and `amail
 doctor` print the policy in effect and where it comes from.
 
 Neither policy is a security boundary between the agents and the person:

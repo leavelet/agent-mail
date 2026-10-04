@@ -994,7 +994,7 @@ string_enum!(
 
 impl LocalPolicy {
     /// The policy of a node, and of a team file, that set none.
-    pub const DEFAULT: LocalPolicy = LocalPolicy::Restricted;
+    pub const DEFAULT: LocalPolicy = LocalPolicy::Open;
 }
 
 string_enum!(

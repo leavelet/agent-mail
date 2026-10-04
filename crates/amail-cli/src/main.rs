@@ -503,7 +503,7 @@ struct NodeArgs {
     /// them, including agent sessions, which may then manage seats; the
     /// node reports their requests to you) or `restricted` (agent sessions
     /// get only their own seat's credentials). Default: <state
-    /// dir>/node.toml, else the built-in default (see docs/security.md).
+    /// dir>/node.toml, else `open` (see docs/security.md).
     #[arg(long, env = "AMAIL_LOCAL_POLICY", value_name = "POLICY")]
     local_policy: Option<amail_proto::LocalPolicy>,
 }

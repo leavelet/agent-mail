@@ -226,8 +226,8 @@ Changes made after a security review, before the first public server.
   earlier checks by parent process: a session gets only its own seat's
   credentials and cannot manage seats). It is set with `amail node
   --local-policy`, `AMAIL_LOCAL_POLICY` or `node.toml`; a team file can
-  only choose `restricted`. `amail up`, `amail ps`, `amail node status`
-  and `amail doctor` print the policy in effect.
+  only choose `restricted`. The default is `open`. `amail up`, `amail ps`,
+  `amail node status` and `amail doctor` print the policy in effect.
 - The node tells the person by system mail, written by the server from
   fixed texts and sent only to the org's own user seat: when its local
   policy, or a supervised seat's permission mode or `git_access`, differs
