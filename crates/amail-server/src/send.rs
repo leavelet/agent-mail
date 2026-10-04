@@ -229,6 +229,7 @@ async fn send_inner(
         deliveries,
         ack_due,
         storage_quota: st.config.limits.org_storage_bytes,
+        notice: false,
     };
     let sent = st.store.send(&msg).await.map_err(|e| match e {
         amail_store::StoreError::StorageQuota(stored) => {

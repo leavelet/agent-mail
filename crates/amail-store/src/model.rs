@@ -123,6 +123,10 @@ pub struct NewMessage {
     /// Refuse the message ([`crate::StoreError::StorageQuota`]) if the
     /// org's stored bytes would then exceed this.
     pub storage_quota: Option<i64>,
+    /// A notice of the mail system (`POST /v1/node/notices`): charged to
+    /// nobody (see [`message_bytes`]) and deleted after
+    /// [`amail_proto::limits::NOTICE_RETENTION_DAYS`].
+    pub notice: bool,
 }
 
 /// The bytes a message counts against the storage quota without its
@@ -135,7 +139,9 @@ pub struct NewMessage {
 /// (in any org). Once the sending org is deleted, each org that keeps
 /// deliveries of the message is charged the message's full bytes and its
 /// own deliveries. The SQL form of this rule is in the migration
-/// `0013_storage_deliveries.sql`.
+/// `0013_storage_deliveries.sql`. Notice mail (`messages.notice`, see
+/// [`NewMessage::notice`]) is charged to nobody: it goes only to its own
+/// org, and its daily budget and retention bound it.
 pub fn message_bytes(subject: &str, body: &str, meta_db: &str, to_db: &str, cc_db: &str) -> i64 {
     amail_proto::limits::STORED_BYTES_PER_MESSAGE
         + (subject.len() + body.len() + meta_db.len() + to_db.len() + cc_db.len()) as i64

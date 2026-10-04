@@ -207,12 +207,19 @@ impl TestDb {
 impl TestDb {
     /// For every org: `(id, stored_bytes, the same count computed from
     /// scratch)`. The second count comes from running the storage migration
-    /// (`0013_storage_deliveries.sql`) again in a transaction that is then
-    /// rolled back.
+    /// (`0013_storage_deliveries.sql`) again, without notice mail, in a
+    /// transaction that is then rolled back.
     pub async fn storage_counts(&self) -> Vec<(i64, i64, i64)> {
         const SQLITE: &str = include_str!("../migrations/sqlite/0013_storage_deliveries.sql");
         const PG: &str = include_str!("../migrations/postgres/0013_storage_deliveries.sql");
         const READ: &str = "SELECT id, stored_bytes FROM orgs ORDER BY id";
+        // Notice mail is charged to nobody (migration 0015); it goes only
+        // to its own org, so only its sender was charged for it above.
+        const NOTICES: &str = "UPDATE orgs SET stored_bytes = stored_bytes - COALESCE((
+            SELECT SUM(512 + octet_length(m.subject) + octet_length(m.body) + octet_length(m.meta)
+                       + octet_length(m.to_addrs) + octet_length(m.cc_addrs)
+                       + 384 * (SELECT COUNT(*) FROM deliveries d WHERE d.message_id = m.id))
+              FROM messages m WHERE m.org_id = orgs.id AND m.notice), 0) WHERE deleted_at IS NULL";
         // Concurrent sends wait until the counts are read: SQLite takes the
         // write lock at once, Postgres locks `orgs` (a send updates its
         // org's row last, so its rows are either all visible or none).
@@ -225,6 +232,10 @@ impl TestDb {
                     .execute(&mut $c)
                     .await
                     .expect("recount");
+                sqlx::raw_sql(NOTICES)
+                    .execute(&mut $c)
+                    .await
+                    .expect("recount notices");
                 let new: Vec<(i64, i64)> =
                     sqlx::query_as(READ).fetch_all(&mut $c).await.expect("read");
                 sqlx::raw_sql("ROLLBACK")

@@ -192,6 +192,7 @@ Public mode turns on:
 | mail stored per org, in MiB (see below) | `--max-org-storage-mb` / `AMAIL_MAX_ORG_STORAGE_MB` | 1024 |
 | requests per org whose database cost depends on the data (see below), in progress at the same time, in each of the three pools | `--max-org-queries` / `AMAIL_MAX_ORG_QUERIES` | 1 |
 | the same over all orgs, in each of the search pool and the other pool (two times this together; keep that below `--max-connections`, the database pool size, 32 by default) | `--max-queries` / `AMAIL_MAX_QUERIES` | 8 |
+| failed authentications per minute per client address (IPv6 per /64; bursts of three minutes' worth); beyond them, requests from that address with a credential the instance has not seen valid lately get 429 without a database lookup | `--max-auth-failures-per-min` / `AMAIL_MAX_AUTH_FAILURES_PER_MIN` | 10 |
 
 `0` turns a limit off. The limits also apply without `--public` when set
 explicitly. Message rate limits come on top of each seat's own send budget;
@@ -208,7 +209,9 @@ bytes); SQLite uses less (about 100 and 130). Mail an org received is
 counted for its sender while the sender exists; once the sender's org is
 deleted, each org that keeps that mail is charged its full bytes and its
 own deliveries of it. Acknowledgement reminders from the mail system are
-counted for their org but never refused. Retention gives back the bytes of
+counted for their org but never refused. Notices from nodes (system mail
+about node settings and agent requests) are not counted: an org receives
+at most 50 of them (128 KB) a day, and they are deleted after 7 days. Retention gives back the bytes of
 the bodies it clears. A send that would go over the quota gets HTTP 507
 with the code `storage_quota`; an org at its quota can send nothing until
 retention frees space. Users see their count with `amail org show`;
@@ -249,7 +252,9 @@ suspended org's open connections end within about 15 seconds.
 `--retention-days N` clears the bodies of messages older than N days (every
 10 minutes, a thousand at a time). Headers stay, so threads keep their
 structure; such messages are shown as expired. It is off by default and
-the web interface tells users when it is on.
+the web interface tells users when it is on. Notices from nodes are
+deleted after 7 days in any case, by the background cleanup that runs
+every minute.
 
 A user deletes their own org with `amail org delete` (asks for the org's
 name, or `--confirm <name>`) or in Admin → Settings. That removes its

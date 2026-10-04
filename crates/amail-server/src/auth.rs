@@ -124,6 +124,61 @@ async fn org_rate_limited(ms: u64) -> ApiError {
     )
 }
 
+/// The failed-authentication limit
+/// ([`crate::config::Limits::auth_failures_per_min`]), before a credential
+/// is looked up in the database. A credential that was not valid lately
+/// takes a token from the client address's bucket (given back if it turns
+/// out valid), and is refused when the bucket is empty, so that at most the
+/// bucket's tokens of such lookups reach the database, also when many
+/// arrive at once. Pass the answer to [`auth_outcome`].
+pub fn auth_gate(state: &AppState, peer: &Peer, hash: &str) -> ApiResult<AuthTicket> {
+    let l = &state.limiters;
+    let mut charged = false;
+    if let Some(b) = &l.auth_failures
+        && !l.known_credentials.contains(hash)
+    {
+        if let Err(ms) = b.take(&peer.key()) {
+            return Err(ApiError::too_many(
+                "rate_limited",
+                "too many failed authentications from this address",
+                ms,
+            ));
+        }
+        charged = true;
+    }
+    l.auth_lookups
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(AuthTicket { charged })
+}
+
+/// A credential lookup let through by [`auth_gate`].
+#[derive(Debug, Clone, Copy)]
+pub struct AuthTicket {
+    /// It took a token from the client address's bucket.
+    charged: bool,
+}
+
+/// Record the outcome of a credential lookup for the failed-authentication
+/// limit.
+pub fn auth_outcome(state: &AppState, peer: &Peer, hash: &str, t: AuthTicket, valid: bool) {
+    let l = &state.limiters;
+    let Some(b) = &l.auth_failures else {
+        return;
+    };
+    let key = peer.key();
+    if valid {
+        l.known_credentials.insert(hash);
+        if t.charged {
+            b.refund(&key);
+        }
+    } else {
+        l.known_credentials.remove(hash);
+        if !t.charged {
+            let _ = b.take(&key);
+        }
+    }
+}
+
 impl FromRequestParts<AppState> for Auth {
     type Rejection = ApiError;
 
@@ -132,6 +187,7 @@ impl FromRequestParts<AppState> for Auth {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let mut session = None;
+        let peer = parts.extensions.get::<Peer>().copied().unwrap_or_default();
         // The credential: a bearer token, or the session cookie (then the
         // request must pass the cross-site checks).
         let (hash, is_session) = match parts.headers.get(header::AUTHORIZATION) {
@@ -151,11 +207,11 @@ impl FromRequestParts<AppState> for Auth {
             None => {
                 let secret = cookie(&parts.headers, SESSION_COOKIE)
                     .ok_or_else(|| ApiError::unauthorized("missing bearer token"))?;
-                let peer = parts.extensions.get::<Peer>().copied().unwrap_or_default();
                 check_csrf(&parts.method, &parts.headers, peer.proxied)?;
                 (hash_token(secret), true)
             }
         };
+        let ticket = auth_gate(state, &peer, &hash)?;
         // An org over its request limit is refused before the database is
         // asked, when this credential's org is known from earlier requests.
         let org_limit = state.limiters.org_requests.as_ref();
@@ -165,21 +221,22 @@ impl FromRequestParts<AppState> for Auth {
         {
             return Err(org_rate_limited(ms).await);
         }
-        let auth = if is_session {
-            let a = state
-                .store
-                .session_auth(&hash)
-                .await?
-                .ok_or_else(|| ApiError::unauthorized("session expired or signed out"))?;
-            session = Some(hash.clone());
-            a
+        let found = if is_session {
+            state.store.session_auth(&hash).await?
         } else {
-            state
-                .store
-                .token_auth(&hash)
-                .await?
-                .ok_or_else(|| ApiError::unauthorized("invalid or revoked token"))?
+            state.store.token_auth(&hash).await?
         };
+        auth_outcome(state, &peer, &hash, ticket, found.is_some());
+        let auth = match found {
+            Some(a) => a,
+            None if is_session => {
+                return Err(ApiError::unauthorized("session expired or signed out"));
+            }
+            None => return Err(ApiError::unauthorized("invalid or revoked token")),
+        };
+        if is_session {
+            session = Some(hash.clone());
+        }
         if let Some(b) = org_limit
             && known_org != Some(auth.org.id)
         {
@@ -301,6 +358,7 @@ impl FromRequestParts<AppState> for Operator {
     type Rejection = ApiError;
 
     async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
+        let peer = parts.extensions.get::<Peer>().copied().unwrap_or_default();
         let token_id = match parts.headers.get(header::AUTHORIZATION) {
             Some(value) => {
                 let token = value
@@ -314,17 +372,21 @@ impl FromRequestParts<AppState> for Operator {
                     .ok_or_else(|| {
                         ApiError::unauthorized("expected 'Authorization: Bearer <token>'")
                     })?;
-                state.store.operator_auth(&hash_token(token)).await?
+                let hash = hash_token(token);
+                let ticket = auth_gate(state, &peer, &hash)?;
+                let id = state.store.operator_auth(&hash).await?;
+                auth_outcome(state, &peer, &hash, ticket, id.is_some());
+                id
             }
             None => {
                 let secret = cookie(&parts.headers, SESSION_COOKIE)
                     .ok_or_else(|| ApiError::unauthorized("missing bearer token"))?;
-                let peer = parts.extensions.get::<Peer>().copied().unwrap_or_default();
                 check_csrf(&parts.method, &parts.headers, peer.proxied)?;
-                state
-                    .store
-                    .operator_session_auth(&hash_token(secret))
-                    .await?
+                let hash = hash_token(secret);
+                let ticket = auth_gate(state, &peer, &hash)?;
+                let id = state.store.operator_session_auth(&hash).await?;
+                auth_outcome(state, &peer, &hash, ticket, id.is_some());
+                id
             }
         };
         let token_id = token_id.ok_or_else(|| ApiError::forbidden("requires an operator token"))?;

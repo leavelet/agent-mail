@@ -63,6 +63,12 @@ pub struct Limits {
     /// so that several orgs together cannot take every database
     /// connection.
     pub queries: Option<usize>,
+    /// Failed authentications (unknown, revoked or expired tokens and
+    /// sessions) per minute per client address (IPv6: per /64), with bursts
+    /// of [`amail_proto::limits::AUTH_FAILURE_BURST_MINUTES`] minutes'
+    /// worth. A client over it gets 429 for requests with a credential the
+    /// server has not seen valid lately, without a database lookup.
+    pub auth_failures_per_min: Option<f64>,
 }
 
 impl Limits {
@@ -84,6 +90,7 @@ impl Limits {
             org_storage_bytes: Some(1 << 30),
             org_queries: Some(1),
             queries: Some(8),
+            auth_failures_per_min: Some(10.0),
         }
     }
 }

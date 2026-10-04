@@ -53,6 +53,14 @@ pub async fn run(st: AppState) {
             if let Err(e) = st.store.cleanup().await {
                 tracing::warn!("cleanup: {e}");
             }
+            // Notice mail has its own retention, whatever the server's.
+            let cutoff =
+                amail_store::now_ms() - amail_proto::limits::NOTICE_RETENTION_DAYS * 86_400_000;
+            match st.store.delete_old_notices(cutoff, 1000).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!("cleanup: deleted {n} notice mails"),
+                Err(e) => tracing::warn!("cleanup of notice mail: {e}"),
+            }
         }
     }
 }
@@ -215,6 +223,7 @@ async fn escalate(st: &AppState, due: &AckDue, now: i64) -> amail_store::Result<
             ack_due: None,
             // Reminders from the mail system are never refused.
             storage_quota: None,
+            notice: false,
         })
         .await?;
     let events: Vec<(String, i64)> = sent

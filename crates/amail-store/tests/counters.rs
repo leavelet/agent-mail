@@ -93,6 +93,7 @@ fn msg(org_id: i64, from: i64, to: &[(&Seat, C, M)]) -> NewMessage {
             .collect(),
         ack_due: None,
         storage_quota: None,
+        notice: false,
     }
 }
 
