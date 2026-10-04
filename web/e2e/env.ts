@@ -18,6 +18,8 @@ export interface E2eState {
   transcript: string;
   node: boolean;
   big?: { org: string; userToken: string; nodeToken: string };
+  /** The public-mode server: invite codes and an operator token. */
+  pub: { base: string; invites: string[]; opToken: string; db: string };
   pids: number[];
 }
 

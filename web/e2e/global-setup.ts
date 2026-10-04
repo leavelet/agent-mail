@@ -204,6 +204,21 @@ async function setup(procs: ChildProcess[]): Promise<void> {
     }
   }
 
+  // A second server in public mode (registration, operator view). Reached
+  // as localhost so that the browser keeps its always-Secure cookie.
+  const pubDb = `sqlite://${path.join(dir, 'public.db')}`;
+  const invites = (JSON.parse(run(['--json', 'admin', 'invite', 'create', '--count', '4', '--note', 'e2e', '--db', pubDb])) as { invites: { code: string }[] }).invites.map((i) => i.code);
+  const opToken = (JSON.parse(run(['--json', 'admin', 'operator-token', 'create', '--label', 'e2e', '--db', pubDb])) as { token: string }).token;
+  const pubPort = await freePort();
+  const pubBase = `http://localhost:${pubPort}`;
+  const pubLog = fs.openSync(path.join(dir, 'serve-public.log'), 'a');
+  const pub = spawn(BIN, ['serve', '--public', '--db', pubDb, '--listen', `127.0.0.1:${pubPort}`, '--retention-days', '90'], {
+    env: env({ RUST_LOG: process.env.RUST_LOG ?? 'info' }),
+    stdio: ['ignore', pubLog, pubLog],
+  });
+  procs.push(pub);
+  await waitFor(async () => (await fetch(`http://127.0.0.1:${pubPort}/healthz`)).ok, 'amail serve --public');
+
   const st: E2eState = {
     base,
     dir,
@@ -214,6 +229,7 @@ async function setup(procs: ChildProcess[]): Promise<void> {
     transcript,
     node: nodeOk,
     big: { org: 'scale', userToken: bigToken, nodeToken: bigNode },
+    pub: { base: pubBase, invites, opToken, db: pubDb },
     pids: procs.map((p) => p.pid!).filter(Boolean),
   };
   fs.writeFileSync(STATE_FILE, JSON.stringify(st, null, 2));
