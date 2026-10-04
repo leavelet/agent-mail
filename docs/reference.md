@@ -125,7 +125,7 @@ session cookie; with the cookie, everything but `GET` needs the header
 | `PUT /focus`, `DELETE /focus` | `seat=` (user tokens; seat tokens: their own): focus `{for_s?, until?}`, or end it |
 | `GET /sent` | `seat`, `before_id`, `limit` (≤ 500): messages a seat sent, newest first; paged like the archive |
 | `GET /archive/messages` | `since`, `until`, `from`, `to`, `thread`, `before_id`, `limit` (≤ 500) (user tokens): below |
-| `GET /archive/search` | `q`, `before_id`, `limit` (≤ 200) (user tokens): full-text search, below |
+| `GET /archive/search` | `q`, `before_id`, `limit` (≤ 200) (user tokens): search, below |
 
 ### Directory and settings
 

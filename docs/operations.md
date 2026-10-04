@@ -201,9 +201,8 @@ received it. Mail an org received is counted for its sender. Retention
 gives back the bytes of the bodies it clears. A send that would go over the
 quota gets HTTP 507 with the code `storage_quota`. Users see their count
 with `amail org show`; `amail admin stats` and `/admin` show it per org.
-The database takes more room than the counted bytes, for its indexes
-(the full-text index above all): about three times as much with SQLite in
-our measurement. Plan disk space for the number of orgs times the quota,
+The database takes more room than the counted bytes: delivery rows,
+indexes and free space inside the database files are not counted. Plan disk space for the number of orgs times the quota,
 and set a retention period so that old bodies are cleared.
 
 ### Operating a public server
