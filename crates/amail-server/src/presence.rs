@@ -224,6 +224,12 @@ impl PresenceBoard {
             .collect())
     }
 
+    /// End the org's presence subscriptions and forget its presence here.
+    pub fn close_org(&self, org_id: i64) {
+        self.orgs.lock().unwrap().remove(&org_id);
+        self.mem.lock().unwrap().remove(&org_id);
+    }
+
     pub fn subscribe(&self, org_id: i64) -> broadcast::Receiver<PresenceEvent> {
         self.sender(org_id).subscribe()
     }

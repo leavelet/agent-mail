@@ -1,0 +1,68 @@
+# amail with Postgres.
+#
+#   cp .env.example .env      # set POSTGRES_PASSWORD at least
+#   docker compose up -d --build
+#   docker compose exec amail amail admin create-org acme
+#
+# The server is published on 127.0.0.1:8025 only; put a reverse proxy or a
+# tunnel in front of it for other hosts (see docs/operations.md), and list
+# that proxy in AMAIL_TRUSTED_PROXIES.
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-postgres:17}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: amail
+      POSTGRES_USER: amail
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U amail -d amail"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  amail:
+    build:
+      context: .
+      args:
+        NODE_IMAGE: ${NODE_IMAGE:-node:22-bookworm-slim}
+        RUST_IMAGE: ${RUST_IMAGE:-rust:1-bookworm}
+        RUNTIME_IMAGE: ${RUNTIME_IMAGE:-debian:bookworm-slim}
+    image: ${AMAIL_IMAGE:-amail:local}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AMAIL_DB: postgres://amail:${POSTGRES_PASSWORD}@postgres:5432/amail
+      AMAIL_LISTEN: 0.0.0.0:8025
+      # true: registration with invite codes and the protective limits.
+      AMAIL_PUBLIC: ${AMAIL_PUBLIC:-false}
+      RUST_LOG: ${RUST_LOG:-info}
+      # Passed only when set (in .env or the shell); see .env.example.
+      AMAIL_TRUSTED_PROXIES:
+      AMAIL_RETENTION_DAYS:
+      AMAIL_WEBHOOK_PRIVATE_TARGETS:
+      AMAIL_MAX_SEATS_PER_ORG:
+      AMAIL_MAX_LISTS_PER_ORG:
+      AMAIL_MAX_TOKENS_PER_ORG:
+      AMAIL_MAX_SENDS_PER_SEC:
+      AMAIL_MAX_ORG_SENDS_PER_SEC:
+      AMAIL_MAX_ORG_STREAMS:
+      AMAIL_MAX_TOKEN_REQUESTS_PER_SEC:
+      AMAIL_MAX_LINK_REQUESTS_PER_HOUR:
+      AMAIL_MAX_REGISTRATIONS_PER_HOUR:
+    ports:
+      - "127.0.0.1:${AMAIL_PORT:-8025}:8025"
+    healthcheck:
+      test: ["CMD", "amail", "healthcheck", "http://127.0.0.1:8025"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+volumes:
+  pgdata:

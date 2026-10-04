@@ -1,6 +1,7 @@
 <script lang="ts">
   import type { Snippet } from 'svelte';
-  import type { Message } from '../lib/types';
+  import type { Message, MessageResponse } from '../lib/types';
+  import { get } from '../lib/api';
   import { t, ui } from '../lib/ui.svelte';
   import { fullTime } from '../lib/time';
   import { href } from '../lib/router.svelte';
@@ -15,6 +16,23 @@
   }: { message: Message; actions?: Snippet; focus?: boolean; showThreadLink?: boolean } = $props();
 
   let showDelivery = $state(false);
+  // A body the thread left out, fetched when asked for.
+  let fetched = $state<string | null>(null);
+  let fetching = $state(false);
+  let fetchError = $state<string | null>(null);
+  const body = $derived(fetched ?? message.body);
+  async function loadBody() {
+    fetching = true;
+    fetchError = null;
+    try {
+      const r = await get<MessageResponse>(`/v1/messages/${message.id}?peek=1`);
+      fetched = r.message.body;
+    } catch (e) {
+      fetchError = e instanceof Error ? e.message : String(e);
+    } finally {
+      fetching = false;
+    }
+  }
   const own = $derived(message.source !== 'external');
   const localSender = $derived(!message.from.includes('@'));
 </script>
@@ -45,7 +63,17 @@
       <MetaView meta={message.meta} />
     {/if}
   </header>
-  <pre class="body">{message.body}</pre>
+  {#if message.expired && !message.body}
+    <p class="expired faint">{t('msg.expired')}</p>
+  {:else if message.body_omitted && fetched === null}
+    <p class="omitted faint" data-testid="body-omitted">
+      {t('msg.omitted')}
+      <button class="small" disabled={fetching} onclick={loadBody}>{t('msg.loadBody')}</button>
+      {#if fetchError}<span class="error" role="alert">{fetchError}</span>{/if}
+    </p>
+  {:else}
+    <pre class="body">{body}</pre>
+  {/if}
   <footer class="row wrap">
     {@render actions?.()}
     {#if own}
@@ -124,6 +152,10 @@
   .src-external {
     color: var(--src-external);
     background: color-mix(in srgb, var(--src-external) 12%, transparent);
+  }
+  .expired {
+    margin: 6px 0;
+    font-style: italic;
   }
   .body {
     font-family: var(--font);

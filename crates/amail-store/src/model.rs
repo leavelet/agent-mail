@@ -24,6 +24,11 @@ pub struct Org {
     pub focus_max_min: i64,
     pub digest_interval_min: i64,
     pub created_at: i64,
+    /// Suspended by the operator: its tokens do not work and mail to it is
+    /// refused.
+    pub suspended_at: Option<i64>,
+    /// Bytes of the messages the org sent (see [`message_bytes`]).
+    pub stored_bytes: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +120,16 @@ pub struct NewMessage {
     /// With `ack_required`: when the sender is told about recipients that
     /// have not acknowledged.
     pub ack_due: Option<i64>,
+    /// Refuse the message ([`crate::StoreError::StorageQuota`]) if the
+    /// org's stored bytes would then exceed this.
+    pub storage_quota: Option<i64>,
+}
+
+/// The bytes a message adds to its org's `stored_bytes`: its subject, body
+/// and meta as stored (a JSON object, or nothing when empty). Addresses and
+/// per-recipient delivery rows are not counted.
+pub fn message_bytes(subject: &str, body: &str, meta_db: &str) -> i64 {
+    (subject.len() + body.len() + meta_db.len()) as i64
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +178,8 @@ pub struct MessageRec {
     pub ack_required: bool,
     pub meta: Meta,
     pub created_at: i64,
+    /// When the retention period cleared the body.
+    pub expired_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -234,6 +251,25 @@ pub struct ArchiveQuery {
     pub thread_id: Option<i64>,
     pub before_id: Option<i64>,
     pub limit: i64,
+}
+
+/// One page of [`ArchiveQuery`]: messages newest first, without bodies.
+#[derive(Debug, Clone, Default)]
+pub struct ArchivePage {
+    pub messages: Vec<MessageRec>,
+    /// Where the next (older) page starts (`before_id`): set when the page
+    /// is full, or when the request looked at its share of the org's
+    /// messages ([`amail_proto::limits::MAX_SCAN_MESSAGES`]) without
+    /// filling the page. `None`: nothing older matches.
+    pub next_before_id: Option<i64>,
+}
+
+/// A message of a thread; bodies past the request's byte budget are left
+/// out (`body` empty, `body_omitted` set).
+#[derive(Debug, Clone)]
+pub struct ThreadMessage {
+    pub message: MessageRec,
+    pub body_omitted: bool,
 }
 
 /// A live token, without its secret.
@@ -327,27 +363,40 @@ pub struct Laggard {
     pub parent_id: Option<i64>,
 }
 
-/// A full-text search (`Store::search`). Every term must occur in the
+/// A substring search (`Store::search`). Every term must occur in the
 /// subject or the body (case-insensitive substring).
 #[derive(Debug, Clone, Default)]
 pub struct SearchQuery {
     pub terms: Vec<String>,
     pub before_id: Option<i64>,
     pub limit: i64,
-    /// `None`: use the index (every term has at least three characters).
-    /// `Some(n)`: scan only the `n` most recent visible messages before
-    /// `before_id`.
-    pub scan: Option<i64>,
+    /// How many of the org's messages, newest first before `before_id`,
+    /// the request looks at.
+    pub scan: i64,
 }
 
-/// Result of [`SearchQuery`]: matches newest first, with bodies, and in scan
-/// mode the oldest message id that was scanned.
+/// One match of a [`SearchQuery`]: the message without its body, and an
+/// excerpt of the body around the first match.
+#[derive(Debug, Clone)]
+pub struct SearchHit {
+    pub message: MessageRec,
+    /// Up to [`SNIPPET_CHARS`] characters of the body.
+    pub excerpt: String,
+    /// Whether the body has text before and after the excerpt.
+    pub cut_before: bool,
+    pub cut_after: bool,
+}
+
+/// Characters of the body a search hit carries.
+pub const SNIPPET_CHARS: i64 = 160;
+
+/// Result of [`SearchQuery`]: matches newest first.
 #[derive(Debug, Clone, Default)]
 pub struct SearchResult {
-    pub messages: Vec<MessageRec>,
-    pub scanned_to: Option<i64>,
-    /// Scan mode: fewer than `scan` messages were left to scan.
-    pub scan_exhausted: bool,
+    pub hits: Vec<SearchHit>,
+    /// Where to continue (`before_id`): set when the page is full or when
+    /// `scan` messages were looked at; `None` when nothing older is left.
+    pub next_before_id: Option<i64>,
 }
 
 /// Mailbox counters of one seat.
@@ -359,4 +408,72 @@ pub struct CountRec {
     pub unread: i64,
     pub pending: i64,
     pub focus_until: Option<i64>,
+}
+
+/// A registration invite (the code itself is never stored).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InviteRec {
+    pub id: i64,
+    pub note: Option<String>,
+    pub created_at: i64,
+    pub expires_at: Option<i64>,
+    pub used_at: Option<i64>,
+    /// The org registered with it.
+    pub used_by: Option<String>,
+    pub revoked_at: Option<i64>,
+}
+
+/// An operator token (no secret).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorTokenRec {
+    pub id: i64,
+    pub label: Option<String>,
+    pub created_at: i64,
+}
+
+/// Why a registration was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InviteError {
+    /// Unknown, used, revoked or expired: indistinguishable to the caller.
+    Invalid,
+    /// The org name is taken.
+    OrgExists,
+}
+
+/// Load and activity of one org, for the operator (no mail content).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgStat {
+    pub id: i64,
+    pub name: String,
+    pub created_at: i64,
+    pub suspended_at: Option<i64>,
+    /// Live agent seats.
+    pub seats: i64,
+    pub messages: i64,
+    pub messages_hour: i64,
+    pub messages_day: i64,
+    /// When the org last sent a message.
+    pub last_activity: Option<i64>,
+    /// Bytes of the messages the org sent (see [`message_bytes`]).
+    pub stored_bytes: i64,
+}
+
+/// What [`crate::Store::operator_stats`] reports.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OperatorStats {
+    /// Busiest first (messages in the last hour, then the last day).
+    pub orgs: Vec<OrgStat>,
+    /// Messages sent in the last five minutes, all orgs.
+    pub messages_5min: i64,
+    /// Node event streams per org recorded by server instances (several
+    /// instances only; a single instance keeps them in memory).
+    pub node_streams: Vec<(i64, i64)>,
+}
+
+/// Row counts of some tables ([`crate::Store::row_counts`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RowCounts {
+    pub tokens: i64,
+    pub revoked_tokens: i64,
+    pub web_sessions: i64,
 }

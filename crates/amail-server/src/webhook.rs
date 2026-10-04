@@ -42,8 +42,25 @@ pub fn valid_url(url: &str) -> bool {
         && !url.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
-pub fn spawn(http: reqwest::Client, cfg: WebhookConfig, url: String, notice: Notice) {
+/// Post the notice in the background. With `private_ok == false` a URL
+/// with a literal non-public address is not tried at all (names are checked
+/// by the client's resolver when they are looked up).
+pub fn spawn(
+    slot: crate::limits::StreamGuard,
+    http: reqwest::Client,
+    cfg: WebhookConfig,
+    url: String,
+    notice: Notice,
+    private_ok: bool,
+) {
     tokio::spawn(async move {
+        // Counts against the org's webhooks in flight until this ends.
+        let _slot = slot;
+        let shown = crate::netguard::redact(&url);
+        if let Err(e) = crate::netguard::check_literal(&url, private_ok) {
+            tracing::warn!("webhook {shown}: not sent: {e}");
+            return;
+        }
         let attempts = cfg.backoff.len() + 1;
         for attempt in 0..attempts {
             if attempt > 0 {
@@ -59,18 +76,41 @@ pub fn spawn(http: reqwest::Client, cfg: WebhookConfig, url: String, notice: Not
             match r {
                 Ok(resp) if resp.status().is_success() => return,
                 Ok(resp) => tracing::debug!(
-                    "webhook {url}: HTTP {} (attempt {})",
+                    "webhook {shown}: HTTP {} (attempt {})",
                     resp.status(),
                     attempt + 1
                 ),
-                Err(e) => tracing::debug!("webhook {url}: {e} (attempt {})", attempt + 1),
+                Err(e) => tracing::debug!(
+                    "webhook {shown}: {} (attempt {})",
+                    error_chain(&e),
+                    attempt + 1
+                ),
             }
         }
         tracing::warn!(
-            "webhook {url}: giving up on message {} after {attempts} attempts",
+            "webhook {shown}: giving up on message {} after {attempts} attempts",
             notice.message.id
         );
     });
+}
+
+/// An error with its causes, without the URL (reqwest puts the full URL in
+/// its errors).
+fn error_chain(e: &reqwest::Error) -> String {
+    let mut out = String::new();
+    let mut src: Option<&dyn std::error::Error> = std::error::Error::source(e);
+    while let Some(s) = src {
+        if !out.is_empty() {
+            out.push_str(": ");
+        }
+        out.push_str(&s.to_string());
+        src = s.source();
+    }
+    if out.is_empty() {
+        "request failed".into()
+    } else {
+        out
+    }
 }
 
 #[cfg(test)]

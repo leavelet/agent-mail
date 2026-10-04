@@ -14,7 +14,7 @@
 //! `claim` selects candidates with `FOR UPDATE SKIP LOCKED`, so concurrent
 //! claims never return the same delivery.
 
-use crate::common::{join_addrs, like_pattern, line_count, meta_to_db, search_sql};
+use crate::common::{join_addrs, line_count, meta_to_db};
 use crate::model::*;
 use crate::{OpenOptions, Result, StoreError, now_ms};
 use futures::future::BoxFuture;
@@ -52,6 +52,31 @@ impl PgStore {
         f(&mut c).await
     }
 
+    /// A read whose cost depends on the data (search, archive, threads): in
+    /// a transaction that Postgres cancels after
+    /// [`amail_proto::limits::QUERY_TIMEOUT_MS`], planned for the actual
+    /// parameters (a generic plan cannot tell a small id range from a large
+    /// one).
+    async fn read_query<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: for<'c> FnOnce(&'c mut PgConnection) -> BoxFuture<'c, Result<T>> + Send + 'static,
+    {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(&format!(
+            "SET LOCAL statement_timeout = {}",
+            amail_proto::limits::QUERY_TIMEOUT_MS
+        ))
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("SET LOCAL plan_cache_mode = force_custom_plan")
+            .execute(&mut *tx)
+            .await?;
+        let out = f(&mut tx).await?;
+        tx.commit().await?;
+        Ok(out)
+    }
+
     async fn write<T, F>(&self, f: F) -> Result<T>
     where
         T: Send + 'static,
@@ -68,6 +93,8 @@ impl PgStore {
         self.write(move |c| {
             Box::pin(async move {
                 let now = now_ms();
+                let meta = meta_to_db(&m.meta);
+                let bytes = message_bytes(&m.subject, &m.body, &meta);
                 let mut seat_ids: Vec<i64> = m.deliveries.iter().map(|d| d.seat_id).collect();
                 seat_ids.sort_unstable();
                 seat_ids.dedup();
@@ -110,7 +137,7 @@ impl PgStore {
                 .bind(m.priority.as_str())
                 .bind(m.ack_required)
                 .bind(now)
-                .bind(meta_to_db(&m.meta))
+                .bind(&meta)
                 .bind(m.ack_due)
                 .execute(&mut *c)
                 .await?;
@@ -139,42 +166,27 @@ impl PgStore {
                 .bind(&seqv)
                 .execute(&mut *c)
                 .await?;
+                // Last, so the org's row stays locked only until the commit.
+                let added: Option<i64> = sqlx::query_scalar(
+                    "UPDATE orgs SET stored_bytes = stored_bytes + $1 \
+                     WHERE id = $2 AND ($3::bigint IS NULL OR stored_bytes + $1 <= $3) RETURNING id",
+                )
+                .bind(bytes)
+                .bind(m.org_id)
+                .bind(m.storage_quota)
+                .fetch_optional(&mut *c)
+                .await?;
+                if added.is_none() {
+                    let stored: i64 = sqlx::query_scalar("SELECT stored_bytes FROM orgs WHERE id = $1")
+                        .bind(m.org_id)
+                        .fetch_one(&mut *c)
+                        .await?;
+                    return Err(StoreError::StorageQuota(stored));
+                }
                 Ok(Sent { message_id: id, thread_id, created_at: now, seqs })
             })
         })
         .await
-    }
-
-    /// `ILIKE` on `subject || ' ' || body`, the expression of the trigram
-    /// index; in scan mode the same condition limited to the window.
-    async fn search_impl(
-        &self,
-        org_id: i64,
-        q: &SearchQuery,
-        lower: Option<i64>,
-    ) -> Result<Vec<MessageRec>> {
-        let conds: Vec<String> = (0..q.terms.len())
-            .map(|i| format!("(m.subject || ' ' || m.body) ILIKE ${} ESCAPE '\\'", i + 5))
-            .collect();
-        let sql = search_sql(&conds);
-        let binds: Vec<String> = q.terms.iter().map(|t| like_pattern(t)).collect();
-        let (before, limit) = (q.before_id, q.limit);
-        let rows: Vec<crate::common::MsgRow> = self
-            .read(move |c| {
-                Box::pin(async move {
-                    let mut query = sqlx::query_as(&sql)
-                        .bind(org_id)
-                        .bind(before)
-                        .bind(lower)
-                        .bind(limit);
-                    for b in &binds {
-                        query = query.bind(b);
-                    }
-                    Ok(query.fetch_all(&mut *c).await?)
-                })
-            })
-            .await?;
-        crate::common::collect(rows, crate::common::MsgRow::into_message)
     }
 
     async fn claim_impl(
@@ -300,4 +312,4 @@ impl PgStore {
     }
 }
 
-impl_store_common!(PgStore, sqlx::Postgres);
+impl_store_common!(PgStore, sqlx::Postgres, Dialect::Postgres);

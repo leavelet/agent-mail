@@ -63,6 +63,9 @@ http_tests!(
     sender_notes,
     digest_claims,
     claim_keys_http,
+    node_tokens_cannot_use_user_mailbox,
+    external_list_members_are_counted,
+    terminal_url_schemes,
 );
 
 struct Server {
@@ -1464,8 +1467,10 @@ async fn pending_counts_http(srv: Server) {
         ])
     );
     // The user seat has no session: nodes do not see it; users do.
-    let v = node.ok(Method::GET, "/pending?seat=owner", None).await;
-    assert_eq!(v["seats"], json!([]));
+    assert_eq!(
+        node.get("/pending?seat=owner").await.0,
+        StatusCode::FORBIDDEN
+    );
     let v = user.ok(Method::GET, "/pending", None).await;
     assert_eq!(v["seats"].as_array().unwrap().len(), 3);
     // One seat; user tokens may ask too.
@@ -1835,13 +1840,12 @@ async fn message_meta(srv: Server) {
     assert_eq!(v["message"]["meta"], meta);
     let inbox = user.inbox("unread=1").await;
     assert_eq!(inbox[0]["message"]["meta"], meta);
+    let _b = user.seat("b").await;
+    a.send(json!({ "to": ["b"], "subject": "merge", "body": "please", "meta": meta }))
+        .await;
     let node = node_token(&user).await;
     let c = node
-        .ok(
-            Method::POST,
-            "/claim?seat=owner",
-            Some(json!({ "via": "t" })),
-        )
+        .ok(Method::POST, "/claim?seat=b", Some(json!({ "via": "t" })))
         .await;
     assert_eq!(c["entries"][0]["message"]["meta"], meta);
     // No meta: the field is omitted.
@@ -2392,4 +2396,127 @@ async fn claim_keys_http(srv: Server) {
         .0,
         StatusCode::BAD_REQUEST
     );
+}
+
+/// Node tokens act for agent seats only: they cannot read, claim or follow
+/// the user seat's mailbox.
+async fn node_tokens_cannot_use_user_mailbox(srv: Server) {
+    let user = srv.org("acme").await;
+    let _a = user.seat("a").await;
+    let node = node_token(&user).await;
+    let other = srv.org("bravo").await;
+    other.link(&user, "acme", "bravo").await;
+    other
+        .send(json!({ "to": ["owner@acme"], "subject": "for the user", "body": "SECRET-BODY" }))
+        .await;
+    for (method, path, body) in [
+        (
+            Method::POST,
+            "/claim?seat=owner",
+            Some(json!({ "via": "x", "inline_body_max": 100000 })),
+        ),
+        (Method::GET, "/inbox?seat=owner", None),
+        (Method::GET, "/changes?seat=owner", None),
+        (Method::GET, "/pending?seat=owner", None),
+        (Method::GET, "/events?seat=owner", None),
+        (Method::GET, "/attention?seat=owner", None),
+    ] {
+        let (s, v) = node.call(method.clone(), path, body).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{method} {path}: {v}");
+        assert!(!v.to_string().contains("SECRET-BODY"));
+    }
+    // The mail is still unread and unnotified for the user.
+    let e = user.inbox("").await;
+    assert_eq!(subjects(&e), ["for the user"]);
+    assert!(e[0]["delivery"]["notified_at"].is_null(), "{e:?}");
+    // Agent seats still work for nodes.
+    node.ok(Method::POST, "/claim?seat=a", Some(json!({ "via": "x" })))
+        .await;
+}
+
+/// The seats behind another org's list, and when each read the mail, are
+/// that org's business: the sender sees counts per list address.
+async fn external_list_members_are_counted(srv: Server) {
+    let alpha = srv.org("alpha").await;
+    let bravo = srv.org("bravo").await;
+    let a = alpha.seat("a").await;
+    let b1 = bravo.seat("b1").await;
+    let ops = bravo.seat("secret-ops").await;
+    bravo.seat("named").await;
+    bravo
+        .list(
+            "team",
+            "anyone",
+            &[("b1", "immediate"), ("secret-ops", "immediate")],
+        )
+        .await;
+    alpha.link(&bravo, "bravo", "alpha").await;
+    let id = a
+        .send(
+            json!({ "to": ["team@bravo", "named@bravo"], "subject": "hi", "body": "x",
+                      "ack_required": true, "ack_timeout_s": 1 }),
+        )
+        .await["id"]
+        .as_i64()
+        .unwrap();
+    b1.ok(Method::GET, &format!("/messages/{id}"), None).await;
+    b1.ok(Method::POST, &format!("/messages/{id}/ack"), None)
+        .await;
+    for who in [&a, &alpha] {
+        let v = who
+            .ok(Method::GET, &format!("/messages/{id}/status"), None)
+            .await;
+        let text = v.to_string();
+        assert!(!text.contains("b1") && !text.contains("secret-ops"), "{v}");
+        let r = v["recipients"].as_array().unwrap();
+        assert_eq!(r.len(), 2, "{v}");
+        let team = r.iter().find(|x| x["address"] == "team@bravo").unwrap();
+        assert_eq!(
+            team["members"],
+            json!({ "seats": 2, "notified": 0, "read": 1, "acked": 1 })
+        );
+        assert_eq!(team["state"], "queued");
+        assert!(team.get("read_at").is_none(), "{team}");
+        // A seat named in the header is shown as itself.
+        let named = r.iter().find(|x| x["address"] == "named@bravo").unwrap();
+        assert!(named.get("members").is_none());
+    }
+    // Escalation counts them too.
+    wait_for("notice", || async { !a.inbox("unread=1").await.is_empty() }).await;
+    let n = a.inbox("unread=1").await[0]["message"]["id"]
+        .as_i64()
+        .unwrap();
+    let body = a.ok(Method::GET, &format!("/messages/{n}"), None).await["message"]["body"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(body.contains("named@bravo"), "{body}");
+    assert!(body.contains("1 seat of team@bravo"), "{body}");
+    assert!(!body.contains("secret-ops"), "{body}");
+    drop(ops);
+}
+
+/// The web interface links to a seat's terminal URL: only http(s) URLs
+/// from presence reports are kept.
+async fn terminal_url_schemes(srv: Server) {
+    let user = srv.org("acme").await;
+    user.seat("a").await;
+    let node = node_token(&user).await;
+    for (url, kept) in [
+        ("javascript:alert(1)", false),
+        ("data:text/html,<b>x</b>", false),
+        ("file:///etc/passwd", false),
+        ("http://host:9/x y", false),
+        ("https://host.example/term/a", true),
+    ] {
+        node.ok(
+            Method::POST,
+            "/presence",
+            Some(json!({ "seats": [{"seat": "a", "state": "idle", "terminal_url": url}] })),
+        )
+        .await;
+        let seat = user.ok(Method::GET, "/seats/a", None).await;
+        let got = seat["presence"].get("terminal_url").cloned();
+        assert_eq!(got.is_some(), kept, "{url}: {seat}");
+    }
 }

@@ -37,11 +37,13 @@ macro_rules! list_select {
     };
 }
 
+/// A deleted org's mail is shown as from `name@<old name> (deleted org)`.
 macro_rules! msg_cols {
     () => {
-        "m.id, m.org_id, mo.name AS org_name, m.sender_seat_id, ms.name AS sender_name, \
+        "m.id, m.org_id, CASE WHEN mo.deleted_at IS NULL THEN mo.name \
+         ELSE mo.deleted_name || ' (deleted org)' END AS org_name, m.sender_seat_id, ms.name AS sender_name, \
          ms.kind AS sender_kind, m.thread_id, m.parent_id, m.depth, m.subject, m.lines, \
-         m.to_addrs, m.cc_addrs, m.priority, m.ack_required, m.meta, m.created_at"
+         m.to_addrs, m.cc_addrs, m.priority, m.ack_required, m.meta, m.created_at, m.expired_at"
     };
 }
 
@@ -81,7 +83,9 @@ macro_rules! entry_select {
     };
 }
 
-/// `SELECT` of delivery + message with body.
+/// `SELECT` of delivery + message with the start of its body (claims):
+/// one character more than `amail_proto::limits::MAX_CLAIM_BODY_CHARS`, so
+/// that a longer body is known to be longer without loading all of it.
 macro_rules! entry_select_body {
     () => {
         concat!(
@@ -89,7 +93,7 @@ macro_rules! entry_select_body {
             deliv_cols!(),
             ", ",
             msg_cols!(),
-            ", m.body FROM deliveries d",
+            ", substr(m.body, 1, 16385) AS body FROM deliveries d",
             deliv_joins!(),
             " JOIN messages m ON m.id = d.message_id",
             msg_joins!()
@@ -119,7 +123,7 @@ macro_rules! auth_select {
     () => {
         "SELECT t.id AS token_id, t.scope, t.seat_id, o.id, o.name, o.send_rate_per_min, o.send_burst, \
          o.max_recipients, o.max_thread_depth, o.webhook_url, o.ack_timeout_min, o.focus_max_min, \
-         o.digest_interval_min, o.created_at, s.id AS s_id, \
+         o.digest_interval_min, o.created_at, o.suspended_at, o.stored_bytes, s.id AS s_id, \
          s.org_id AS s_org_id, s.name AS s_name, \
          s.kind AS s_kind, s.parent_id AS s_parent_id, p.name AS s_parent_name, \
          s.display_name AS s_display_name, s.role AS s_role, s.harness AS s_harness, \
@@ -128,13 +132,6 @@ macro_rules! auth_select {
          s.deleted_at AS s_deleted_at, s.focus_until AS s_focus_until \
          FROM tokens t JOIN orgs o ON o.id = t.org_id \
          LEFT JOIN seats s ON s.id = t.seat_id LEFT JOIN seats p ON p.id = s.parent_id"
-    };
-}
-
-/// Visibility of message `m` to org `$1`: sent by it or delivered to it.
-macro_rules! visible_to_org {
-    () => {
-        "(m.org_id = $1 OR EXISTS (SELECT 1 FROM deliveries vd WHERE vd.message_id = m.id AND vd.org_id = $1))"
     };
 }
 
@@ -153,7 +150,7 @@ pub(crate) fn parse<T: FromStr<Err = String>>(s: &str) -> Result<T> {
         .map_err(|e| StoreError::Invalid(format!("corrupt row: {e}")))
 }
 
-fn split_addrs(s: &str) -> Vec<String> {
+pub(crate) fn split_addrs(s: &str) -> Vec<String> {
     if s.is_empty() {
         Vec::new()
     } else {
@@ -179,66 +176,167 @@ pub(crate) fn like_pattern(term: &str) -> String {
     p
 }
 
-/// The query part shared by both backends' search: visibility, the page
-/// (`before_id`) and, in scan mode, the window's lower bound. Binds `$1` org,
-/// `$2` before_id, `$3` lower bound, `$4` limit; terms start at `$5`.
-pub(crate) fn search_sql(term_conds: &[String]) -> String {
-    let mut sql = String::from(concat!(
-        "SELECT ",
-        msg_cols!(),
-        ", m.body FROM messages m",
-        msg_joins!(),
-        " WHERE ",
-        visible_to_org!(),
-        " AND ($2 IS NULL OR m.id < $2) AND ($3 IS NULL OR m.id >= $3)"
-    ));
-    for c in term_conds {
-        sql.push_str(" AND ");
-        sql.push_str(c);
+/// What differs between the two backends' SQL in search.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Dialect {
+    Sqlite,
+    Postgres,
+}
+
+impl Dialect {
+    /// Case-insensitive `LIKE` (SQLite's `LIKE` folds ASCII letters).
+    fn ilike(self) -> &'static str {
+        match self {
+            Dialect::Sqlite => "LIKE",
+            Dialect::Postgres => "ILIKE",
+        }
+    }
+    /// Character position of a substring, 0 when absent.
+    fn strpos(self, hay: &str, needle: &str) -> String {
+        match self {
+            Dialect::Sqlite => format!("instr({hay}, {needle})"),
+            Dialect::Postgres => format!("strpos({hay}, {needle})"),
+        }
+    }
+    fn greatest(self) -> &'static str {
+        match self {
+            Dialect::Sqlite => "max",
+            Dialect::Postgres => "GREATEST",
+        }
+    }
+}
+
+/// Ids of the messages visible to org `$1` in `[$3, $2)`: the org's own
+/// and those delivered to it, each from its index.
+pub(crate) const WINDOW_IDS: &str = "SELECT id FROM messages WHERE org_id = $1 AND id >= $3 AND id < $2 \
+     UNION SELECT message_id FROM deliveries WHERE org_id = $1 AND message_id >= $3 AND message_id < $2";
+
+/// One search step over the window `[$3, $2)` of org `$1`, at most `$4`
+/// hits. Term `i` binds its `LIKE` pattern at `$(5+2i)` and its text at
+/// `$(6+2i)`. The body itself is not returned: only an excerpt of
+/// [`SNIPPET_CHARS`] characters starting 40 characters before the first
+/// match in the body (`ex_start`, 1-based) and the body's length.
+pub(crate) fn search_sql(d: Dialect, nterms: usize) -> String {
+    let lb = "lower(m.body)";
+    let positions: Vec<String> = (0..nterms)
+        .map(|i| {
+            format!(
+                "NULLIF({}, 0)",
+                d.strpos(lb, &format!("lower(${})", 6 + 2 * i))
+            )
+        })
+        .collect();
+    // The first match in the body, NULL when only the subject matched.
+    let at = match d {
+        Dialect::Postgres => format!("LEAST({})", positions.join(", ")),
+        Dialect::Sqlite => {
+            let big = "1000000000";
+            let args: Vec<String> = positions
+                .iter()
+                .map(|p| format!("COALESCE({p}, {big})"))
+                .chain([big.to_string()])
+                .collect();
+            format!("NULLIF(min({}), {big})", args.join(", "))
+        }
+    };
+    let start = format!("{}(1, COALESCE({at}, 1) - 40)", d.greatest());
+    let len = match d {
+        Dialect::Sqlite => "length(m.body)",
+        Dialect::Postgres => "CAST(char_length(m.body) AS BIGINT)",
+    };
+    let mut sql = format!(
+        "SELECT {cols}, substr(m.body, {start}, {n}) AS body, CAST({start} AS BIGINT) AS ex_start, {len} AS body_chars \
+         FROM messages m{joins} WHERE m.id IN ({WINDOW_IDS})",
+        cols = msg_cols!(),
+        joins = msg_joins!(),
+        n = SNIPPET_CHARS,
+    );
+    for i in 0..nterms {
+        let n = 5 + 2 * i;
+        sql.push_str(&format!(
+            " AND (m.subject {op} ${n} ESCAPE '\\' OR m.body {op} ${n} ESCAPE '\\')",
+            op = d.ilike()
+        ));
     }
     sql.push_str(" ORDER BY m.id DESC LIMIT $4");
     sql
 }
 
-/// SQLite's search: the same binds as [`search_sql`], but the page bounds
-/// only when given (SQLite does not see through `$n IS NULL OR ...`), and
-/// with `fts` the full-text index drives the query newest first.
-pub(crate) fn search_sql_sqlite(
-    term_conds: &[String],
-    before: bool,
-    lower: bool,
-    fts: bool,
-) -> String {
-    let mut sql = String::from(concat!("SELECT ", msg_cols!(), ", m.body FROM "));
-    if fts {
-        sql.push_str("messages_fts f JOIN messages m ON m.id = f.rowid");
-    } else {
-        sql.push_str("messages m");
+/// A row of [`search_sql`].
+#[derive(sqlx::FromRow)]
+pub(crate) struct HitRow {
+    #[sqlx(flatten)]
+    msg: MsgRow,
+    ex_start: i64,
+    body_chars: i64,
+}
+
+impl HitRow {
+    pub(crate) fn into_hit(self) -> Result<SearchHit> {
+        let (start, total) = (self.ex_start, self.body_chars);
+        let mut message = self.msg.into_message()?;
+        let excerpt = std::mem::take(&mut message.body);
+        let shown = excerpt.chars().count() as i64;
+        Ok(SearchHit {
+            message,
+            excerpt,
+            cut_before: start > 1,
+            cut_after: start - 1 + shown < total,
+        })
     }
-    sql.push_str(msg_joins!());
-    sql.push_str(" WHERE ");
-    if lower {
-        // A bounded window: the visible ids from the two indexes.
-        sql.push_str(
-            "m.id IN (SELECT id FROM messages WHERE org_id = $1 AND id >= $3 \
-             UNION SELECT message_id FROM deliveries WHERE org_id = $1 AND message_id >= $3)",
-        );
-    } else {
-        sql.push_str(visible_to_org!());
+}
+
+/// The lower end of a window of at most `n` messages below some id, from
+/// the counts and lowest ids of the index ranges it was built from (each
+/// read at most `n` rows): `a` the org's own messages, `b` its deliveries,
+/// `v` their union cut to `n`.
+pub(crate) fn window_bounds(
+    n: i64,
+    a: (i64, Option<i64>),
+    b: (i64, Option<i64>),
+    v: (i64, Option<i64>),
+) -> Window {
+    let Some(mut lo) = v.1 else {
+        return Window {
+            lo: None,
+            count: 0,
+            exhausted: true,
+        };
+    };
+    // A range that stopped at `n` rows may have more ids below its lowest
+    // one; the window cannot reach below that.
+    for (count, min) in [a, b] {
+        if count >= n {
+            lo = lo.max(min.unwrap_or(lo));
+        }
     }
-    let id = if fts { "f.rowid" } else { "m.id" };
-    if before {
-        sql.push_str(&format!(" AND {id} < $2"));
+    Window {
+        lo: Some(lo),
+        count: v.0,
+        exhausted: a.0 < n && b.0 < n && v.0 < n,
     }
-    if lower {
-        sql.push_str(&format!(" AND {id} >= $3"));
-    }
-    for c in term_conds {
-        sql.push_str(" AND ");
-        sql.push_str(c);
-    }
-    sql.push_str(&format!(" ORDER BY {id} DESC LIMIT $4"));
-    sql
+}
+
+/// Visible ids `[lo, before)` that one step of a search or an archive
+/// query looks at.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Window {
+    /// `None`: nothing visible below `before`.
+    pub lo: Option<i64>,
+    /// Ids counted in the window (at most `n`).
+    pub count: i64,
+    /// Nothing visible lies below `lo`.
+    pub exhausted: bool,
+}
+
+/// Messages one step of a search or an archive query looks at.
+pub(crate) const STEP_MESSAGES: i64 = 5_000;
+
+/// A `LIKE` pattern matching `addr` as one element of a comma-separated
+/// address list wrapped in commas.
+pub(crate) fn addr_pattern(addr: &str) -> String {
+    let inner = like_pattern(addr);
+    format!("%,{},%", &inner[1..inner.len() - 1])
 }
 
 pub(crate) fn line_count(body: &str) -> i64 {
@@ -278,6 +376,8 @@ pub(crate) struct OrgRow {
     focus_max_min: i64,
     digest_interval_min: i64,
     created_at: i64,
+    suspended_at: Option<i64>,
+    stored_bytes: i64,
 }
 
 impl From<OrgRow> for Org {
@@ -294,6 +394,8 @@ impl From<OrgRow> for Org {
             focus_max_min: r.focus_max_min,
             digest_interval_min: r.digest_interval_min,
             created_at: r.created_at,
+            suspended_at: r.suspended_at,
+            stored_bytes: r.stored_bytes,
         }
     }
 }
@@ -481,6 +583,7 @@ pub(crate) struct MsgRow {
     ack_required: bool,
     meta: String,
     created_at: i64,
+    expired_at: Option<i64>,
 }
 
 impl MsgRow {
@@ -504,8 +607,17 @@ impl MsgRow {
             ack_required: self.ack_required,
             meta: meta_from_db(&self.meta)?,
             created_at: self.created_at,
+            expired_at: self.expired_at,
         })
     }
+}
+
+/// A message header with the size of its body in bytes.
+#[derive(sqlx::FromRow)]
+pub(crate) struct SizedRow {
+    #[sqlx(flatten)]
+    pub(crate) msg: MsgRow,
+    pub(crate) body_bytes: Option<i64>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -681,19 +793,21 @@ pub(crate) fn collect<R, T>(rows: Vec<R>, f: impl Fn(R) -> Result<T>) -> Result<
 /// Generates `mod q` (the portable queries, for one sqlx database type) and
 /// `impl Store for $store`.
 macro_rules! impl_store_common {
-    ($store:ty, $db:ty) => {
+    ($store:ty, $db:ty, $dialect:expr) => {
         #[allow(dead_code)]
         pub(crate) mod q {
             use $crate::common::*;
             use $crate::model::*;
             use $crate::{now_ms, Result, StoreError};
+            use amail_proto::limits::MAX_SCAN_MESSAGES;
             use amail_proto::{LinkState, SeatKind, TokenScope};
 
             pub(crate) type Conn = <$db as sqlx::Database>::Connection;
             pub(crate) type Db = $db;
+            const DIALECT: Dialect = $dialect;
 
             pub async fn org_by_id(c: &mut Conn, id: i64) -> Result<Option<Org>> {
-                let r: Option<OrgRow> = sqlx::query_as("SELECT * FROM orgs WHERE id = $1")
+                let r: Option<OrgRow> = sqlx::query_as("SELECT * FROM orgs WHERE id = $1 AND deleted_at IS NULL")
                     .bind(id)
                     .fetch_optional(&mut *c)
                     .await?;
@@ -701,7 +815,7 @@ macro_rules! impl_store_common {
             }
 
             pub async fn org_by_name(c: &mut Conn, name: &str) -> Result<Option<Org>> {
-                let r: Option<OrgRow> = sqlx::query_as("SELECT * FROM orgs WHERE name = $1")
+                let r: Option<OrgRow> = sqlx::query_as("SELECT * FROM orgs WHERE name = $1 AND deleted_at IS NULL")
                     .bind(name)
                     .fetch_optional(&mut *c)
                     .await?;
@@ -821,6 +935,11 @@ macro_rules! impl_store_common {
                         StoreError::Conflict(_) => StoreError::Conflict(format!("org {name:?} already exists")),
                         other => other,
                     })?;
+                // Requests made while no org had this name do not carry over.
+                sqlx::query("DELETE FROM link_requests WHERE peer_name = $1")
+                    .bind(name)
+                    .execute(&mut *c)
+                    .await?;
                 let seat = NewSeat { name: user_seat.to_string(), ..Default::default() };
                 let seat = insert_seat(c, id, SeatKind::User, None, &seat).await?;
                 let token = NewToken {
@@ -884,12 +1003,11 @@ macro_rules! impl_store_common {
                 row.map(AuthRow::into_auth).transpose().map(Option::flatten)
             }
 
+            /// Store a browser session; the token's oldest sessions beyond
+            /// [`amail_proto::limits::MAX_SESSIONS_PER_TOKEN`] end. (Expired sessions are
+            /// dropped by [`cleanup`].)
             pub async fn create_session(c: &mut Conn, hash: &str, token_id: i64, expires_at: i64) -> Result<()> {
                 let now = now_ms();
-                sqlx::query("DELETE FROM web_sessions WHERE expires_at <= $1")
-                    .bind(now)
-                    .execute(&mut *c)
-                    .await?;
                 sqlx::query(
                     "INSERT INTO web_sessions (hash, token_id, created_at, expires_at) VALUES ($1, $2, $3, $4)",
                 )
@@ -897,6 +1015,15 @@ macro_rules! impl_store_common {
                 .bind(token_id)
                 .bind(now)
                 .bind(expires_at)
+                .execute(&mut *c)
+                .await?;
+                sqlx::query(
+                    "DELETE FROM web_sessions WHERE token_id = $1 AND hash <> $3 AND hash NOT IN \
+                     (SELECT hash FROM web_sessions WHERE token_id = $1 AND hash <> $3 ORDER BY created_at DESC, hash LIMIT $2)",
+                )
+                .bind(token_id)
+                .bind(amail_proto::limits::MAX_SESSIONS_PER_TOKEN - 1)
+                .bind(hash)
                 .execute(&mut *c)
                 .await?;
                 Ok(())
@@ -965,33 +1092,112 @@ macro_rules! impl_store_common {
                 collect(rows, EntryRow::into_entry)
             }
 
+            /// The first message id created at or after `t` (ids follow
+            /// creation times up to [`ID_TIME_MARGIN_MS`]), from the time index.
+            async fn id_at(c: &mut Conn, t: i64) -> Result<Option<i64>> {
+                Ok(sqlx::query_scalar::<_, i64>(
+                    "SELECT id FROM messages WHERE created_at >= $1 ORDER BY created_at, id LIMIT 1",
+                )
+                .bind(t)
+                .fetch_optional(&mut *c)
+                .await?)
+            }
+
             pub async fn message_count(c: &mut Conn, org_id: i64, since: i64) -> Result<i64> {
-                Ok(sqlx::query_scalar(concat!(
-                    "SELECT COUNT(*) FROM messages m WHERE m.created_at >= $2 AND ",
-                    visible_to_org!()
-                ))
+                // The org's ids from the window start on (each from its
+                // index), counted up to the scan bound.
+                let Some(lo) = id_at(c, since - ID_TIME_MARGIN_MS).await? else {
+                    return Ok(0);
+                };
+                Ok(sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM (SELECT v.id FROM (SELECT id FROM messages WHERE org_id = $1 AND id >= $2 \
+                     UNION SELECT message_id FROM deliveries WHERE org_id = $1 AND message_id >= $2) v \
+                     LIMIT $4) w JOIN messages m ON m.id = w.id WHERE m.created_at >= $3",
+                )
                 .bind(org_id)
+                .bind(lo)
                 .bind(since)
+                .bind(MAX_SCAN_MESSAGES)
                 .fetch_one(&mut *c)
                 .await?)
             }
 
-            /// The `n` most recent messages visible to the org before
-            /// `before_id`: `(count, oldest id)`.
-            pub async fn scan_window(c: &mut Conn, org_id: i64, before_id: Option<i64>, n: i64) -> Result<(i64, Option<i64>)> {
-                // The org's own messages and those delivered to it, each from
-                // its index (testing visibility row by row is slow on SQLite).
-                Ok(sqlx::query_as(
-                    "SELECT COUNT(*), MIN(id) FROM (SELECT id FROM ( \
-                       SELECT id FROM messages WHERE org_id = $1 AND id < $2 \
-                       UNION SELECT message_id AS id FROM deliveries WHERE org_id = $1 AND message_id < $2) v \
-                     ORDER BY id DESC LIMIT $3) w",
+            /// The window of the (at most) `n` newest messages visible to
+            /// the org below `before`, read from the org's two indexes
+            /// (at most `n` rows from each).
+            pub async fn scan_window(c: &mut Conn, org_id: i64, before: i64, n: i64) -> Result<Window> {
+                type R = (i64, Option<i64>, i64, Option<i64>, i64, Option<i64>);
+                let r: R = sqlx::query_as(
+                    "WITH a AS (SELECT id FROM messages WHERE org_id = $1 AND id < $2 ORDER BY id DESC LIMIT $3), \
+                     b AS (SELECT message_id AS id FROM deliveries WHERE org_id = $1 AND message_id < $2 \
+                           ORDER BY message_id DESC LIMIT $3), \
+                     v AS (SELECT id FROM (SELECT id FROM a UNION SELECT id FROM b) u ORDER BY id DESC LIMIT $3) \
+                     SELECT (SELECT COUNT(*) FROM a), (SELECT MIN(id) FROM a), \
+                            (SELECT COUNT(*) FROM b), (SELECT MIN(id) FROM b), \
+                            (SELECT COUNT(*) FROM v), (SELECT MIN(id) FROM v)",
                 )
                 .bind(org_id)
-                .bind(before_id.unwrap_or(i64::MAX))
+                .bind(before)
                 .bind(n)
                 .fetch_one(&mut *c)
-                .await?)
+                .await?;
+                Ok(window_bounds(n, (r.0, r.1), (r.2, r.3), (r.4, r.5)))
+            }
+
+            /// The window of the (at most) `n` newest messages of a thread
+            /// below `before`, of all orgs (visibility is checked after).
+            async fn thread_window(c: &mut Conn, thread_id: i64, before: i64, n: i64) -> Result<Window> {
+                let r: (i64, Option<i64>) = sqlx::query_as(
+                    "SELECT COUNT(*), MIN(id) FROM (SELECT id FROM messages WHERE thread_id = $1 AND id < $2 \
+                     ORDER BY id DESC LIMIT $3) t",
+                )
+                .bind(thread_id)
+                .bind(before)
+                .bind(n)
+                .fetch_one(&mut *c)
+                .await?;
+                Ok(match r.1 {
+                    None => Window { lo: None, count: 0, exhausted: true },
+                    Some(lo) => Window { lo: Some(lo), count: r.0, exhausted: r.0 < n },
+                })
+            }
+
+            /// Search: steps of [`STEP_MESSAGES`] of the org's window, newest
+            /// first, until the page is full or `q.scan` messages were
+            /// looked at.
+            pub async fn search(c: &mut Conn, org_id: i64, q: &SearchQuery) -> Result<SearchResult> {
+                let sql = search_sql(DIALECT, q.terms.len());
+                let mut out = SearchResult::default();
+                let mut before = q.before_id.unwrap_or(i64::MAX);
+                let mut seen = 0;
+                while seen < q.scan {
+                    let w = scan_window(c, org_id, before, STEP_MESSAGES.min(q.scan - seen)).await?;
+                    let Some(lo) = w.lo else {
+                        return Ok(out);
+                    };
+                    let mut query = sqlx::query_as::<_, HitRow>(&sql)
+                        .bind(org_id)
+                        .bind(before)
+                        .bind(lo)
+                        .bind(q.limit - out.hits.len() as i64);
+                    for t in &q.terms {
+                        query = query.bind(like_pattern(t)).bind(t.clone());
+                    }
+                    for r in query.fetch_all(&mut *c).await? {
+                        out.hits.push(r.into_hit()?);
+                    }
+                    if out.hits.len() as i64 >= q.limit {
+                        out.next_before_id = out.hits.last().map(|h| h.message.id);
+                        return Ok(out);
+                    }
+                    if w.exhausted {
+                        return Ok(out);
+                    }
+                    seen += w.count;
+                    before = lo;
+                }
+                out.next_before_id = Some(before);
+                Ok(out)
             }
 
             /// Live seats of the org with the given names (missing ones are skipped).
@@ -1256,12 +1462,37 @@ macro_rules! impl_store_common {
             pub async fn links(c: &mut Conn, org_id: i64) -> Result<Vec<Link>> {
                 let rows: Vec<LinkRow> = sqlx::query_as(
                     "SELECT l.peer_org_id, o.name AS peer_name, l.state FROM links l \
-                     JOIN orgs o ON o.id = l.peer_org_id WHERE l.org_id = $1 ORDER BY o.name",
+                     JOIN orgs o ON o.id = l.peer_org_id WHERE l.org_id = $1 \
+                     UNION ALL SELECT CAST(0 AS BIGINT), r.peer_name, 'requested' \
+                     FROM link_requests r WHERE r.org_id = $1 ORDER BY 2",
                 )
                 .bind(org_id)
                 .fetch_all(&mut *c)
                 .await?;
                 collect(rows, LinkRow::into_link)
+            }
+
+            pub async fn request_unknown_link(c: &mut Conn, org_id: i64, name: &str) -> Result<()> {
+                sqlx::query(
+                    "INSERT INTO link_requests (org_id, peer_name, created_at) VALUES ($1, $2, $3) \
+                     ON CONFLICT (org_id, peer_name) DO NOTHING",
+                )
+                .bind(org_id)
+                .bind(name)
+                .bind(now_ms())
+                .execute(&mut *c)
+                .await?;
+                Ok(())
+            }
+
+            pub async fn revoke_unknown_link(c: &mut Conn, org_id: i64, name: &str) -> Result<bool> {
+                let n = sqlx::query("DELETE FROM link_requests WHERE org_id = $1 AND peer_name = $2")
+                    .bind(org_id)
+                    .bind(name)
+                    .execute(&mut *c)
+                    .await?
+                    .rows_affected();
+                Ok(n > 0)
             }
 
             pub async fn message(c: &mut Conn, id: i64) -> Result<Option<MessageRec>> {
@@ -1310,17 +1541,55 @@ macro_rules! impl_store_common {
                 r.map(DelivRow::into_delivery).transpose()
             }
 
-            pub async fn thread(c: &mut Conn, thread_id: i64, org_id: i64) -> Result<Vec<MessageRec>> {
-                let rows: Vec<MsgRow> = sqlx::query_as(concat!(
-                    "SELECT ", msg_cols!(), ", m.body FROM messages m", msg_joins!(),
-                    " WHERE m.thread_id = $1 AND (m.org_id = $2 OR EXISTS \
-                     (SELECT 1 FROM deliveries d WHERE d.message_id = m.id AND d.org_id = $2)) ORDER BY m.id"
+            pub async fn thread(c: &mut Conn, thread_id: i64, org_id: i64, limit: i64, body_bytes: usize) -> Result<Vec<ThreadMessage>> {
+                let w = thread_window(c, thread_id, i64::MAX, MAX_SCAN_MESSAGES).await?;
+                let Some(lo) = w.lo else {
+                    return Ok(Vec::new());
+                };
+                // Headers and body sizes first (the size is read without
+                // the body on both backends).
+                let rows: Vec<SizedRow> = sqlx::query_as(concat!(
+                    "SELECT ", msg_cols!(), ", '' AS body, CAST(octet_length(m.body) AS BIGINT) AS body_bytes \
+                     FROM messages m", msg_joins!(),
+                    " WHERE m.thread_id = $1 AND m.id >= $3 AND (m.org_id = $2 OR EXISTS \
+                     (SELECT 1 FROM deliveries d WHERE d.message_id = m.id AND d.org_id = $2)) ORDER BY m.id DESC LIMIT $4"
                 ))
                 .bind(thread_id)
                 .bind(org_id)
+                .bind(lo)
+                .bind(limit)
                 .fetch_all(&mut *c)
                 .await?;
-                collect(rows, MsgRow::into_message)
+                // Bodies newest first within the budget.
+                let mut left = body_bytes as i64;
+                let mut out = Vec::with_capacity(rows.len());
+                let mut want = Vec::new();
+                for r in rows {
+                    let size = r.body_bytes.unwrap_or(0);
+                    let m = r.msg.into_message()?;
+                    let fits = size <= left;
+                    if fits {
+                        left -= size;
+                        if size > 0 {
+                            want.push(m.id);
+                        }
+                    }
+                    out.push(ThreadMessage { message: m, body_omitted: !fits });
+                }
+                if !want.is_empty() {
+                    let sql = format!("SELECT id, body FROM messages WHERE id IN ({})", placeholders(1, want.len()));
+                    let mut query = sqlx::query_as::<_, (i64, String)>(&sql);
+                    for id in &want {
+                        query = query.bind(*id);
+                    }
+                    for (id, body) in query.fetch_all(&mut *c).await? {
+                        if let Some(t) = out.iter_mut().find(|t| t.message.id == id) {
+                            t.message.body = body;
+                        }
+                    }
+                }
+                out.reverse();
+                Ok(out)
             }
 
             pub async fn inbox(c: &mut Conn, seat_id: i64, q: &InboxQuery) -> Result<Vec<Entry>> {
@@ -1440,74 +1709,188 @@ macro_rules! impl_store_common {
                 collect(rows, DelivRow::into_delivery)
             }
 
-            /// Built with only the conditions the query has, so that both
-            /// planners can use the id order and the indexes (SQLite cannot
-            /// see through `$n IS NULL OR ...`).
-            pub async fn archive(c: &mut Conn, org_id: i64, q: &ArchiveQuery) -> Result<Vec<MessageRec>> {
-                // A time window as an id range, so that the newest-first
-                // scan starts and stops near it (ids grow with creation
-                // time; a message's id and timestamp are taken within one
-                // send, so the margin covers any reordering).
-                let id_at = |t: i64| {
-                    sqlx::query_scalar::<_, i64>(
-                        "SELECT id FROM messages WHERE created_at >= $1 ORDER BY created_at, id LIMIT 1",
-                    )
-                    .bind(t)
-                };
-                let lo = match q.since {
-                    Some(t) => id_at(t - ID_TIME_MARGIN_MS).fetch_optional(&mut *c).await?,
+            /// Ids of the org's seats called `name` (a deleted seat's name
+            /// can be taken again).
+            async fn own_seat_ids(c: &mut Conn, org_id: i64, name: &str) -> Result<Vec<i64>> {
+                Ok(sqlx::query_scalar("SELECT id FROM seats WHERE org_id = $1 AND name = $2")
+                    .bind(org_id)
+                    .bind(name.to_string())
+                    .fetch_all(&mut *c)
+                    .await?)
+            }
+
+            /// The archive. Every query starts from the org's own data: one
+            /// of its seats' sent mail or mailbox when `from` or `to` names
+            /// one, else the org's messages (or a thread's) newest first in
+            /// steps, at most [`MAX_SCAN_MESSAGES`] per request. Built with
+            /// only the conditions the query has, so that both planners can
+            /// use the id order and the indexes (SQLite cannot see through
+            /// `$n IS NULL OR ...`).
+            pub async fn archive(c: &mut Conn, org_id: i64, q: &ArchiveQuery) -> Result<ArchivePage> {
+                let empty = Ok(ArchivePage::default());
+                // A time window as an id range (ids grow with creation time;
+                // a message's id and timestamp are taken within one send, so
+                // the margin covers any reordering).
+                let lo_t = match q.since {
+                    Some(t) => match id_at(c, t - ID_TIME_MARGIN_MS).await? {
+                        Some(x) => Some(x),
+                        None => return empty,
+                    },
                     None => None,
                 };
-                // No message after the window: no upper bound needed.
-                let hi = match q.until {
-                    Some(t) => id_at(t + ID_TIME_MARGIN_MS).fetch_optional(&mut *c).await?,
+                let hi_t = match q.until {
+                    Some(t) => id_at(c, t + ID_TIME_MARGIN_MS).await?,
                     None => None,
                 };
-                let mut b = sqlx::QueryBuilder::<Db>::new(concat!(
-                    "SELECT ", msg_cols!(), ", '' AS body FROM messages m", msg_joins!(), " WHERE (m.org_id = "
-                ));
-                b.push_bind(org_id)
-                    .push(" OR EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = m.id AND d.org_id = ")
-                    .push_bind(org_id)
-                    .push("))");
-                // `+ 0`: filter by time, but scan by id (the id range below);
-                // a time index scan would read the whole window and sort it.
-                if let Some(t) = q.since {
-                    b.push(" AND m.created_at + 0 >= ").push_bind(t);
+                let upper = q.before_id.unwrap_or(i64::MAX).min(hi_t.unwrap_or(i64::MAX));
+                let me: String = sqlx::query_scalar("SELECT name FROM orgs WHERE id = $1")
+                    .bind(org_id)
+                    .fetch_one(&mut *c)
+                    .await?;
+                let own = |a: &Option<(String, String)>| a.as_ref().filter(|(o, _)| *o == me).map(|(_, n)| n.clone());
+                let own_from = match own(&q.from) {
+                    Some(n) => Some(own_seat_ids(c, org_id, &n).await?),
+                    None => None,
+                };
+                let own_to = match own(&q.to) {
+                    Some(n) => Some(own_seat_ids(c, org_id, &n).await?),
+                    None => None,
+                };
+                if own_from.as_ref().is_some_and(Vec::is_empty) || own_to.as_ref().is_some_and(Vec::is_empty) {
+                    return empty;
                 }
-                if let Some(t) = q.until {
-                    b.push(" AND m.created_at + 0 < ").push_bind(t);
+                let filters = |b: &mut sqlx::QueryBuilder<'_, Db>| {
+                    // `+ 0`: filter by time, but scan by id.
+                    if let Some(t) = q.since {
+                        b.push(" AND m.created_at + 0 >= ").push_bind(t);
+                    }
+                    if let Some(t) = q.until {
+                        b.push(" AND m.created_at + 0 < ").push_bind(t);
+                    }
+                    if let Some(x) = lo_t {
+                        b.push(" AND m.id >= ").push_bind(x);
+                    }
+                    if let Some(t) = q.thread_id {
+                        b.push(" AND m.thread_id = ").push_bind(t);
+                    }
+                    match (&own_from, &q.from) {
+                        (Some(ids), _) => {
+                            b.push(" AND m.sender_seat_id IN (");
+                            let mut l = b.separated(", ");
+                            for id in ids {
+                                l.push_bind(*id);
+                            }
+                            b.push(")");
+                        }
+                        (None, Some((o, n))) => {
+                            b.push(" AND m.sender_seat_id IN (SELECT fs.id FROM seats fs JOIN orgs fo ON fo.id = fs.org_id WHERE fo.name = ")
+                                .push_bind(o.clone())
+                                .push(" AND fs.name = ")
+                                .push_bind(n.clone())
+                                .push(")");
+                        }
+                        _ => {}
+                    }
+                    match (&own_to, &q.to) {
+                        (Some(ids), _) => {
+                            b.push(" AND EXISTS (SELECT 1 FROM deliveries td WHERE td.message_id = m.id AND td.seat_id IN (");
+                            let mut l = b.separated(", ");
+                            for id in ids {
+                                l.push_bind(*id);
+                            }
+                            b.push("))");
+                        }
+                        // Another org's seat: only messages that name it.
+                        // Which of that org's seats a list reached is that
+                        // org's business.
+                        (None, Some((o, n))) => {
+                            b.push(" AND (',' || m.to_addrs || ',' || m.cc_addrs || ',') LIKE ")
+                                .push_bind(addr_pattern(&format!("{n}@{o}")))
+                                .push(" ESCAPE '\\'");
+                        }
+                        _ => {}
+                    }
+                };
+                let select = concat!("SELECT ", msg_cols!(), ", '' AS body FROM ");
+                let page = |mut v: Vec<MessageRec>, limit: i64| {
+                    v.sort_by(|a, b| b.id.cmp(&a.id));
+                    v.dedup_by_key(|m| m.id);
+                    v.truncate(limit as usize);
+                    let next_before_id = (v.len() as i64 == limit).then(|| v.last().map(|m| m.id)).flatten();
+                    ArchivePage { messages: v, next_before_id }
+                };
+                // One of the org's seats: its sent mail, or its mailbox.
+                if let Some(ids) = own_from.as_ref().or(own_to.as_ref()) {
+                    let mut all = Vec::new();
+                    for id in ids {
+                        let mut b = sqlx::QueryBuilder::<Db>::new(select);
+                        if own_from.is_some() {
+                            b.push("messages m").push(msg_joins!()).push(" WHERE m.sender_seat_id = ").push_bind(*id);
+                        } else {
+                            b.push("deliveries sd JOIN messages m ON m.id = sd.message_id")
+                                .push(msg_joins!())
+                                .push(" WHERE sd.seat_id = ")
+                                .push_bind(*id);
+                        }
+                        b.push(" AND m.id < ").push_bind(upper);
+                        filters(&mut b);
+                        // A seat's deliveries are numbered in message order.
+                        b.push(if own_from.is_some() { " ORDER BY m.id DESC LIMIT " } else { " ORDER BY sd.seq DESC LIMIT " })
+                            .push_bind(q.limit);
+                        let rows: Vec<MsgRow> = b.build_query_as().fetch_all(&mut *c).await?;
+                        all.extend(collect(rows, MsgRow::into_message)?);
+                    }
+                    return Ok(page(all, q.limit));
                 }
-                if let Some(x) = lo {
-                    b.push(" AND m.id >= ").push_bind(x);
+                // Steps over the org's messages (or the thread's).
+                let mut out: Vec<MessageRec> = Vec::new();
+                let mut before = upper;
+                let mut seen = 0;
+                while seen < MAX_SCAN_MESSAGES {
+                    let n = STEP_MESSAGES.min(MAX_SCAN_MESSAGES - seen);
+                    let w = match q.thread_id {
+                        Some(t) => thread_window(c, t, before, n).await?,
+                        None => scan_window(c, org_id, before, n).await?,
+                    };
+                    let Some(lo) = w.lo else {
+                        return Ok(ArchivePage { messages: out, next_before_id: None });
+                    };
+                    let mut b = sqlx::QueryBuilder::<Db>::new(select);
+                    b.push("messages m").push(msg_joins!()).push(" WHERE m.id < ").push_bind(before);
+                    b.push(" AND m.id >= ").push_bind(lo);
+                    match q.thread_id {
+                        Some(t) => {
+                            b.push(" AND m.thread_id = ").push_bind(t);
+                            b.push(" AND (m.org_id = ").push_bind(org_id);
+                            b.push(" OR EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = m.id AND d.org_id = ")
+                                .push_bind(org_id)
+                                .push("))");
+                        }
+                        None => {
+                            b.push(" AND m.id IN (SELECT id FROM messages WHERE org_id = ").push_bind(org_id);
+                            b.push(" AND id >= ").push_bind(lo).push(" AND id < ").push_bind(before);
+                            b.push(" UNION SELECT message_id FROM deliveries WHERE org_id = ").push_bind(org_id);
+                            b.push(" AND message_id >= ").push_bind(lo).push(" AND message_id < ").push_bind(before);
+                            b.push(")");
+                        }
+                    }
+                    filters(&mut b);
+                    b.push(" ORDER BY m.id DESC LIMIT ").push_bind(q.limit - out.len() as i64);
+                    let rows: Vec<MsgRow> = b.build_query_as().fetch_all(&mut *c).await?;
+                    out.extend(collect(rows, MsgRow::into_message)?);
+                    if out.len() as i64 >= q.limit {
+                        let next_before_id = out.last().map(|m| m.id);
+                        return Ok(ArchivePage { messages: out, next_before_id });
+                    }
+                    // Nothing older can match: the window reached the start
+                    // of the time range, or the org's (thread's) first message.
+                    if w.exhausted || lo_t.is_some_and(|t| lo <= t) {
+                        return Ok(ArchivePage { messages: out, next_before_id: None });
+                    }
+                    seen += w.count;
+                    before = lo;
                 }
-                if let Some(x) = hi {
-                    b.push(" AND m.id < ").push_bind(x);
-                }
-                if let Some(x) = q.before_id {
-                    b.push(" AND m.id < ").push_bind(x);
-                }
-                if let Some(t) = q.thread_id {
-                    b.push(" AND m.thread_id = ").push_bind(t);
-                }
-                if let Some((o, n)) = &q.from {
-                    b.push(" AND m.sender_seat_id IN (SELECT fs.id FROM seats fs JOIN orgs fo ON fo.id = fs.org_id WHERE fo.name = ")
-                        .push_bind(o.clone())
-                        .push(" AND fs.name = ")
-                        .push_bind(n.clone())
-                        .push(")");
-                }
-                if let Some((o, n)) = &q.to {
-                    b.push(" AND m.id IN (SELECT td.message_id FROM deliveries td JOIN seats ts ON ts.id = td.seat_id \
-                            JOIN orgs tor ON tor.id = ts.org_id WHERE tor.name = ")
-                        .push_bind(o.clone())
-                        .push(" AND ts.name = ")
-                        .push_bind(n.clone())
-                        .push(")");
-                }
-                b.push(" ORDER BY m.id DESC LIMIT ").push_bind(q.limit);
-                let rows: Vec<MsgRow> = b.build_query_as().fetch_all(&mut *c).await?;
-                collect(rows, MsgRow::into_message)
+                Ok(ArchivePage { messages: out, next_before_id: Some(before) })
             }
 
             pub async fn seat_seqs(c: &mut Conn, org_id: i64) -> Result<Vec<(i64, String, i64)>> {
@@ -1532,6 +1915,11 @@ macro_rules! impl_store_common {
             }
 
             pub async fn revoke_token(c: &mut Conn, org_id: i64, id: i64) -> Result<bool> {
+                sqlx::query("DELETE FROM web_sessions WHERE token_id = (SELECT id FROM tokens WHERE id = $1 AND org_id = $2)")
+                    .bind(id)
+                    .bind(org_id)
+                    .execute(&mut *c)
+                    .await?;
                 let n = sqlx::query(
                     "UPDATE tokens SET revoked_at = $1 WHERE org_id = $2 AND id = $3 AND revoked_at IS NULL",
                 )
@@ -1781,8 +2169,17 @@ macro_rules! impl_store_common {
                 .await?)
             }
 
-            /// Drop expired claim keys, watches and instances.
+            /// Drop expired claim keys, watches, instances and browser
+            /// sessions, and revoked tokens with their sessions.
             pub async fn cleanup(c: &mut Conn, now: i64) -> Result<()> {
+                sqlx::query("DELETE FROM web_sessions WHERE expires_at <= $1").bind(now).execute(&mut *c).await?;
+                sqlx::query("DELETE FROM operator_sessions WHERE expires_at <= $1").bind(now).execute(&mut *c).await?;
+                sqlx::query(
+                    "DELETE FROM web_sessions WHERE token_id IN (SELECT id FROM tokens WHERE revoked_at IS NOT NULL)",
+                )
+                .execute(&mut *c)
+                .await?;
+                sqlx::query("DELETE FROM tokens WHERE revoked_at IS NOT NULL").execute(&mut *c).await?;
                 sqlx::query("DELETE FROM claim_keys WHERE created_at < $1").bind(now - 600_000).execute(&mut *c).await?;
                 sqlx::query("DELETE FROM mirror_watch WHERE expires_at < $1").bind(now).execute(&mut *c).await?;
                 sqlx::query(
@@ -1794,6 +2191,48 @@ macro_rules! impl_store_common {
                 .await?;
                 sqlx::query("DELETE FROM server_instances WHERE heartbeat_at < $1").bind(now - 300_000).execute(&mut *c).await?;
                 Ok(())
+            }
+
+            /// The ids of `tokens` that are live, and the hashes of
+            /// `sessions` that are live (unexpired, with a live token).
+            pub async fn live_credentials(c: &mut Conn, tokens: &[i64], sessions: &[String], now: i64) -> Result<(Vec<i64>, Vec<String>)> {
+                let mut live_tokens = Vec::new();
+                for chunk in tokens.chunks(500) {
+                    let sql = format!(
+                        "SELECT id FROM tokens WHERE revoked_at IS NULL AND id IN ({})",
+                        placeholders(1, chunk.len())
+                    );
+                    let mut q = sqlx::query_scalar::<_, i64>(&sql);
+                    for id in chunk {
+                        q = q.bind(*id);
+                    }
+                    live_tokens.extend(q.fetch_all(&mut *c).await?);
+                }
+                let mut live_sessions = Vec::new();
+                for chunk in sessions.chunks(500) {
+                    let sql = format!(
+                        "SELECT w.hash FROM web_sessions w JOIN tokens t ON t.id = w.token_id \
+                         WHERE t.revoked_at IS NULL AND w.expires_at > $1 AND w.hash IN ({})",
+                        placeholders(2, chunk.len())
+                    );
+                    let mut q = sqlx::query_scalar::<_, String>(&sql).bind(now);
+                    for h in chunk {
+                        q = q.bind(h.clone());
+                    }
+                    live_sessions.extend(q.fetch_all(&mut *c).await?);
+                }
+                Ok((live_tokens, live_sessions))
+            }
+
+            pub async fn row_counts(c: &mut Conn) -> Result<RowCounts> {
+                let (tokens, revoked_tokens, web_sessions): (i64, i64, i64) = sqlx::query_as(
+                    "SELECT (SELECT COUNT(*) FROM tokens), \
+                     (SELECT COUNT(*) FROM tokens WHERE revoked_at IS NOT NULL), \
+                     (SELECT COUNT(*) FROM web_sessions)",
+                )
+                .fetch_one(&mut *c)
+                .await?;
+                Ok(RowCounts { tokens, revoked_tokens, web_sessions })
             }
 
             // --- attention ---------------------------------------------------
@@ -1902,6 +2341,453 @@ macro_rules! impl_store_common {
                     .into_iter()
                     .map(|(seat_id, org_id, name, parent_id)| Laggard { seat_id, org_id, name, parent_id })
                     .collect())
+            }
+
+            // --- public mode: invites, operator, org lifecycle, retention ----
+
+            pub async fn create_invite(c: &mut Conn, hash: &str, note: Option<&str>, expires_at: Option<i64>) -> Result<i64> {
+                Ok(sqlx::query_scalar(
+                    "INSERT INTO invites (hash, note, created_at, expires_at) VALUES ($1, $2, $3, $4) RETURNING id",
+                )
+                .bind(hash)
+                .bind(note)
+                .bind(now_ms())
+                .bind(expires_at)
+                .fetch_one(&mut *c)
+                .await?)
+            }
+
+            pub async fn invites(c: &mut Conn) -> Result<Vec<InviteRec>> {
+                #[allow(clippy::type_complexity)]
+                let rows: Vec<(i64, Option<String>, i64, Option<i64>, Option<i64>, Option<String>, Option<i64>)> =
+                    sqlx::query_as(
+                        "SELECT id, note, created_at, expires_at, used_at, used_by, revoked_at FROM invites ORDER BY id",
+                    )
+                    .fetch_all(&mut *c)
+                    .await?;
+                Ok(rows
+                    .into_iter()
+                    .map(|(id, note, created_at, expires_at, used_at, used_by, revoked_at)| InviteRec {
+                        id, note, created_at, expires_at, used_at, used_by, revoked_at,
+                    })
+                    .collect())
+            }
+
+            pub async fn revoke_invite(c: &mut Conn, id: i64) -> Result<bool> {
+                let n = sqlx::query(
+                    "UPDATE invites SET revoked_at = $1 WHERE id = $2 AND revoked_at IS NULL AND used_at IS NULL",
+                )
+                .bind(now_ms())
+                .bind(id)
+                .execute(&mut *c)
+                .await?
+                .rows_affected();
+                Ok(n > 0)
+            }
+
+            /// Use the invite and create the org with its user seat and user
+            /// token. The invite is taken by one conditional update, so two
+            /// registrations cannot both use it; if creating the org then
+            /// fails, the whole job (and the use) is rolled back.
+            pub async fn register(
+                c: &mut Conn,
+                invite_hash: &str,
+                org: &str,
+                user_seat: &str,
+                token_hash: &str,
+            ) -> Result<std::result::Result<(Org, Seat), InviteError>> {
+                let now = now_ms();
+                // The invite is checked first, so that without a valid one
+                // nobody learns which org names are taken.
+                let valid: Option<i64> = sqlx::query_scalar(
+                    "SELECT id FROM invites WHERE hash = $1 AND used_at IS NULL \
+                     AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > $2)",
+                )
+                .bind(invite_hash)
+                .bind(now)
+                .fetch_optional(&mut *c)
+                .await?;
+                if valid.is_none() {
+                    return Ok(Err(InviteError::Invalid));
+                }
+                if org_by_name(c, org).await?.is_some() {
+                    return Ok(Err(InviteError::OrgExists));
+                }
+                let used: Option<i64> = sqlx::query_scalar(
+                    "UPDATE invites SET used_at = $1, used_by = $2 WHERE hash = $3 AND used_at IS NULL \
+                     AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > $1) RETURNING id",
+                )
+                .bind(now)
+                .bind(org)
+                .bind(invite_hash)
+                .fetch_optional(&mut *c)
+                .await?;
+                if used.is_none() {
+                    return Ok(Err(InviteError::Invalid));
+                }
+                create_org(c, org, user_seat, token_hash).await.map(Ok)
+            }
+
+            pub async fn create_operator_token(c: &mut Conn, hash: &str, label: Option<&str>) -> Result<i64> {
+                Ok(sqlx::query_scalar(
+                    "INSERT INTO operator_tokens (hash, label, created_at) VALUES ($1, $2, $3) RETURNING id",
+                )
+                .bind(hash)
+                .bind(label)
+                .bind(now_ms())
+                .fetch_one(&mut *c)
+                .await?)
+            }
+
+            pub async fn operator_tokens(c: &mut Conn) -> Result<Vec<OperatorTokenRec>> {
+                let rows: Vec<(i64, Option<String>, i64)> = sqlx::query_as(
+                    "SELECT id, label, created_at FROM operator_tokens WHERE revoked_at IS NULL ORDER BY id",
+                )
+                .fetch_all(&mut *c)
+                .await?;
+                Ok(rows.into_iter().map(|(id, label, created_at)| OperatorTokenRec { id, label, created_at }).collect())
+            }
+
+            pub async fn revoke_operator_token(c: &mut Conn, id: i64) -> Result<bool> {
+                let n = sqlx::query("UPDATE operator_tokens SET revoked_at = $1 WHERE id = $2 AND revoked_at IS NULL")
+                    .bind(now_ms())
+                    .bind(id)
+                    .execute(&mut *c)
+                    .await?
+                    .rows_affected();
+                Ok(n > 0)
+            }
+
+            pub async fn operator_auth(c: &mut Conn, hash: &str) -> Result<Option<i64>> {
+                Ok(sqlx::query_scalar("SELECT id FROM operator_tokens WHERE hash = $1 AND revoked_at IS NULL")
+                    .bind(hash)
+                    .fetch_optional(&mut *c)
+                    .await?)
+            }
+
+            pub async fn operator_session_auth(c: &mut Conn, hash: &str, now: i64) -> Result<Option<i64>> {
+                Ok(sqlx::query_scalar(
+                    "SELECT t.id FROM operator_sessions w JOIN operator_tokens t ON t.id = w.token_id \
+                     WHERE w.hash = $1 AND w.expires_at > $2 AND t.revoked_at IS NULL",
+                )
+                .bind(hash)
+                .bind(now)
+                .fetch_optional(&mut *c)
+                .await?)
+            }
+
+            /// Like [`create_session`], for operator sessions.
+            pub async fn create_operator_session(c: &mut Conn, hash: &str, token_id: i64, expires_at: i64) -> Result<()> {
+                sqlx::query(
+                    "INSERT INTO operator_sessions (hash, token_id, created_at, expires_at) VALUES ($1, $2, $3, $4)",
+                )
+                .bind(hash)
+                .bind(token_id)
+                .bind(now_ms())
+                .bind(expires_at)
+                .execute(&mut *c)
+                .await?;
+                sqlx::query(
+                    "DELETE FROM operator_sessions WHERE token_id = $1 AND hash <> $3 AND hash NOT IN \
+                     (SELECT hash FROM operator_sessions WHERE token_id = $1 AND hash <> $3 ORDER BY created_at DESC, hash LIMIT $2)",
+                )
+                .bind(token_id)
+                .bind(amail_proto::limits::MAX_SESSIONS_PER_TOKEN - 1)
+                .bind(hash)
+                .execute(&mut *c)
+                .await?;
+                Ok(())
+            }
+
+            pub async fn delete_operator_session(c: &mut Conn, hash: &str) -> Result<bool> {
+                let n = sqlx::query("DELETE FROM operator_sessions WHERE hash = $1")
+                    .bind(hash)
+                    .execute(&mut *c)
+                    .await?
+                    .rows_affected();
+                Ok(n > 0)
+            }
+
+            pub async fn orgs(c: &mut Conn) -> Result<Vec<Org>> {
+                let rows: Vec<OrgRow> = sqlx::query_as("SELECT * FROM orgs WHERE deleted_at IS NULL ORDER BY name").fetch_all(&mut *c).await?;
+                Ok(rows.into_iter().map(Org::from).collect())
+            }
+
+            pub async fn set_org_suspended(c: &mut Conn, org_id: i64, at: Option<i64>) -> Result<bool> {
+                let n = sqlx::query("UPDATE orgs SET suspended_at = $1 WHERE id = $2")
+                    .bind(at)
+                    .bind(org_id)
+                    .execute(&mut *c)
+                    .await?
+                    .rows_affected();
+                Ok(n > 0)
+            }
+
+            /// Delete the org and everything it owns, in one transaction:
+            /// its seats, tokens and browser sessions, lists, links, its
+            /// deliveries (of any org's mail) and the mail it sent that no
+            /// other org received. External list members naming its seats
+            /// are removed.
+            ///
+            /// Mail it sent that other orgs received stays with them. The
+            /// org's row is then kept, marked deleted and renamed
+            /// `deleted:<id>` (so the name is free), with the seats that
+            /// sent such mail (deleted, with only their names); that mail
+            /// shows as from `name@<org> (deleted org)`, and the addresses
+            /// naming the org in the mail it sent or received are rewritten
+            /// the same way, so that a new org of that name is never taken
+            /// for the old one. Its acknowledgement reminders stop. Such
+            /// mail no longer counts against any org's storage.
+            pub async fn delete_org(c: &mut Conn, org_id: i64) -> Result<bool> {
+                let Some(org) = org_by_id(c, org_id).await? else {
+                    return Ok(false);
+                };
+                let now = now_ms();
+                sqlx::query(
+                    "DELETE FROM list_members WHERE seat_id IS NULL \
+                     AND substr(address, length(address) - length($1)) = '@' || $1",
+                )
+                .bind(&org.name)
+                .execute(&mut *c)
+                .await?;
+                // Addresses naming the org, in the mail it sent or received
+                // (the only mail that can name it).
+                let pattern = like_pattern(&format!("@{}", org.name));
+                let addrs: Vec<(i64, String, String)> = sqlx::query_as(
+                    "SELECT id, to_addrs, cc_addrs FROM messages \
+                     WHERE (org_id = $1 OR id IN (SELECT message_id FROM deliveries WHERE org_id = $1)) \
+                     AND (to_addrs LIKE $2 ESCAPE '\\' OR cc_addrs LIKE $2 ESCAPE '\\')",
+                )
+                .bind(org_id)
+                .bind(&pattern)
+                .fetch_all(&mut *c)
+                .await?;
+                let suffix = format!("@{}", org.name);
+                let mark = |list: &str| -> String {
+                    let v: Vec<String> = split_addrs(list)
+                        .into_iter()
+                        .map(|a| if a.ends_with(&suffix) { format!("{a} (deleted org)") } else { a })
+                        .collect();
+                    join_addrs(&v)
+                };
+                for (id, to, cc) in addrs {
+                    let (to2, cc2) = (mark(&to), mark(&cc));
+                    if to2 != to || cc2 != cc {
+                        sqlx::query("UPDATE messages SET to_addrs = $1, cc_addrs = $2 WHERE id = $3")
+                            .bind(to2)
+                            .bind(cc2)
+                            .bind(id)
+                            .execute(&mut *c)
+                            .await?;
+                    }
+                }
+                // After its deliveries are gone, the mail it sent that no
+                // other org received has no deliveries left.
+                let steps: [&str; 18] = [
+                    "DELETE FROM web_sessions WHERE token_id IN (SELECT id FROM tokens WHERE org_id = $1)",
+                    "DELETE FROM tokens WHERE org_id = $1",
+                    "DELETE FROM claim_keys WHERE seat_id IN (SELECT id FROM seats WHERE org_id = $1)",
+                    "DELETE FROM send_budget WHERE seat_id IN (SELECT id FROM seats WHERE org_id = $1)",
+                    "DELETE FROM presence WHERE org_id = $1",
+                    "DELETE FROM mirror_watch WHERE org_id = $1",
+                    "DELETE FROM node_streams WHERE org_id = $1",
+                    "UPDATE messages SET ack_due = NULL WHERE org_id = $1 AND ack_due IS NOT NULL",
+                    "DELETE FROM deliveries WHERE org_id = $1",
+                    "UPDATE messages SET parent_id = NULL WHERE parent_id IN (SELECT id FROM messages \
+                     WHERE org_id = $1 AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = messages.id))",
+                    "DELETE FROM messages WHERE org_id = $1 \
+                     AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = messages.id)",
+                    "DELETE FROM list_members WHERE org_id = $1",
+                    "DELETE FROM lists WHERE org_id = $1",
+                    "DELETE FROM links WHERE org_id = $1 OR peer_org_id = $1",
+                    "DELETE FROM link_requests WHERE org_id = $1",
+                    "UPDATE seats SET parent_id = NULL WHERE org_id = $1",
+                    "DELETE FROM seats WHERE org_id = $1 \
+                     AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.sender_seat_id = seats.id)",
+                    "UPDATE seats SET display_name = NULL, role = NULL, harness = NULL, model = NULL, \
+                     permission_mode = NULL, group_name = NULL, focus_until = NULL WHERE org_id = $1",
+                ];
+                for sql in steps {
+                    sqlx::query(sql).bind(org_id).execute(&mut *c).await?;
+                }
+                sqlx::query("UPDATE seats SET deleted_at = $1 WHERE org_id = $2 AND deleted_at IS NULL")
+                    .bind(now)
+                    .bind(org_id)
+                    .execute(&mut *c)
+                    .await?;
+                // Mail of orgs deleted earlier that only this org had kept.
+                const GONE: [&str; 4] = [
+                    "UPDATE messages SET parent_id = NULL WHERE parent_id IN (SELECT id FROM messages \
+                     WHERE org_id IN (SELECT id FROM orgs WHERE deleted_at IS NOT NULL) \
+                     AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = messages.id))",
+                    "DELETE FROM messages WHERE org_id IN (SELECT id FROM orgs WHERE deleted_at IS NOT NULL) \
+                     AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = messages.id)",
+                    "DELETE FROM seats WHERE org_id IN (SELECT id FROM orgs WHERE deleted_at IS NOT NULL) \
+                     AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.sender_seat_id = seats.id)",
+                    "DELETE FROM orgs WHERE deleted_at IS NOT NULL \
+                     AND NOT EXISTS (SELECT 1 FROM seats s WHERE s.org_id = orgs.id)",
+                ];
+                for sql in GONE {
+                    sqlx::query(sql).execute(&mut *c).await?;
+                }
+                let kept: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM messages WHERE org_id = $1)")
+                    .bind(org_id)
+                    .fetch_one(&mut *c)
+                    .await?;
+                if kept {
+                    sqlx::query(
+                        "UPDATE orgs SET deleted_at = $1, deleted_name = name, name = $2, \
+                         webhook_url = NULL, stored_bytes = 0 WHERE id = $3",
+                    )
+                    .bind(now)
+                    .bind(format!("deleted:{org_id}"))
+                    .bind(org_id)
+                    .execute(&mut *c)
+                    .await?;
+                } else {
+                    sqlx::query("DELETE FROM orgs WHERE id = $1").bind(org_id).execute(&mut *c).await?;
+                }
+                Ok(true)
+            }
+
+            /// Clear the bodies of up to `limit` messages created before
+            /// `cutoff` (oldest first); returns how many. The bytes of the
+            /// cleared bodies are subtracted from their orgs' stored bytes.
+            pub async fn expire_bodies(c: &mut Conn, cutoff: i64, limit: i64) -> Result<u64> {
+                // Marking the messages first returns each body's size once,
+                // also when another instance expires the same messages.
+                let now = now_ms();
+                let rows: Vec<(i64, i64, i64)> = sqlx::query_as(
+                    "UPDATE messages SET expired_at = $1 WHERE id IN (SELECT id FROM messages \
+                     WHERE created_at < $2 AND expired_at IS NULL ORDER BY created_at LIMIT $3) \
+                     AND expired_at IS NULL RETURNING id, org_id, CAST(octet_length(body) AS BIGINT)",
+                )
+                .bind(now)
+                .bind(cutoff)
+                .bind(limit)
+                .fetch_all(&mut *c)
+                .await?;
+                if rows.is_empty() {
+                    return Ok(0);
+                }
+                for chunk in rows.chunks(500) {
+                    let sql = format!(
+                        "UPDATE messages SET body = '' WHERE id IN ({})",
+                        placeholders(1, chunk.len())
+                    );
+                    let mut q = sqlx::query(&sql);
+                    for (id, ..) in chunk {
+                        q = q.bind(*id);
+                    }
+                    q.execute(&mut *c).await?;
+                }
+                let mut freed: std::collections::BTreeMap<i64, i64> = Default::default();
+                for (_, org, n) in &rows {
+                    *freed.entry(*org).or_default() += n;
+                }
+                for (org, n) in freed {
+                    sqlx::query("UPDATE orgs SET stored_bytes = stored_bytes - $1 WHERE id = $2")
+                        .bind(n)
+                        .bind(org)
+                        .execute(&mut *c)
+                        .await?;
+                }
+                Ok(rows.len() as u64)
+            }
+
+            pub async fn operator_stats(c: &mut Conn, now: i64) -> Result<OperatorStats> {
+                // A time as an id bound (with a margin, see `archive`), so the
+                // counts read the (org_id, id) index from there.
+                let first_id = |t: i64| {
+                    sqlx::query_scalar::<_, i64>(
+                        "SELECT id FROM messages WHERE created_at >= $1 ORDER BY created_at, id LIMIT 1",
+                    )
+                    .bind(t - ID_TIME_MARGIN_MS)
+                };
+                let hour = now - 3_600_000;
+                let day = now - 86_400_000;
+                let hour_lo = first_id(hour).fetch_optional(&mut *c).await?.unwrap_or(i64::MAX);
+                let day_lo = first_id(day).fetch_optional(&mut *c).await?.unwrap_or(i64::MAX);
+                #[allow(clippy::type_complexity)]
+                let rows: Vec<(i64, String, i64, Option<i64>, i64, i64, i64, i64, Option<i64>, i64)> = sqlx::query_as(
+                    "SELECT o.id, o.name, o.created_at, o.suspended_at, \
+                     (SELECT COUNT(*) FROM seats s WHERE s.org_id = o.id AND s.kind = 'agent' AND s.deleted_at IS NULL), \
+                     (SELECT COUNT(*) FROM messages m WHERE m.org_id = o.id), \
+                     (SELECT COUNT(*) FROM messages m WHERE m.org_id = o.id AND m.id >= $1 AND m.created_at >= $2), \
+                     (SELECT COUNT(*) FROM messages m WHERE m.org_id = o.id AND m.id >= $3 AND m.created_at >= $4), \
+                     (SELECT m.created_at FROM messages m WHERE m.org_id = o.id ORDER BY m.id DESC LIMIT 1), \
+                     o.stored_bytes \
+                     FROM orgs o WHERE o.deleted_at IS NULL",
+                )
+                .bind(hour_lo)
+                .bind(hour)
+                .bind(day_lo)
+                .bind(day)
+                .fetch_all(&mut *c)
+                .await?;
+                let mut orgs: Vec<OrgStat> = rows
+                    .into_iter()
+                    .map(|(id, name, created_at, suspended_at, seats, messages, messages_hour, messages_day, last_activity, stored_bytes)| OrgStat {
+                        id, name, created_at, suspended_at, seats, messages, messages_hour, messages_day, last_activity, stored_bytes,
+                    })
+                    .collect();
+                orgs.sort_by(|a, b| {
+                    (b.messages_hour, b.messages_day, b.seats)
+                        .cmp(&(a.messages_hour, a.messages_day, a.seats))
+                        .then_with(|| a.name.cmp(&b.name))
+                });
+                let messages_5min: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE created_at >= $1")
+                    .bind(now - 300_000)
+                    .fetch_one(&mut *c)
+                    .await?;
+                let node_streams = node_streams(c, "", now - 30_000).await?;
+                Ok(OperatorStats { orgs, messages_5min, node_streams })
+            }
+
+            /// Issue `new` (a user token of the org) and revoke `old`, whose
+            /// browser sessions end. Returns the new id.
+            pub async fn rotate_token(c: &mut Conn, org_id: i64, old: i64, new: &NewToken) -> Result<i64> {
+                let id: i64 = sqlx::query_scalar(
+                    "INSERT INTO tokens (org_id, scope, seat_id, hash, label, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+                )
+                .bind(new.org_id)
+                .bind(new.scope.as_str())
+                .bind(new.seat_id)
+                .bind(&new.hash)
+                .bind(&new.label)
+                .bind(now_ms())
+                .fetch_one(&mut *c)
+                .await?;
+                sqlx::query("DELETE FROM web_sessions WHERE token_id = $1")
+                    .bind(old)
+                    .execute(&mut *c)
+                    .await?;
+                if !revoke_token(c, org_id, old).await? {
+                    return Err(StoreError::NotFound(format!("token {old}")));
+                }
+                Ok(id)
+            }
+
+            /// Revoke every user token of the org (which ends their browser
+            /// sessions) and issue a new one.
+            pub async fn reset_user_tokens(c: &mut Conn, org_id: i64, hash: &str) -> Result<()> {
+                let user = user_seat(c, org_id)
+                    .await?
+                    .ok_or_else(|| StoreError::NotFound("user seat".into()))?;
+                sqlx::query("UPDATE tokens SET revoked_at = $1 WHERE org_id = $2 AND scope = 'user' AND revoked_at IS NULL")
+                    .bind(now_ms())
+                    .bind(org_id)
+                    .execute(&mut *c)
+                    .await?;
+                insert_token(c, &NewToken {
+                    org_id,
+                    scope: TokenScope::User,
+                    seat_id: Some(user.id),
+                    hash: hash.to_string(),
+                    label: Some("reset by the operator".into()),
+                })
+                .await
             }
 
             /// Entries (with bodies) whose mod_seq is in `(lo, hi]`, by seq.
@@ -2028,6 +2914,16 @@ macro_rules! impl_store_common {
                 run!(self.read, |c| q::links(c, org_id).await)
             }
 
+            async fn request_unknown_link(&self, org_id: i64, name: &str) -> $crate::Result<()> {
+                let name = name.to_string();
+                run!(self.write, |c| q::request_unknown_link(c, org_id, &name).await)
+            }
+
+            async fn revoke_unknown_link(&self, org_id: i64, name: &str) -> $crate::Result<bool> {
+                let name = name.to_string();
+                run!(self.write, |c| q::revoke_unknown_link(c, org_id, &name).await)
+            }
+
             async fn link_active(&self, org_id: i64, peer_id: i64) -> $crate::Result<bool> {
                 let s = run!(self.read, |c| q::link_state(c, org_id, peer_id).await)?;
                 Ok(s == Some(amail_proto::LinkState::Active))
@@ -2056,8 +2952,8 @@ macro_rules! impl_store_common {
                 run!(self.read, |c| q::delivery(c, message_id, seat_id).await)
             }
 
-            async fn thread(&self, thread_id: i64, org_id: i64) -> $crate::Result<Vec<$crate::MessageRec>> {
-                run!(self.read, |c| q::thread(c, thread_id, org_id).await)
+            async fn thread(&self, thread_id: i64, org_id: i64, limit: i64, body_bytes: usize) -> $crate::Result<Vec<$crate::ThreadMessage>> {
+                run!(self.read_query, |c| q::thread(c, thread_id, org_id, limit, body_bytes).await)
             }
 
             async fn inbox(&self, seat_id: i64, query: &$crate::InboxQuery) -> $crate::Result<Vec<$crate::Entry>> {
@@ -2110,9 +3006,9 @@ macro_rules! impl_store_common {
                 run!(self.read, |c| q::recipients(c, message_id).await)
             }
 
-            async fn archive(&self, org_id: i64, query: &$crate::ArchiveQuery) -> $crate::Result<Vec<$crate::MessageRec>> {
+            async fn archive(&self, org_id: i64, query: &$crate::ArchiveQuery) -> $crate::Result<$crate::ArchivePage> {
                 let query = query.clone();
-                run!(self.read, |c| q::archive(c, org_id, &query).await)
+                run!(self.read_query, |c| q::archive(c, org_id, &query).await)
             }
 
             async fn seat_seqs(&self, org_id: i64) -> $crate::Result<Vec<(i64, String, i64)>> {
@@ -2160,26 +3056,15 @@ macro_rules! impl_store_common {
             }
 
             async fn message_count(&self, org_id: i64, since: i64) -> $crate::Result<i64> {
-                run!(self.read, |c| q::message_count(c, org_id, since).await)
+                run!(self.read_query, |c| q::message_count(c, org_id, since).await)
             }
 
             async fn search(&self, org_id: i64, query: &$crate::SearchQuery) -> $crate::Result<$crate::SearchResult> {
-                if query.terms.is_empty() {
+                if query.terms.is_empty() || query.limit < 1 {
                     return Ok($crate::SearchResult::default());
                 }
-                let (scanned_to, exhausted) = match query.scan {
-                    Some(n) => {
-                        let before = query.before_id;
-                        let (count, oldest) = run!(self.read, |c| q::scan_window(c, org_id, before, n).await)?;
-                        (oldest, count < n)
-                    }
-                    None => (None, false),
-                };
-                if query.scan.is_some() && scanned_to.is_none() {
-                    return Ok($crate::SearchResult { messages: Vec::new(), scanned_to: None, scan_exhausted: true });
-                }
-                let messages = self.search_impl(org_id, query, scanned_to).await?;
-                Ok($crate::SearchResult { messages, scanned_to, scan_exhausted: exhausted })
+                let query = query.clone();
+                run!(self.read_query, |c| q::search(c, org_id, &query).await)
             }
 
             async fn presence(&self, org_id: i64, seat: Option<&str>) -> $crate::Result<Vec<$crate::PresenceRec>> {
@@ -2232,6 +3117,16 @@ macro_rules! impl_store_common {
                 run!(self.read, |c| q::mirror_watchers(c, org_id, &seat, now).await)
             }
 
+            async fn live_credentials(&self, tokens: &[i64], sessions: &[String]) -> $crate::Result<(Vec<i64>, Vec<String>)> {
+                let (tokens, sessions) = (tokens.to_vec(), sessions.to_vec());
+                let now = now_ms();
+                run!(self.read, |c| q::live_credentials(c, &tokens, &sessions, now).await)
+            }
+
+            async fn row_counts(&self) -> $crate::Result<$crate::RowCounts> {
+                run!(self.read, |c| q::row_counts(c).await)
+            }
+
             async fn cleanup(&self) -> $crate::Result<()> {
                 let now = now_ms();
                 run!(self.write, |c| q::cleanup(c, now).await)
@@ -2263,6 +3158,95 @@ macro_rules! impl_store_common {
 
             async fn laggards(&self, message_id: i64) -> $crate::Result<Vec<$crate::Laggard>> {
                 run!(self.read, |c| q::laggards(c, message_id).await)
+            }
+
+            async fn create_invite(&self, hash: &str, note: Option<&str>, expires_at: Option<i64>) -> $crate::Result<i64> {
+                let (hash, note) = (hash.to_string(), note.map(str::to_string));
+                run!(self.write, |c| q::create_invite(c, &hash, note.as_deref(), expires_at).await)
+            }
+
+            async fn invites(&self) -> $crate::Result<Vec<$crate::InviteRec>> {
+                run!(self.read, |c| q::invites(c).await)
+            }
+
+            async fn revoke_invite(&self, id: i64) -> $crate::Result<bool> {
+                run!(self.write, |c| q::revoke_invite(c, id).await)
+            }
+
+            async fn register(
+                &self,
+                invite_hash: &str,
+                org: &str,
+                user_seat: &str,
+                token_hash: &str,
+            ) -> $crate::Result<std::result::Result<($crate::Org, $crate::Seat), $crate::InviteError>> {
+                let (i, o, u, t) = (invite_hash.to_string(), org.to_string(), user_seat.to_string(), token_hash.to_string());
+                run!(self.write, |c| q::register(c, &i, &o, &u, &t).await)
+            }
+
+            async fn create_operator_token(&self, hash: &str, label: Option<&str>) -> $crate::Result<i64> {
+                let (hash, label) = (hash.to_string(), label.map(str::to_string));
+                run!(self.write, |c| q::create_operator_token(c, &hash, label.as_deref()).await)
+            }
+
+            async fn operator_tokens(&self) -> $crate::Result<Vec<$crate::OperatorTokenRec>> {
+                run!(self.read, |c| q::operator_tokens(c).await)
+            }
+
+            async fn revoke_operator_token(&self, id: i64) -> $crate::Result<bool> {
+                run!(self.write, |c| q::revoke_operator_token(c, id).await)
+            }
+
+            async fn operator_auth(&self, hash: &str) -> $crate::Result<Option<i64>> {
+                let hash = hash.to_string();
+                run!(self.read, |c| q::operator_auth(c, &hash).await)
+            }
+
+            async fn operator_session_auth(&self, hash: &str) -> $crate::Result<Option<i64>> {
+                let hash = hash.to_string();
+                let now = now_ms();
+                run!(self.read, |c| q::operator_session_auth(c, &hash, now).await)
+            }
+
+            async fn create_operator_session(&self, hash: &str, token_id: i64, expires_at: i64) -> $crate::Result<()> {
+                let hash = hash.to_string();
+                run!(self.write, |c| q::create_operator_session(c, &hash, token_id, expires_at).await)
+            }
+
+            async fn delete_operator_session(&self, hash: &str) -> $crate::Result<bool> {
+                let hash = hash.to_string();
+                run!(self.write, |c| q::delete_operator_session(c, &hash).await)
+            }
+
+            async fn orgs(&self) -> $crate::Result<Vec<$crate::Org>> {
+                run!(self.read, |c| q::orgs(c).await)
+            }
+
+            async fn set_org_suspended(&self, org_id: i64, at: Option<i64>) -> $crate::Result<bool> {
+                run!(self.write, |c| q::set_org_suspended(c, org_id, at).await)
+            }
+
+            async fn delete_org(&self, org_id: i64) -> $crate::Result<bool> {
+                run!(self.write, |c| q::delete_org(c, org_id).await)
+            }
+
+            async fn expire_bodies(&self, cutoff: i64, limit: i64) -> $crate::Result<u64> {
+                run!(self.write, |c| q::expire_bodies(c, cutoff, limit).await)
+            }
+
+            async fn operator_stats(&self) -> $crate::Result<$crate::OperatorStats> {
+                let now = now_ms();
+                run!(self.read, |c| q::operator_stats(c, now).await)
+            }
+
+            async fn rotate_token(&self, org_id: i64, old: i64, new: &$crate::NewToken) -> $crate::Result<i64> {
+                let new = new.clone();
+                run!(self.write, |c| q::rotate_token(c, org_id, old, &new).await)
+            }
+
+            async fn reset_user_tokens(&self, org_id: i64, hash: &str) -> $crate::Result<()> {
+                let hash = hash.to_string();
+                run!(self.write, |c| q::reset_user_tokens(c, org_id, &hash).await)
             }
         }
     };

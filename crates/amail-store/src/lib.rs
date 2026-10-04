@@ -41,12 +41,24 @@ pub enum StoreError {
     Commit(String),
     #[error("store is shut down")]
     Closed,
+    /// The message would take the org's stored bytes over its quota; the
+    /// value is what the org has stored.
+    #[error("storage quota exceeded ({0} bytes stored)")]
+    StorageQuota(i64),
+    /// The query ran longer than
+    /// [`amail_proto::limits::QUERY_TIMEOUT_MS`] and was cancelled.
+    #[error("query cancelled: it took too long")]
+    Timeout,
 }
 
 impl From<sqlx::Error> for StoreError {
     fn from(e: sqlx::Error) -> Self {
         match e.as_database_error() {
             Some(d) if d.is_unique_violation() => StoreError::Conflict(d.message().to_string()),
+            // Postgres `query_canceled` (statement_timeout).
+            Some(d) if d.code().as_deref() == Some("57014") => StoreError::Timeout,
+            // SQLite `SQLITE_INTERRUPT`: only the query time limit interrupts.
+            Some(d) if d.code().as_deref() == Some("9") => StoreError::Timeout,
             _ => StoreError::Db(e),
         }
     }
@@ -142,7 +154,14 @@ pub trait Store: Send + Sync + 'static {
     async fn accept_link(&self, org_id: i64, peer_id: i64) -> Result<()>;
     /// Remove the link in both directions. Returns false if there was none.
     async fn revoke_link(&self, org_id: i64, peer_id: i64) -> Result<bool>;
+    /// Links and pending requests, including requests to names that are
+    /// not an org (`peer_org_id` 0, state `requested`).
     async fn links(&self, org_id: i64) -> Result<Vec<Link>>;
+    /// Record a request to a name that is not an (active) org, so that it
+    /// is listed like any other request.
+    async fn request_unknown_link(&self, org_id: i64, name: &str) -> Result<()>;
+    /// Remove such a request. Returns false if there was none.
+    async fn revoke_unknown_link(&self, org_id: i64, name: &str) -> Result<bool>;
     async fn link_active(&self, org_id: i64, peer_id: i64) -> Result<bool>;
 
     // --- mail ----------------------------------------------------------------
@@ -157,8 +176,18 @@ pub trait Store: Send + Sync + 'static {
     /// True if the seat sent or received any message in the thread.
     async fn seat_in_thread(&self, seat_id: i64, thread_id: i64) -> Result<bool>;
     async fn delivery(&self, message_id: i64, seat_id: i64) -> Result<Option<DeliveryRec>>;
-    /// Messages of a thread visible to `org_id`, oldest first, with bodies.
-    async fn thread(&self, thread_id: i64, org_id: i64) -> Result<Vec<MessageRec>>;
+    /// Messages of a thread visible to `org_id`: the newest `limit`, oldest
+    /// first. Bodies are loaded newest first while their total stays within
+    /// `body_bytes`; the others are left out. Only the newest
+    /// [`amail_proto::limits::MAX_SCAN_MESSAGES`] messages of the thread
+    /// (of all orgs) are looked at.
+    async fn thread(
+        &self,
+        thread_id: i64,
+        org_id: i64,
+        limit: i64,
+        body_bytes: usize,
+    ) -> Result<Vec<ThreadMessage>>;
     async fn inbox(&self, seat_id: i64, q: &InboxQuery) -> Result<Vec<Entry>>;
     /// Mark the seat's delivery read. `None` if the seat has no delivery.
     async fn mark_read(
@@ -185,14 +214,16 @@ pub trait Store: Send + Sync + 'static {
     async fn changes(&self, seat_id: i64, since: i64, limit: i64) -> Result<Vec<Entry>>;
     /// All deliveries of a message, across orgs.
     async fn recipients(&self, message_id: i64) -> Result<Vec<DeliveryRec>>;
-    /// Messages visible to the org, newest first, without bodies.
-    async fn archive(&self, org_id: i64, q: &ArchiveQuery) -> Result<Vec<MessageRec>>;
+    /// Messages visible to the org, newest first, without bodies. The query
+    /// starts from the org's own messages (or one of its seats'), never from
+    /// the whole table.
+    async fn archive(&self, org_id: i64, q: &ArchiveQuery) -> Result<ArchivePage>;
     /// `(seat_id, name, last_seq)` of every live seat in the org.
     async fn seat_seqs(&self, org_id: i64) -> Result<Vec<(i64, String, i64)>>;
     /// Live (unrevoked) tokens of the org.
     async fn tokens(&self, org_id: i64) -> Result<Vec<TokenRec>>;
-    /// Revoke a token of the org. Returns false if there was no live token
-    /// with that id.
+    /// Revoke a token of the org and end its browser sessions. Returns
+    /// false if there was no live token with that id.
     async fn revoke_token(&self, org_id: i64, id: i64) -> Result<bool>;
     /// Pending-notification counts of every live seat of the org (or only
     /// `seat_id`), including seats with nothing pending.
@@ -203,7 +234,8 @@ pub trait Store: Send + Sync + 'static {
     /// The token behind a live (unexpired) browser session, if its token is
     /// still live.
     async fn session_auth(&self, hash: &str) -> Result<Option<TokenAuth>>;
-    /// Store a browser session (and drop expired ones).
+    /// Store a browser session; the token's oldest sessions beyond
+    /// `amail_proto::limits::MAX_SESSIONS_PER_TOKEN` end.
     async fn create_session(&self, hash: &str, token_id: i64, expires_at: i64) -> Result<()>;
     async fn delete_session(&self, hash: &str) -> Result<bool>;
     /// The org's user seat.
@@ -213,10 +245,11 @@ pub trait Store: Send + Sync + 'static {
     /// Deliveries to the user seat that wait for the user (see the server's
     /// `/v1/attention`), oldest first.
     async fn attention(&self, user_seat_id: i64, limit: i64) -> Result<Vec<Entry>>;
-    /// Messages visible to the org created at or after `since`.
+    /// Messages visible to the org created at or after `since`, counted up
+    /// to [`amail_proto::limits::MAX_SCAN_MESSAGES`].
     async fn message_count(&self, org_id: i64, since: i64) -> Result<i64>;
-    /// Full-text search over messages visible to the org, newest first, with
-    /// bodies.
+    /// Substring search over the most recent messages visible to the org
+    /// (`q.scan` of them before `q.before_id`), newest first.
     async fn search(&self, org_id: i64, q: &SearchQuery) -> Result<SearchResult>;
 
     // --- presence and server instances ------------------------------------
@@ -264,8 +297,18 @@ pub trait Store: Send + Sync + 'static {
         org_id: i64,
         seat: &str,
     ) -> Result<Vec<(String, Option<String>)>>;
-    /// Drop expired claim keys, watches and server instances.
+    /// Drop expired claim keys, watches, server instances and browser
+    /// sessions, and revoked tokens (with their sessions).
     async fn cleanup(&self) -> Result<()>;
+    /// Which of these token ids are live, and which of these browser
+    /// sessions (by hash) are live and belong to a live token.
+    async fn live_credentials(
+        &self,
+        tokens: &[i64],
+        sessions: &[String],
+    ) -> Result<(Vec<i64>, Vec<String>)>;
+    /// Row counts of some tables (tests and diagnostics).
+    async fn row_counts(&self) -> Result<RowCounts>;
 
     // --- attention -------------------------------------------------------------
 
@@ -289,4 +332,59 @@ pub trait Store: Send + Sync + 'static {
     /// Recipients that have not acknowledged the message (not the sender,
     /// not `archive` members).
     async fn laggards(&self, message_id: i64) -> Result<Vec<Laggard>>;
+
+    // --- public mode ----------------------------------------------------------
+
+    /// Store a registration invite (by the hash of its code).
+    async fn create_invite(
+        &self,
+        hash: &str,
+        note: Option<&str>,
+        expires_at: Option<i64>,
+    ) -> Result<i64>;
+    /// Every invite, oldest first.
+    async fn invites(&self) -> Result<Vec<InviteRec>>;
+    /// Revoke an unused invite; false if there was none.
+    async fn revoke_invite(&self, id: i64) -> Result<bool>;
+    /// Use the invite with this hash and create the org (see
+    /// [`Store::create_org`]), atomically: an invite is used at most once,
+    /// and only if the org could be created.
+    async fn register(
+        &self,
+        invite_hash: &str,
+        org: &str,
+        user_seat: &str,
+        token_hash: &str,
+    ) -> Result<std::result::Result<(Org, Seat), InviteError>>;
+    async fn create_operator_token(&self, hash: &str, label: Option<&str>) -> Result<i64>;
+    /// Live operator tokens.
+    async fn operator_tokens(&self) -> Result<Vec<OperatorTokenRec>>;
+    async fn revoke_operator_token(&self, id: i64) -> Result<bool>;
+    /// The id of the live operator token with this hash.
+    async fn operator_auth(&self, hash: &str) -> Result<Option<i64>>;
+    /// The operator token behind a live browser session.
+    async fn operator_session_auth(&self, hash: &str) -> Result<Option<i64>>;
+    async fn create_operator_session(
+        &self,
+        hash: &str,
+        token_id: i64,
+        expires_at: i64,
+    ) -> Result<()>;
+    async fn delete_operator_session(&self, hash: &str) -> Result<bool>;
+    /// Every org, by name.
+    async fn orgs(&self) -> Result<Vec<Org>>;
+    /// Suspend (`Some(time)`) or resume (`None`) an org; false if none.
+    async fn set_org_suspended(&self, org_id: i64, at: Option<i64>) -> Result<bool>;
+    /// Delete an org with all its data (see the backends); false if none.
+    async fn delete_org(&self, org_id: i64) -> Result<bool>;
+    /// Clear the bodies of up to `limit` messages created before `cutoff`;
+    /// returns how many were cleared.
+    async fn expire_bodies(&self, cutoff: i64, limit: i64) -> Result<u64>;
+    /// Load and activity per org, for the operator.
+    async fn operator_stats(&self) -> Result<OperatorStats>;
+    /// Replace a user token: issue `new`, revoke `old` and end its browser
+    /// sessions. Returns the new token's id.
+    async fn rotate_token(&self, org_id: i64, old: i64, new: &NewToken) -> Result<i64>;
+    /// Revoke all user tokens of the org and issue one with this hash.
+    async fn reset_user_tokens(&self, org_id: i64, hash: &str) -> Result<()>;
 }

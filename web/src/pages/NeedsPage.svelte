@@ -5,7 +5,7 @@
   import { attentionKey, isUrgent } from '../lib/attention';
   import { duration } from '../lib/time';
   import { typing, moveIndex } from '../lib/keys';
-  import { parseTime } from '../lib/presence';
+  import { parseTime, terminalHref } from '../lib/presence';
   import type { AttentionItem } from '../lib/types';
   import MessagePane from '../components/MessagePane.svelte';
   import StateBadge from '../components/StateBadge.svelte';
@@ -125,8 +125,8 @@
         <div class="row"><h2 class="mono">{current.seat}</h2>{#if current.state}<StateBadge state={current.state} />{/if}</div>
         <p class="error"><strong>⚠ {current.attention ? attnLabel(current.attention) : t('flag.wakeFailed')}</strong></p>
         {#if current.hint}<p>{current.hint}</p>{/if}
-        {#if seat?.presence?.terminal_url}
-          <p><a href={seat.presence.terminal_url} target="_blank" rel="noopener noreferrer">{t('seat.openTerminal')} ↗</a></p>
+        {#if terminalHref(seat?.presence?.terminal_url)}
+          <p><a href={terminalHref(seat?.presence?.terminal_url)} target="_blank" rel="noopener noreferrer">{t('seat.openTerminal')} ↗</a></p>
         {:else}
           <p class="muted">{t('seat.attachCmd')} <code>amail attach {current.seat}</code></p>
         {/if}

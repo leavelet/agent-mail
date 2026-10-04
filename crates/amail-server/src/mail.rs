@@ -5,6 +5,7 @@ use crate::AppState;
 use crate::auth::Auth;
 use crate::error::{ApiError, ApiResult, Json, Path, Query};
 use crate::render;
+use amail_proto::limits::{MAX_PAGE_BYTES, MAX_THREAD_BODY_BYTES, MAX_THREAD_MESSAGES};
 use amail_proto::{self as p, Address, Priority, TokenScope};
 use amail_store::{ArchiveQuery, ClaimFilter, InboxQuery, MessageRec, SeqBump};
 use axum::extract::State;
@@ -20,7 +21,7 @@ use tokio_stream::wrappers::BroadcastStream;
 /// in threads the seat takes part in.
 pub async fn can_read(st: &AppState, auth: &Auth, m: &MessageRec) -> ApiResult<bool> {
     match auth.scope {
-        TokenScope::Node => Ok(false),
+        TokenScope::Node | TokenScope::Operator => Ok(false),
         TokenScope::User => Ok(st.store.org_sees_message(auth.org.id, m.id).await?),
         TokenScope::Seat => {
             let seat = auth.mail_seat()?;
@@ -82,12 +83,16 @@ pub async fn inbox(
         limit: q.limit.unwrap_or(50).clamp(1, 1000),
     };
     let entries = st.store.inbox(seat.id, &query).await?;
+    let mut entries: Vec<p::InboxEntry> = entries
+        .iter()
+        .map(|e| render::entry(e, &auth.org))
+        .collect();
+    // Paging backwards, the entries next to `before_seq` (the end) stay.
+    let truncated = render::fit(&mut entries, MAX_PAGE_BYTES, query.before_seq.is_some());
     Ok(Json(p::InboxResponse {
         seat: seat.name,
-        entries: entries
-            .iter()
-            .map(|e| render::entry(e, &auth.org))
-            .collect(),
+        entries,
+        truncated,
     }))
 }
 
@@ -150,24 +155,99 @@ pub async fn status(
             "only the sender and the sender org's user can see delivery status",
         ));
     }
-    let recipients = st
-        .store
-        .recipients(id)
-        .await?
-        .iter()
-        .map(|d| {
-            let delivery = render::delivery(d, &auth.org);
-            p::RecipientStatus {
+    let rows = st.store.recipients(id).await?;
+    let mut recipients: Vec<p::RecipientStatus> = Vec::new();
+    for d in &rows {
+        let delivery = render::delivery(d, &auth.org);
+        let Some(group) = external_group(&m, &rows, d) else {
+            recipients.push(p::RecipientStatus {
                 address: delivery.seat.clone(),
                 state: p::delivery_state(&delivery).into(),
                 delivery,
+                members: None,
+            });
+            continue;
+        };
+        let i = match recipients
+            .iter()
+            .position(|r| r.members.is_some() && r.address == group)
+        {
+            Some(i) => i,
+            None => {
+                recipients.push(p::RecipientStatus {
+                    address: group.clone(),
+                    state: String::new(),
+                    delivery: p::Delivery {
+                        seat: group.clone(),
+                        seq: 0,
+                        mod_seq: 0,
+                        notified_via: None,
+                        ..delivery.clone()
+                    },
+                    members: Some(p::MemberCounts::default()),
+                });
+                recipients.len() - 1
             }
-        })
-        .collect();
+        };
+        let r = &mut recipients[i];
+        let c = r.members.as_mut().expect("group");
+        let first = c.seats == 0;
+        c.seats += 1;
+        c.notified += i64::from(delivery.notified_at.is_some());
+        c.read += i64::from(delivery.read_at.is_some());
+        c.acked += i64::from(delivery.acked_at.is_some());
+        // A time is shown only once every seat reached that state, and
+        // then it is the latest one.
+        let agg = |have: &mut Option<String>, new: &Option<String>| {
+            *have = match (first, have.take(), new) {
+                (true, _, n) => n.clone(),
+                (false, Some(a), Some(b)) => Some(a.max(b.clone())),
+                _ => None,
+            };
+        };
+        agg(&mut r.delivery.notified_at, &delivery.notified_at);
+        agg(&mut r.delivery.read_at, &delivery.read_at);
+        agg(&mut r.delivery.acked_at, &delivery.acked_at);
+    }
+    for r in &mut recipients {
+        if r.members.is_some() {
+            r.state = p::delivery_state(&r.delivery).into();
+        }
+    }
     Ok(Json(p::StatusResponse {
         message_id: id,
         recipients,
     }))
+}
+
+/// When a delivery reached a seat of another org through one of that org's
+/// lists, the list addresses it is counted under; `None` when the seat was
+/// named itself, is in the sender's org, or came through a list of the
+/// sender's org. Which seats stand behind another org's list, and when each
+/// of them read the mail, is that org's business.
+pub(crate) fn external_group(
+    m: &MessageRec,
+    all: &[amail_store::DeliveryRec],
+    d: &amail_store::DeliveryRec,
+) -> Option<String> {
+    if d.org_id == m.org_id {
+        return None;
+    }
+    let own = format!("{}@{}", d.seat_name, d.org_name);
+    let named = || m.to_addrs.iter().chain(&m.cc_addrs);
+    if named().any(|a| *a == own) {
+        return None;
+    }
+    let suffix = format!("@{}", d.org_name);
+    let lists: Vec<&str> = named()
+        .filter(|a| a.ends_with(&suffix))
+        .filter(|a| {
+            !all.iter()
+                .any(|x| x.org_id == d.org_id && format!("{}@{}", x.seat_name, x.org_name) == **a)
+        })
+        .map(String::as_str)
+        .collect();
+    (!lists.is_empty()).then(|| lists.join(", "))
 }
 
 pub async fn thread(
@@ -179,16 +259,57 @@ pub async fn thread(
     if auth.scope == TokenScope::Seat && !st.store.seat_in_thread(seat.id, id).await? {
         return Err(ApiError::not_found(format!("no thread {id}")));
     }
-    let messages = st.store.thread(id, auth.org.id).await?;
-    if messages.is_empty() {
+    let mut found = st
+        .store
+        .thread(
+            id,
+            auth.org.id,
+            MAX_THREAD_MESSAGES + 1,
+            MAX_THREAD_BODY_BYTES,
+        )
+        .await?;
+    if found.is_empty() {
         return Err(ApiError::not_found(format!("no thread {id}")));
+    }
+    let mut truncated = found.len() as i64 > MAX_THREAD_MESSAGES;
+    if truncated {
+        found.remove(0);
+    }
+    let mut messages: Vec<p::Message> = found
+        .into_iter()
+        .map(|t| {
+            let mut m = render::message(&t.message, &auth.org);
+            m.body_omitted = t.body_omitted;
+            m
+        })
+        .collect();
+    // Bodies, newest first, within MAX_THREAD_BODY_BYTES as JSON (the
+    // store kept their raw size within it); headers, newest first, within
+    // MAX_PAGE_BYTES.
+    let (mut bodies, mut headers) = (0usize, 0usize);
+    let mut keep = 0;
+    for m in messages.iter_mut().rev() {
+        if !m.body.is_empty() {
+            bodies += render::json_len(&m.body);
+            if bodies > MAX_THREAD_BODY_BYTES {
+                m.body = String::new();
+                m.body_omitted = true;
+            }
+        }
+        headers += render::json_len(&m.header) + 1;
+        if headers > MAX_PAGE_BYTES && keep > 0 {
+            break;
+        }
+        keep += 1;
+    }
+    if keep < messages.len() {
+        messages.drain(..messages.len() - keep);
+        truncated = true;
     }
     Ok(Json(p::ThreadResponse {
         thread_id: id,
-        messages: messages
-            .iter()
-            .map(|m| render::message(m, &auth.org))
-            .collect(),
+        truncated,
+        messages,
     }))
 }
 
@@ -214,13 +335,20 @@ pub async fn claim(
     {
         return Err(ApiError::bad_request("key must be 1..=100 characters"));
     }
+    // Claims load at most this much of each body (see the store).
+    let inline_max = req
+        .inline_body_max
+        .map(|m| (m as usize).min(p::limits::MAX_CLAIM_BODY_CHARS));
+    let preview_chars = req
+        .preview_chars
+        .map(|n| (n as usize).min(p::limits::MAX_CLAIM_BODY_CHARS));
     let filter = ClaimFilter {
         classes: req.classes,
         urgent_only: req.min_priority == Some(Priority::Urgent),
         include_digest: req.include_digest,
         via: req.via,
         limit: req.limit.unwrap_or(50).clamp(1, 500) as i64,
-        read_body_max: match req.inline_body_max {
+        read_body_max: match inline_max {
             Some(max) if req.mark_inlined_read && max > 0 => Some(max as i64),
             _ => None,
         },
@@ -229,7 +357,7 @@ pub async fn claim(
     };
     let (entries, bump) = st.store.claim(seat.id, &filter).await?;
     publish(&st, &seat.name, bump);
-    let max = req.inline_body_max.unwrap_or(0) as usize;
+    let max = inline_max.unwrap_or(0);
     let entries = entries
         .iter()
         .map(|e| {
@@ -237,8 +365,8 @@ pub async fn claim(
             if max > 0 && e.message.body.chars().count() <= max {
                 out.body = Some(e.message.body.clone());
             }
-            if let Some(n) = req.preview_chars {
-                out.preview = Some(render::preview(&e.message.body, n as usize));
+            if let Some(n) = preview_chars {
+                out.preview = Some(render::preview(&e.message.body, n));
             }
             out
         })
@@ -265,15 +393,18 @@ pub async fn changes(
     let since = q.since.unwrap_or(0);
     let limit = q.limit.unwrap_or(500).clamp(1, 5000);
     let entries = st.store.changes(seat.id, since, limit).await?;
+    let full = entries.len() as i64 == limit;
+    let mut entries: Vec<p::InboxEntry> = entries
+        .iter()
+        .map(|e| render::entry(e, &auth.org))
+        .collect();
+    let cut = render::fit(&mut entries, MAX_PAGE_BYTES, false);
     let next = entries.last().map(|e| e.delivery.mod_seq).unwrap_or(since);
     Ok(Json(p::ChangesResponse {
         seat: seat.name,
-        more: entries.len() as i64 == limit,
+        more: full || cut,
         next,
-        entries: entries
-            .iter()
-            .map(|e| render::entry(e, &auth.org))
-            .collect(),
+        entries,
     }))
 }
 
@@ -295,6 +426,15 @@ pub async fn events(
             None => None,
         },
     };
+    let guard = st.limiters.streams.open(auth.org.id).ok_or_else(|| {
+        ApiError::too_many(
+            "too_many_streams",
+            "this org has too many open event streams",
+            5000,
+        )
+    })?;
+    // The stream ends when its token (or browser session) is revoked.
+    let (cred, ended) = st.revocations.open(&auth);
     let last = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
@@ -388,7 +528,11 @@ pub async fn events(
     let stream = stream::select(mailbox, others)
         .take_while(|e| std::future::ready(e.is_some()))
         .filter_map(std::future::ready)
-        .map(Ok);
+        .take_until(ended)
+        .map(move |e| {
+            let _open = (&guard, &cred);
+            Ok(e)
+        });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 
@@ -452,14 +596,41 @@ pub async fn archive(
         before_id: q.before_id,
         limit,
     };
-    let msgs = st.store.archive(auth.org.id, &query).await?;
-    let next_before_id = if msgs.len() as i64 == limit {
-        msgs.last().map(|m| m.id)
+    let _slot = query_slot(&st, &auth)?;
+    let page = st.store.archive(auth.org.id, &query).await?;
+    Ok(Json(archive_response(page, &auth.org)))
+}
+
+/// An archive page as sent: within [`MAX_PAGE_BYTES`], continuing after
+/// the last message kept when it was cut.
+pub fn archive_response(
+    page: amail_store::ArchivePage,
+    org: &amail_store::Org,
+) -> p::ArchiveResponse {
+    let mut messages: Vec<p::MessageHeader> = page
+        .messages
+        .iter()
+        .map(|m| render::header(m, org))
+        .collect();
+    let next_before_id = if render::fit(&mut messages, MAX_PAGE_BYTES, false) {
+        messages.last().map(|m| m.id)
     } else {
-        None
+        page.next_before_id
     };
-    Ok(Json(p::ArchiveResponse {
-        messages: msgs.iter().map(|m| render::header(m, &auth.org)).collect(),
+    p::ArchiveResponse {
+        messages,
         next_before_id,
-    }))
+    }
+}
+
+/// One of the org's search or archive requests in flight; 429 when the org
+/// has as many as its limit.
+pub fn query_slot(st: &AppState, auth: &Auth) -> ApiResult<crate::limits::StreamGuard> {
+    st.limiters.queries.open(auth.org.id).ok_or_else(|| {
+        ApiError::too_many(
+            "too_many_queries",
+            "this org has too many search and archive requests in progress",
+            1000,
+        )
+    })
 }

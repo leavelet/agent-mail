@@ -4,13 +4,20 @@ pub mod attention;
 pub mod auth;
 pub mod cluster;
 pub mod commands;
+pub mod config;
 mod directory;
 pub mod error;
 pub mod events;
+pub mod limits;
 mod mail;
+pub mod netguard;
 mod nodes;
+mod operator;
+pub mod peer;
 pub mod presence;
+pub mod public;
 mod render;
+mod revoke;
 mod send;
 pub mod transcript;
 mod ui;
@@ -24,6 +31,7 @@ use std::sync::Arc;
 
 pub use auth::{hash_token, new_token};
 pub use events::{EventBus, Hub};
+pub use public::new_invite;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -41,6 +49,11 @@ pub struct AppState {
     /// Set when several instances share the database (Postgres).
     pub cluster: Option<Arc<cluster::Cluster>>,
     pub attention: attention::Config,
+    /// Public mode, limits, proxies, retention (see [`config`]).
+    pub config: Arc<config::Config>,
+    pub limiters: Arc<limits::Limiters>,
+    /// Open streams by credential, to end them on revocation.
+    pub revocations: Arc<revoke::Revocations>,
 }
 
 impl AppState {
@@ -53,15 +66,23 @@ impl AppState {
             nodes: Arc::new(commands::NodeHub::new()),
             mirror: Arc::new(transcript::MirrorHub::new()),
             mirror_config: transcript::MirrorConfig::default(),
-            http: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(5))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .expect("building the HTTP client"),
+            http: netguard::webhook_client(true, None),
             webhook_config: webhook::WebhookConfig::default(),
             cluster: None,
             attention: attention::Config::default(),
+            config: Arc::new(config::Config::default()),
+            limiters: Arc::new(limits::Limiters::new(&config::Limits::default())),
+            revocations: Arc::new(revoke::Revocations::default()),
         }
+    }
+
+    /// Apply server settings (public mode, limits, proxies, webhook
+    /// targets, retention); call before serving.
+    pub fn set_config(&mut self, cfg: config::Config) {
+        self.http = netguard::webhook_client(cfg.webhook_private_targets, None);
+        self.limiters = Arc::new(limits::Limiters::new(&cfg.limits));
+        self.mirror = Arc::new(transcript::MirrorHub::with_limit(cfg.limits.mirror_bytes));
+        self.config = Arc::new(cfg);
     }
 
     /// An instance of possibly several sharing one Postgres database at
@@ -76,6 +97,31 @@ impl AppState {
         });
         st.cluster = Some(c);
         st
+    }
+
+    /// A token was revoked: end its streams here and on the other
+    /// instances. (Every instance also checks the credentials of its open
+    /// streams at each sweep.)
+    pub(crate) fn token_revoked(&self, _org_id: i64, token_id: i64) {
+        self.credentials_ended(vec![token_id], Vec::new());
+    }
+
+    /// End the streams of these tokens and browser sessions (by hash) here
+    /// and on the other instances.
+    pub(crate) fn credentials_ended(&self, tokens: Vec<i64>, sessions: Vec<String>) {
+        self.revocations.end(
+            tokens
+                .iter()
+                .copied()
+                .map(revoke::Cred::Token)
+                .chain(sessions.iter().cloned().map(revoke::Cred::Session)),
+        );
+        if let Some(c) = &self.cluster {
+            c.notify(cluster::Wire::Ended {
+                k: tokens,
+                s: sessions,
+            });
+        }
     }
 
     /// Tell other instances that the presence of these seats changed.
@@ -97,12 +143,31 @@ pub fn start_background(state: &AppState) -> Vec<tokio::task::JoinHandle<()>> {
         tasks.extend(c.start(state));
     }
     tasks.push(tokio::spawn(attention::run(state.clone())));
+    tasks.push(tokio::spawn(public::sweep(state.clone())));
+    if state.config.retention_days.is_some() {
+        tasks.push(tokio::spawn(public::retention(state.clone())));
+    }
     tasks
 }
+
+/// Largest request body (the default of the HTTP framework, made explicit):
+/// a message body is at most 256 KB, a node's transcript batch is cut well
+/// below this.
+pub const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 
 pub fn router(state: AppState) -> Router {
     use directory as d;
     let v1 = Router::new()
+        .route("/info", get(public::info))
+        .route("/register", post(public::register))
+        .route("/tokens/rotate", post(public::rotate_token))
+        .route("/operator/stats", get(operator::stats))
+        .route("/operator/orgs/{name}/suspend", post(operator::suspend))
+        .route("/operator/orgs/{name}/resume", post(operator::resume))
+        .route(
+            "/operator/orgs/{name}",
+            axum::routing::delete(operator::delete_org),
+        )
         .route("/messages", post(mail::send))
         .route("/messages/{id}", get(mail::read))
         .route("/messages/{id}/ack", post(mail::ack))
@@ -130,8 +195,13 @@ pub fn router(state: AppState) -> Router {
         .route("/changes", get(mail::changes))
         .route("/events", get(mail::events))
         .route("/archive/messages", get(mail::archive))
-        .route("/whoami", get(d::whoami))
-        .route("/org", get(d::get_org).patch(d::patch_org))
+        .route("/whoami", get(public::whoami))
+        .route(
+            "/org",
+            get(d::get_org)
+                .patch(d::patch_org)
+                .delete(public::delete_own_org),
+        )
         .route("/tokens", get(d::list_tokens).post(d::org_token))
         .route("/tokens/{id}", axum::routing::delete(d::revoke_token))
         .route("/pending", get(nodes::pending))
@@ -165,7 +235,12 @@ pub fn router(state: AppState) -> Router {
         .nest("/v1", v1)
         .route("/healthz", get(|| async { "ok" }))
         .fallback(web::static_file)
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BYTES))
         .layer(axum::middleware::from_fn(web::headers))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            peer::layer,
+        ))
         .with_state(state)
 }
 
@@ -183,7 +258,8 @@ pub async fn serve(
     {
         tracing::warn!("cluster: not listening yet; serving anyway");
     }
-    let r = axum::serve(listener, router(state.clone()))
+    let app = router(state.clone()).into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let r = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown)
         .await;
     for t in tasks {

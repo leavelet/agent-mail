@@ -148,6 +148,7 @@ async fn launch(h: &Harness, seat: &str, cwd: &Path) -> Value {
             extra: vec![],
             pane: None,
             mux_session: None,
+            permission_mode: Some(amail_proto::PermissionMode::Unattended),
         })
         .await;
     assert!(plan.get("error").is_none(), "{plan}");
@@ -320,6 +321,10 @@ async fn dsh_host_wrapper(b: Backend) {
     let work = h.dir.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
     let work = work.canonicalize().unwrap();
+    // The node answers dsh hooks only from processes under the one it
+    // launched for the seat (here: this test process, whose children run
+    // the wrapper and the hooks).
+    launch(&h, "dw", &work).await;
     let home = h.dir.path().join("dsh-home");
     let fake = h.dir.path().join("fake-dsh");
     std::fs::write(
@@ -440,10 +445,17 @@ async fn dsh_host_wrapper(b: Backend) {
     std::fs::write(
         &jailed,
         format!(
-            "#!/bin/sh\ncat '{}' > '{}/read.txt' 2>&1\necho \"dsh web: {}/?token={TOKEN}\"\nexec sleep 30\n",
+            "#!/bin/sh\ncat '{}' > '{}/read.txt' 2>&1\n\
+             echo \"dsh web: {}/?token={TOKEN}\"\n\
+             while [ ! -f '{w}/go' ]; do sleep 0.1; done\n\
+             printf '%s' '{{\"hook_event_name\":\"Interrupt\",\"session_id\":\"session-old\",\"cwd\":\"{w}\"}}' \
+             | AMAIL_SEAT=dw '{bin}' hook dsh > '{w}/hook.txt' 2>&1\n\
+             exec sleep 30\n",
             secret.display(),
             work.display(),
-            host.url
+            host.url,
+            w = work.display(),
+            bin = BIN,
         ),
     )
     .unwrap();
@@ -453,6 +465,12 @@ async fn dsh_host_wrapper(b: Backend) {
         .arg(&endpoint)
         .args(["--jail", "--rw", work.to_str().unwrap(), "--ro"])
         .arg(jailed.parent().unwrap())
+        // The hook client and the node socket, as amail lists them for a
+        // seat.
+        .arg("--ro")
+        .arg(Path::new(BIN).parent().unwrap())
+        .arg("--ro")
+        .arg(h.sock.parent().unwrap())
         .args(["--resume", "session-old", "--", jailed.to_str().unwrap()])
         .current_dir(&work)
         .env("AMAIL_NODE_SOCK", &h.sock)
@@ -468,5 +486,15 @@ async fn dsh_host_wrapper(b: Backend) {
     let read = std::fs::read_to_string(work.join("read.txt")).unwrap();
     assert!(!read.contains("s3cret"), "{read}");
     assert!(read.contains("No such file"), "{read}");
+    // A hook run inside the jail (its own PID namespace) is identified as
+    // the seat's: the node follows its parents up to the launched process.
+    h.hook("dsh", env.clone(), dsh("UserPromptSubmit", "session-old"))
+        .await;
+    assert_eq!(h.state("dw").await, "busy");
+    std::fs::write(work.join("go"), "").unwrap();
+    h.wait("idle through the jailed hook", || async {
+        h.state("dw").await == "idle"
+    })
+    .await;
     child.kill().await.unwrap();
 }

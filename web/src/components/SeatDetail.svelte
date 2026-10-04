@@ -5,7 +5,7 @@
   import { t, ui } from '../lib/ui.svelte';
   import { href, go } from '../lib/router.svelte';
   import { get, qs, ApiError } from '../lib/api';
-  import { effectiveState, focusUntil, freshPresence, stateAge, nodeOpBlock } from '../lib/presence';
+  import { effectiveState, focusUntil, freshPresence, stateAge, nodeOpBlock, terminalHref } from '../lib/presence';
   import { duration, shortTime } from '../lib/time';
   import { fromEntry, fromHeader, newestFirst, type MailRow } from '../lib/mailrows';
   import type { ArchiveResponse, InboxResponse } from '../lib/types';
@@ -134,8 +134,8 @@
         {#if seat.group}<dt>{t('seat.group')}</dt><dd class="mono">{seat.group}</dd>{/if}
         <dt>{t('seat.terminal')}</dt>
         <dd>
-          {#if p?.terminal_url}
-            <a href={p.terminal_url} target="_blank" rel="noopener noreferrer">{t('seat.openTerminal')} ↗</a>
+          {#if terminalHref(p?.terminal_url)}
+            <a href={terminalHref(p?.terminal_url)} target="_blank" rel="noopener noreferrer">{t('seat.openTerminal')} ↗</a>
           {:else}
             <span class="faint">{t('seat.attachCmd')}</span>
             <code class="cmd">{attachCmd}</code>

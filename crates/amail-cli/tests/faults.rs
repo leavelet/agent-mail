@@ -158,6 +158,7 @@ impl Env {
                     mux_session: "amail-acme-main".into(),
                     tab: s.to_string(),
                     paste_fallback: false,
+                    permission_mode: None,
                 }
             })
             .collect();

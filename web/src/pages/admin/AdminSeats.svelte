@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { post, patch, del, enc } from '../../lib/api';
+  import { get, post, patch, del, enc } from '../../lib/api';
   import { store } from '../../lib/store.svelte';
   import { t } from '../../lib/ui.svelte';
   import { href } from '../../lib/router.svelte';
@@ -51,7 +51,16 @@
     });
   }
 
-  function startEdit(s: Seat) {
+  async function startEdit(s: Seat) {
+    // The seat list carries only the start of a long role.
+    if (s.role_truncated) {
+      try {
+        s = await get<Seat>(`/v1/seats/${enc(s.name)}`);
+      } catch (e) {
+        error = e instanceof Error ? e.message : String(e);
+        return;
+      }
+    }
     editing = s.name;
     edit = {
       name: s.name,

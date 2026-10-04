@@ -1,5 +1,6 @@
 //! The node's durable state: Codex session registrations, launch
-//! reservations, and the seat tokens handed out at launch.
+//! reservations, the seat tokens handed out at launch, and the session
+//! processes the node launched.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -44,6 +45,26 @@ pub struct Saved {
     /// (the server then returns what they took), by key.
     #[serde(default)]
     pub claim_retries: BTreeMap<String, ClaimRetry>,
+    /// Seat -> the process of its most recently launched session (the
+    /// `amail run` process, which becomes the harness). Requests on the node
+    /// socket are tied to a seat through it.
+    #[serde(default)]
+    pub roots: BTreeMap<String, SessionRoot>,
+    /// The value of `AMAIL_CODEX_PASS` that the node's Codex sessions (their
+    /// shared app-server, its hooks and tool commands) hold; see
+    /// [`crate::wire::CODEX_PASS_ENV`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_pass: Option<String>,
+}
+
+/// A session process the node launched (see [`Saved::roots`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRoot {
+    pub harness: String,
+    pub pid: u32,
+    /// The process start time, which guards against pid reuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_start: Option<u64>,
 }
 
 /// A claim to retry (see [`Saved::claim_retries`]).
@@ -62,6 +83,10 @@ pub struct TranscriptRef {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// The harness's transcript directory the path was accepted under
+    /// (checked again when the file is opened).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
 }
 
 /// A supervised seat: where it runs and what the supervisor knows about it.
@@ -106,6 +131,9 @@ pub struct Managed {
     /// Type the wake-up into the pane when native wake-ups fail (guarded).
     #[serde(default)]
     pub paste_fallback: bool,
+    /// The permission mode from the team file (see `SeatPlacement`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<amail_proto::PermissionMode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

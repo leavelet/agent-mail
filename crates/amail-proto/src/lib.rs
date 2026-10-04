@@ -7,6 +7,7 @@ use std::fmt;
 use std::str::FromStr;
 
 mod address;
+pub mod text;
 pub use address::{Address, AddressError, valid_name};
 
 /// Declares a string-valued enum with `as_str`, `FromStr`, `Display` and serde
@@ -100,7 +101,12 @@ string_enum!(
     PostPolicy { Anyone => "anyone", Members => "members", UserOnly => "user_only" }
 );
 
-string_enum!(TokenScope { User => "user", Seat => "seat", Node => "node" });
+string_enum!(
+    /// What a token may do. `operator` tokens belong to no org: they run a
+    /// public server (stats, suspending and deleting orgs) and never see
+    /// mail.
+    TokenScope { User => "user", Seat => "seat", Node => "node", Operator => "operator" }
+);
 
 string_enum!(
     /// How a seat's harness is launched with respect to permission prompts.
@@ -188,8 +194,12 @@ pub struct SendRequest {
 /// Structured message fields (`meta`): a small string map.
 pub type Meta = std::collections::BTreeMap<String, String>;
 
-/// Size limits enforced on every send (HTTP 422 when exceeded).
+/// The fixed bounds of the server and the node, in one place. The
+/// configurable limits (rates, counts per org, the storage quota) are in the
+/// server's `config::Limits`. Both are listed in `docs/security.md`.
 pub mod limits {
+    // --- one message (HTTP 422 when exceeded) ---
+
     /// Maximum subject length in characters.
     pub const MAX_SUBJECT_CHARS: usize = 300;
     /// Maximum body size in bytes.
@@ -200,6 +210,117 @@ pub mod limits {
     pub const MAX_META_KEYS: usize = 16;
     /// Maximum total size of `meta` keys and values in bytes.
     pub const MAX_META_BYTES: usize = 4096;
+
+    // --- other stored text, in characters (HTTP 400 when exceeded) ---
+
+    /// Token labels.
+    pub const MAX_LABEL_CHARS: usize = 200;
+    /// A seat's display name.
+    pub const MAX_DISPLAY_NAME_CHARS: usize = 200;
+    /// A seat's role (part of its agent's system prompt).
+    pub const MAX_ROLE_CHARS: usize = 16_000;
+    /// A seat's model name.
+    pub const MAX_MODEL_CHARS: usize = 200;
+    /// A seat's harness name.
+    pub const MAX_HARNESS_CHARS: usize = 64;
+    /// A list's description.
+    pub const MAX_DESCRIPTION_CHARS: usize = 1_000;
+    /// Presence: the `attention` tag.
+    pub const MAX_ATTENTION_CHARS: usize = 64;
+    /// Presence: the attention hint.
+    pub const MAX_HINT_CHARS: usize = 500;
+    /// URLs (webhook, terminal).
+    pub const MAX_URL_CHARS: usize = 2_000;
+    /// A node's label.
+    pub const MAX_NODE_LABEL_CHARS: usize = 200;
+
+    // --- responses ---
+
+    /// Upper bound of the bytes of message headers (and snippets) in one
+    /// answer of `/inbox`, `/changes`, `/archive/messages`, `/sent` and
+    /// `/archive/search`; a page that would be larger is cut and continues
+    /// with its cursor.
+    pub const MAX_PAGE_BYTES: usize = 2 * 1024 * 1024;
+    /// Upper bound of the message bodies in one answer of
+    /// `GET /threads/{id}`; older messages beyond it come without their
+    /// body (`body_omitted`), to be fetched one at a time.
+    pub const MAX_THREAD_BODY_BYTES: usize = 1024 * 1024;
+    /// The most messages `GET /threads/{id}` answers (the newest ones).
+    pub const MAX_THREAD_MESSAGES: i64 = 500;
+    /// Messages of the org one archive or search request looks at, newest
+    /// first, before it answers with what it found and a cursor
+    /// (`next_before_id`) to continue.
+    pub const MAX_SCAN_MESSAGES: i64 = 50_000;
+    /// Messages a search with a term shorter than three characters looks at.
+    pub const SHORT_TERM_SCAN_MESSAGES: i64 = 2_000;
+    /// Postgres cancels a search, archive or thread query that runs longer
+    /// than this (`statement_timeout`); the request fails with 503
+    /// `query_timeout`.
+    pub const QUERY_TIMEOUT_MS: u64 = 10_000;
+    /// Members of one list.
+    pub const MAX_LIST_MEMBERS: i64 = 1_000;
+    /// Characters of a seat's role in `GET /seats` (the list); longer roles
+    /// are cut there and marked `role_truncated`. `GET /seats/{name}` has
+    /// the whole role.
+    pub const LIST_ROLE_CHARS: usize = 1_000;
+
+    // --- what the node reads (so a server cannot exhaust its memory) ---
+
+    /// Largest response body the node reads from the server.
+    pub const NODE_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+    /// Longest line, and largest event, the node reads from the server's
+    /// event stream; a longer one ends the stream (the node reconnects).
+    pub const NODE_MAX_EVENT_BYTES: usize = 1024 * 1024;
+    /// Largest request (one line) the node reads from its socket. The hook
+    /// client forwards at most 32 MiB of hook input.
+    pub const NODE_MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+    /// Seats the node keeps state for without hosting them (their pending
+    /// counts, from the server); further names from the server are ignored.
+    pub const NODE_MAX_OTHER_SEATS: usize = 1_000;
+
+    /// The most body characters `POST /claim` works with per delivery:
+    /// `inline_body_max` and `preview_chars` are capped at it, and the
+    /// server loads no more of a body than that for a claim.
+    pub const MAX_CLAIM_BODY_CHARS: usize = 16_384;
+
+    // --- browser sessions ---
+
+    /// Browser sessions per token; signing in once more ends the oldest.
+    pub const MAX_SESSIONS_PER_TOKEN: i64 = 20;
+
+    // --- conversation mirror (server memory, per server instance) ---
+
+    /// Largest body of one transcript post (`POST /seats/{name}/transcript`,
+    /// HTTP 413 beyond). Nodes split their batches to fit.
+    pub const MAX_TRANSCRIPT_POST_BYTES: usize = 1024 * 1024;
+    /// Events in one transcript post (the newest are kept).
+    pub const MAX_TRANSCRIPT_POST_EVENTS: usize = 1000;
+    /// Characters of one transcript event's text (longer texts are cut).
+    pub const MAX_TRANSCRIPT_TEXT_CHARS: usize = 16_000;
+    /// Characters of each text field of a transcript status (longer ones
+    /// are cut).
+    pub const MAX_TRANSCRIPT_STATUS_CHARS: usize = 2_000;
+    /// Events of a watched seat kept for watchers that join later.
+    pub const MIRROR_REPLAY_EVENTS: usize = 1000;
+    /// Bytes of those events (the oldest go first).
+    pub const MIRROR_REPLAY_BYTES: usize = 4 * 1024 * 1024;
+    /// Bytes waiting to be sent to one watcher. A watcher that falls
+    /// further behind is disconnected; it reconnects and starts again from
+    /// the replay events.
+    pub const MIRROR_WATCHER_BYTES: usize = 8 * 1024 * 1024;
+    /// Bytes of one watched seat: its replay events plus what waits to be
+    /// sent to all its watchers. Beyond it, the watchers furthest behind
+    /// are disconnected.
+    pub const MIRROR_SEAT_BYTES: usize = 16 * 1024 * 1024;
+
+    /// Characters of `s`, or an error naming `field` and the limit.
+    pub fn check_chars(field: &str, s: &str, max: usize) -> Result<(), String> {
+        if s.chars().count() > max {
+            Err(format!("{field} is limited to {max} characters"))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -272,6 +393,9 @@ pub struct MessageHeader {
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Meta::is_empty")]
     pub meta: Meta,
+    /// The retention period cleared the body (the header is kept).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub expired: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,6 +403,10 @@ pub struct Message {
     #[serde(flatten)]
     pub header: MessageHeader,
     pub body: String,
+    /// `GET /threads/{id}`: the body was left out to keep the answer small
+    /// (`body` is empty); fetch it with `GET /messages/{id}`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub body_omitted: bool,
 }
 
 /// One delivery row: the state of one message in one seat's mailbox.
@@ -319,6 +447,11 @@ pub struct InboxEntry {
 pub struct InboxResponse {
     pub seat: String,
     pub entries: Vec<InboxEntry>,
+    /// The page was cut to stay within [`limits::MAX_PAGE_BYTES`]: more
+    /// entries follow. Continue after the last entry (`after_seq`), or,
+    /// when paging with `before_seq`, before the first.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -347,12 +480,30 @@ pub struct RecipientStatus {
     pub state: String,
     #[serde(flatten)]
     pub delivery: Delivery,
+    /// Set for the seats another org's list reached: they are counted
+    /// together under the list's address (`address`), without their names.
+    /// `state` and the times then describe the slowest of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub members: Option<MemberCounts>,
+}
+
+/// How many of the seats behind another org's list reached each state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberCounts {
+    pub seats: i64,
+    pub notified: i64,
+    pub read: i64,
+    pub acked: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadResponse {
     pub thread_id: i64,
     pub messages: Vec<Message>,
+    /// Older messages were left out (a thread answers at most its newest
+    /// 500 messages, and headers of at most [`limits::MAX_PAGE_BYTES`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -435,6 +586,10 @@ pub struct Seat {
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// `GET /seats` (the list): `role` holds only the first
+    /// [`limits::LIST_ROLE_CHARS`] characters; `GET /seats/{name}` has all.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub role_truncated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -612,6 +767,13 @@ pub struct OrgInfo {
     /// only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook_url: Option<String>,
+    /// Bytes of the mail the org sent that the server stores (subject, body
+    /// and meta of each message, counted once).
+    #[serde(default)]
+    pub stored_bytes: i64,
+    /// The server's limit on `stored_bytes`; absent when there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_quota_bytes: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -912,8 +1074,8 @@ pub struct SearchHit {
 }
 
 string_enum!(
-    /// How a search ran: through the full-text index, or as a bounded scan
-    /// of recent messages (some term shorter than three characters).
+    /// How a search ran. Servers now always answer `scan` (a bounded scan
+    /// of the org's recent messages); `index` is kept for older servers.
     SearchMode { Index => "index", Scan => "scan" }
 );
 
@@ -923,7 +1085,7 @@ pub struct SearchResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_before_id: Option<i64>,
     pub mode: SearchMode,
-    /// In `scan` mode: how many of the most recent messages one page scans.
+    /// How many of the org's most recent messages one request looks at.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_limit: Option<i64>,
 }
@@ -1048,4 +1210,80 @@ pub struct TranscriptPost {
 pub struct TranscriptPostResponse {
     /// Browsers currently watching the seat.
     pub subscribers: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Public mode: registration, server information, the operator
+
+/// Response of `GET /v1/info` (no authentication).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServerInfo {
+    pub version: String,
+    /// The server runs in public mode (`amail serve --public`).
+    pub public: bool,
+    /// `POST /v1/register` accepts invite codes.
+    pub registration: bool,
+    /// Message bodies older than this many days are cleared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_days: Option<u32>,
+}
+
+/// Body of `POST /v1/register`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterRequest {
+    pub invite: String,
+    pub org: String,
+    /// Name of the user seat (default `owner`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_name: Option<String>,
+}
+
+/// Response of `POST /v1/register`: the user token is shown only here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterResponse {
+    pub org: String,
+    pub user_seat: String,
+    pub token: String,
+}
+
+/// Body of `DELETE /v1/org` and of the operator's org deletion: the org's
+/// name, typed again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteOrgRequest {
+    pub confirm: String,
+}
+
+/// One org as the operator sees it (no mail content).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrgStatInfo {
+    pub name: String,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspended_at: Option<String>,
+    /// Live agent seats.
+    pub seats: i64,
+    /// Connected node event streams.
+    pub nodes: i64,
+    pub messages: i64,
+    pub messages_hour: i64,
+    pub messages_day: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity: Option<String>,
+    /// Bytes of the mail the org sent that the server stores.
+    #[serde(default)]
+    pub stored_bytes: i64,
+}
+
+/// Response of `GET /v1/operator/stats`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OperatorStatsResponse {
+    pub orgs: i64,
+    pub suspended: i64,
+    pub seats: i64,
+    pub nodes_online: i64,
+    /// Messages sent in the last five minutes, all orgs.
+    pub mail_last_5min: i64,
+    pub mail_last_hour: i64,
+    /// Busiest first.
+    pub list: Vec<OrgStatInfo>,
 }

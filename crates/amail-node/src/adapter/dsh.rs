@@ -74,6 +74,11 @@ impl Endpoint {
     }
 }
 
+/// The dsh home of a node with state directory `state_dir`.
+pub fn home_in(state_dir: &Path) -> PathBuf {
+    state_dir.join("dsh-home")
+}
+
 /// Read `NAME=value` lines (blank lines, `#` comments and a leading
 /// `export ` are allowed; one pair of surrounding quotes is removed).
 pub fn read_env_file(path: &Path) -> Result<BTreeMap<String, String>> {
@@ -301,7 +306,7 @@ impl Dsh {
 
     /// The dsh home all dsh seats of this node share.
     pub fn home(&self) -> PathBuf {
-        self.env.state_dir.join("dsh-home")
+        home_in(&self.env.state_dir)
     }
 
     fn run_dir(&self) -> PathBuf {
@@ -339,7 +344,7 @@ impl Dsh {
     pub fn jail_paths(&self, cwd: &str, seat: &str) -> (Vec<String>, Vec<String>) {
         let s = |p: PathBuf| p.to_string_lossy().into_owned();
         let mut rw = vec![cwd.to_string()];
-        rw.extend(super::git_dirs(cwd));
+        rw.extend(super::codex::git_dirs(cwd));
         rw.push(s(self.home()));
         let mut ro = Vec::new();
         ro.extend(self.env.amail_dir());
@@ -593,7 +598,7 @@ impl Adapter for Dsh {
             "--endpoint".into(),
             endpoint.to_string_lossy().into_owned(),
         ];
-        let unattended = info.permission_mode == Some(PermissionMode::Unattended);
+        let unattended = ctx.permission_mode == PermissionMode::Unattended;
         if unattended {
             // The whole host runs in a jail (see `crate::dsh_host`): dsh's
             // own sandbox limits writes only, and its file tools run inside
@@ -674,6 +679,7 @@ impl Adapter for Dsh {
             env,
             unset_env: vec!["DSH_PERMISSION_MODE".into()],
             path_prepend: self.env.amail_dir().into_iter().collect(),
+            notice: None,
         })
     }
 
@@ -698,6 +704,7 @@ mod tests {
             dsh_bin: "dsh".into(),
             dsh_env: BTreeMap::from([("DEEPSEEK_API_KEY".to_string(), "k".to_string())]),
             codex_auth: dir.join("auth.json"),
+            codex_pass: String::new(),
         })
     }
 

@@ -17,14 +17,19 @@
 //! When the server is unreachable every hook gets an empty answer; local
 //! state is kept and re-synchronized on reconnect. Live sessions, Codex
 //! registrations and undelivered mail are persisted in the state directory.
+//!
+//! Requests on the socket are checked against the process that sent them
+//! (see [`caller`]): a seat's hooks and credentials are served only to that
+//! seat's session, and requests for the person only to processes outside
+//! the sessions the node launched.
 
 use crate::adapter::{Adapter, AdapterEnv, Event, Harness, Hook, LaunchCtx, Output};
 use crate::persist::{self, LiveSession, Reservation, Saved, SessionReg};
 use crate::server::{ClaimSpec, ServerClient};
 use crate::wire::{Credentials, LaunchPlan, Request};
 use amail_proto::{
-    DeliveryClass, InboxEntry, MailboxEvent, PendingCounts, PresenceReport, PresenceUpdate,
-    Priority, SeatState,
+    DeliveryClass, InboxEntry, MailboxEvent, PendingCounts, PermissionMode, PresenceReport,
+    PresenceUpdate, Priority, SeatState,
 };
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -32,9 +37,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Notify, OnceCell};
 
+mod caller;
 mod mirror;
 mod supervise;
 
@@ -102,6 +108,15 @@ pub struct Config {
     pub web_terminal: Option<WebTerminal>,
     /// Use this digest interval instead of the org's (for tests).
     pub digest_every: Option<Duration>,
+    /// Check who sends each socket request (see [`caller`]). Only tests
+    /// that drive the socket from processes the node did not launch turn
+    /// this off.
+    pub check_callers: bool,
+    /// Claude Code's configuration directory as the node sees it
+    /// (`$CLAUDE_CONFIG_DIR`, else `~/.claude`). Claude Code transcripts are
+    /// followed only under its `projects` directory, or under that of the
+    /// directory the session was started with.
+    pub claude_config_dir: PathBuf,
 }
 
 /// The node's browser terminal: a `zellij web` server of its own (on its
@@ -152,6 +167,11 @@ impl Config {
             mirror_poll: Duration::from_millis(500),
             web_terminal: None,
             digest_every: None,
+            check_callers: true,
+            claude_config_dir: std::env::var_os("CLAUDE_CONFIG_DIR")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| crate::paths::home().join(".claude")),
         }
     }
 }
@@ -317,6 +337,26 @@ impl State {
             .or_insert_with(|| SeatRt::new(name))
     }
 
+    /// A seat named by the server: its entry, created only for a valid name
+    /// while the node keeps fewer than [`NODE_MAX_OTHER_SEATS`] seats it
+    /// does not host (so a server cannot make the node grow without bound).
+    ///
+    /// [`NODE_MAX_OTHER_SEATS`]: amail_proto::limits::NODE_MAX_OTHER_SEATS
+    fn server_seat(&mut self, name: &str) -> Option<&mut SeatRt> {
+        if !self.seats.contains_key(name) {
+            let others = self
+                .seats
+                .iter()
+                .filter(|(n, s)| s.harness.is_none() && !self.saved.managed.contains_key(*n))
+                .count();
+            if !amail_proto::valid_name(name) || others >= amail_proto::limits::NODE_MAX_OTHER_SEATS
+            {
+                return None;
+            }
+        }
+        Some(self.seat(name))
+    }
+
     /// Change a seat's state; returns true if it changed.
     fn set_state(&mut self, name: &str, s: SeatState) -> bool {
         let seat = self.seat(name);
@@ -477,6 +517,16 @@ fn claim_key() -> String {
     hex::encode(rand::random::<[u8; 12]>())
 }
 
+/// A model name the node passes to a harness: it cannot be read as an
+/// option, and has no spaces or control characters.
+fn valid_model(m: &str) -> bool {
+    !m.is_empty()
+        && m.len() <= 200
+        && !m.starts_with('-')
+        && m.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-:/@[]+".contains(c))
+}
+
 /// RFC 3339 to Unix ms.
 fn parse_ts(s: &str) -> Option<i64> {
     s.parse::<jiff::Timestamp>()
@@ -560,6 +610,7 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
         std::os::unix::fs::PermissionsExt::from_mode(0o700),
     )
     .with_context(|| format!("securing {}", sock_dir.display()))?;
+    crate::paths::check_socket_dir(sock_dir)?;
     if cfg.socket.exists() {
         if tokio::net::UnixStream::connect(&cfg.socket).await.is_ok() {
             bail!("a node is already listening on {}", cfg.socket.display());
@@ -569,6 +620,41 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
     let listener = tokio::net::UnixListener::bind(&cfg.socket)
         .with_context(|| format!("binding {}", cfg.socket.display()))?;
 
+    let state_file = cfg.state_dir.join("node-state.json");
+    let mut st = State {
+        saved: persist::load(&state_file),
+        ..Default::default()
+    };
+    let codex_pass = match &st.saved.codex_pass {
+        Some(p) => p.clone(),
+        None => {
+            let p = hex::encode(rand::random::<[u8; 32]>());
+            st.saved.codex_pass = Some(p.clone());
+            st.save_dirty = true;
+            p
+        }
+    };
+    // Transcripts recorded before paths were checked: keep those in the
+    // default transcript directories.
+    let defaults = [
+        cfg.claude_config_dir.join("projects"),
+        crate::adapter::codex::home_in(&cfg.state_dir).join("sessions"),
+    ];
+    st.saved.transcripts.retain(|_, t| {
+        if t.base.is_some() {
+            return true;
+        }
+        t.base = defaults
+            .iter()
+            .find(|b| crate::transcript::path_under(std::path::Path::new(&t.path), b))
+            .map(|b| b.to_string_lossy().into_owned());
+        st.save_dirty = true;
+        t.base.is_some()
+    });
+    // Sessions that ended while the node was down.
+    let before = st.saved.roots.len();
+    st.saved.roots.retain(|_, r| alive(r.pid, r.pid_start));
+    st.save_dirty |= st.saved.roots.len() != before;
     let env = AdapterEnv {
         state_dir: cfg.state_dir.clone(),
         amail_exe: cfg.amail_exe.clone(),
@@ -579,15 +665,11 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
         dsh_bin: cfg.dsh_bin.clone(),
         dsh_env: cfg.dsh_env.clone(),
         codex_auth: cfg.codex_auth.clone(),
+        codex_pass,
     };
     let claude: Arc<dyn Adapter> = Arc::new(crate::adapter::claude::Claude::new(env.clone()));
     let codex: Arc<dyn Adapter> = Arc::new(crate::adapter::codex::Codex::new(env.clone()));
     let dsh: Arc<dyn Adapter> = Arc::new(crate::adapter::dsh::Dsh::new(env));
-    let state_file = cfg.state_dir.join("node-state.json");
-    let mut st = State {
-        saved: persist::load(&state_file),
-        ..Default::default()
-    };
     // Live sessions survive restarts. One whose process (and wake target) is
     // still there is assumed idle: a wake-up that reaches a busy session is
     // harmless (it is handled after the current turn).
@@ -769,6 +851,21 @@ impl Node {
         self.wake_kick.notify_one();
     }
 
+    /// Keep claimed mail that did not fit in a hook's answer for the next
+    /// hook of the seat.
+    fn keep(&self, seat: &str, entries: Vec<InboxEntry>) {
+        let mut st = self.lock();
+        let s = st.seat(seat);
+        let mut all = entries;
+        all.append(&mut s.stash);
+        all.sort_by_key(|e| e.delivery.seq);
+        all.dedup_by_key(|e| e.message.id);
+        s.stash = all;
+        st.record_stash(seat);
+        drop(st);
+        self.wake_kick.notify_one();
+    }
+
     // --- socket ---------------------------------------------------------------
 
     async fn accept_loop(self: Arc<Self>, listener: tokio::net::UnixListener) {
@@ -787,22 +884,61 @@ impl Node {
     }
 
     async fn serve_conn(self: Arc<Self>, stream: tokio::net::UnixStream) {
+        // The connecting process, as the kernel reports it.
+        let peer = stream
+            .peer_cred()
+            .ok()
+            .map(|c| (c.pid().unwrap_or(0).max(0) as u32, c.uid()));
         let (r, mut w) = stream.into_split();
         let mut line = String::new();
-        let mut reader = BufReader::new(r);
+        let max = amail_proto::limits::NODE_MAX_REQUEST_BYTES;
+        let mut reader = BufReader::new(r).take(max as u64);
         let read = reader.read_line(&mut line);
         match tokio::time::timeout(Duration::from_secs(10), read).await {
             Ok(Ok(n)) if n > 0 => {}
             _ => return,
         }
+        if line.len() >= max && !line.ends_with('\n') {
+            let msg = format!("{{\"error\":\"request larger than {max} bytes\"}}\n");
+            let _ = w.write_all(msg.as_bytes()).await;
+            return;
+        }
         let started = Instant::now();
-        let resp = match serde_json::from_str::<Request>(&line) {
+        let req = serde_json::from_str::<Request>(&line);
+        let caller = match (&req, self.cfg.check_callers) {
+            (Ok(r), true) => match peer {
+                Some((pid, uid)) if pid > 0 && uid == crate::paths::uid() => {
+                    let for_person =
+                        !matches!(r, Request::Hook { .. } | Request::Credentials { .. });
+                    Some(self.caller(pid, for_person))
+                }
+                _ => {
+                    let _ = w
+                        .write_all(b"{\"error\":\"cannot identify the calling process\"}\n")
+                        .await;
+                    return;
+                }
+            },
+            _ => None,
+        };
+        let resp = match req {
             Ok(Request::Hook {
                 harness,
                 env,
                 input,
                 budget_ms,
             }) => {
+                if let Some(c) = &caller
+                    && !self.hook_allowed(c, &harness, &env)
+                {
+                    tracing::warn!(
+                        "refused a {harness} hook from process {}: not a session this node \
+                         launched for the seat it names",
+                        c.pid
+                    );
+                    let _ = w.write_all(b"{\"stdout\":\"\"}\n").await;
+                    return;
+                }
                 let deadline = budget_ms
                     .map(|b| started + Duration::from_millis(b).saturating_sub(LATE_MARGIN));
                 let out = self.hook_outcome(&harness, &env, &input, deadline).await;
@@ -825,7 +961,16 @@ impl Node {
                 }
                 return;
             }
-            Ok(req) => self.handle(req).await,
+            Ok(req) => match &caller {
+                None => self.handle(req).await,
+                Some(c) => match self.authorize(c, req) {
+                    Ok(req) => self.handle(req).await,
+                    Err(e) => {
+                        tracing::warn!("refused a request from process {}: {e}", c.pid);
+                        json!({"error": e})
+                    }
+                },
+            },
             Err(e) => json!({"error": format!("bad request: {e}")}),
         };
         let mut out = resp.to_string();
@@ -849,6 +994,7 @@ impl Node {
                 extra,
                 pane,
                 mux_session,
+                permission_mode,
             } => match self
                 .launch(
                     &seat,
@@ -858,13 +1004,14 @@ impl Node {
                     &extra,
                     pane,
                     mux_session,
+                    permission_mode,
                 )
                 .await
             {
                 Ok(plan) => serde_json::to_value(plan).unwrap_or_default(),
                 Err(e) => json!({"error": format!("{e:#}")}),
             },
-            Request::Credentials { codex_thread } => match self.credentials(&codex_thread) {
+            Request::Credentials { codex_thread, .. } => match self.credentials(&codex_thread) {
                 Some(c) => serde_json::to_value(c).unwrap_or_default(),
                 None => json!({"error": "no seat is registered for this thread"}),
             },
@@ -881,6 +1028,46 @@ impl Node {
             Request::Wake { seat } => self.sup_wake(&seat),
             Request::Ps => self.sup_ps(),
             Request::Locate { target } => self.sup_locate(&target),
+        }
+    }
+
+    /// Check a request (other than a hook) against its sender; returns the
+    /// request to serve, with a launch's pid set to the sender's.
+    fn authorize(&self, caller: &caller::Caller, req: Request) -> Result<Request, String> {
+        match req {
+            Request::Hook { .. } => Ok(req),
+            Request::Credentials { codex_thread, pass } => {
+                if caller.is_claude() || !self.codex_pass_ok(pass.as_deref()) {
+                    return Err("credentials are given only to the seat's own Codex session".into());
+                }
+                Ok(Request::Credentials { codex_thread, pass })
+            }
+            _ if caller.is_session() => Err(
+                "this request is for the person, not for agent sessions: run it outside \
+                 the sessions this node launched"
+                    .into(),
+            ),
+            Request::Launch {
+                seat,
+                cwd,
+                harness,
+                extra,
+                pane,
+                mux_session,
+                permission_mode,
+                ..
+            } => Ok(Request::Launch {
+                seat,
+                cwd,
+                // `amail run` becomes the harness: its process is the session.
+                pid: caller.pid,
+                harness,
+                extra,
+                pane,
+                mux_session,
+                permission_mode,
+            }),
+            req => Ok(req),
         }
     }
 
@@ -985,6 +1172,70 @@ impl Node {
         Some((seat, true))
     }
 
+    /// Directories where the harness writes `seat`'s transcripts: for
+    /// Codex the dedicated home's `sessions`; for dsh the node's dsh home's
+    /// `sessions`; for Claude Code `projects` of
+    /// the configuration directory the seat's session was started with
+    /// (from its environment) and of the node's.
+    fn transcript_bases(&self, h: Harness, seat: &str) -> Vec<PathBuf> {
+        match h {
+            Harness::Codex => {
+                vec![crate::adapter::codex::home_in(&self.cfg.state_dir).join("sessions")]
+            }
+            Harness::Dsh => {
+                vec![crate::adapter::dsh::home_in(&self.cfg.state_dir).join("sessions")]
+            }
+            Harness::Claude => {
+                let mut v = vec![self.cfg.claude_config_dir.join("projects")];
+                let root = self.lock().saved.roots.get(seat).cloned();
+                if let Some(r) = root.filter(|r| alive(r.pid, r.pid_start)) {
+                    let dir = caller::environ_var(r.pid, "CLAUDE_CONFIG_DIR")
+                        .filter(|d| !d.is_empty())
+                        .map(PathBuf::from)
+                        .or_else(|| {
+                            caller::environ_var(r.pid, "HOME")
+                                .map(|h| PathBuf::from(h).join(".claude"))
+                        });
+                    if let Some(d) = dir {
+                        v.push(d.join("projects"));
+                    }
+                }
+                v
+            }
+        }
+    }
+
+    /// `(path, base)` if a hook's transcript path lies in a directory where
+    /// the harness writes `seat`'s transcripts.
+    fn accept_transcript(&self, h: Harness, seat: &str, path: &str) -> Option<(String, String)> {
+        let known = self
+            .lock()
+            .saved
+            .transcripts
+            .get(seat)
+            .filter(|t| t.path == path && t.harness == h.as_str())
+            .and_then(|t| t.base.clone());
+        if let Some(base) = known {
+            return Some((path.to_string(), base));
+        }
+        let p = std::path::Path::new(path);
+        match self
+            .transcript_bases(h, seat)
+            .into_iter()
+            .find(|b| crate::transcript::path_under(p, b))
+        {
+            Some(b) => Some((path.to_string(), b.to_string_lossy().into_owned())),
+            None => {
+                tracing::warn!(
+                    "seat {seat}: ignoring transcript path {path:?}, which is outside the \
+                     directories where {} writes transcripts",
+                    h.as_str()
+                );
+                None
+            }
+        }
+    }
+
     /// Run the state machine for one hook; returns the answer and the
     /// claimed mail it shows.
     async fn run_hook(
@@ -998,6 +1249,10 @@ impl Node {
     ) -> (Output, Vec<InboxEntry>) {
         let hint = adapter.session_hint(env, hook);
         let cap = self.cfg.stop_block_cap;
+        let transcript = hook
+            .transcript_path
+            .as_deref()
+            .and_then(|p| self.accept_transcript(adapter.harness(), seat, p));
         // 1. State transition and plan, under the lock.
         let plan = {
             let mut st = self.lock();
@@ -1046,11 +1301,12 @@ impl Node {
                     sess.target = hint.wake_target.clone();
                 }
             }
-            if let Some(path) = &hook.transcript_path {
+            if let Some((path, base)) = transcript {
                 let r = crate::persist::TranscriptRef {
                     harness: adapter.harness().as_str().to_string(),
-                    path: path.clone(),
+                    path,
                     session_id: hook.session_id.clone(),
+                    base: Some(base),
                 };
                 if st.saved.transcripts.get(seat) != Some(&r) {
                     st.saved.transcripts.insert(seat.to_string(), r);
@@ -1137,9 +1393,11 @@ impl Node {
         }
 
         // 2. Server calls, without the lock, all within `deadline`.
-        let limit = adapter.claim_limit();
-        let via = format!("hook:{}", hook.name);
         let stashed = plan.stash.len();
+        // Kept mail counts against the claim limit: what one hook shows is
+        // bounded, and kept mail goes first.
+        let limit = adapter.claim_limit().saturating_sub(stashed as u32);
+        let via = format!("hook:{}", hook.name);
         let mut claimed: Vec<InboxEntry> = plan.stash;
         let mut digest: Vec<InboxEntry> = Vec::new();
         let mut failed = false;
@@ -1153,7 +1411,9 @@ impl Node {
             limit: if digest { DIGEST_LIMIT } else { limit },
         };
         let mut calls: Vec<ClaimSpec> = Vec::new();
-        if plan.claim_all {
+        if limit == 0 {
+            more = plan.claim_all || plan.claim_urgent_all || plan.claim_to || plan.claim_urgent;
+        } else if plan.claim_all {
             calls.push(spec(&[To, Cc, List], false, false));
         } else if plan.claim_urgent_all {
             calls.push(spec(&[To, Cc, List], true, false));
@@ -1249,9 +1509,19 @@ impl Node {
             }
         }
 
+        // Claimed mail is shown whole, as much as fits in the harness's limit
+        // (leaving room for the digest and the summary); the rest is kept and
+        // shown by the next hook. An entry is never cut, since mail with an
+        // inlined body is marked read by the claim.
         let mut text = String::new();
+        let mut kept = Vec::new();
         if !claimed.is_empty() {
-            text = crate::inject::new_mail(seat, &claimed, more);
+            let reserve =
+                if digest.is_empty() { 0 } else { 1000 } + if summary.is_empty() { 0 } else { 500 };
+            let budget = adapter.inject_budget().saturating_sub(reserve);
+            let (t, shown) = crate::inject::new_mail(seat, &claimed, more, budget);
+            text = t;
+            kept = claimed.split_off(shown);
         }
         if !digest.is_empty() {
             let rest = adapter.inject_budget().saturating_sub(text.len()).max(1000);
@@ -1274,6 +1544,9 @@ impl Node {
         } else {
             Output::Context(text)
         };
+        if !kept.is_empty() {
+            self.keep(seat, kept);
+        }
         claimed.extend(digest);
         (out, claimed)
     }
@@ -1368,10 +1641,38 @@ impl Node {
         extra: &[String],
         pane: Option<u32>,
         mux_session: Option<String>,
+        permission_mode: Option<PermissionMode>,
     ) -> Result<LaunchPlan> {
         let managed = self.lock().saved.managed.get(seat).cloned();
         let harness = harness.or(managed.as_ref().map(|m| m.harness.as_str()));
-        let info = self.server.launch(seat).await?;
+        let mut info = self.server.launch(seat).await?;
+        if info.seat != seat {
+            bail!("the server answered for seat {:?}, not {seat:?}", info.seat);
+        }
+        // The permission mode is decided on this machine: the `amail run`
+        // flag, else the team file of a supervised seat, else the harness's
+        // normal prompting. The server's value is only reported.
+        let mode = permission_mode
+            .or(managed.as_ref().and_then(|m| m.permission_mode))
+            .unwrap_or(PermissionMode::Default);
+        let notice = (info.permission_mode == Some(PermissionMode::Unattended)
+            && mode != PermissionMode::Unattended)
+            .then(|| {
+                format!(
+                    "seat {seat}: the server's seat settings say permission_mode \
+                     \"unattended\", but this machine did not choose it, so the \
+                     session keeps the harness's permission prompts. To run it \
+                     without prompts, set permission_mode in the team file and run \
+                     amail up, or use amail run --permission-mode unattended."
+                )
+            });
+        if let Some(n) = &notice {
+            tracing::warn!("{n}");
+        }
+        info.permission_mode = Some(mode);
+        if let Some(m) = info.model.take_if(|m| !valid_model(m)) {
+            tracing::warn!("seat {seat}: ignoring the server's model {m:?}");
+        }
         let name = harness
             .map(str::to_string)
             .or_else(|| info.harness.clone())
@@ -1396,7 +1697,10 @@ impl Node {
             st.saved.tokens.insert(seat.to_string(), info.token.clone());
             st.seat(seat).harness = Some(h);
             st.save_dirty = true;
+            // Its pending counts, in case the node did not keep them.
+            st.dirty_pending.insert(seat.to_string());
         }
+        self.refresh_kick.notify_one();
         // A supervised seat resumes its last session when it has one;
         // Claude Code sessions get their id up front.
         let resume = managed
@@ -1410,6 +1714,7 @@ impl Node {
             .adapter(h)
             .launch(&LaunchCtx {
                 info: &info,
+                permission_mode: mode,
                 cwd,
                 extra,
                 nonce: &nonce,
@@ -1418,6 +1723,21 @@ impl Node {
                 context_lost,
             })
             .await?;
+        {
+            // The process that asked becomes the session: requests from it
+            // and its child processes are tied to this seat.
+            let mut st = self.lock();
+            st.saved.roots.insert(
+                seat.to_string(),
+                persist::SessionRoot {
+                    harness: h.as_str().to_string(),
+                    pid,
+                    pid_start: proc_start(pid),
+                },
+            );
+            st.save_dirty = true;
+        }
+        let plan = LaunchPlan { notice, ..plan };
         if managed.is_some() {
             let lazy = self.adapter(h).resume_is_lazy();
             let mut st = self.lock();
@@ -1466,8 +1786,10 @@ impl Node {
                     "harness": s.harness.map(Harness::as_str),
                     "state": s.state,
                     "since": ts(s.since),
+                    // Without session ids or wake targets: they name a
+                    // session to the harness's own interfaces.
                     "session": s.session.as_ref().map(|x| json!({
-                        "id": x.id, "pid": x.pid.map(|p| p.0), "target": x.target,
+                        "pid": x.pid.map(|p| p.0),
                     })),
                     "pending": {"to": s.pending.to, "cc": s.pending.cc, "list": s.pending.list, "urgent": s.pending.urgent},
                     "stashed": s.stash.len(),
@@ -1514,7 +1836,9 @@ impl Node {
         }
         for c in resp.seats {
             let name = c.seat.clone();
-            let seat = st.seat(&name);
+            let Some(seat) = st.server_seat(&name) else {
+                continue;
+            };
             if c.seq < seat.pending.seq {
                 continue;
             }
@@ -1583,7 +1907,10 @@ impl Node {
                             continue;
                         };
                         let mut st = self.lock();
-                        if m.seq > st.seat(&m.seat).pending.seq {
+                        if st
+                            .server_seat(&m.seat)
+                            .is_some_and(|s| m.seq > s.pending.seq)
+                        {
                             st.dirty_pending.insert(m.seat);
                             self.refresh_kick.notify_one();
                         }
@@ -2041,6 +2368,7 @@ async fn web_terminal_loop(zellij: String, state_dir: PathBuf, port: u16) {
         // Stopped with the node: `kill_on_drop` when the task ends, and the
         // parent-death signal if the node process dies.
         // SAFETY: prctl is async-signal-safe and touches no memory.
+        #[cfg(target_os = "linux")]
         unsafe {
             c.pre_exec(|| {
                 libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
@@ -2073,7 +2401,7 @@ async fn web_terminal_loop(zellij: String, state_dir: PathBuf, port: u16) {
 /// Ask a running node (as `amail run` and the CLI do).
 pub fn request(socket: &std::path::Path, req: &Request, timeout: Duration) -> Result<Value> {
     use std::io::{BufRead, Write};
-    let mut s = std::os::unix::net::UnixStream::connect(socket).with_context(|| {
+    let mut s = crate::paths::connect_node(socket).with_context(|| {
         format!(
             "connecting to the amail node at {} (is `amail node` running?)",
             socket.display()

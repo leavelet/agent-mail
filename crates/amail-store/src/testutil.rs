@@ -83,6 +83,53 @@ pub async fn open(backend: Backend, test: &str) -> Option<TestDb> {
     })
 }
 
+impl TestDb {
+    /// Store `n` messages from seat `seat_id` of org `org_id` directly in
+    /// the database, each its own thread with subject `filler <i>` and the
+    /// given body, without deliveries (for tests that need much mail).
+    pub async fn fill_messages(&self, org_id: i64, seat_id: i64, n: i64, body: &str) {
+        let sql = "WITH RECURSIVE g(i) AS (SELECT CAST(1 AS BIGINT) UNION ALL SELECT i + 1 FROM g WHERE i < $3) \
+                   INSERT INTO messages (org_id, sender_seat_id, thread_id, parent_id, depth, subject, body, \
+                   lines, to_addrs, cc_addrs, priority, ack_required, created_at, meta) \
+                   SELECT $1, $2, 0, NULL, 0, 'filler ' || CAST(i AS TEXT), $4, 1, '', '', 'normal', FALSE, $5, '' FROM g";
+        let fix = "UPDATE messages SET thread_id = id WHERE thread_id = 0";
+        let now = crate::now_ms();
+        if self.url.starts_with("sqlite:") {
+            let mut c = sqlx::SqliteConnection::connect(&self.url)
+                .await
+                .expect("connect");
+            sqlx::query(sql)
+                .bind(org_id)
+                .bind(seat_id)
+                .bind(n)
+                .bind(body)
+                .bind(now)
+                .execute(&mut c)
+                .await
+                .expect("fill");
+            sqlx::query(fix).execute(&mut c).await.expect("fill");
+        } else {
+            let mut c = sqlx::PgConnection::connect(&self.url)
+                .await
+                .expect("connect");
+            sqlx::query(sql)
+                .bind(org_id)
+                .bind(seat_id)
+                .bind(n)
+                .bind(body)
+                .bind(now)
+                .execute(&mut c)
+                .await
+                .expect("fill");
+            sqlx::query(fix).execute(&mut c).await.expect("fill");
+            sqlx::query("ANALYZE messages")
+                .execute(&mut c)
+                .await
+                .expect("analyze");
+        }
+    }
+}
+
 /// Replace the database name in a Postgres URL.
 pub fn with_database(url: &str, db: &str) -> String {
     let (base, query) = match url.split_once('?') {

@@ -42,6 +42,28 @@ pub async fn send(st: &AppState, auth: &Auth, req: SendRequest) -> ApiResult<Sen
             "ack_timeout_s must be between 1 and 2592000 (30 days)",
         ));
     }
+    // Protective limits (public mode): all orgs, then this org.
+    if let Some(b) = &st.limiters.global_send
+        && let Err(ms) = b.take(&())
+    {
+        return Err(ApiError::too_many(
+            "server_busy",
+            "the server is at its message rate limit; retry shortly",
+            ms,
+        ));
+    }
+    if let Some(b) = &st.limiters.org_send
+        && let Err(ms) = b.take(&org.id)
+    {
+        if let Some(g) = &st.limiters.global_send {
+            g.refund(&());
+        }
+        return Err(ApiError::too_many(
+            "org_rate_limited",
+            "this org is at the server's per-org message rate limit; retry shortly",
+            ms,
+        ));
+    }
     let limited = sender.kind != SeatKind::User;
     if limited {
         st.store
@@ -206,8 +228,14 @@ async fn send_inner(
         meta: req.meta,
         deliveries,
         ack_due,
+        storage_quota: st.config.limits.org_storage_bytes,
     };
-    let sent = st.store.send(&msg).await?;
+    let sent = st.store.send(&msg).await.map_err(|e| match e {
+        amail_store::StoreError::StorageQuota(stored) => {
+            ApiError::storage_quota(stored, st.config.limits.org_storage_bytes)
+        }
+        e => e.into(),
+    })?;
 
     let mut by_org: HashMap<i64, Vec<(String, i64)>> = HashMap::new();
     for b in &sent.seqs {
@@ -326,7 +354,16 @@ async fn notify_users(
             message = st.store.message(sent.message_id).await.ok().flatten();
         }
         let Some(m) = &message else { return };
+        let Some(slot) = st.limiters.webhooks.open(org_id) else {
+            tracing::warn!(
+                "webhook of org {}: notice for message {} dropped, too many in flight",
+                target.name,
+                m.id
+            );
+            continue;
+        };
         crate::webhook::spawn(
+            slot,
             st.http.clone(),
             st.webhook_config.clone(),
             url,
@@ -336,6 +373,7 @@ async fn notify_users(
                 seat: user.name.clone(),
                 message: crate::render::header(m, target),
             },
+            st.config.webhook_private_targets,
         );
     }
 }
@@ -456,7 +494,13 @@ impl<'a> Resolver<'a> {
         if let Some(o) = self.orgs.get(name) {
             return Ok(o.clone());
         }
-        let o = self.st.store.org_by_name(name).await?;
+        // A suspended org cannot be reached (as if it did not exist).
+        let o = self
+            .st
+            .store
+            .org_by_name(name)
+            .await?
+            .filter(|o| o.suspended_at.is_none());
         self.orgs.insert(name.to_string(), o.clone());
         Ok(o)
     }

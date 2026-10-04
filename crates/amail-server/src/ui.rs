@@ -5,18 +5,17 @@ use crate::AppState;
 use crate::auth::Auth;
 use crate::error::{ApiError, ApiResult, Json, Path, Query};
 use crate::render;
+use amail_proto::limits::{MAX_PAGE_BYTES, MAX_SCAN_MESSAGES, SHORT_TERM_SCAN_MESSAGES};
 use amail_proto::{
     self as p, AttentionItem, AttentionKind, NodeCommand, Presence, Priority, SeatKind, SeatState,
     TokenScope,
 };
-use amail_store::{ArchiveQuery, SearchQuery};
+use amail_store::{ArchiveQuery, SearchHit, SearchQuery};
 use axum::extract::State;
 use axum::http::StatusCode;
 use serde::Deserialize;
 use std::collections::HashMap;
 
-/// Messages one scan-mode search page looks at.
-pub const SCAN_LIMIT: i64 = 2000;
 const MAX_TERMS: usize = 10;
 const ATTENTION_LIMIT: i64 = 500;
 
@@ -103,9 +102,9 @@ pub async fn attention(
     auth: Auth,
 ) -> ApiResult<Json<p::AttentionResponse>> {
     auth.require_user()?;
-    Ok(Json(p::AttentionResponse {
-        items: attention_items(&st, &auth).await?,
-    }))
+    let mut items = attention_items(&st, &auth).await?;
+    render::fit(&mut items, MAX_PAGE_BYTES, false);
+    Ok(Json(p::AttentionResponse { items }))
 }
 
 /// `GET /v1/overview`: seats per state and recent mail volume.
@@ -211,14 +210,8 @@ pub async fn sent(
         limit,
         ..Default::default()
     };
-    let msgs = st.store.archive(auth.org.id, &query).await?;
-    let next_before_id = (msgs.len() as i64 == limit)
-        .then(|| msgs.last().map(|m| m.id))
-        .flatten();
-    Ok(Json(p::ArchiveResponse {
-        messages: msgs.iter().map(|m| render::header(m, &auth.org)).collect(),
-        next_before_id,
-    }))
+    let page = st.store.archive(auth.org.id, &query).await?;
+    Ok(Json(crate::mail::archive_response(page, &auth.org)))
 }
 
 #[derive(Deserialize)]
@@ -229,7 +222,7 @@ pub struct SearchParams {
 }
 
 /// `GET /v1/archive/search`: substring search over subjects and bodies of
-/// the messages the org can see.
+/// the org's most recent messages (see [`SearchQuery::scan`]).
 pub async fn search(
     State(st): State<AppState>,
     auth: Auth,
@@ -245,75 +238,54 @@ pub async fn search(
             "at most {MAX_TERMS} terms of up to 200 characters"
         )));
     }
-    let scan = terms.iter().any(|t| t.chars().count() < 3);
+    let short = terms.iter().any(|t| t.chars().count() < 3);
+    let scan = if short {
+        SHORT_TERM_SCAN_MESSAGES
+    } else {
+        MAX_SCAN_MESSAGES
+    };
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
     let query = SearchQuery {
-        terms: terms.clone(),
+        terms,
         before_id: q.before_id,
         limit,
-        scan: scan.then_some(SCAN_LIMIT),
+        scan,
     };
+    let _slot = crate::mail::query_slot(&st, &auth)?;
     let r = st.store.search(auth.org.id, &query).await?;
-    let full = r.messages.len() as i64 == limit;
-    let next_before_id = if full {
-        r.messages.last().map(|m| m.id)
-    } else if scan && !r.scan_exhausted {
-        r.scanned_to
+    let mut messages: Vec<p::SearchHit> = r
+        .hits
+        .iter()
+        .map(|h| p::SearchHit {
+            header: render::header(&h.message, &auth.org),
+            snippet: snippet(h),
+        })
+        .collect();
+    let next_before_id = if render::fit(&mut messages, MAX_PAGE_BYTES, false) {
+        messages.last().map(|m| m.header.id)
     } else {
-        None
+        r.next_before_id
     };
     Ok(Json(p::SearchResponse {
-        messages: r
-            .messages
-            .iter()
-            .map(|m| p::SearchHit {
-                header: render::header(m, &auth.org),
-                snippet: snippet(&m.subject, &m.body, &terms),
-            })
-            .collect(),
+        messages,
         next_before_id,
-        mode: if scan {
-            p::SearchMode::Scan
-        } else {
-            p::SearchMode::Index
-        },
-        scan_limit: scan.then_some(SCAN_LIMIT),
+        mode: p::SearchMode::Scan,
+        scan_limit: Some(scan),
     }))
 }
 
-/// About 160 characters of `body` around the first match of any term
-/// (case-insensitive), on one line; the start of the body if only the
-/// subject matched.
-pub fn snippet(_subject: &str, body: &str, terms: &[String]) -> String {
-    let chars: Vec<char> = body.chars().collect();
-    let lower: Vec<char> = body.to_lowercase().chars().collect();
-    let mut at = None;
-    if lower.len() == chars.len() {
-        for t in terms {
-            let t: Vec<char> = t.to_lowercase().chars().collect();
-            if t.is_empty() || t.len() > lower.len() {
-                continue;
-            }
-            if let Some(i) = (0..=lower.len() - t.len()).find(|&i| lower[i..i + t.len()] == t[..]) {
-                at = Some(at.map_or(i, |a: usize| a.min(i)));
-            }
-        }
-    }
-    let start = at.map_or(0, |i| i.saturating_sub(40));
-    let end = (start + 160).min(chars.len());
-    let mut s: String = chars[start..end]
-        .iter()
-        .map(|&c| if c.is_whitespace() { ' ' } else { c })
-        .collect();
-    s = s
-        .split(' ')
+/// The excerpt of a hit on one line, with `…` where the body goes on.
+pub fn snippet(h: &SearchHit) -> String {
+    let mut s = h
+        .excerpt
+        .split(char::is_whitespace)
         .filter(|w| !w.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
-    if start > 0 {
+    if h.cut_before {
         s.insert(0, '…');
     }
-    if end < chars.len() {
+    if h.cut_after {
         s.push('…');
     }
     s
@@ -409,23 +381,4 @@ pub async fn wake(
     Path(name): Path<String>,
 ) -> ApiResult<(StatusCode, Json<p::SeatOpResponse>)> {
     seat_op(&st, &auth, &name, "wake").await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::snippet;
-
-    #[test]
-    fn snippets() {
-        let t = |s: &str| vec![s.to_string()];
-        assert_eq!(snippet("s", "hello world", &t("WORLD")), "hello world");
-        let long = format!("{}needle{}", "a ".repeat(100), " b".repeat(200));
-        let s = snippet("s", &long, &t("needle"));
-        assert!(s.starts_with('…') && s.ends_with('…') && s.contains("needle"));
-        assert_eq!(
-            snippet("s", "数据库\n迁移方案", &t("迁移")),
-            "数据库 迁移方案"
-        );
-        assert_eq!(snippet("subject only", "body", &t("subject")), "body");
-    }
 }

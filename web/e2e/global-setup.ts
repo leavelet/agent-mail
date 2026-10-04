@@ -160,15 +160,35 @@ async function setup(procs: ChildProcess[]): Promise<void> {
     body: '建议先迁移只读副本，再切换主库。迁移期间检索服务保持可用。',
   });
 
-  // A node that hosts be-1, whose transcript is a fixture file.
-  const transcript = path.join(dir, 'be-1-session.jsonl');
+  // A node that hosts be-1, whose transcript is a fixture file. Claude Code
+  // keeps transcripts under `<config dir>/projects/`, the only place the node
+  // follows them from.
+  const claudeDir = path.join(dir, 'claude-config');
+  fs.mkdirSync(path.join(claudeDir, 'projects', 'e2e'), { recursive: true });
+  const transcript = path.join(claudeDir, 'projects', 'e2e', 'be-1-session.jsonl');
   fs.writeFileSync(transcript, transcriptLines().join('\n') + '\n');
   let nodeOk = false;
   if (process.env.AMAIL_E2E_NODE !== '0') {
     const realNodeToken = (await call<{ token: string }>(base, userToken, 'POST', '/tokens', { scope: 'node', label: 'e2e node' })).token;
     const sock = path.join(dir, 'node.sock');
+    // Stand-in for claude/codex: never starts a model. Started by
+    // `amail run` as a session, it sends the hooks listed in $E2E_HOOKS (the
+    // node answers hooks only from the session of the seat they name) and
+    // then stays alive; anything else (version checks) exits at once.
     const fake = path.join(dir, 'fake-harness');
-    fs.writeFileSync(fake, '#!/bin/sh\n# Stand-in for claude/codex: never starts a model.\nexit 0\n', { mode: 0o755 });
+    fs.writeFileSync(
+      fake,
+      [
+        '#!/bin/sh',
+        '[ -n "$E2E_HOOKS" ] || exit 0',
+        'export CLAUDE_PID=$$',
+        'while IFS= read -r line; do printf \'%s\\n\' "$line" | "$E2E_AMAIL" hook claude >/dev/null 2>&1; done < "$E2E_HOOKS"',
+        ': > "$E2E_HOOKS.done"',
+        'exec sleep 3600',
+        '',
+      ].join('\n'),
+      { mode: 0o755 },
+    );
     const nodeLog = fs.openSync(path.join(dir, 'node.log'), 'a');
     const node = spawn(
       BIN,
@@ -177,14 +197,32 @@ async function setup(procs: ChildProcess[]): Promise<void> {
     );
     procs.push(node);
     await waitFor(async () => fs.existsSync(sock), 'amail node socket');
-    // A stand-in process plays the session (its pid keeps the seat alive).
-    const session = spawn('sleep', ['3600'], { stdio: 'ignore' });
+    const hookInput = (o: Record<string, unknown>) => JSON.stringify({ session_id: 'e2e-session', transcript_path: transcript, cwd: dir, ...o });
+    const hooks = path.join(dir, 'be-1-hooks.jsonl');
+    fs.writeFileSync(
+      hooks,
+      [
+        hookInput({ hook_event_name: 'SessionStart', source: 'startup', model: 'sonnet' }),
+        hookInput({ hook_event_name: 'UserPromptSubmit', prompt: '[amail] You have new mail (wake #1).', prompt_id: 'p1', permission_mode: 'bypassPermissions' }),
+        '',
+      ].join('\n'),
+    );
+    // The session: `amail run` asks the node for the launch plan and becomes
+    // the stand-in harness (its pid keeps the seat alive).
+    const session = spawn(BIN, ['run', 'be-1', '--harness', 'claude'], {
+      cwd: dir,
+      env: env({
+        AMAIL_NODE_SOCK: sock,
+        CLAUDE_CONFIG_DIR: claudeDir,
+        CLAUDE_CODE_MESSAGING_SOCKET: path.join(dir, 'no-inbox.sock'),
+        AMAIL_HOOK_TIMEOUT_MS: '5000',
+        E2E_HOOKS: hooks,
+        E2E_AMAIL: BIN,
+      }),
+      stdio: ['ignore', nodeLog, nodeLog],
+    });
     procs.push(session);
-    const hookEnv = { AMAIL_NODE_SOCK: sock, AMAIL_SEAT: 'be-1', CLAUDE_PID: String(session.pid), CLAUDE_CODE_MESSAGING_SOCKET: path.join(dir, 'no-inbox.sock'), AMAIL_HOOK_TIMEOUT_MS: '5000' };
-    const hook = (o: Record<string, unknown>) =>
-      run(['hook', 'claude'], hookEnv, JSON.stringify({ session_id: 'e2e-session', transcript_path: transcript, cwd: dir, ...o }));
-    hook({ hook_event_name: 'SessionStart', source: 'startup', model: 'sonnet' });
-    hook({ hook_event_name: 'UserPromptSubmit', prompt: '[amail] You have new mail (wake #1).', prompt_id: 'p1', permission_mode: 'bypassPermissions' });
+    await waitFor(async () => fs.existsSync(hooks + '.done'), 'the stand-in session to send its hooks');
     nodeOk = true;
   }
 
@@ -193,7 +231,7 @@ async function setup(procs: ChildProcess[]): Promise<void> {
   const big: { name: string; parent?: string; harness: string; model: string; group?: string }[] = [{ name: 'chief', harness: 'claude', model: 'sonnet' }];
   for (let g = 0; g < 37; g++) {
     const lead = `team${String(g).padStart(2, '0')}-lead`;
-    big.push({ name: lead, parent: 'chief', harness: g % 3 ? 'claude' : 'codex', model: g % 3 ? 'sonnet' : 'gpt-6.1-sol', group: `team${g}` });
+    big.push({ name: lead, parent: 'chief', harness: g % 3 ? 'claude' : 'codex', model: g % 3 ? 'sonnet' : 'codex-model', group: `team${g}` });
     for (let w = 1; w <= 26; w++) big.push({ name: `team${String(g).padStart(2, '0')}-w${w}`, parent: lead, harness: 'claude', model: 'sonnet', group: `team${g}` });
   }
   // Parents first: the chief, then the leads, then the workers in parallel batches.
@@ -203,6 +241,21 @@ async function setup(procs: ChildProcess[]): Promise<void> {
       await Promise.all(level.slice(i, i + chunk).map((x) => call(base, bigToken, 'POST', '/seats', x)));
     }
   }
+
+  // A second server in public mode (registration, operator view). Reached
+  // as localhost so that the browser keeps its always-Secure cookie.
+  const pubDb = `sqlite://${path.join(dir, 'public.db')}`;
+  const invites = (JSON.parse(run(['--json', 'admin', 'invite', 'create', '--count', '4', '--note', 'e2e', '--db', pubDb])) as { invites: { code: string }[] }).invites.map((i) => i.code);
+  const opToken = (JSON.parse(run(['--json', 'admin', 'operator-token', 'create', '--label', 'e2e', '--db', pubDb])) as { token: string }).token;
+  const pubPort = await freePort();
+  const pubBase = `http://localhost:${pubPort}`;
+  const pubLog = fs.openSync(path.join(dir, 'serve-public.log'), 'a');
+  const pub = spawn(BIN, ['serve', '--public', '--db', pubDb, '--listen', `127.0.0.1:${pubPort}`, '--retention-days', '90'], {
+    env: env({ RUST_LOG: process.env.RUST_LOG ?? 'info' }),
+    stdio: ['ignore', pubLog, pubLog],
+  });
+  procs.push(pub);
+  await waitFor(async () => (await fetch(`http://127.0.0.1:${pubPort}/healthz`)).ok, 'amail serve --public');
 
   const st: E2eState = {
     base,
@@ -214,6 +267,7 @@ async function setup(procs: ChildProcess[]): Promise<void> {
     transcript,
     node: nodeOk,
     big: { org: 'scale', userToken: bigToken, nodeToken: bigNode },
+    pub: { base: pubBase, invites, opToken, db: pubDb },
     pids: procs.map((p) => p.pid!).filter(Boolean),
   };
   fs.writeFileSync(STATE_FILE, JSON.stringify(st, null, 2));

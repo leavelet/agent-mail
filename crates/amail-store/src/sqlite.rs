@@ -7,7 +7,7 @@
 //! others) and commits once. Concurrent sends are thereby merged into one
 //! commit, and per-seat sequence numbers are trivially serialized.
 
-use crate::common::{join_addrs, like_pattern, line_count, meta_to_db};
+use crate::common::{join_addrs, line_count, meta_to_db};
 use crate::model::*;
 use crate::{OpenOptions, Result, StoreError, now_ms};
 use futures::future::BoxFuture;
@@ -72,6 +72,14 @@ impl SqliteStore {
         writer
             .execute("CREATE TEMP TABLE claim_ids (ord INTEGER PRIMARY KEY, id INTEGER NOT NULL)")
             .await?;
+        // `SEND_SQL` stops at its first statement, with a CHECK violation,
+        // when the message does not fit in the org's storage quota.
+        writer
+            .execute(
+                "CREATE TEMP TABLE send_quota (fits BOOLEAN CHECK (fits)); \
+                 INSERT INTO temp.send_quota VALUES (TRUE)",
+            )
+            .await?;
         let read = SqlitePoolOptions::new()
             .max_connections(opts.max_connections.max(1))
             .test_before_acquire(false)
@@ -102,6 +110,24 @@ impl SqliteStore {
     {
         let mut c = self.read.acquire().await?;
         f(&mut c).await
+    }
+
+    /// A read whose cost depends on the data (search, archive, threads):
+    /// interrupted after [`amail_proto::limits::QUERY_TIMEOUT_MS`].
+    async fn read_query<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: for<'c> FnOnce(&'c mut SqliteConnection) -> BoxFuture<'c, Result<T>> + Send + 'static,
+    {
+        let mut c = self.read.acquire().await?;
+        let deadline = std::time::Instant::now()
+            + Duration::from_millis(amail_proto::limits::QUERY_TIMEOUT_MS);
+        c.lock_handle()
+            .await?
+            .set_progress_handler(10_000, move || std::time::Instant::now() < deadline);
+        let out = f(&mut c).await;
+        c.lock_handle().await?.remove_progress_handler();
+        out
     }
 
     async fn write<T, F>(&self, f: F) -> Result<T>
@@ -139,10 +165,12 @@ impl SqliteStore {
         );
         let m = m.clone();
         let now = now_ms();
+        let meta = meta_to_db(&m.meta);
+        let bytes = message_bytes(&m.subject, &m.body, &meta);
         let rows: Vec<(i64, i64, i64, i64, i64)> = self
             .write(move |c| {
                 Box::pin(async move {
-                    Ok(sqlx::query_as(SEND_SQL)
+                    let rows = sqlx::query_as(SEND_SQL)
                         .bind(m.org_id)
                         .bind(m.sender_seat_id)
                         .bind(m.thread_id)
@@ -157,10 +185,25 @@ impl SqliteStore {
                         .bind(m.ack_required)
                         .bind(now)
                         .bind(deliveries)
-                        .bind(meta_to_db(&m.meta))
+                        .bind(meta)
                         .bind(m.ack_due)
+                        .bind(bytes)
+                        .bind(m.storage_quota)
                         .fetch_all(&mut *c)
-                        .await?)
+                        .await;
+                    match rows {
+                        Err(sqlx::Error::Database(e))
+                            if e.kind() == sqlx::error::ErrorKind::CheckViolation =>
+                        {
+                            let stored: i64 =
+                                sqlx::query_scalar("SELECT stored_bytes FROM orgs WHERE id = $1")
+                                    .bind(m.org_id)
+                                    .fetch_one(&mut *c)
+                                    .await?;
+                            Err(StoreError::StorageQuota(stored))
+                        }
+                        r => Ok(r?),
+                    }
                 })
             })
             .await?;
@@ -181,60 +224,6 @@ impl SqliteStore {
             created_at: now,
             seqs,
         })
-    }
-
-    /// Index mode: FTS5 trigram `MATCH` with one quoted phrase per term (a
-    /// phrase of three or more characters matches any substring). Scan mode:
-    /// `LIKE` over the window (case-insensitive for ASCII).
-    async fn search_impl(
-        &self,
-        org_id: i64,
-        q: &SearchQuery,
-        lower: Option<i64>,
-    ) -> Result<Vec<MessageRec>> {
-        let fts = q.scan.is_none();
-        let conds: Vec<String> = if !fts {
-            (0..q.terms.len())
-                .map(|i| {
-                    format!(
-                        "(m.subject LIKE ${n} ESCAPE '\\' OR m.body LIKE ${n} ESCAPE '\\')",
-                        n = i + 5
-                    )
-                })
-                .collect()
-        } else {
-            vec!["f.messages_fts MATCH $5".into()]
-        };
-        let sql =
-            crate::common::search_sql_sqlite(&conds, q.before_id.is_some(), lower.is_some(), fts);
-        let binds: Vec<String> = if q.scan.is_some() {
-            q.terms.iter().map(|t| like_pattern(t)).collect()
-        } else {
-            vec![
-                q.terms
-                    .iter()
-                    .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
-                    .collect::<Vec<_>>()
-                    .join(" AND "),
-            ]
-        };
-        let (before, limit) = (q.before_id, q.limit);
-        let rows: Vec<crate::common::MsgRow> = self
-            .read(move |c| {
-                Box::pin(async move {
-                    let mut query = sqlx::query_as(&sql)
-                        .bind(org_id)
-                        .bind(before)
-                        .bind(lower)
-                        .bind(limit);
-                    for b in &binds {
-                        query = query.bind(b);
-                    }
-                    Ok(query.fetch_all(&mut *c).await?)
-                })
-            })
-            .await?;
-        crate::common::collect(rows, crate::common::MsgRow::into_message)
     }
 
     async fn claim_impl(
@@ -286,9 +275,12 @@ impl SqliteStore {
 
 /// Binds: $1 org, $2 sender, $3 thread (NULL for a new thread), $4 parent,
 /// $5 depth, $6 subject, $7 body, $8 lines, $9 to, $10 cc, $11 priority,
-/// $12 ack_required, $13 now, $14 deliveries JSON, $15 meta, $16 ack_due.
+/// $12 ack_required, $13 now, $14 deliveries JSON, $15 meta, $16 ack_due,
+/// $17 the message's bytes (added to the org's `stored_bytes`), $18 the
+/// org's storage quota (NULL: none).
 /// Returns `(message_id, thread_id, seat_id, org_id, seq)` per delivery.
 const SEND_SQL: &str = "
+UPDATE temp.send_quota SET fits = ($18 IS NULL OR (SELECT stored_bytes FROM orgs WHERE id = $1) + $17 <= $18);
 INSERT INTO messages (org_id, sender_seat_id, thread_id, parent_id, depth, subject, body, lines,
                       to_addrs, cc_addrs, priority, ack_required, created_at, meta, ack_due)
 VALUES ($1, $2, COALESCE($3, 0), $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $15, $16);
@@ -299,6 +291,7 @@ INSERT INTO deliveries (org_id, message_id, seat_id, class, mode, seq, mod_seq)
 SELECT json_extract(j.value, '$.o'), (SELECT MAX(id) FROM messages), s.id,
        json_extract(j.value, '$.c'), json_extract(j.value, '$.m'), s.last_seq, s.last_seq
   FROM json_each($14) j JOIN seats s ON s.id = json_extract(j.value, '$.s');
+UPDATE orgs SET stored_bytes = stored_bytes + $17 WHERE id = $1;
 SELECT m.id, m.thread_id, d.seat_id, d.org_id, d.seq
   FROM deliveries d JOIN messages m ON m.id = d.message_id
  WHERE d.message_id = (SELECT MAX(id) FROM messages)
@@ -432,4 +425,4 @@ impl SqliteStore {
     }
 }
 
-impl_store_common!(SqliteStore, sqlx::Sqlite);
+impl_store_common!(SqliteStore, sqlx::Sqlite, Dialect::Sqlite);

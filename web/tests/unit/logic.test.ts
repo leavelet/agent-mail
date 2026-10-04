@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { scrollToRow, virtualWindow } from '../../src/lib/virtual';
-import { effectiveState, focusUntil, freshPresence, needsPerson, nodeOpBlock, stateAge } from '../../src/lib/presence';
+import { effectiveState, focusUntil, freshPresence, needsPerson, nodeOpBlock, stateAge, terminalHref } from '../../src/lib/presence';
 import { Coalescer } from '../../src/lib/coalesce';
 import { attentionKey, seatsWaitingForUser, sortAttention } from '../../src/lib/attention';
 import { deliveryState, deliveryStep, viaLabel } from '../../src/lib/delivery';
@@ -154,5 +154,16 @@ describe('how mail reached a seat', () => {
   });
   it('shows old list deliveries like cc', () => {
     expect(reachedBy('a', 'list', { to: ['backend'], cc: [] }, isList)).toEqual({ cls: 'cc', via: 'backend' });
+  });
+});
+
+describe('terminal links', () => {
+  it('keeps only http and https URLs', () => {
+    expect(terminalHref('https://host.example/t/a')).toBe('https://host.example/t/a');
+    expect(terminalHref('http://127.0.0.1:9/x')).toBe('http://127.0.0.1:9/x');
+    expect(terminalHref('javascript:alert(1)')).toBeUndefined();
+    expect(terminalHref('data:text/html,x')).toBeUndefined();
+    expect(terminalHref('not a url')).toBeUndefined();
+    expect(terminalHref(undefined)).toBeUndefined();
   });
 });

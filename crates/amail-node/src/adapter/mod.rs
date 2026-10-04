@@ -8,7 +8,7 @@ pub mod codex;
 pub mod dsh;
 
 use crate::wire::LaunchPlan;
-use amail_proto::{LaunchInfo, SeatState};
+use amail_proto::{LaunchInfo, PermissionMode, SeatState};
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -102,6 +102,8 @@ pub struct AdapterEnv {
     pub dsh_env: BTreeMap<String, String>,
     /// The `auth.json` the dedicated Codex home links to.
     pub codex_auth: PathBuf,
+    /// The node's Codex pass ([`crate::wire::CODEX_PASS_ENV`]).
+    pub codex_pass: String,
 }
 
 impl AdapterEnv {
@@ -124,7 +126,12 @@ impl AdapterEnv {
 
 /// Inputs of [`Adapter::launch`].
 pub struct LaunchCtx<'a> {
+    /// What the server says about the seat. Its `permission_mode` is not
+    /// used; see `permission_mode` below.
     pub info: &'a LaunchInfo,
+    /// The permission mode chosen on this machine (team file or `amail run`
+    /// flag). Only `Unattended` turns off the harness's permission prompts.
+    pub permission_mode: PermissionMode,
     pub cwd: &'a str,
     pub extra: &'a [String],
     /// One-time registration nonce, for adapters that register sessions.
@@ -219,37 +226,6 @@ pub trait Adapter: Send + Sync + 'static {
     fn resume_is_lazy(&self) -> bool {
         false
     }
-}
-
-/// The git directory and common directory of `cwd` (absolute), if it is in
-/// a git repository.
-pub fn git_dirs(cwd: &str) -> Vec<String> {
-    let out = std::process::Command::new("git")
-        .args([
-            "-C",
-            cwd,
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-dir",
-            "--git-common-dir",
-        ])
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output();
-    let Ok(out) = out else { return Vec::new() };
-    if !out.status.success() {
-        return Vec::new();
-    }
-    let mut v: Vec<String> = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
-    v.sort();
-    v.dedup();
-    v
 }
 
 pub fn str_field<'a>(v: &'a Value, key: &str) -> Option<&'a str> {

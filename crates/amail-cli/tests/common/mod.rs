@@ -29,6 +29,7 @@ const CLEAR_ENV: &[&str] = &[
     "CODEX_THREAD_ID",
     "AMAIL_DSH_ENDPOINT",
     "DSH_HOME",
+    "AMAIL_CODEX_PASS",
 ];
 
 pub fn fixture(harness: &str, name: &str) -> Value {
@@ -161,6 +162,10 @@ pub struct Opts {
     /// Hold back the server's answers to the first `n` claims by this long
     /// (the claim itself is done), like an answer lost on the way.
     pub slow_claims: Option<(usize, Duration)>,
+    /// Check who sends socket requests (default: only with `supervise`,
+    /// where sessions are launched as they are in use; other tests send
+    /// hooks from the test process).
+    pub check_callers: Option<bool>,
 }
 
 impl Default for Opts {
@@ -174,6 +179,7 @@ impl Default for Opts {
             tweak: None,
             server_tweak: None,
             slow_claims: None,
+            check_callers: None,
         }
     }
 }
@@ -280,6 +286,9 @@ impl Harness {
         cfg.kill_grace = Duration::from_secs(2);
         cfg.restart_backoff = Duration::from_millis(200);
         cfg.resume_grace = Duration::from_secs(3);
+        cfg.check_callers = opts.check_callers.unwrap_or(opts.supervise);
+        // Claude Code transcripts are followed only under `projects` here.
+        cfg.claude_config_dir = dir.path().join("claude");
         let fake_dir = dir.path().join("fake");
         let mut mux = None;
         if opts.supervise {
@@ -539,4 +548,18 @@ pub fn with(mut v: Value, fields: &[(&str, Value)]) -> Value {
         v[*k] = x.clone();
     }
     v
+}
+
+/// Send one request on the node socket from this process, as the command
+/// line client does; the answer, or `{"error": ...}`.
+pub async fn socket_request(sock: &Path, req: amail_node::wire::Request) -> Value {
+    let sock = sock.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        match amail_node::request(&sock, &req, Duration::from_secs(10)) {
+            Ok(v) => v,
+            Err(e) => json!({"error": format!("{e:#}")}),
+        }
+    })
+    .await
+    .unwrap()
 }

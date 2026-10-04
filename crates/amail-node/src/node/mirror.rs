@@ -13,6 +13,54 @@ use amail_proto::{NodeCommand, TranscriptPost, TranscriptState, TranscriptStatus
 
 /// Events per post.
 const BATCH: usize = 500;
+/// Bytes per post (the server refuses larger ones).
+const POST_BYTES: usize = amail_proto::limits::MAX_TRANSCRIPT_POST_BYTES;
+
+/// Split `events` into posts of at most [`BATCH`] events and
+/// [`POST_BYTES`] of JSON. The first post is `first` (with its `reset` and
+/// `status`); the others carry only its `node`. An event too large for a
+/// post on its own has its text cut to fit.
+fn batches(
+    first: TranscriptPost,
+    events: Vec<amail_proto::TranscriptEvent>,
+) -> Vec<TranscriptPost> {
+    let next = |node: &Option<String>| TranscriptPost {
+        node: node.clone(),
+        ..Default::default()
+    };
+    let node = first.node.clone();
+    let mut posts = vec![first];
+    let mut size = len(&posts[0]);
+    for mut e in events {
+        let mut n = len(&e) + 1;
+        let cur = posts.last().unwrap();
+        if !cur.events.is_empty() && (size + n > POST_BYTES || cur.events.len() >= BATCH) {
+            posts.push(next(&node));
+            size = len(posts.last().unwrap());
+        }
+        // A single event that does not fit: cut its text (rare: texts are
+        // already cut to a few thousand characters).
+        while size + n > POST_BYTES && !e.text.is_empty() {
+            let keep = e.text.chars().count() / 2;
+            e.text = e.text.chars().take(keep).collect();
+            e.truncated = true;
+            n = len(&e) + 1;
+        }
+        if size + n > POST_BYTES {
+            e.tool = None;
+            e.ts = None;
+            n = len(&e) + 1;
+        }
+        size += n;
+        posts.last_mut().unwrap().events.push(e);
+    }
+    posts
+}
+
+/// The length of a value's JSON.
+fn len<T: serde::Serialize>(v: &T) -> usize {
+    serde_json::to_vec(v).map_or(0, |v| v.len())
+}
 
 /// A forwarding task's runtime entry.
 #[derive(Debug, Clone)]
@@ -69,6 +117,14 @@ impl Node {
         if !known && cmd.node.is_none() {
             return;
         }
+        // Named, but unknown here: answered with a status, within bounds.
+        if !known
+            && !st.mirrors.contains_key(&cmd.seat)
+            && (!amail_proto::valid_name(&cmd.seat)
+                || st.mirrors.len() >= amail_proto::limits::NODE_MAX_OTHER_SEATS)
+        {
+            return;
+        }
         let until = Instant::now() + lease;
         let backfill = cmd.backfill.unwrap_or(200).min(2000) as usize;
         match st.mirrors.get_mut(&cmd.seat) {
@@ -118,7 +174,8 @@ impl Node {
         .await
     }
 
-    /// Post events in batches; the first batch carries `reset` and `status`.
+    /// Post events in batches that fit the server's post size; the first
+    /// batch carries `reset` and `status`.
     async fn post_events(
         &self,
         seat: &str,
@@ -126,21 +183,16 @@ impl Node {
         status: Option<TranscriptStatus>,
         events: Vec<amail_proto::TranscriptEvent>,
     ) -> bool {
-        let mut chunks: Vec<Vec<_>> = events.chunks(BATCH).map(<[_]>::to_vec).collect();
-        if chunks.is_empty() {
-            chunks.push(Vec::new());
-        }
-        let (mut reset, mut status) = (reset, status);
-        for events in chunks {
-            if events.is_empty() && !reset && status.is_none() {
+        let first = TranscriptPost {
+            node: self.cfg.label.clone(),
+            reset,
+            status,
+            events: Vec::new(),
+        };
+        for post in batches(first, events) {
+            if post.events.is_empty() && !post.reset && post.status.is_none() {
                 continue;
             }
-            let post = TranscriptPost {
-                node: self.cfg.label.clone(),
-                reset: std::mem::take(&mut reset),
-                status: status.take(),
-                events,
-            };
             if !self.post_mirror(seat, post).await {
                 return false;
             }
@@ -192,8 +244,17 @@ impl Node {
                     Some(w) => {
                         let harness = Harness::parse(&w.harness).unwrap_or(Harness::Claude);
                         let path = w.path.clone();
+                        let base = w.base.clone().unwrap_or_default();
                         let opened = tokio::task::spawn_blocking(move || {
-                            Tail::open(std::path::Path::new(&path), harness, backfill)
+                            let p = std::path::Path::new(&path);
+                            // Checked again: links may have changed.
+                            if !crate::transcript::path_under(p, std::path::Path::new(&base)) {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::PermissionDenied,
+                                    "outside the harness's transcript directory",
+                                ));
+                            }
+                            Tail::open(p, harness, backfill)
                         })
                         .await;
                         match opened {
@@ -284,5 +345,64 @@ impl Node {
             tokio::time::sleep(self.cfg.mirror_poll).await;
         }
         tracing::info!("stopped mirroring the transcript of seat {seat}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use amail_proto::{TranscriptEvent, TranscriptKind, TranscriptRole};
+
+    fn ev(text: String) -> TranscriptEvent {
+        TranscriptEvent {
+            ts: Some("2026-10-04T10:00:00.000Z".into()),
+            role: TranscriptRole::Assistant,
+            kind: TranscriptKind::Text,
+            text,
+            tool: None,
+            truncated: false,
+            error: false,
+        }
+    }
+
+    /// Large backfills are split into posts the server accepts, in order,
+    /// with `reset` and `status` on the first only.
+    #[test]
+    fn batches_fit_the_post_size() {
+        // Control characters take six bytes each in JSON.
+        let events: Vec<_> = (0..300)
+            .map(|i| ev(format!("{i}:{}", "\u{1}".repeat(15_990))))
+            .collect();
+        let first = TranscriptPost {
+            node: Some("n1".into()),
+            reset: true,
+            status: Some(TranscriptStatus::new(TranscriptState::Streaming)),
+            events: Vec::new(),
+        };
+        let posts = batches(first, events.clone());
+        assert!(posts.len() > 20, "{} posts", posts.len());
+        for (i, p) in posts.iter().enumerate() {
+            assert!(len(p) <= POST_BYTES, "post {i}: {} bytes", len(p));
+            assert_eq!(p.reset, i == 0);
+            assert_eq!(p.status.is_some(), i == 0);
+            assert_eq!(p.node.as_deref(), Some("n1"));
+        }
+        let all: Vec<_> = posts.into_iter().flat_map(|p| p.events).collect();
+        assert_eq!(all.len(), events.len());
+        assert!(all.iter().zip(&events).all(|(a, b)| a.text == b.text));
+
+        // Many small events: at most BATCH per post.
+        let small: Vec<_> = (0..1200).map(|i| ev(i.to_string())).collect();
+        let posts = batches(TranscriptPost::default(), small);
+        let sizes: Vec<_> = posts.iter().map(|p| p.events.len()).collect();
+        assert_eq!(sizes, vec![500, 500, 200]);
+
+        // One event too large on its own is cut to fit.
+        let mut huge = ev("x".repeat(3 * POST_BYTES));
+        huge.tool = Some("t".repeat(10));
+        let posts = batches(TranscriptPost::default(), vec![huge]);
+        assert_eq!(posts.len(), 1);
+        assert!(len(&posts[0]) <= POST_BYTES);
+        assert!(posts[0].events[0].truncated);
     }
 }

@@ -103,16 +103,28 @@ async fn escalate(st: &AppState, due: &AckDue, now: i64) -> amail_store::Result<
         .collect();
     let waited = due.due - due.created_at;
     let mut who = Vec::new();
+    // Seats behind another org's list are counted, not named.
+    let mut groups: Vec<(String, usize)> = Vec::new();
+    let rows = if laggards.iter().any(|l| l.org_id != due.org_id) {
+        store.recipients(due.message_id).await?
+    } else {
+        Vec::new()
+    };
     for l in &laggards {
         let mut s = if l.org_id == due.org_id {
             l.name.clone()
         } else {
-            let org = store
-                .delivery(due.message_id, l.seat_id)
-                .await?
-                .map(|d| d.org_name)
-                .unwrap_or_default();
-            format!("{}@{org}", l.name)
+            let Some(d) = rows.iter().find(|d| d.seat_id == l.seat_id) else {
+                continue;
+            };
+            if let Some(g) = crate::mail::external_group(&msg, &rows, d) {
+                match groups.iter_mut().find(|(x, _)| *x == g) {
+                    Some((_, n)) => *n += 1,
+                    None => groups.push((g, 1)),
+                }
+                continue;
+            }
+            format!("{}@{}", l.name, d.org_name)
         };
         if due.stage >= 1
             && l.org_id == due.org_id
@@ -121,6 +133,9 @@ async fn escalate(st: &AppState, due: &AckDue, now: i64) -> amail_store::Result<
             s.push_str(&format!(" (lead: {p})"));
         }
         who.push(s);
+    }
+    for (g, n) in groups {
+        who.push(format!("{n} seat{} of {g}", if n == 1 { "" } else { "s" }));
     }
     let (next_stage, next_due, body, cc) = if due.stage == 0 {
         let next = (!leads.is_empty()).then_some(now + waited.max(1000));
@@ -198,6 +213,8 @@ async fn escalate(st: &AppState, due: &AckDue, now: i64) -> amail_store::Result<
             meta: Default::default(),
             deliveries,
             ack_due: None,
+            // Reminders from the mail system are never refused.
+            storage_quota: None,
         })
         .await?;
     let events: Vec<(String, i64)> = sent

@@ -49,6 +49,7 @@ team_tests!(
     list_mail_wakes_and_cold_starts,
     staged_merge_worktrees_and_validation,
     paste_fallback_types_only_when_safe,
+    server_permission_mode_is_informational,
 );
 
 async fn setup(
@@ -80,6 +81,7 @@ async fn cli_sock(h: &Harness, sock: &Path, args: &[&str]) -> (bool, String) {
         "AMAIL_SEAT",
         "AMAIL_PROFILE",
         "CODEX_THREAD_ID",
+        "AMAIL_CODEX_PASS",
         "ZELLIJ",
         "ZELLIJ_PANE_ID",
         "ZELLIJ_SESSION_NAME",
@@ -915,6 +917,88 @@ async fn server_commands_sleep_and_wake(b: Backend) {
     h.api.post("/seats/c/wake", json!({})).await;
     wait_state(&h, "c", "idle").await;
     assert_eq!(launches(&h, "c").len(), 2);
+    cli(&h, &["down"]).await;
+}
+
+/// The permission mode comes from the team file; the server's seat setting
+/// cannot turn off a seat's permission prompts.
+async fn server_permission_mode_is_informational(b: Backend) {
+    let Some(h) = setup(b, "server_permission_mode_is_informational", None).await else {
+        return;
+    };
+    let _inboxes: Vec<FakeInbox> = ["a", "b"].iter().map(|s| inbox(&h, s)).collect();
+    write_team(
+        &h,
+        r#"
+[team]
+workroot = "@DIR@/work"
+[defaults]
+harness = "claude"
+model = "test-model"
+[[seat]]
+name = "a"
+[[seat]]
+name = "b"
+permission_mode = "unattended"
+[[seat]]
+name = "x"
+harness = "codex"
+[[seat]]
+name = "y"
+harness = "codex"
+permission_mode = "unattended"
+"#,
+    );
+    up(&h, &[]).await;
+    for s in ["a", "b", "x", "y"] {
+        wait_state(&h, s, "idle").await;
+    }
+    let skips = |s: &str| {
+        launches(&h, s)
+            .iter()
+            .map(|l| l.contains("--dangerously-skip-permissions") || l.contains("-a never"))
+            .collect::<Vec<bool>>()
+    };
+    assert_eq!(skips("a"), [false]);
+    assert_eq!(skips("b"), [true]);
+    assert_eq!(skips("x"), [false]);
+    assert_eq!(skips("y"), [true]);
+    // The server's settings change (an admin, or a compromised server):
+    // "unattended" for a and x, "default" for b and y. The next starts
+    // still follow the team file.
+    for (s, m) in [
+        ("a", "unattended"),
+        ("x", "unattended"),
+        ("b", "default"),
+        ("y", "default"),
+    ] {
+        h.api
+            .call(
+                reqwest::Method::PATCH,
+                &format!("/seats/{s}"),
+                Some(json!({ "permission_mode": m })),
+            )
+            .await;
+        assert_eq!(
+            h.api.get(&format!("/seats/{s}")).await["permission_mode"],
+            m
+        );
+    }
+    h.wait("node connected for commands", || async {
+        h.api.get("/seats/a").await["presence"]["node_connected"] == true
+    })
+    .await;
+    for s in ["a", "b", "x", "y"] {
+        h.api.post(&format!("/seats/{s}/sleep"), json!({})).await;
+        wait_state(&h, s, "dormant").await;
+        h.api.post(&format!("/seats/{s}/wake"), json!({})).await;
+        wait_for("the second start", || launches(&h, s).len() == 2).await;
+        wait_state(&h, s, "idle").await;
+    }
+    assert_eq!(skips("a"), [false, false]);
+    assert_eq!(skips("b"), [true, true]);
+    assert_eq!(skips("x"), [false, false]);
+    assert_eq!(skips("y"), [true, true]);
     cli(&h, &["down"]).await;
 }
 

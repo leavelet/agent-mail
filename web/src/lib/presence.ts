@@ -49,3 +49,15 @@ export function nodeOpBlock(seat: Seat, now: number): 'user' | 'noPresence' | 'n
   if (p.node_connected === false) return 'noNode';
   return null;
 }
+
+/** A seat's terminal link, only if it is an http(s) URL (the server drops
+ * others; this guards older servers). */
+export function terminalHref(url: string | undefined): string | undefined {
+  if (!url) return undefined;
+  try {
+    const u = new URL(url);
+    return u.protocol === 'http:' || u.protocol === 'https:' ? u.href : undefined;
+  } catch {
+    return undefined;
+  }
+}

@@ -19,6 +19,10 @@
   import AdminLinks from './pages/admin/AdminLinks.svelte';
   import AdminTokens from './pages/admin/AdminTokens.svelte';
   import AdminSettings from './pages/admin/AdminSettings.svelte';
+  import RegisterPage from './pages/RegisterPage.svelte';
+  import OperatorPage from './pages/OperatorPage.svelte';
+
+  const registering = globalThis.location?.pathname === '/register';
 
   onMount(() => {
     applyTheme(ui.theme);
@@ -73,8 +77,12 @@
 
 {#if store.auth === 'checking'}
   <div class="empty">{t('app.loading')}</div>
+{:else if store.auth === 'out' && registering}
+  <RegisterPage />
 {:else if store.auth === 'out'}
   <Login />
+{:else if store.auth === 'operator'}
+  <OperatorPage />
 {:else}
   <div class="shell">
     <TopBar />

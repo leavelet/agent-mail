@@ -36,6 +36,7 @@ const UNSET: &[&str] = &[
     "CLAUDE_CODE_SESSION_ID",
     "CLAUDE_PID",
     "AMAIL_PROFILE",
+    crate::wire::CODEX_PASS_ENV,
 ];
 
 pub struct Claude {
@@ -175,8 +176,8 @@ impl Adapter for Claude {
     }
 
     fn claim_limit(&self) -> u32 {
-        // A shown entry is at most about 1,100 characters (an 800-character
-        // body and its header): 8 stay below Claude Code's 10,000.
+        // Claimed mail is packed into `inject_budget` by its rendered size;
+        // what does not fit waits for the next hook.
         8
     }
 
@@ -233,7 +234,7 @@ impl Adapter for Claude {
             args.push("--model".into());
             args.push(m.clone());
         }
-        if info.permission_mode == Some(PermissionMode::Unattended) {
+        if ctx.permission_mode == PermissionMode::Unattended {
             args.push("--dangerously-skip-permissions".into());
         }
         args.extend(ctx.extra.iter().cloned());
@@ -255,6 +256,7 @@ impl Adapter for Claude {
             env,
             unset_env: UNSET.iter().map(|s| s.to_string()).collect(),
             path_prepend: self.env.amail_dir().into_iter().collect(),
+            notice: None,
         })
     }
 }

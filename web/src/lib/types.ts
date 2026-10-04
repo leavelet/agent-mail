@@ -7,7 +7,7 @@ export type Source = 'user' | 'agent' | 'external' | 'system';
 export type DeliveryClass = 'to' | 'cc' | 'list';
 export type DeliveryMode = 'immediate' | 'digest' | 'archive';
 export type Priority = 'normal' | 'urgent';
-export type TokenScope = 'user' | 'seat' | 'node';
+export type TokenScope = 'user' | 'seat' | 'node' | 'operator';
 export type PostPolicy = 'anyone' | 'members' | 'user_only';
 export type LinkState = 'requested' | 'invited' | 'active';
 export type PermissionMode = 'default' | 'unattended';
@@ -38,6 +38,8 @@ export interface Seat {
   parent?: string;
   display_name?: string;
   role?: string;
+  /** In `GET /v1/seats`: `role` holds only its beginning; `GET /v1/seats/{name}` has all of it. */
+  role_truncated?: boolean;
   harness?: string;
   model?: string;
   permission_mode?: PermissionMode;
@@ -71,10 +73,14 @@ export interface MessageHeader {
   lines: number;
   created_at: string;
   meta?: Meta;
+  /** The server's retention period removed the body. */
+  expired?: boolean;
 }
 
 export interface Message extends MessageHeader {
   body: string;
+  /** In a thread: the body was left out to keep the answer small; fetch it with `GET /v1/messages/{id}`. */
+  body_omitted?: boolean;
 }
 
 export interface Delivery {
@@ -97,6 +103,8 @@ export interface InboxEntry {
 export interface InboxResponse {
   seat: string;
   entries: InboxEntry[];
+  /** The page was cut by size: more entries follow. */
+  truncated?: boolean;
 }
 
 export interface MessageResponse {
@@ -107,6 +115,8 @@ export interface MessageResponse {
 export interface RecipientStatus extends Delivery {
   address: string;
   state: 'queued' | 'notified' | 'read' | 'acked';
+  /** Seats behind another org's list, counted without their names. */
+  members?: { seats: number; notified: number; read: number; acked: number };
 }
 
 export interface StatusResponse {
@@ -117,6 +127,8 @@ export interface StatusResponse {
 export interface ThreadResponse {
   thread_id: number;
   messages: Message[];
+  /** Older messages were left out. */
+  truncated?: boolean;
 }
 
 export interface ArchiveResponse {
@@ -263,4 +275,43 @@ export interface TranscriptStatus {
 
 export interface ApiErrorBody {
   error: { code: string; message: string; rejected?: { address: string; reason: string }[] };
+}
+
+/** `GET /v1/info` (no sign-in needed). */
+export interface ServerInfo {
+  version: string;
+  public: boolean;
+  registration: boolean;
+  retention_days?: number;
+}
+
+/** `POST /v1/register`: the user token is shown only here. */
+export interface RegisterResponse {
+  org: string;
+  user_seat: string;
+  token: string;
+}
+
+/** One org as the operator sees it (no mail content). */
+export interface OrgStat {
+  name: string;
+  created_at: string;
+  suspended_at?: string;
+  seats: number;
+  nodes: number;
+  messages: number;
+  messages_hour: number;
+  messages_day: number;
+  last_activity?: string;
+}
+
+/** `GET /v1/operator/stats`. */
+export interface OperatorStats {
+  orgs: number;
+  suspended: number;
+  seats: number;
+  nodes_online: number;
+  mail_last_5min: number;
+  mail_last_hour: number;
+  list: OrgStat[];
 }

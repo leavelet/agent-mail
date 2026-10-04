@@ -10,6 +10,32 @@ use amail_store::{Member, NewToken};
 use axum::extract::State;
 use axum::http::StatusCode;
 
+/// A free-text field of at most `max` characters (see
+/// [`amail_proto::limits`]).
+pub(crate) fn check_text(field: &str, v: Option<&str>, max: usize) -> ApiResult<()> {
+    match v {
+        Some(s) => p::limits::check_chars(field, s, max).map_err(ApiError::bad_request),
+        None => Ok(()),
+    }
+}
+
+fn check_seat_text(
+    display_name: Option<&str>,
+    role: Option<&str>,
+    harness: Option<&str>,
+    model: Option<&str>,
+) -> ApiResult<()> {
+    use p::limits::*;
+    check_text("display_name", display_name, MAX_DISPLAY_NAME_CHARS)?;
+    check_text("role", role, MAX_ROLE_CHARS)?;
+    check_text("harness", harness, MAX_HARNESS_CHARS)?;
+    check_text("model", model, MAX_MODEL_CHARS)
+}
+
+fn inner(v: &Option<Option<String>>) -> Option<&str> {
+    v.as_ref().and_then(|v| v.as_deref())
+}
+
 fn check_name(name: &str) -> ApiResult<()> {
     if valid_name(name) {
         Ok(())
@@ -20,17 +46,15 @@ fn check_name(name: &str) -> ApiResult<()> {
     }
 }
 
-pub async fn whoami(auth: Auth) -> Json<p::WhoAmI> {
-    Json(p::WhoAmI {
-        org: auth.org.name.clone(),
-        scope: auth.scope,
-        seat: auth.seat.map(|s| s.name),
-    })
-}
-
-pub async fn get_org(auth: Auth) -> ApiResult<Json<p::OrgInfo>> {
+pub async fn get_org(State(st): State<AppState>, auth: Auth) -> ApiResult<Json<p::OrgInfo>> {
     auth.require_directory()?;
-    Ok(Json(render::org(&auth.org)))
+    let mut org = render::org(&auth.org, st.config.limits.org_storage_bytes);
+    // Webhook URLs often carry credentials (in the path or as user:password):
+    // only the user sees them, not the agents.
+    if !auth.is_user() {
+        org.webhook_url = None;
+    }
+    Ok(Json(org))
 }
 
 pub async fn patch_org(
@@ -39,11 +63,22 @@ pub async fn patch_org(
     Json(patch): Json<p::OrgPatch>,
 ) -> ApiResult<Json<p::OrgInfo>> {
     auth.require_user()?;
-    let check = |v: Option<i64>, min: i64, name: &str| match v {
-        Some(x) if x < min => Err(ApiError::bad_request(format!(
-            "{name} must be at least {min}"
-        ))),
-        _ => Ok(()),
+    let public = st.config.public;
+    let check = |v: Option<i64>, min: i64, name: &str| {
+        let max = crate::config::ORG_SETTING_MAX
+            .iter()
+            .find(|m| m.name == name && (public || !m.public_only))
+            .map(|m| m.max);
+        match v {
+            Some(x) if x < min => Err(ApiError::bad_request(format!(
+                "{name} must be at least {min}"
+            ))),
+            Some(x) if max.is_some_and(|m| x > m) => Err(ApiError::bad_request(format!(
+                "{name} must be at most {}",
+                max.unwrap_or_default()
+            ))),
+            _ => Ok(()),
+        }
     };
     check(patch.send_rate_per_min, 0, "send_rate_per_min")?;
     check(patch.send_burst, 1, "send_burst")?;
@@ -52,15 +87,19 @@ pub async fn patch_org(
     check(patch.ack_timeout_min, 1, "ack_timeout_min")?;
     check(patch.focus_max_min, 1, "focus_max_min")?;
     check(patch.digest_interval_min, 1, "digest_interval_min")?;
-    if let Some(Some(url)) = &patch.webhook_url
-        && !crate::webhook::valid_url(url)
-    {
-        return Err(ApiError::bad_request(
-            "webhook_url must be an http:// or https:// URL",
-        ));
+    if let Some(Some(url)) = &patch.webhook_url {
+        if !crate::webhook::valid_url(url) {
+            return Err(ApiError::bad_request(
+                "webhook_url must be an http:// or https:// URL",
+            ));
+        }
+        // Names are checked again whenever the webhook fires.
+        crate::netguard::check_literal(url, st.config.webhook_private_targets)
+            .map_err(|e| ApiError::unprocessable("webhook_target", e))?;
     }
     Ok(Json(render::org(
         &st.store.update_org(auth.org.id, &patch).await?,
+        st.config.limits.org_storage_bytes,
     )))
 }
 
@@ -82,7 +121,7 @@ pub async fn list_seats(State(st): State<AppState>, auth: Auth) -> ApiResult<Jso
             .seats(auth.org.id)
             .await?
             .iter()
-            .map(|s| render::seat(s, presence.remove(&s.name)))
+            .map(|s| render::seat_in_list(s, presence.remove(&s.name)))
             .collect(),
     ))
 }
@@ -93,9 +132,30 @@ pub async fn create_seat(
     Json(seat): Json<p::NewSeat>,
 ) -> ApiResult<(StatusCode, Json<p::Seat>)> {
     auth.require_user()?;
-    check_name(&seat.name)?;
+    crate::public::check_new_name(&st, &seat.name)?;
+    check_seat_text(
+        seat.display_name.as_deref(),
+        seat.role.as_deref(),
+        seat.harness.as_deref(),
+        seat.model.as_deref(),
+    )?;
     if let Some(g) = &seat.group {
         check_name(g)?;
+    }
+    if let Some(max) = st.config.limits.seats_per_org {
+        let n = st
+            .store
+            .seats(auth.org.id)
+            .await?
+            .iter()
+            .filter(|s| s.kind == amail_proto::SeatKind::Agent)
+            .count() as i64;
+        if n >= max {
+            return Err(ApiError::unprocessable(
+                "seat_limit",
+                format!("this server allows at most {max} agent seats per org"),
+            ));
+        }
     }
     let s = st.store.create_seat(auth.org.id, &seat).await?;
     Ok((StatusCode::CREATED, Json(seat_out(&st, &auth, &s).await?)))
@@ -122,6 +182,12 @@ pub async fn patch_seat(
     Json(patch): Json<p::SeatPatch>,
 ) -> ApiResult<Json<p::Seat>> {
     auth.require_user()?;
+    check_seat_text(
+        inner(&patch.display_name),
+        inner(&patch.role),
+        inner(&patch.harness),
+        inner(&patch.model),
+    )?;
     if let Some(Some(g)) = &patch.group {
         check_name(g)?;
     }
@@ -151,8 +217,10 @@ pub async fn seat_token(
         .seat_by_name(auth.org.id, &name)
         .await?
         .ok_or_else(|| ApiError::not_found(format!("no seat {name:?}")))?;
-    let token = new_token();
     let label = body.and_then(|b| b.label);
+    check_text("label", label.as_deref(), p::limits::MAX_LABEL_CHARS)?;
+    check_token_room(&st, auth.org.id).await?;
+    let token = new_token();
     st.store
         .create_token(&NewToken {
             org_id: auth.org.id,
@@ -188,7 +256,14 @@ pub async fn org_token(
                 "use POST /v1/seats/{name}/tokens for seat tokens",
             ));
         }
+        TokenScope::Operator => {
+            return Err(ApiError::forbidden(
+                "operator tokens are issued on the server's database (amail admin operator-token)",
+            ));
+        }
     };
+    check_text("label", req.label.as_deref(), p::limits::MAX_LABEL_CHARS)?;
+    check_token_room(&st, auth.org.id).await?;
     let token = new_token();
     st.store
         .create_token(&NewToken {
@@ -210,6 +285,19 @@ pub async fn org_token(
 }
 
 /// `GET /v1/tokens`: live tokens of the org (labels and scopes only).
+/// Public mode: refuse a new token when the org holds the most it may.
+async fn check_token_room(st: &AppState, org_id: i64) -> ApiResult<()> {
+    if let Some(max) = st.config.limits.tokens_per_org
+        && st.store.tokens(org_id).await?.len() as i64 >= max
+    {
+        return Err(ApiError::unprocessable(
+            "token_limit",
+            format!("this server allows at most {max} live tokens per org; revoke some first"),
+        ));
+    }
+    Ok(())
+}
+
 pub async fn list_tokens(
     State(st): State<AppState>,
     auth: Auth,
@@ -257,6 +345,7 @@ pub async fn revoke_token(
         ));
     }
     if st.store.revoke_token(auth.org.id, id).await? {
+        st.token_revoked(auth.org.id, id);
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found(format!("no token {id}")))
@@ -283,7 +372,20 @@ pub async fn create_list(
     Json(list): Json<p::NewList>,
 ) -> ApiResult<(StatusCode, Json<p::List>)> {
     auth.require_user()?;
-    check_name(&list.name)?;
+    crate::public::check_new_name(&st, &list.name)?;
+    check_text(
+        "description",
+        list.description.as_deref(),
+        p::limits::MAX_DESCRIPTION_CHARS,
+    )?;
+    if let Some(max) = st.config.limits.lists_per_org
+        && st.store.lists(auth.org.id).await?.len() as i64 >= max
+    {
+        return Err(ApiError::unprocessable(
+            "list_limit",
+            format!("this server allows at most {max} lists per org"),
+        ));
+    }
     let l = st.store.create_list(auth.org.id, &list).await?;
     Ok((
         StatusCode::CREATED,
@@ -391,6 +493,20 @@ pub async fn put_member(
         seat_id,
         mode,
     };
+    let max = amail_proto::limits::MAX_LIST_MEMBERS;
+    if l.member_count >= max
+        && !st
+            .store
+            .list_members(l.id)
+            .await?
+            .iter()
+            .any(|m| m.address == member.address)
+    {
+        return Err(ApiError::unprocessable(
+            "too_many_members",
+            format!("a list has at most {max} members"),
+        ));
+    }
     st.store.put_member(auth.org.id, l.id, &member).await?;
     Ok(Json(p::ListMember {
         address: member.address,
@@ -436,23 +552,72 @@ pub async fn list_links(State(st): State<AppState>, auth: Auth) -> ApiResult<Jso
     ))
 }
 
-async fn peer_org(st: &AppState, name: &str) -> ApiResult<amail_store::Org> {
-    st.store
+/// Another org by name; a suspended org counts as absent.
+async fn find_peer(st: &AppState, name: &str) -> ApiResult<Option<amail_store::Org>> {
+    Ok(st
+        .store
         .org_by_name(name)
         .await?
-        .ok_or_else(|| ApiError::not_found(format!("no org {name:?}")))
+        .filter(|o| o.suspended_at.is_none()))
 }
 
+/// Most pending outgoing link requests an org may have.
+pub const MAX_PENDING_LINK_REQUESTS: usize = 1000;
+
+/// Link requests are answered the same whether or not an org of that name
+/// exists: a request to an unknown name is recorded and listed as
+/// `requested`, like a request the other org has not accepted yet.
 pub async fn request_link(
     State(st): State<AppState>,
     auth: Auth,
     Json(req): Json<p::NewLink>,
 ) -> ApiResult<Json<p::Link>> {
     auth.require_user()?;
-    let peer = peer_org(&st, &req.org).await?;
-    let state = st.store.request_link(auth.org.id, peer.id).await?;
+    // Limited before the lookup, so that probing for org names counts too.
+    if let Some(b) = &st.limiters.link_requests
+        && let Err(ms) = b.take(&auth.org.id)
+    {
+        return Err(ApiError::too_many(
+            "rate_limited",
+            "too many link requests from this org",
+            ms,
+        ));
+    }
+    let name = req.org.trim();
+    check_name(name)?;
+    if name == auth.org.name {
+        return Err(ApiError::bad_request("an org cannot link to itself"));
+    }
+    let links = st.store.links(auth.org.id).await?;
+    if let Some(l) = links.iter().find(|l| l.peer_name == name) {
+        if l.state != p::LinkState::Invited {
+            return Ok(Json(p::Link {
+                org: name.to_string(),
+                state: l.state,
+            }));
+        }
+    } else if links
+        .iter()
+        .filter(|l| l.state == p::LinkState::Requested)
+        .count()
+        >= MAX_PENDING_LINK_REQUESTS
+    {
+        return Err(ApiError::unprocessable(
+            "too_many_link_requests",
+            format!(
+                "this org has {MAX_PENDING_LINK_REQUESTS} pending link requests; withdraw some first"
+            ),
+        ));
+    }
+    let state = match find_peer(&st, name).await? {
+        Some(peer) => st.store.request_link(auth.org.id, peer.id).await?,
+        None => {
+            st.store.request_unknown_link(auth.org.id, name).await?;
+            p::LinkState::Requested
+        }
+    };
     Ok(Json(p::Link {
-        org: peer.name,
+        org: name.to_string(),
         state,
     }))
 }
@@ -463,7 +628,9 @@ pub async fn accept_link(
     Path(org): Path<String>,
 ) -> ApiResult<Json<p::Link>> {
     auth.require_user()?;
-    let peer = peer_org(&st, &org).await?;
+    let peer = find_peer(&st, &org)
+        .await?
+        .ok_or_else(|| ApiError::not_found("no pending link request from that org"))?;
     st.store.accept_link(auth.org.id, peer.id).await?;
     Ok(Json(p::Link {
         org: peer.name,
@@ -477,8 +644,12 @@ pub async fn revoke_link(
     Path(org): Path<String>,
 ) -> ApiResult<StatusCode> {
     auth.require_user()?;
-    let peer = peer_org(&st, &org).await?;
-    if st.store.revoke_link(auth.org.id, peer.id).await? {
+    let removed = match find_peer(&st, &org).await? {
+        Some(peer) => st.store.revoke_link(auth.org.id, peer.id).await?,
+        None => false,
+    };
+    // A request made to the name while no (active) org had it.
+    if removed || st.store.revoke_unknown_link(auth.org.id, &org).await? {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found(format!("no link with {org:?}")))

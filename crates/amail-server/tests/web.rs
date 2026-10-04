@@ -79,7 +79,14 @@ impl Server {
         Some(Server {
             base,
             db,
-            http: reqwest::Client::new(),
+            // No idle connections: with keep-alive connections next to
+            // several open event streams, a request occasionally waited
+            // forever for a pooled connection (seen about once in 25 runs
+            // of transcript_relay, in the HTTP client, not the server).
+            http: reqwest::Client::builder()
+                .pool_max_idle_per_host(0)
+                .build()
+                .unwrap(),
             state,
         })
     }
@@ -248,7 +255,8 @@ async fn search_english_chinese_short_and_visibility(srv: Server) {
 
     // English, case-insensitive, subject or body, newest first.
     let r = acme.search("tokenizer").await;
-    assert_eq!(r["mode"], "index");
+    assert_eq!(r["mode"], "scan");
+    assert_eq!(r["scan_limit"], 50_000);
     assert_eq!(subjects(&r), vec!["Status", "Parser plan"]);
     assert!(
         r["messages"][1]["snippet"]
@@ -261,17 +269,15 @@ async fn search_english_chinese_short_and_visibility(srv: Server) {
         subjects(&acme.search("tokenizer AST").await),
         vec!["Parser plan"]
     );
-    // Chinese substrings of three or more characters use the index.
+    // Chinese substrings.
     let r = acme.search("迁移方案").await;
-    assert_eq!(r["mode"], "index");
     assert_eq!(subjects(&r), vec!["数据库迁移方案"]);
     assert_eq!(
         subjects(&acme.search("订单表").await),
         vec!["数据库迁移方案"]
     );
-    // Shorter queries scan recent mail and say so.
+    // Shorter queries look at fewer recent messages and say so.
     let r = acme.search("接口").await;
-    assert_eq!(r["mode"], "scan");
     assert_eq!(r["scan_limit"], 2000);
     assert_eq!(subjects(&r), vec!["Status", "数据库迁移方案"]);
     assert!(r.get("next_before_id").is_none());
@@ -377,11 +383,31 @@ async fn session_cookie_and_csrf(srv: Server) {
     );
     let cookie = set.split(';').next().unwrap().to_string();
 
-    // Behind an HTTPS proxy the cookie is Secure.
+    // X-Forwarded-Proto counts only from a trusted proxy (none here; see
+    // tests/public.rs).
     let r = http
         .post(url("/session"))
         .header("X-Amail-Csrf", "1")
         .header("X-Forwarded-Proto", "https")
+        .json(&json!({ "token": user.token }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        !r.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .contains("; Secure")
+    );
+    // An HTTPS origin makes it Secure.
+    let r = http
+        .post(url("/session"))
+        .header("X-Amail-Csrf", "1")
+        .header(
+            "Origin",
+            format!("https://{}", srv.base.trim_start_matches("http://")),
+        )
+        .header("Host", srv.base.trim_start_matches("http://"))
         .json(&json!({ "token": user.token }))
         .send()
         .await
@@ -443,7 +469,7 @@ async fn session_cookie_and_csrf(srv: Server) {
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
-    // Behind a proxy the original host may come as X-Forwarded-Host.
+    // X-Forwarded-Host counts only from a trusted proxy (none here).
     let r = http
         .post(url("/messages"))
         .header("Cookie", &cookie)
@@ -454,7 +480,7 @@ async fn session_cookie_and_csrf(srv: Server) {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
     // A bearer token is not subject to the cookie rules.
     user.ok(Method::POST, "/messages", Some(send.clone())).await;
     // Server-sent events work with the cookie.
@@ -592,6 +618,11 @@ async fn webhook_on_user_mail(srv: Server) {
         .await;
     assert_eq!(org["webhook_url"], url);
     assert_eq!(acme.ok(Method::GET, "/org", None).await["webhook_url"], url);
+    // Agents read the org's settings but not the webhook URL, which may
+    // carry credentials.
+    let seen = a.ok(Method::GET, "/org", None).await;
+    assert_eq!(seen["name"], "acme");
+    assert!(seen.get("webhook_url").is_none(), "{seen}");
 
     // Mail between agents: no notice. Mail to the user: one, after a retry.
     a.send(json!({ "to": ["b"], "subject": "between agents", "body": "x" }))

@@ -19,7 +19,9 @@ const MAX_PRESENCE_BATCH: usize = 5000;
 fn require_node_or_user(auth: &Auth) -> ApiResult<()> {
     match auth.scope {
         TokenScope::Node | TokenScope::User => Ok(()),
-        TokenScope::Seat => Err(ApiError::forbidden("requires a node or user token")),
+        TokenScope::Seat | TokenScope::Operator => {
+            Err(ApiError::forbidden("requires a node or user token"))
+        }
     }
 }
 
@@ -86,10 +88,21 @@ pub async fn presence(
             "at most {MAX_PRESENCE_BATCH} seats per report"
         )));
     }
-    if let Some(n) = &report.node
-        && n.len() > 200
     {
-        return Err(ApiError::bad_request("node label is too long"));
+        use crate::directory::check_text;
+        use amail_proto::limits::*;
+        check_text("node", report.node.as_deref(), MAX_NODE_LABEL_CHARS)?;
+        for u in &report.seats {
+            check_text("harness", u.harness.as_deref(), MAX_HARNESS_CHARS)?;
+            check_text("since", u.since.as_deref(), 64)?;
+            check_text("attention", u.attention.as_deref(), MAX_ATTENTION_CHARS)?;
+            check_text(
+                "attention_hint",
+                u.attention_hint.as_deref(),
+                MAX_HINT_CHARS,
+            )?;
+            check_text("terminal_url", u.terminal_url.as_deref(), MAX_URL_CHARS)?;
+        }
     }
     let live: HashSet<String> = st
         .store
@@ -102,6 +115,16 @@ pub async fn presence(
         .seats
         .into_iter()
         .filter(|u| live.contains(&u.seat))
+        .map(|mut u| {
+            // The web interface links to it: only http(s) URLs are kept.
+            if u.terminal_url
+                .as_deref()
+                .is_some_and(|t| !crate::webhook::valid_url(t))
+            {
+                u.terminal_url = None;
+            }
+            u
+        })
         .collect();
     let changed = st
         .presence

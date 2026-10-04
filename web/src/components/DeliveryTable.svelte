@@ -41,6 +41,7 @@
               <span class="st st-{st}" data-dstate={st}>{t(`dlv.${st}`)}</span>
             </td>
             <td class="faint"><div class="times">
+              {#if r.members}<span data-testid="dlv-members">{t('dlv.members', { seats: r.members.seats, read: r.members.read, acked: r.members.acked })}</span>{/if}
               {#if r.notified_at}<span>{t('dlv.notified')} {shortTime(r.notified_at, ui.now, ui.lang)}{#if r.notified_via} · {t('dlv.via', { via: viaLabel(r.notified_via) })}{/if}</span>{/if}
               {#if r.read_at}<span>{t('dlv.read')} {shortTime(r.read_at, ui.now, ui.lang)}</span>{/if}
               {#if r.acked_at}<span>{t('dlv.acked')} {shortTime(r.acked_at, ui.now, ui.lang)}</span>{/if}

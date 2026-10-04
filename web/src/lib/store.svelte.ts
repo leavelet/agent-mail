@@ -3,8 +3,11 @@
 // come from the server's event stream and are merged into about one update
 // per second.
 
-import { ApiError, get, post, del, qs, enc, setUnauthorizedHandler } from './api';
+import { ApiError, get, post, del, qs, enc, request, setUnauthorizedHandler } from './api';
 import { Coalescer } from './coalesce';
+import { announce, itemKey, newItems } from './notify';
+import { go } from './router.svelte';
+import { t } from './ui.svelte';
 import type {
   AttentionItem,
   CountsResponse,
@@ -15,10 +18,11 @@ import type {
   PresenceEvent,
   Seat,
   SeatCounts,
+  ServerInfo,
   WhoAmI,
 } from './types';
 
-export type AuthState = 'checking' | 'out' | 'in';
+export type AuthState = 'checking' | 'out' | 'in' | 'operator';
 
 const FLUSH_MS = 1000;
 const OVERVIEW_MIN_MS = 5000;
@@ -35,6 +39,8 @@ class Store {
   links = $state.raw<Link[]>([]);
   /** The event stream is open. */
   live = $state(false);
+  /** What the server says about itself (public mode, retention). */
+  info = $state.raw<ServerInfo | null>(null);
   loadError = $state<string | null>(null);
 
   seatMap = $derived(new Map(this.seats.map((s) => [s.name, s])));
@@ -45,14 +51,30 @@ class Store {
   private lastOverview = 0;
   private overviewTimer: ReturnType<typeof setTimeout> | null = null;
   private timers: ReturnType<typeof setInterval>[] = [];
+  /** Keys of the attention items seen so far (null: not loaded yet). */
+  private seenAttention: Set<string> | null = null;
 
   constructor() {
     setUnauthorizedHandler(() => this.signedOut());
   }
 
+  async loadInfo(): Promise<void> {
+    try {
+      this.info = await get<ServerInfo>('/v1/info');
+    } catch {
+      // An older server: no public mode.
+    }
+  }
+
   async check(): Promise<void> {
+    void this.loadInfo();
     try {
       const me = await get<WhoAmI>('/v1/whoami');
+      if (me.scope === 'operator') {
+        this.me = me;
+        this.auth = 'operator';
+        return;
+      }
       if (me.scope !== 'user') {
         this.signedOut();
         return;
@@ -72,8 +94,24 @@ class Store {
   async login(token: string): Promise<void> {
     const me = await post<WhoAmI>('/v1/session', { token });
     this.me = me;
+    if (me.scope === 'operator') {
+      this.auth = 'operator';
+      return;
+    }
     this.auth = 'in';
     await this.start();
+  }
+
+  /** Replace the signed-in user token; the session moves to the new one. */
+  async rotateToken(): Promise<string> {
+    const r = await post<{ token: string }>('/v1/tokens/rotate', {});
+    return r.token;
+  }
+
+  /** Delete the org with all its data; the session ends with it. */
+  async deleteOrg(confirm: string): Promise<void> {
+    await request<void>('DELETE', '/v1/org', { confirm });
+    this.signedOut();
   }
 
   async logout(): Promise<void> {
@@ -89,6 +127,7 @@ class Store {
     this.stop();
     this.me = null;
     this.auth = 'out';
+    this.seenAttention = null;
   }
 
   private async start() {
@@ -213,6 +252,12 @@ class Store {
   async refreshAttention(): Promise<void> {
     const r = await get<{ items: AttentionItem[] }>('/v1/attention');
     this.attention = r.items;
+    const fresh = newItems(this.seenAttention, r.items);
+    this.seenAttention = new Set(r.items.map(itemKey));
+    announce(fresh, t, (i) => {
+      if (i.message) go(['thread', i.message.thread_id], { m: i.message.id });
+      else go(['needs']);
+    });
   }
 
   async refreshOverview(): Promise<void> {

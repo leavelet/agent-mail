@@ -129,20 +129,22 @@ impl Headless {
         use std::os::unix::process::CommandExt;
         let mut master: libc::c_int = -1;
         let mut slave: libc::c_int = -1;
-        let ws = libc::winsize {
+        let mut ws = libc::winsize {
             ws_row: rows,
             ws_col: cols,
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        // SAFETY: openpty writes two descriptors; name and termios may be null.
+        // SAFETY: openpty writes two descriptors; name and termios may be
+        // null. (`*mut` pointers: macOS declares them so; Linux takes
+        // `*const`.)
         let rc = unsafe {
             libc::openpty(
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                &ws,
+                std::ptr::null_mut(),
+                &raw mut ws,
             )
         };
         if rc != 0 {

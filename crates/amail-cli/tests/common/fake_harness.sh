@@ -17,6 +17,8 @@
 #   <seat>.started   "<unix ms> <pid>" when a Claude session sent SessionStart
 #   sock/<seat>.sock the seat's inbox socket (served by the test)
 #   thread-<id>.seat the seat of a Codex thread (for `codex queue`)
+#   <seat>.run       created by the test: a shell script the session runs (like
+#                    an agent's tool command); its output goes to <seat>.ran
 D=$(cd "$(dirname "$0")" && pwd)
 kind=$(basename "$0")
 now() { date +%s%3N; }
@@ -168,6 +170,11 @@ while :; do
         rm -f "$D/$seat.prompt"
         turn "\"a prompt\""
         screen
+    fi
+    if [ -f "$D/$seat.run" ]; then
+        mv "$D/$seat.run" "$D/$seat.running"
+        sh "$D/$seat.running" > "$D/$seat.ran.tmp" 2>&1
+        mv "$D/$seat.ran.tmp" "$D/$seat.ran"
     fi
     if [ -f "$D/$seat.ask" ]; then
         rm -f "$D/$seat.ask"
