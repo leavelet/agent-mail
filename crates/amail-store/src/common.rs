@@ -1206,19 +1206,66 @@ macro_rules! impl_store_common {
                 })
             }
 
-            /// Search: steps of [`STEP_MESSAGES`] of the org's window, newest
-            /// first, until the page is full or `q.scan` messages were
-            /// looked at.
+            /// Body sizes of the messages visible to the org in `[lo, before)`,
+            /// newest first (the size is read without the body on both
+            /// backends).
+            async fn window_sizes(c: &mut Conn, org_id: i64, before: i64, lo: i64) -> Result<Vec<(i64, i64)>> {
+                let sql = format!(
+                    "SELECT m.id, CAST(COALESCE(octet_length(m.body), 0) AS BIGINT) FROM messages m \
+                     WHERE m.id IN ({WINDOW_IDS}) ORDER BY m.id DESC"
+                );
+                Ok(sqlx::query_as(&sql)
+                    .bind(org_id)
+                    .bind(before)
+                    .bind(lo)
+                    .fetch_all(&mut *c)
+                    .await?)
+            }
+
+            /// Search: steps over the org's window, newest first, until the
+            /// page is full, `q.scan` messages were looked at, or
+            /// `q.time_limit` has passed. A step looks at up to
+            /// [`STEP_MESSAGES`] messages with up to
+            /// [`amail_proto::limits::SEARCH_STEP_BYTES`] of body text in
+            /// all (divided by the number of terms, at least one message),
+            /// so that one step takes a short, bounded time whatever the
+            /// sizes of the bodies.
             pub async fn search(c: &mut Conn, org_id: i64, q: &SearchQuery) -> Result<SearchResult> {
+                let started = std::time::Instant::now();
                 let sql = search_sql(DIALECT, q.terms.len());
+                let step_bytes = amail_proto::limits::SEARCH_STEP_BYTES / q.terms.len().max(1) as i64;
                 let mut out = SearchResult::default();
                 let mut before = q.before_id.unwrap_or(i64::MAX);
                 let mut seen = 0;
+                // Messages per step: grows back to STEP_MESSAGES while the
+                // bodies are small, shrinks when they are large.
+                let mut step = STEP_MESSAGES;
                 while seen < q.scan {
-                    let w = scan_window(c, org_id, before, STEP_MESSAGES.min(q.scan - seen)).await?;
-                    let Some(lo) = w.lo else {
+                    if seen > 0 && q.time_limit.is_some_and(|t| started.elapsed() >= t) {
+                        break;
+                    }
+                    let mut w = scan_window(c, org_id, before, step.min(q.scan - seen)).await?;
+                    let Some(mut lo) = w.lo else {
                         return Ok(out);
                     };
+                    // Cut the window to the byte budget.
+                    let sizes = window_sizes(c, org_id, before, lo).await?;
+                    let mut total = 0;
+                    let mut kept = 0;
+                    for (_, n) in &sizes {
+                        if kept > 0 && total + n > step_bytes {
+                            break;
+                        }
+                        total += n;
+                        kept += 1;
+                    }
+                    if kept < sizes.len() {
+                        lo = sizes[kept - 1].0;
+                        w = Window { lo: Some(lo), count: kept as i64, exhausted: false };
+                        step = (kept as i64 * 2).clamp(16, STEP_MESSAGES);
+                    } else {
+                        step = (step * 2).min(STEP_MESSAGES);
+                    }
                     let mut query = sqlx::query_as::<_, HitRow>(&sql)
                         .bind(org_id)
                         .bind(before)
@@ -1806,7 +1853,8 @@ macro_rules! impl_store_common {
             /// The archive. Every query starts from the org's own data: one
             /// of its seats' sent mail or mailbox when `from` or `to` names
             /// one, else the org's messages (or a thread's) newest first in
-            /// steps, at most [`MAX_SCAN_MESSAGES`] per request. Built with
+            /// steps, at most [`MAX_SCAN_MESSAGES`] per request and no further
+            /// step once `q.time_limit` has passed. Built with
             /// only the conditions the query has, so that both planners can
             /// use the id order and the indexes (SQLite cannot see through
             /// `$n IS NULL OR ...`).
@@ -1930,7 +1978,11 @@ macro_rules! impl_store_common {
                 let mut out: Vec<MessageRec> = Vec::new();
                 let mut before = upper;
                 let mut seen = 0;
+                let started = std::time::Instant::now();
                 while seen < MAX_SCAN_MESSAGES {
+                    if seen > 0 && q.time_limit.is_some_and(|t| started.elapsed() >= t) {
+                        break;
+                    }
                     let n = STEP_MESSAGES.min(MAX_SCAN_MESSAGES - seen);
                     let w = match q.thread_id {
                         Some(t) => thread_window(c, t, before, n).await?,

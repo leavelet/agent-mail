@@ -54,11 +54,14 @@ pub struct Limits {
     pub org_storage_bytes: Option<i64>,
     /// Requests whose database cost depends on the data (search, archive,
     /// threads, attention, overview, delivery status, lists) of one org in
-    /// progress at the same time; a further one waits briefly for a slot,
+    /// progress at the same time, in each pool of
+    /// [`crate::limits::Pool`]; a further one waits briefly for a slot,
     /// then gets 429.
     pub org_queries: Option<usize>,
-    /// The same over all orgs, so that several orgs together cannot take
-    /// every database connection.
+    /// The same over all orgs, in each of the pools
+    /// [`crate::limits::Pool::Scan`] and [`crate::limits::Pool::Other`],
+    /// so that several orgs together cannot take every database
+    /// connection.
     pub queries: Option<usize>,
 }
 

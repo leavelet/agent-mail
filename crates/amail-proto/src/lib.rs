@@ -277,6 +277,14 @@ pub mod limits {
     /// first, before it answers with what it found and a cursor
     /// (`next_before_id`) to continue.
     pub const MAX_SCAN_MESSAGES: i64 = 50_000;
+    /// Body bytes one step of a search looks at, divided by the number of
+    /// search terms (at least one message per step).
+    pub const SEARCH_STEP_BYTES: i64 = 4 * 1024 * 1024;
+    /// A search or archive request starts no further step of
+    /// [`MAX_SCAN_MESSAGES`] after this many milliseconds; it answers with
+    /// what it found and a cursor (`next_before_id`) to continue. This
+    /// bounds how long one request holds a query slot.
+    pub const SCAN_TIME_LIMIT_MS: u64 = 300;
     /// `GET /inbox` and `GET /sent` pages of up to this many entries are
     /// served without one of the org's query slots; larger pages, and every
     /// `GET /changes` page, take one.

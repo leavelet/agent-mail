@@ -190,8 +190,8 @@ Public mode turns on:
 | registration attempts per hour per client address (failed ones too; IPv6 per /64, and 4 times that per /48) | `--max-registrations-per-hour` / `AMAIL_MAX_REGISTRATIONS_PER_HOUR` | 10 |
 | memory for conversation mirrors over all seats (per instance, MiB); beyond it, watchers furthest behind are disconnected and kept events dropped | `--max-mirror-mb` / `AMAIL_MAX_MIRROR_MB` | 256 |
 | mail stored per org, in MiB (see below) | `--max-org-storage-mb` / `AMAIL_MAX_ORG_STORAGE_MB` | 1024 |
-| requests per org whose database cost depends on the data (see below), in progress at the same time | `--max-org-queries` / `AMAIL_MAX_ORG_QUERIES` | 1 |
-| the same over all orgs (keep it below `--max-connections`, the database pool size, 32 by default) | `--max-queries` / `AMAIL_MAX_QUERIES` | 8 |
+| requests per org whose database cost depends on the data (see below), in progress at the same time, in each of the three pools | `--max-org-queries` / `AMAIL_MAX_ORG_QUERIES` | 1 |
+| the same over all orgs, in each of the search pool and the other pool (two times this together; keep that below `--max-connections`, the database pool size, 32 by default) | `--max-queries` / `AMAIL_MAX_QUERIES` | 8 |
 
 `0` turns a limit off. The limits also apply without `--public` when set
 explicitly. Message rate limits come on top of each seat's own send budget;
@@ -298,24 +298,42 @@ No delivery was ever injected twice, also under overload. Wake-up latency
 is the 3-second coalescing window; busy-injection latency is the time to
 the next tool call.
 
-Requests whose database cost depends on the data are limited per org and
-over all orgs (`--max-org-queries`, `--max-queries`): search, archive,
-`GET /threads/{id}`, `/attention`, `/overview`, `/messages/{id}/status`,
-`/lists`, `/lists/{name}`, `/changes`, and `/inbox` and `/sent` pages of
-more than 100 entries. Each runs until its database work ends, also when the
-client gave up, and each query is cancelled after 10 seconds. Everything else
-is a bounded index lookup. `GET /pending` and `GET /counts` read per-seat
+Requests whose database cost depends on the data take a slot of one of
+three pools while their database work runs (also when the client gave up;
+each query is cancelled after 10 seconds):
+
+- the search pool: `/archive/search` and `/archive/messages`;
+- the other pool: `GET /threads/{id}`, `/messages/{id}/status`,
+  `/changes`, and `/inbox` and `/sent` pages of more than 100 entries;
+- the light pool: `/overview`, `/attention`, `/lists` and `/lists/{name}`,
+  whose cost has a fixed upper bound (the user seat's newest 5,000
+  deliveries, the org's seats, at most 500 lists of 1,000 members).
+
+In each pool an org has `--max-org-queries` slots. The search pool and the
+other pool also have `--max-queries` slots over all orgs; the light pool has
+no such limit, so other orgs cannot make these requests wait. A request
+waits up to one second for a slot, then gets 429 `too_many_queries`. A
+freed slot goes to the waiting request of the org that holds the fewest
+slots of that pool, then of the org that was given one least recently, then
+the one that waited longest: an org's first waiting request is served
+before the next one of an org that was just served. Everything else is a
+bounded index lookup. `GET /pending` and `GET /counts` read per-seat
 counters kept in the transactions that change deliveries, and `/overview`
 counts recent mail per org and minute, so these answers cost the same for
 an org with millions of deliveries as for an empty one.
 
-A search is a bounded scan: each request reads the org's newest 50,000
-messages before its cursor (2,000 when a term is shorter than three
-characters) and answers with what it found and `next_before_id`. Older mail
-is reached by following the cursor. In a large org, a search for a rare
-term therefore takes several requests: one for every 50,000 messages until
-the page is full or the oldest message is reached. The web interface's
-archive page loads the next part when the user asks for more; API clients
+A search is a bounded scan in steps. Each request looks at the org's newest
+messages before its cursor, at most 50,000 of them (2,000 when a term is
+shorter than three characters), in steps of at most 5,000 messages and
+4 MiB of body text divided by the number of terms, and starts no further
+step after 300 ms. It then answers with what it found and
+`next_before_id`. An archive request (headers only) walks the same way in
+steps of 5,000 messages and also stops after 300 ms. So one request holds
+its slot for about 300 ms plus one step, whatever the size of the org's
+mail. Older mail is reached by following the cursor: in a large org a
+search for a rare term takes several requests. The web interface's archive
+page repeats a search request up to ten times until it has a page of
+results, and loads further parts when the user asks for more; API clients
 repeat the request with `before_id` set to `next_before_id`.
 
 `amail-bench --mode tenants` measures one org's load against another

@@ -355,10 +355,13 @@ pub async fn revoke_token(
 // --- lists -------------------------------------------------------------------
 
 /// The org's lists with their member counts (up to 500 lists of 1,000
-/// members in public mode): in one of the org's query slots.
+/// members in public mode): in one of the org's light query slots.
 async fn lists_of(st: &AppState, auth: &Auth) -> ApiResult<Vec<amail_store::List>> {
     let (store, org_id) = (st.store.clone(), auth.org.id);
-    crate::mail::limited(st, auth, async move { Ok(store.lists(org_id).await?) }).await
+    crate::mail::limited(st, auth, crate::mail::Pool::Light, async move {
+        Ok(store.lists(org_id).await?)
+    })
+    .await
 }
 
 pub async fn list_lists(State(st): State<AppState>, auth: Auth) -> ApiResult<Json<Vec<p::List>>> {
@@ -406,7 +409,7 @@ pub async fn get_list(
 ) -> ApiResult<Json<p::List>> {
     auth.require_directory()?;
     let (store, org_id) = (st.store.clone(), auth.org.id);
-    let (l, members) = crate::mail::limited(&st, &auth, async move {
+    let (l, members) = crate::mail::limited(&st, &auth, crate::mail::Pool::Light, async move {
         let l = store
             .list_by_name(org_id, &name)
             .await?

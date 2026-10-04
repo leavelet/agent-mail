@@ -260,6 +260,10 @@ pub struct ArchiveQuery {
     pub thread_id: Option<i64>,
     pub before_id: Option<i64>,
     pub limit: i64,
+    /// Time after which the query stops looking at further steps of
+    /// messages and answers with what it found and a cursor
+    /// (`next_before_id`). Checked between steps; `None`: no limit.
+    pub time_limit: Option<std::time::Duration>,
 }
 
 /// One page of [`ArchiveQuery`]: messages newest first, without bodies.
@@ -382,6 +386,8 @@ pub struct SearchQuery {
     /// How many of the org's messages, newest first before `before_id`,
     /// the request looks at.
     pub scan: i64,
+    /// As [`ArchiveQuery::time_limit`].
+    pub time_limit: Option<std::time::Duration>,
 }
 
 /// One match of a [`SearchQuery`]: the message without its body, and an
