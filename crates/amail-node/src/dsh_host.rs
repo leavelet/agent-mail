@@ -32,6 +32,71 @@ pub struct HostArgs {
     pub prompt: Option<String>,
     /// The host command (`dsh web ...`).
     pub command: Vec<String>,
+    /// Run the host in a bwrap jail (unattended seats).
+    pub jail: bool,
+    /// Writable paths inside the jail.
+    pub rw: Vec<String>,
+    /// Read-only paths inside the jail (besides the system).
+    pub ro: Vec<String>,
+}
+
+/// The `bwrap` arguments of a seat's jail, before `--` and the command.
+///
+/// The system is mounted read-only, `/tmp` and the home directory are empty
+/// (so nothing under the home directory is visible unless listed), and the
+/// listed paths are mounted back, read-only or writable. Paths that do not
+/// exist are skipped. The network is shared (the model API, the amail
+/// server).
+pub fn jail_args(home: &str, rw: &[String], ro: &[String]) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--tmpfs",
+        "/tmp",
+        "--die-with-parent",
+    ]
+    .map(String::from)
+    .to_vec();
+    if !home.is_empty() && home != "/" {
+        args.extend(["--tmpfs".into(), home.to_string()]);
+    }
+    let mut mounts: Vec<(&str, &String)> = ro
+        .iter()
+        .map(|p| ("--ro-bind", p))
+        .chain(rw.iter().map(|p| ("--bind", p)))
+        .filter(|(_, p)| std::path::Path::new(p.as_str()).exists())
+        .collect();
+    // Parents before children, so a deeper mount is not hidden.
+    mounts.sort_by_key(|(_, p)| (p.matches('/').count(), (*p).clone()));
+    for (flag, p) in mounts {
+        args.extend([flag.to_string(), p.clone(), p.clone()]);
+    }
+    args
+}
+
+/// Paths a jailed host needs besides those amail lists: the Node.js
+/// runtime that runs `dsh` and the user's git configuration.
+fn runtime_paths(home: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(node) = std::env::var_os("PATH").and_then(|p| {
+        p.to_string_lossy()
+            .split(':')
+            .map(|d| std::path::Path::new(d).join("node"))
+            .find(|p| p.is_file())
+    }) && let Ok(real) = std::fs::canonicalize(node)
+        && let Some(root) = real.parent().and_then(|b| b.parent())
+    {
+        out.push(root.to_string_lossy().into_owned());
+    }
+    for rel in [".gitconfig", ".config/git"] {
+        out.push(format!("{home}/{rel}"));
+    }
+    out
 }
 
 /// Environment of the launching shell that must not reach the host and its
@@ -78,9 +143,23 @@ async fn run_inner(a: HostArgs) -> Result<i32> {
     let cwd = std::env::current_dir()?.to_string_lossy().into_owned();
     // A stale file of an earlier host must not be used for wake-ups.
     let _ = std::fs::remove_file(&a.endpoint);
-    let mut cmd = tokio::process::Command::new(program);
-    cmd.args(args)
-        .stdout(std::process::Stdio::piped())
+    let mut cmd = if a.jail {
+        // Fail closed: if bwrap cannot run, the host does not run.
+        let home = std::env::var("HOME").unwrap_or_default();
+        let mut ro = a.ro.clone();
+        ro.extend(runtime_paths(&home));
+        let mut c = tokio::process::Command::new("bwrap");
+        c.args(jail_args(&home, &a.rw, &ro))
+            .arg("--")
+            .arg(program)
+            .args(args);
+        c
+    } else {
+        let mut c = tokio::process::Command::new(program);
+        c.args(args);
+        c
+    };
+    cmd.stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     for (k, _) in std::env::vars_os() {
@@ -95,7 +174,14 @@ async fn run_inner(a: HostArgs) -> Result<i32> {
             Ok(())
         });
     }
-    let mut child = cmd.spawn().with_context(|| format!("starting {program}"))?;
+    let mut child = cmd.spawn().with_context(|| {
+        if a.jail {
+            "starting bwrap (unattended dsh seats run in a bwrap jail; install bubblewrap)"
+                .to_string()
+        } else {
+            format!("starting {program}")
+        }
+    })?;
     let child_pid = child.id().context("host pid")? as i32;
 
     let (url_tx, url_rx) = tokio::sync::oneshot::channel::<(String, String, String)>();
@@ -307,6 +393,27 @@ mod tests {
         ));
         assert!(!is_unfinished_turn(r#"{"type":"turn/start"}"#));
         assert!(!is_unfinished_turn("garbage"));
+    }
+
+    #[test]
+    fn jail() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_string_lossy().into_owned();
+        let work = format!("{d}/work");
+        let deep = format!("{d}/work/.git");
+        std::fs::create_dir_all(&deep).unwrap();
+        let args = jail_args(
+            "/home/u",
+            &[deep.clone(), work.clone(), format!("{d}/missing")],
+            std::slice::from_ref(&d),
+        );
+        let s = args.join(" ");
+        assert!(s.starts_with("--ro-bind / / --dev /dev --proc /proc --tmpfs /tmp"));
+        assert!(s.contains("--tmpfs /home/u"));
+        let pos = |x: &str| s.find(x).unwrap();
+        assert!(pos(&format!("--ro-bind {d} {d}")) < pos(&format!("--bind {work} {work}")));
+        assert!(pos(&format!("--bind {work} {work}")) < pos(&format!("--bind {deep} {deep}")));
+        assert!(!s.contains("missing"));
     }
 
     #[test]

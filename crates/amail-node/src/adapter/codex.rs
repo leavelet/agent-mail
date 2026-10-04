@@ -39,37 +39,6 @@ const HOOK_TIMEOUT: i64 = 5;
 /// The permissions profile Codex sessions run under (see `apply_managed`).
 const PERMISSIONS_PROFILE: &str = "amail";
 
-/// The git directory and common directory of `cwd` (absolute), if it is in
-/// a git repository.
-fn git_dirs(cwd: &str) -> Vec<String> {
-    let out = std::process::Command::new("git")
-        .args([
-            "-C",
-            cwd,
-            "rev-parse",
-            "--path-format=absolute",
-            "--git-dir",
-            "--git-common-dir",
-        ])
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output();
-    let Ok(out) = out else { return Vec::new() };
-    if !out.status.success() {
-        return Vec::new();
-    }
-    let mut v: Vec<String> = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
-    v.sort();
-    v.dedup();
-    v
-}
-
 /// Codex caps the timeout of some events at 3 s (and warns about larger ones).
 fn hook_timeout(snake: &str) -> i64 {
     if matches!(snake, "session_end" | "interrupt") {

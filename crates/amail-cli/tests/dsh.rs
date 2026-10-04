@@ -171,6 +171,22 @@ async fn dsh_hooks_and_wake(b: Backend) {
     assert_eq!(&args[sep + 1..sep + 4], ["dsh", "web", "--patch"]);
     assert_eq!(args[sep + 5], "--no-open");
     assert!(args.ends_with(&["--port".into(), "0".into()]), "{args:?}");
+    // Unattended: the host runs in a jail; the working directory is
+    // writable in it, the dsh home too, the node state files read-only.
+    assert!(args.iter().any(|a| a == "--jail"), "{args:?}");
+    let flagged = |flag: &str| -> Vec<String> {
+        args.windows(2)
+            .filter(|w| w[0] == flag)
+            .map(|w| w[1].clone())
+            .collect()
+    };
+    assert!(flagged("--rw").contains(&cwd.to_string_lossy().into_owned()));
+    assert!(
+        flagged("--rw")
+            .iter()
+            .any(|p| p.ends_with("state/dsh-home"))
+    );
+    assert!(flagged("--ro").iter().any(|p| p.ends_with("state/dsh/run")));
     let prompt = &args[args.iter().position(|a| a == "--prompt").unwrap() + 1];
     assert!(prompt.starts_with("[amail]"), "{prompt}");
     let env = &plan["env"];
@@ -394,5 +410,54 @@ async fn dsh_host_wrapper(b: Backend) {
     assert_eq!(host.calls("session/create")[1]["sessionId"], "session-old");
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(host.calls("session/prompt").len(), 1);
+    child.kill().await.unwrap();
+    let _ = child.wait().await;
+
+    // In a jail: a file outside the listed paths cannot be read, the
+    // working directory can be written. (Skipped where bwrap cannot run.)
+    let bwrap_ok = std::process::Command::new("bwrap")
+        .args(["--ro-bind", "/", "/", "--", "true"])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !bwrap_ok {
+        eprintln!("bwrap cannot run here: jail check skipped");
+        return;
+    }
+    let secret = h.dir.path().join("secret.txt");
+    std::fs::write(&secret, "s3cret").unwrap();
+    let jailed = h.dir.path().join("bin").join("fake-dsh");
+    std::fs::create_dir_all(jailed.parent().unwrap()).unwrap();
+    std::fs::write(
+        &jailed,
+        format!(
+            "#!/bin/sh\ncat '{}' > '{}/read.txt' 2>&1\necho \"dsh web: {}/?token={TOKEN}\"\nexec sleep 30\n",
+            secret.display(),
+            work.display(),
+            host.url
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&jailed, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let mut c = tokio::process::Command::new(BIN);
+    c.args(["dsh-host", "--seat", "dw", "--endpoint"])
+        .arg(&endpoint)
+        .args(["--jail", "--rw", work.to_str().unwrap(), "--ro"])
+        .arg(jailed.parent().unwrap())
+        .args(["--resume", "session-old", "--", jailed.to_str().unwrap()])
+        .current_dir(&work)
+        .env("AMAIL_NODE_SOCK", &h.sock)
+        .env("DSH_HOME", &home)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let mut child = c.spawn().unwrap();
+    h.wait("jailed host up", || async {
+        Endpoint::read(&endpoint).is_some_and(|e| e.pid == child.id().unwrap())
+    })
+    .await;
+    let read = std::fs::read_to_string(work.join("read.txt")).unwrap();
+    assert!(!read.contains("s3cret"), "{read}");
+    assert!(read.contains("No such file"), "{read}");
     child.kill().await.unwrap();
 }

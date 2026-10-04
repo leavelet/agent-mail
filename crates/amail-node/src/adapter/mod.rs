@@ -219,6 +219,37 @@ pub trait Adapter: Send + Sync + 'static {
     }
 }
 
+/// The git directory and common directory of `cwd` (absolute), if it is in
+/// a git repository.
+pub fn git_dirs(cwd: &str) -> Vec<String> {
+    let out = std::process::Command::new("git")
+        .args([
+            "-C",
+            cwd,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+        ])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    let Ok(out) = out else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let mut v: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
 pub fn str_field<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
     v.get(key).and_then(Value::as_str)
 }

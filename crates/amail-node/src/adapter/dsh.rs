@@ -74,6 +74,28 @@ impl Endpoint {
     }
 }
 
+/// The directory that holds the `dsh` installation (the parent of the
+/// `node_modules` that contains it), found from the launcher's real path.
+pub fn dsh_install_root(dsh_bin: &str) -> Option<PathBuf> {
+    let bin = if dsh_bin.contains('/') {
+        PathBuf::from(dsh_bin)
+    } else {
+        std::env::var_os("PATH")?
+            .to_string_lossy()
+            .split(':')
+            .map(|d| Path::new(d).join(dsh_bin))
+            .find(|p| p.is_file())?
+    };
+    let real = std::fs::canonicalize(&bin).ok()?;
+    let mut top = None;
+    for a in real.ancestors() {
+        if a.file_name().is_some_and(|n| n == "node_modules") {
+            top = a.parent().map(Path::to_path_buf);
+        }
+    }
+    top.or_else(|| real.parent().map(Path::to_path_buf))
+}
+
 /// dsh's file name for a session id: safe characters stay, others become
 /// `~XXXX` (UTF-16 code units).
 pub fn encode_segment(raw: &str) -> String {
@@ -275,6 +297,31 @@ impl Dsh {
             .join("dsh")
             .join("seats")
             .join(format!("{seat}.toml"))
+    }
+
+    /// What an unattended seat's jail exposes: `(writable, read-only)`.
+    /// Writable: the working directory, its git directories (a worktree's
+    /// git directory and the repository's common one lie outside it) and
+    /// the dsh home (session logs). Read-only: the `amail` and `dsh`
+    /// installations, the seat's profile and the endpoint files, and the
+    /// node socket's directory. Everything else under the home directory is
+    /// hidden; the rest of the system is read-only.
+    pub fn jail_paths(&self, cwd: &str, seat: &str) -> (Vec<String>, Vec<String>) {
+        let s = |p: PathBuf| p.to_string_lossy().into_owned();
+        let mut rw = vec![cwd.to_string()];
+        rw.extend(super::git_dirs(cwd));
+        rw.push(s(self.home()));
+        let mut ro = Vec::new();
+        ro.extend(self.env.amail_dir());
+        ro.extend(dsh_install_root(&self.env.dsh_bin).map(s));
+        ro.push(s(self.seat_profile_path(seat)));
+        ro.push(s(self.run_dir()));
+        ro.extend(self.env.node_socket.parent().map(|p| s(p.to_path_buf())));
+        rw.sort();
+        rw.dedup();
+        ro.sort();
+        ro.dedup();
+        (rw, ro)
     }
 
     fn hooks_path(&self) -> PathBuf {
@@ -515,6 +562,19 @@ impl Adapter for Dsh {
             "--endpoint".into(),
             endpoint.to_string_lossy().into_owned(),
         ];
+        let unattended = info.permission_mode == Some(PermissionMode::Unattended);
+        if unattended {
+            // The whole host runs in a jail (see `crate::dsh_host`): dsh's
+            // own sandbox limits writes only, and its file tools run inside
+            // the host without any sandbox.
+            args.push("--jail".into());
+            for p in self.jail_paths(ctx.cwd, &info.seat).0 {
+                args.extend(["--rw".into(), p]);
+            }
+            for p in self.jail_paths(ctx.cwd, &info.seat).1 {
+                args.extend(["--ro".into(), p]);
+            }
+        }
         match ctx.resume {
             Some(id) => args.extend(["--resume".into(), id.to_string()]),
             None => {
@@ -567,7 +627,10 @@ impl Adapter for Dsh {
                 endpoint.to_string_lossy().into_owned(),
             ),
         ]);
-        if info.permission_mode == Some(PermissionMode::Unattended) {
+        if unattended {
+            // Inside the jail; dsh's own sandbox would only repeat it, and
+            // without the repository's git directories (a worktree commits
+            // into the common one).
             env.insert("DSH_PERMISSION_MODE".into(), "danger-full-access".into());
         }
         Ok(LaunchPlan {

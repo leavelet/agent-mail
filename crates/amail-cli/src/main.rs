@@ -153,6 +153,15 @@ enum Cmd {
         resume: Option<String>,
         #[arg(long)]
         prompt: Option<String>,
+        /// Run the host in a bwrap jail.
+        #[arg(long)]
+        jail: bool,
+        /// A writable path in the jail (repeatable).
+        #[arg(long)]
+        rw: Vec<String>,
+        /// A read-only path in the jail (repeatable).
+        #[arg(long)]
+        ro: Vec<String>,
         /// The host command, after `--`.
         #[arg(last = true, required = true)]
         command: Vec<String>,
@@ -506,6 +515,9 @@ fn main() -> ExitCode {
         endpoint,
         resume,
         prompt,
+        jail,
+        rw,
+        ro,
         command,
     } = &cli.cmd
     {
@@ -515,6 +527,9 @@ fn main() -> ExitCode {
             resume: resume.clone(),
             prompt: prompt.clone(),
             command: command.clone(),
+            jail: *jail,
+            rw: rw.clone(),
+            ro: ro.clone(),
         };
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
