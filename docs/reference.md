@@ -112,7 +112,7 @@ session cookie; with the cookie, everything but `GET` needs the header
 
 | | |
 |---|---|
-| `POST /messages` | send `{to, cc, subject, body, in_reply_to?, priority?, ack_required?, ack_timeout_s?, meta?}`; the answer lists each address with its seat count (and for a list in `To`, `wakes`: its members notified at once) and `notes` on recipients that will not see it at once |
+| `POST /messages` | send `{to, cc, subject, body, in_reply_to?, priority?, ack_required?, ack_timeout_s?, meta?}`; the answer lists each address with its seat count (and for a list in `To`, `wakes`: its members notified at once) and `notes` on recipients that will not see it at once. 507 `storage_quota` when the message does not fit in the org's storage quota |
 | `GET /inbox` | `seat`, `unread`, `after_seq`, `before_seq`, `limit` (≤ 1000); headers only |
 | `GET /messages/{id}` | full message; marks the caller's delivery read unless `peek=1` |
 | `POST /messages/{id}/ack` | acknowledge |
@@ -134,7 +134,7 @@ session cookie; with the cookie, everything but `GET` needs the header
 | `GET, POST /seats`; `GET, PATCH, DELETE /seats/{name}`; `POST /seats/{name}/tokens` | seats |
 | `GET, POST /lists`; `GET, DELETE /lists/{name}`; `PUT, DELETE /lists/{name}/members/{address}` | lists |
 | `GET, POST /links`; `POST /links/{org}/accept`; `DELETE /links/{org}` | links |
-| `GET, PATCH /org` | org settings (including `webhook_url`; `null` clears it) |
+| `GET, PATCH /org` | org settings (including `webhook_url`; `null` clears it), and `stored_bytes` (the mail the org sent, as counted for the storage quota) with `storage_quota_bytes` when the server has a quota |
 | `DELETE /org` | user tokens, `{"confirm": "<org name>"}`: delete the org and all its data |
 | `GET, POST /tokens`; `DELETE /tokens/{id}` | tokens |
 | `POST /tokens/rotate` | user tokens, `{label?}`: a new user token (answered once); the calling token is revoked, its browser sessions end and its open streams close; a browser that rotated gets a new session |
@@ -161,7 +161,7 @@ session cookie; with the cookie, everything but `GET` needs the header
 
 | | |
 |---|---|
-| `GET /operator/stats` | orgs, suspended orgs, seats, nodes online, mail in the last 5 minutes and hour, and per org: seats, nodes, messages (total, hour, day), creation time, last activity, suspension |
+| `GET /operator/stats` | orgs, suspended orgs, seats, nodes online, mail in the last 5 minutes and hour, and per org: seats, nodes, messages (total, hour, day), `stored_bytes`, creation time, last activity, suspension |
 | `POST /operator/orgs/{name}/suspend`, `/resume` | suspend (tokens and sessions stop working, open streams end, data is kept) / resume |
 | `DELETE /operator/orgs/{name}` | `{"confirm": "<name>"}`: delete the org with all its data |
 

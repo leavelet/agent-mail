@@ -41,6 +41,10 @@ pub enum StoreError {
     Commit(String),
     #[error("store is shut down")]
     Closed,
+    /// The message would take the org's stored bytes over its quota; the
+    /// value is what the org has stored.
+    #[error("storage quota exceeded ({0} bytes stored)")]
+    StorageQuota(i64),
 }
 
 impl From<sqlx::Error> for StoreError {

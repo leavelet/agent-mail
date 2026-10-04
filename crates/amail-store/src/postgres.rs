@@ -68,6 +68,8 @@ impl PgStore {
         self.write(move |c| {
             Box::pin(async move {
                 let now = now_ms();
+                let meta = meta_to_db(&m.meta);
+                let bytes = message_bytes(&m.subject, &m.body, &meta);
                 let mut seat_ids: Vec<i64> = m.deliveries.iter().map(|d| d.seat_id).collect();
                 seat_ids.sort_unstable();
                 seat_ids.dedup();
@@ -110,7 +112,7 @@ impl PgStore {
                 .bind(m.priority.as_str())
                 .bind(m.ack_required)
                 .bind(now)
-                .bind(meta_to_db(&m.meta))
+                .bind(&meta)
                 .bind(m.ack_due)
                 .execute(&mut *c)
                 .await?;
@@ -139,6 +141,23 @@ impl PgStore {
                 .bind(&seqv)
                 .execute(&mut *c)
                 .await?;
+                // Last, so the org's row stays locked only until the commit.
+                let added: Option<i64> = sqlx::query_scalar(
+                    "UPDATE orgs SET stored_bytes = stored_bytes + $1 \
+                     WHERE id = $2 AND ($3::bigint IS NULL OR stored_bytes + $1 <= $3) RETURNING id",
+                )
+                .bind(bytes)
+                .bind(m.org_id)
+                .bind(m.storage_quota)
+                .fetch_optional(&mut *c)
+                .await?;
+                if added.is_none() {
+                    let stored: i64 = sqlx::query_scalar("SELECT stored_bytes FROM orgs WHERE id = $1")
+                        .bind(m.org_id)
+                        .fetch_one(&mut *c)
+                        .await?;
+                    return Err(StoreError::StorageQuota(stored));
+                }
                 Ok(Sent { message_id: id, thread_id, created_at: now, seqs })
             })
         })

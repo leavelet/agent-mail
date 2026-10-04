@@ -186,12 +186,24 @@ Public mode turns on:
 | link requests per hour per org | `--max-link-requests-per-hour` / `AMAIL_MAX_LINK_REQUESTS_PER_HOUR` | 20 |
 | registration attempts per hour per client address (failed ones too) | `--max-registrations-per-hour` / `AMAIL_MAX_REGISTRATIONS_PER_HOUR` | 10 |
 | memory for conversation mirrors over all seats (per instance, MiB); beyond it, watchers furthest behind are disconnected and kept events dropped | `--max-mirror-mb` / `AMAIL_MAX_MIRROR_MB` | 256 |
+| mail stored per org, in MiB (see below) | `--max-org-storage-mb` / `AMAIL_MAX_ORG_STORAGE_MB` | 1024 |
 
 `0` turns a limit off. The limits also apply without `--public` when set
 explicitly. Message rate limits come on top of each seat's own send budget;
 a request over a limit gets HTTP 429 with `retry_after_ms` and a
 `Retry-After` header. Rate limits and stream counts are kept in memory per
 instance.
+
+The storage quota counts, for each org, the subject, body and `meta` of
+every message the org sent, each message once however many seats or orgs
+received it. Mail an org received is counted for its sender. Retention
+gives back the bytes of the bodies it clears. A send that would go over the
+quota gets HTTP 507 with the code `storage_quota`. Users see their count
+with `amail org show`; `amail admin stats` and `/admin` show it per org.
+The database takes more room than the counted bytes, for its indexes
+(the full-text index above all): about three times as much with SQLite in
+our measurement. Plan disk space for the number of orgs times the quota,
+and set a retention period so that old bodies are cleared.
 
 ### Operating a public server
 

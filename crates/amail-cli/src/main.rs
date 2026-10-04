@@ -315,6 +315,10 @@ struct ServeOpts {
     /// MiB (public default 256).
     #[arg(long, env = "AMAIL_MAX_MIRROR_MB")]
     max_mirror_mb: Option<usize>,
+    /// MiB of mail an org may store: subject, body and meta of each
+    /// message it sent (public default 1024; 0: no limit).
+    #[arg(long, env = "AMAIL_MAX_ORG_STORAGE_MB")]
+    max_org_storage_mb: Option<i64>,
 }
 
 impl ServeOpts {
@@ -372,6 +376,9 @@ impl ServeOpts {
         }
         if let Some(v) = self.max_mirror_mb {
             l.mirror_bytes = (v > 0).then(|| v.saturating_mul(1024 * 1024));
+        }
+        if let Some(v) = self.max_org_storage_mb {
+            l.org_storage_bytes = (v > 0).then(|| v.saturating_mul(1 << 20));
         }
         Ok(c)
     }
@@ -1264,6 +1271,11 @@ async fn run(cli: Cli) -> Result<()> {
     }
 }
 
+/// Bytes in MiB: `1.5 MiB`.
+fn mib(bytes: i64) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+}
+
 fn org_text(v: &Value) -> Result<String> {
     let o: p::OrgInfo = parse(v)?;
     let mut s = format!(
@@ -1280,6 +1292,14 @@ fn org_text(v: &Value) -> Result<String> {
     );
     if let Some(u) = o.webhook_url {
         s.push_str(&format!(" webhook_url={u}"));
+    }
+    s.push_str(&format!("\nstorage: {}", mib(o.stored_bytes)));
+    if let Some(q) = o.storage_quota_bytes {
+        s.push_str(&format!(
+            " of {} ({:.0}%)",
+            mib(q),
+            o.stored_bytes as f64 * 100.0 / q.max(1) as f64
+        ));
     }
     Ok(s)
 }

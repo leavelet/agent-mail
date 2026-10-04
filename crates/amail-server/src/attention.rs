@@ -213,6 +213,8 @@ async fn escalate(st: &AppState, due: &AckDue, now: i64) -> amail_store::Result<
             meta: Default::default(),
             deliveries,
             ack_due: None,
+            // Reminders from the mail system are never refused.
+            storage_quota: None,
         })
         .await?;
     let events: Vec<(String, i64)> = sent

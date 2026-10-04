@@ -119,7 +119,7 @@ macro_rules! auth_select {
     () => {
         "SELECT t.id AS token_id, t.scope, t.seat_id, o.id, o.name, o.send_rate_per_min, o.send_burst, \
          o.max_recipients, o.max_thread_depth, o.webhook_url, o.ack_timeout_min, o.focus_max_min, \
-         o.digest_interval_min, o.created_at, o.suspended_at, s.id AS s_id, \
+         o.digest_interval_min, o.created_at, o.suspended_at, o.stored_bytes, s.id AS s_id, \
          s.org_id AS s_org_id, s.name AS s_name, \
          s.kind AS s_kind, s.parent_id AS s_parent_id, p.name AS s_parent_name, \
          s.display_name AS s_display_name, s.role AS s_role, s.harness AS s_harness, \
@@ -279,6 +279,7 @@ pub(crate) struct OrgRow {
     digest_interval_min: i64,
     created_at: i64,
     suspended_at: Option<i64>,
+    stored_bytes: i64,
 }
 
 impl From<OrgRow> for Org {
@@ -296,6 +297,7 @@ impl From<OrgRow> for Org {
             digest_interval_min: r.digest_interval_min,
             created_at: r.created_at,
             suspended_at: r.suspended_at,
+            stored_bytes: r.stored_bytes,
         }
     }
 }
@@ -2229,18 +2231,48 @@ macro_rules! impl_store_common {
             }
 
             /// Clear the bodies of up to `limit` messages created before
-            /// `cutoff` (oldest first); returns how many.
+            /// `cutoff` (oldest first); returns how many. The bytes of the
+            /// cleared bodies are subtracted from their orgs' stored bytes.
             pub async fn expire_bodies(c: &mut Conn, cutoff: i64, limit: i64) -> Result<u64> {
-                Ok(sqlx::query(
-                    "UPDATE messages SET body = '', expired_at = $1 WHERE id IN (SELECT id FROM messages \
-                     WHERE created_at < $2 AND expired_at IS NULL ORDER BY created_at LIMIT $3)",
+                // Marking the messages first returns each body's size once,
+                // also when another instance expires the same messages.
+                let now = now_ms();
+                let rows: Vec<(i64, i64, i64)> = sqlx::query_as(
+                    "UPDATE messages SET expired_at = $1 WHERE id IN (SELECT id FROM messages \
+                     WHERE created_at < $2 AND expired_at IS NULL ORDER BY created_at LIMIT $3) \
+                     AND expired_at IS NULL RETURNING id, org_id, CAST(octet_length(body) AS BIGINT)",
                 )
-                .bind(now_ms())
+                .bind(now)
                 .bind(cutoff)
                 .bind(limit)
-                .execute(&mut *c)
-                .await?
-                .rows_affected())
+                .fetch_all(&mut *c)
+                .await?;
+                if rows.is_empty() {
+                    return Ok(0);
+                }
+                for chunk in rows.chunks(500) {
+                    let sql = format!(
+                        "UPDATE messages SET body = '' WHERE id IN ({})",
+                        placeholders(1, chunk.len())
+                    );
+                    let mut q = sqlx::query(&sql);
+                    for (id, ..) in chunk {
+                        q = q.bind(*id);
+                    }
+                    q.execute(&mut *c).await?;
+                }
+                let mut freed: std::collections::BTreeMap<i64, i64> = Default::default();
+                for (_, org, n) in &rows {
+                    *freed.entry(*org).or_default() += n;
+                }
+                for (org, n) in freed {
+                    sqlx::query("UPDATE orgs SET stored_bytes = stored_bytes - $1 WHERE id = $2")
+                        .bind(n)
+                        .bind(org)
+                        .execute(&mut *c)
+                        .await?;
+                }
+                Ok(rows.len() as u64)
             }
 
             pub async fn operator_stats(c: &mut Conn, now: i64) -> Result<OperatorStats> {
@@ -2257,13 +2289,14 @@ macro_rules! impl_store_common {
                 let hour_lo = first_id(hour).fetch_optional(&mut *c).await?.unwrap_or(i64::MAX);
                 let day_lo = first_id(day).fetch_optional(&mut *c).await?.unwrap_or(i64::MAX);
                 #[allow(clippy::type_complexity)]
-                let rows: Vec<(i64, String, i64, Option<i64>, i64, i64, i64, i64, Option<i64>)> = sqlx::query_as(
+                let rows: Vec<(i64, String, i64, Option<i64>, i64, i64, i64, i64, Option<i64>, i64)> = sqlx::query_as(
                     "SELECT o.id, o.name, o.created_at, o.suspended_at, \
                      (SELECT COUNT(*) FROM seats s WHERE s.org_id = o.id AND s.kind = 'agent' AND s.deleted_at IS NULL), \
                      (SELECT COUNT(*) FROM messages m WHERE m.org_id = o.id), \
                      (SELECT COUNT(*) FROM messages m WHERE m.org_id = o.id AND m.id >= $1 AND m.created_at >= $2), \
                      (SELECT COUNT(*) FROM messages m WHERE m.org_id = o.id AND m.id >= $3 AND m.created_at >= $4), \
-                     (SELECT m.created_at FROM messages m WHERE m.org_id = o.id ORDER BY m.id DESC LIMIT 1) \
+                     (SELECT m.created_at FROM messages m WHERE m.org_id = o.id ORDER BY m.id DESC LIMIT 1), \
+                     o.stored_bytes \
                      FROM orgs o",
                 )
                 .bind(hour_lo)
@@ -2274,8 +2307,8 @@ macro_rules! impl_store_common {
                 .await?;
                 let mut orgs: Vec<OrgStat> = rows
                     .into_iter()
-                    .map(|(id, name, created_at, suspended_at, seats, messages, messages_hour, messages_day, last_activity)| OrgStat {
-                        id, name, created_at, suspended_at, seats, messages, messages_hour, messages_day, last_activity,
+                    .map(|(id, name, created_at, suspended_at, seats, messages, messages_hour, messages_day, last_activity, stored_bytes)| OrgStat {
+                        id, name, created_at, suspended_at, seats, messages, messages_hour, messages_day, last_activity, stored_bytes,
                     })
                     .collect();
                 orgs.sort_by(|a, b| {

@@ -44,6 +44,7 @@ bound_tests!(
     mirror_post_size_is_capped,
     stalled_mirror_watcher_is_dropped,
     mirror_memory_limit,
+    storage_quota,
 );
 
 /// Start a server; `None` (test skipped) when Postgres is not configured.
@@ -752,4 +753,109 @@ async fn mirror_memory_limit(b: Backend, t: &str) {
     let (s, _) = acme.stream("/seats/a/transcript").await;
     assert_eq!(s, StatusCode::OK);
     assert!(hub.bytes() <= LIMIT, "{}", hub.bytes());
+}
+
+// --- storage -------------------------------------------------------------------
+
+/// Each org's stored bytes (subject, body and meta of the mail it sent, once
+/// per message) are counted on send, reduced when retention clears bodies,
+/// and a send that would exceed the quota is refused with 507.
+async fn storage_quota(b: Backend, t: &str) {
+    let mut cfg = public();
+    cfg.limits.org_storage_bytes = Some(10_000);
+    let srv = start!(b, t, cfg);
+    let acme = srv.org("acme").await;
+    let beta = srv.org("beta").await;
+    acme.link(&beta, "beta", "acme").await;
+    let a = acme.seat("a").await;
+    let body = "x".repeat(3000);
+    // Three recipients, counted once: 3 + 3000 + {"k":"v"} = 3012 bytes.
+    a.send(json!({ "to": ["owner", "owner@beta"], "cc": ["a"], "subject": "one", "body": body, "meta": { "k": "v" } }))
+        .await;
+    let org = acme.get("/org").await.1;
+    assert_eq!(org["stored_bytes"], 3012, "{org}");
+    assert_eq!(org["storage_quota_bytes"], 10_000, "{org}");
+    // The receiving org is not charged.
+    assert_eq!(beta.get("/org").await.1["stored_bytes"], 0);
+    // The user seat is not exempt.
+    acme.send(json!({ "to": ["a"], "subject": "two", "body": body }))
+        .await;
+    a.send(json!({ "to": ["owner"], "subject": "three", "body": body }))
+        .await;
+    let (s, v) = a
+        .call(
+            Method::POST,
+            "/messages",
+            Some(json!({ "to": ["owner"], "subject": "four", "body": body })),
+        )
+        .await;
+    assert_eq!(s, StatusCode::INSUFFICIENT_STORAGE, "{v}");
+    assert_eq!(v["error"]["code"], "storage_quota", "{v}");
+    let stored = 3012 + 3003 + 3005;
+    assert_eq!(acme.get("/org").await.1["stored_bytes"], stored);
+    // Small mail still fits; the operator sees the count.
+    a.send(json!({ "to": ["owner"], "subject": "s", "body": "b" }))
+        .await;
+    let op = srv.operator().await;
+    let stats = op.get("/operator/stats").await.1;
+    let row = stats["list"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["name"] == "acme")
+        .unwrap()
+        .clone();
+    assert_eq!(row["stored_bytes"], stored + 2, "{stats}");
+    // Retention clears bodies and gives their bytes back.
+    let n = srv
+        .db
+        .store
+        .expire_bodies(amail_store::now_ms() + 1, 1000)
+        .await
+        .unwrap();
+    let o = acme.get("/org").await.1;
+    assert_eq!(n, 4, "{o}");
+    let left = 3 + 9 + 3 + 5 + 1;
+    assert_eq!(acme.get("/org").await.1["stored_bytes"], left);
+    assert_eq!(
+        srv.db
+            .store
+            .expire_bodies(amail_store::now_ms() + 1, 1000)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(acme.get("/org").await.1["stored_bytes"], left);
+    a.send(json!({ "to": ["owner"], "subject": "four", "body": body }))
+        .await;
+
+    // Concurrent sends never take an org over its quota.
+    let gamma = srv.org("gamma").await;
+    let sends = (0..10).map(|_| {
+        let g = gamma.clone();
+        let body = body.clone();
+        async move {
+            g.status(
+                Method::POST,
+                "/messages",
+                Some(json!({ "to": ["owner"], "subject": "s", "body": body })),
+            )
+            .await
+        }
+    });
+    let codes = futures::future::join_all(sends).await;
+    let ok = codes.iter().filter(|c| c.is_success()).count();
+    assert_eq!(ok, 3, "{codes:?}");
+    assert_eq!(gamma.get("/org").await.1["stored_bytes"], 3 * 3001);
+
+    // Self-hosted: counted, never refused.
+    let srv = start!(b, &format!("{t}_self"), selfhosted());
+    let acme = srv.org("acme").await;
+    for _ in 0..4 {
+        acme.send(json!({ "to": ["owner"], "subject": "s", "body": body }))
+            .await;
+    }
+    let org = acme.get("/org").await.1;
+    assert_eq!(org["stored_bytes"], 4 * 3001, "{org}");
+    assert!(org.get("storage_quota_bytes").is_none(), "{org}");
 }

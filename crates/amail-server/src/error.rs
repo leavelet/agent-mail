@@ -47,6 +47,22 @@ impl ApiError {
         e.retry_after_ms = Some(retry_after_ms);
         e
     }
+    /// 507: the message would take the org over its storage quota.
+    pub fn storage_quota(stored: i64, limit: Option<i64>) -> Self {
+        let limit = match limit {
+            Some(l) => format!(" of {}", crate::render::mib(l)),
+            None => String::new(),
+        };
+        Self::new(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "storage_quota",
+            format!(
+                "this message does not fit in the org's storage quota{limit} on this server \
+                 ({} stored); ask the server's operator",
+                crate::render::mib(stored)
+            ),
+        )
+    }
     pub fn rate_limited(retry_after_ms: u64) -> Self {
         let mut e = Self::new(
             StatusCode::TOO_MANY_REQUESTS,
@@ -67,6 +83,7 @@ impl From<StoreError> for ApiError {
             StoreError::NotFound(m) => Self::not_found(m),
             StoreError::Conflict(m) => Self::new(StatusCode::CONFLICT, "conflict", m),
             StoreError::Invalid(m) => Self::bad_request(m),
+            StoreError::StorageQuota(stored) => Self::storage_quota(stored, None),
             other => {
                 tracing::error!("store error: {other}");
                 Self::new(

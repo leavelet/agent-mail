@@ -228,8 +228,14 @@ async fn send_inner(
         meta: req.meta,
         deliveries,
         ack_due,
+        storage_quota: st.config.limits.org_storage_bytes,
     };
-    let sent = st.store.send(&msg).await?;
+    let sent = st.store.send(&msg).await.map_err(|e| match e {
+        amail_store::StoreError::StorageQuota(stored) => {
+            ApiError::storage_quota(stored, st.config.limits.org_storage_bytes)
+        }
+        e => e.into(),
+    })?;
 
     let mut by_org: HashMap<i64, Vec<(String, i64)>> = HashMap::new();
     for b in &sent.seqs {

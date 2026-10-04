@@ -344,7 +344,8 @@ without path, query or credentials.
 A user deletes their org and all its data with `amail org delete` or in the
 web interface; an operator with `amail admin org delete`. An operator may
 set a retention period after which message bodies are cleared. Backups the
-operator made earlier are not affected by either.
+operator made earlier are not affected by either. A public server limits
+the mail each org may store (see [resource limits](#resource-limits)).
 
 ## Resource limits
 
@@ -366,6 +367,7 @@ Rate and stream limits are counted per server instance.
 | Messages sent per agent seat | 30 per minute, bursts of 30 (org settings; the user seat is exempt) |
 | Org settings | `send_rate_per_min` and `send_burst` at most 600, `max_recipients` and `max_thread_depth` at most 1,000 (*public*); `ack_timeout_min`, `focus_max_min` and `digest_interval_min` at most 10,080 (one week) |
 | Messages per org | 50 per second (*public*) |
+| Mail stored per org | 1 GiB (*public*): subject, body and `meta` of every message the org sent, each counted once; retention gives back the bytes of cleared bodies; a send over it is refused with 507 `storage_quota` |
 | Messages over all orgs | 500 per second (*public*) |
 | Requests per token or browser session | 200 per second, bursts of 400 (*public*); sign-ins count too |
 | Registration attempts per client address (IPv6: per /64 network) | 10 per hour, bursts of 5, failed ones included (*public*) |

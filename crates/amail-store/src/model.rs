@@ -27,6 +27,8 @@ pub struct Org {
     /// Suspended by the operator: its tokens do not work and mail to it is
     /// refused.
     pub suspended_at: Option<i64>,
+    /// Bytes of the messages the org sent (see [`message_bytes`]).
+    pub stored_bytes: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +120,16 @@ pub struct NewMessage {
     /// With `ack_required`: when the sender is told about recipients that
     /// have not acknowledged.
     pub ack_due: Option<i64>,
+    /// Refuse the message ([`crate::StoreError::StorageQuota`]) if the
+    /// org's stored bytes would then exceed this.
+    pub storage_quota: Option<i64>,
+}
+
+/// The bytes a message adds to its org's `stored_bytes`: its subject, body
+/// and meta as stored (a JSON object, or nothing when empty). Addresses and
+/// per-recipient delivery rows are not counted.
+pub fn message_bytes(subject: &str, body: &str, meta_db: &str) -> i64 {
+    (subject.len() + body.len() + meta_db.len()) as i64
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -410,6 +422,8 @@ pub struct OrgStat {
     pub messages_day: i64,
     /// When the org last sent a message.
     pub last_activity: Option<i64>,
+    /// Bytes of the messages the org sent (see [`message_bytes`]).
+    pub stored_bytes: i64,
 }
 
 /// What [`crate::Store::operator_stats`] reports.

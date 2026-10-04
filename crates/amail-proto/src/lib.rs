@@ -739,6 +739,13 @@ pub struct OrgInfo {
     /// only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook_url: Option<String>,
+    /// Bytes of the mail the org sent that the server stores (subject, body
+    /// and meta of each message, counted once).
+    #[serde(default)]
+    pub stored_bytes: i64,
+    /// The server's limit on `stored_bytes`; absent when there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_quota_bytes: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1234,6 +1241,9 @@ pub struct OrgStatInfo {
     pub messages_day: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity: Option<String>,
+    /// Bytes of the mail the org sent that the server stores.
+    #[serde(default)]
+    pub stored_bytes: i64,
 }
 
 /// Response of `GET /v1/operator/stats`.

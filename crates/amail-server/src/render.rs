@@ -139,7 +139,12 @@ pub fn list(l: &List, members: Option<Vec<p::ListMember>>) -> p::List {
     }
 }
 
-pub fn org(o: &Org) -> p::OrgInfo {
+/// Bytes in MiB, for messages: `1.5 MiB`.
+pub fn mib(bytes: i64) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+}
+
+pub fn org(o: &Org, storage_quota: Option<i64>) -> p::OrgInfo {
     p::OrgInfo {
         name: o.name.clone(),
         send_rate_per_min: o.send_rate_per_min,
@@ -150,5 +155,7 @@ pub fn org(o: &Org) -> p::OrgInfo {
         focus_max_min: o.focus_max_min,
         digest_interval_min: o.digest_interval_min,
         webhook_url: o.webhook_url.clone(),
+        stored_bytes: o.stored_bytes,
+        storage_quota_bytes: storage_quota,
     }
 }

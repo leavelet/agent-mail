@@ -42,6 +42,10 @@ pub struct Limits {
     /// watcher furthest behind is disconnected or the largest replay buffer
     /// shortened, whichever holds more.
     pub mirror_bytes: Option<usize>,
+    /// Bytes of mail an org may store: the subject, body and meta of every
+    /// message it sent, each counted once (`amail_store::message_bytes`).
+    /// A send that would go over it is refused.
+    pub org_storage_bytes: Option<i64>,
 }
 
 impl Limits {
@@ -59,6 +63,7 @@ impl Limits {
             registrations_per_hour: Some(10.0),
             org_webhooks_in_flight: Some(16),
             mirror_bytes: Some(256 * 1024 * 1024),
+            org_storage_bytes: Some(1 << 30),
         }
     }
 }
