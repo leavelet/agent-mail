@@ -5,6 +5,7 @@
 //! is set).
 
 use amail_server::config::Config;
+use amail_server::limits::Pool;
 use amail_server::{AppState, hash_token, new_token};
 use amail_store::testutil::{Backend, TestDb};
 use reqwest::{Method, StatusCode};
@@ -36,6 +37,7 @@ macro_rules! load_tests {
 load_tests!(
     org_request_limit_counts_all_tokens,
     heavy_endpoints_take_a_query_slot,
+    other_orgs_cannot_take_every_slot,
     counts_do_not_grow_with_deliveries,
     invisible_thread_costs_what_a_missing_one_does,
 );
@@ -211,10 +213,18 @@ async fn heavy_endpoints_take_a_query_slot(b: Backend, t: &str) {
         sent["thread_id"].as_i64().unwrap(),
     );
 
-    let held: Vec<_> = vec![
-        srv.limiters.queries.acquire(acme.org_id).await.unwrap(),
-        srv.limiters.queries.acquire(acme.org_id).await.unwrap(),
-    ];
+    let mut held = Vec::new();
+    for pool in [Pool::Scan, Pool::Other, Pool::Light] {
+        for _ in 0..2 {
+            held.push(
+                srv.limiters
+                    .queries
+                    .acquire(pool, acme.org_id)
+                    .await
+                    .unwrap(),
+            );
+        }
+    }
     let heavy = [
         "/overview".to_string(),
         "/attention".to_string(),
@@ -272,6 +282,95 @@ async fn heavy_endpoints_take_a_query_slot(b: Backend, t: &str) {
     for path in &heavy {
         acme.get(path).await;
     }
+}
+
+/// Other orgs holding every server-wide query slot (public defaults: one
+/// per org of each pool, eight of each pool over all orgs) do not refuse
+/// an org's overview, attention, lists and counts, which need no
+/// server-wide slot; its search and thread requests wait for the next
+/// free slot, which goes to it before the next request of an org that
+/// was given a slot before.
+async fn other_orgs_cannot_take_every_slot(b: Backend, t: &str) {
+    let cfg = Config::public();
+    let (per_org, total) = (cfg.limits.org_queries, cfg.limits.queries);
+    assert_eq!((per_org, total), (Some(1), Some(8)));
+    let srv = start!(b, t, cfg);
+    let vic = srv.org("victim").await;
+    vic.ok(Method::POST, "/seats", Some(json!({"name": "a"})))
+        .await;
+    vic.ok(Method::POST, "/lists", Some(json!({"name": "team"})))
+        .await;
+    vic.ok(Method::PUT, "/lists/team/members/a", None).await;
+    let sent = vic
+        .send(json!({"to": ["a", "team"], "subject": "s", "body": "hello there"}))
+        .await;
+    let (id, thread) = (
+        sent["id"].as_i64().unwrap(),
+        sent["thread_id"].as_i64().unwrap(),
+    );
+    // Eight other orgs take every server-wide slot of both pools, and each
+    // has another request waiting.
+    let mut held = Vec::new();
+    for org in 1_000..1_008 {
+        for pool in [Pool::Scan, Pool::Other] {
+            held.push(srv.limiters.queries.acquire(pool, org).await.unwrap());
+        }
+    }
+    let waiting: Vec<_> = (1_000..1_008)
+        .map(|org| {
+            let l = srv.limiters.clone();
+            tokio::spawn(async move { l.queries.acquire(Pool::Scan, org).await.is_ok() })
+        })
+        .collect();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    for path in [
+        "/overview".to_string(),
+        "/attention".to_string(),
+        "/lists".to_string(),
+        "/lists/team".to_string(),
+        "/counts".to_string(),
+        "/pending".to_string(),
+        "/inbox?seat=a".to_string(),
+        "/sent".to_string(),
+        format!("/messages/{id}"),
+        "/seats".to_string(),
+    ] {
+        let t0 = Instant::now();
+        vic.get(&path).await;
+        assert!(t0.elapsed().as_millis() < 500, "{path}: {:?}", t0.elapsed());
+    }
+    // The victim's search waits; the next freed slot goes to it, not to
+    // the orgs that hold one.
+    let search = {
+        let c = vic.clone();
+        tokio::spawn(async move { c.call(Method::GET, "/archive/search?q=hello", None).await })
+    };
+    let thread_req = {
+        let c = vic.clone();
+        tokio::spawn(async move {
+            c.call(Method::GET, &format!("/threads/{thread}"), None)
+                .await
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let mut held = held.into_iter();
+    drop(held.next()); // a Scan slot of org 1000
+    drop(held.next()); // an Other slot of org 1000
+    let (s, v) = search.await.unwrap();
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["messages"][0]["id"], id, "{v}");
+    let (s, v) = thread_req.await.unwrap();
+    assert_eq!(s, StatusCode::OK, "{v}");
+    // Then org 1000's waiting request is served; the other orgs, holding
+    // one slot each, are refused when their wait runs out.
+    let served: Vec<bool> = futures::future::join_all(waiting)
+        .await
+        .into_iter()
+        .map(Result::unwrap)
+        .collect();
+    assert!(served[0], "{served:?}");
+    assert_eq!(served.iter().filter(|x| **x).count(), 1, "{served:?}");
+    drop(held);
 }
 
 /// `pending` and `counts` read counters: their cost does not grow with the

@@ -393,11 +393,13 @@ struct ServeOpts {
     max_org_storage_mb: Option<i64>,
     /// Search, archive and other requests whose cost depends on the data
     /// (threads, attention, overview, delivery status, lists) per org in
-    /// progress at the same time (public default 1; 0: no limit).
+    /// progress at the same time, in each of three pools (search, other,
+    /// light) (public default 1; 0: no limit).
     #[arg(long, env = "AMAIL_MAX_ORG_QUERIES")]
     max_org_queries: Option<usize>,
-    /// The same over all orgs (public default 8; 0: no limit). Keep it
-    /// below the database pool size (`--max-connections`).
+    /// The same over all orgs, in each of the search and the other pool
+    /// (public default 8; 0: no limit). Keep twice this below the database
+    /// pool size (`--max-connections`).
     #[arg(long, env = "AMAIL_MAX_QUERIES")]
     max_queries: Option<usize>,
 }

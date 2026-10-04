@@ -221,7 +221,6 @@ impl Limiters {
         if let Some(b) = &self.registration_nets {
             b.prune();
         }
-        self.queries.prune();
         self.node_notices.prune();
     }
 }
@@ -248,23 +247,42 @@ impl CredentialOrgs {
     }
 }
 
-/// Slots for requests whose database cost depends on the data: at most
-/// `per_org` of one org and `total` of all orgs run at a time. A request
-/// waits up to [`QUERY_SLOT_WAIT`] for a slot.
+/// The pools of query slots. Search and archive requests can look at many
+/// messages (in steps, for a bounded time per request); the other requests
+/// whose cost depends on the data look at a bounded amount each. Separate
+/// pools keep one kind from taking every slot of the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pool {
+    /// `/archive/search`, `/archive/messages`.
+    Scan,
+    /// Threads, delivery status, `/changes`, large `/inbox` and `/sent`
+    /// pages.
+    Other,
+    /// Requests whose cost has a fixed upper bound: `/overview`,
+    /// `/attention`, `/lists`, `/lists/{name}`. Limited per org only, so
+    /// that other orgs cannot make them wait.
+    Light,
+}
+
+/// Slots for requests whose database cost depends on the data, in
+/// [`Pool`]s: in each, at most `per_org` of one org and (except
+/// [`Pool::Light`]) `total` of all orgs run at a time. A request waits up
+/// to [`QUERY_SLOT_WAIT`] for a slot.
+/// When a slot frees, it goes to the waiting request of the org that holds
+/// the fewest slots of the pool at that moment, then of the org that held
+/// slots of the pool for the least time lately (decaying by half every
+/// 10 s), then the longest waiting: an org with one request waiting is
+/// served before another org's next one, however many requests that org
+/// has waiting, and an org whose requests are short is not kept waiting by
+/// orgs whose requests use their slots for long.
 pub struct QuerySlots {
-    per_org: Option<usize>,
-    orgs: Mutex<HashMap<i64, Arc<tokio::sync::Semaphore>>>,
-    total: Option<Arc<tokio::sync::Semaphore>>,
+    scan: FairSlots,
+    other: FairSlots,
+    light: FairSlots,
 }
 
 /// How long a request waits for a query slot before it is refused.
 pub const QUERY_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
-
-/// A query slot; dropping it frees the slot.
-pub struct QuerySlot {
-    _org: Option<tokio::sync::OwnedSemaphorePermit>,
-    _total: Option<tokio::sync::OwnedSemaphorePermit>,
-}
 
 /// Which limit refused a query slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,52 +294,235 @@ pub enum SlotRefused {
 impl QuerySlots {
     pub fn new(per_org: Option<usize>, total: Option<usize>) -> Self {
         QuerySlots {
-            per_org,
-            orgs: Mutex::new(HashMap::new()),
-            total: total.map(|n| Arc::new(tokio::sync::Semaphore::new(n))),
+            scan: FairSlots::new(per_org, total),
+            other: FairSlots::new(per_org, total),
+            light: FairSlots::new(per_org, None),
         }
     }
 
-    /// Take a slot for the org, waiting up to [`QUERY_SLOT_WAIT`] in all.
-    pub async fn acquire(&self, org_id: i64) -> Result<QuerySlot, SlotRefused> {
-        let deadline = tokio::time::Instant::now() + QUERY_SLOT_WAIT;
-        let org = match self.per_org {
-            None => None,
-            Some(n) => {
-                let sem = self
-                    .orgs
-                    .lock()
-                    .unwrap()
-                    .entry(org_id)
-                    .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(n)))
-                    .clone();
-                match tokio::time::timeout_at(deadline, sem.acquire_owned()).await {
-                    Ok(Ok(p)) => Some(p),
-                    _ => return Err(SlotRefused::Org),
-                }
-            }
-        };
-        let total = match &self.total {
-            None => None,
-            Some(sem) => match tokio::time::timeout_at(deadline, sem.clone().acquire_owned()).await
-            {
-                Ok(Ok(p)) => Some(p),
-                _ => return Err(SlotRefused::Total),
-            },
-        };
-        Ok(QuerySlot {
-            _org: org,
-            _total: total,
-        })
+    /// Take a slot of the pool for the org, waiting up to
+    /// [`QUERY_SLOT_WAIT`].
+    pub async fn acquire(&self, pool: Pool, org_id: i64) -> Result<QuerySlot, SlotRefused> {
+        match pool {
+            Pool::Scan => self.scan.acquire(org_id).await,
+            Pool::Other => self.other.acquire(org_id).await,
+            Pool::Light => self.light.acquire(org_id).await,
+        }
     }
 
-    /// Forget orgs with no slot in use.
-    pub fn prune(&self) {
-        let Some(n) = self.per_org else { return };
-        self.orgs
-            .lock()
-            .unwrap()
-            .retain(|_, s| Arc::strong_count(s) > 1 || s.available_permits() < n);
+    /// Requests waiting for a slot, in both pools.
+    pub fn waiting(&self) -> usize {
+        self.scan.waiting() + self.other.waiting() + self.light.waiting()
+    }
+}
+
+/// One pool of query slots (see [`QuerySlots`]).
+struct FairSlots {
+    per_org: usize,
+    total: usize,
+    state: Arc<Mutex<FairState>>,
+}
+
+#[derive(Default)]
+struct FairState {
+    /// Per org: slots held and recent use. Orgs holding none whose recent
+    /// use has decayed below a millisecond are dropped.
+    orgs: HashMap<i64, OrgUse>,
+    in_use: usize,
+    /// Requests waiting, in arrival order.
+    waiters: Vec<Waiter>,
+    next_id: u64,
+}
+
+struct OrgUse {
+    held: usize,
+    /// Seconds the org held slots of the pool, decayed by half every
+    /// [`USE_HALF_LIFE_S`], as of `at`.
+    used: f64,
+    at: Instant,
+}
+
+/// Half-life of an org's recorded slot time, in seconds.
+const USE_HALF_LIFE_S: f64 = 10.0;
+
+impl OrgUse {
+    fn used_now(&self, now: Instant) -> f64 {
+        let dt = now.saturating_duration_since(self.at).as_secs_f64();
+        self.used * 0.5f64.powf(dt / USE_HALF_LIFE_S)
+    }
+}
+
+struct Waiter {
+    id: u64,
+    org: i64,
+    grant: tokio::sync::oneshot::Sender<()>,
+}
+
+impl FairState {
+    fn held(&self, org: i64) -> usize {
+        self.orgs.get(&org).map_or(0, |o| o.held)
+    }
+
+    /// Give free slots to waiting requests: each to the waiter of the org
+    /// that holds the fewest slots, then of the org that held slots of the
+    /// pool for the least time lately, then the oldest.
+    fn dispatch(&mut self, per_org: usize, total: usize) {
+        let now = Instant::now();
+        while self.in_use < total {
+            let best = self
+                .waiters
+                .iter()
+                .enumerate()
+                .filter_map(|(i, w)| {
+                    let (held, used) = match self.orgs.get(&w.org) {
+                        Some(o) => (o.held, o.used_now(now)),
+                        None => (0, 0.0),
+                    };
+                    (held < per_org).then_some((held, used, w.id, i))
+                })
+                .min_by(|a, b| {
+                    (a.0, a.1, a.2)
+                        .partial_cmp(&(b.0, b.1, b.2))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            let Some((_, _, _, i)) = best else { return };
+            let w = self.waiters.remove(i);
+            if w.grant.send(()).is_ok() {
+                self.orgs
+                    .entry(w.org)
+                    .or_insert(OrgUse {
+                        held: 0,
+                        used: 0.0,
+                        at: now,
+                    })
+                    .held += 1;
+                self.in_use += 1;
+            }
+        }
+    }
+
+    /// An org gives back a slot it held for `held_for`.
+    fn release(&mut self, org: i64, held_for: std::time::Duration) {
+        let now = Instant::now();
+        if let Some(o) = self.orgs.get_mut(&org) {
+            o.held = o.held.saturating_sub(1);
+            o.used = o.used_now(now) + held_for.as_secs_f64();
+            o.at = now;
+        }
+        self.in_use -= 1;
+        if self.orgs.len() > 1024 {
+            self.orgs
+                .retain(|_, o| o.held > 0 || o.used_now(now) >= 0.001);
+        }
+    }
+}
+
+impl FairSlots {
+    fn new(per_org: Option<usize>, total: Option<usize>) -> Self {
+        FairSlots {
+            per_org: per_org.unwrap_or(usize::MAX),
+            total: total.unwrap_or(usize::MAX),
+            state: Default::default(),
+        }
+    }
+
+    fn waiting(&self) -> usize {
+        self.state.lock().unwrap().waiters.len()
+    }
+
+    async fn acquire(&self, org_id: i64) -> Result<QuerySlot, SlotRefused> {
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let mut pending = {
+            let mut st = self.state.lock().unwrap();
+            let id = st.next_id;
+            st.next_id += 1;
+            st.waiters.push(Waiter {
+                id,
+                org: org_id,
+                grant: tx,
+            });
+            st.dispatch(self.per_org, self.total);
+            Pending {
+                slots: self,
+                id,
+                org: org_id,
+                done: false,
+            }
+        };
+        let granted = tokio::time::timeout(QUERY_SLOT_WAIT, &mut rx).await.is_ok() || {
+            let mut st = self.state.lock().unwrap();
+            match st.waiters.iter().position(|w| w.id == pending.id) {
+                Some(i) => {
+                    st.waiters.remove(i);
+                    false
+                }
+                // Granted while the wait ran out (grants are sent under the
+                // lock, so it has been sent).
+                None => true,
+            }
+        };
+        pending.done = true;
+        if !granted {
+            let held = self.state.lock().unwrap().held(org_id);
+            return Err(if held >= self.per_org {
+                SlotRefused::Org
+            } else {
+                SlotRefused::Total
+            });
+        }
+        Ok(QuerySlot {
+            state: self.state.clone(),
+            org: org_id,
+            per_org: self.per_org,
+            total: self.total,
+            since: Instant::now(),
+        })
+    }
+}
+
+/// A request waiting for a slot. If the request is dropped while it waits
+/// (the client went away), this takes it out of the queue, or gives back
+/// the slot it was granted meanwhile.
+struct Pending<'a> {
+    slots: &'a FairSlots,
+    id: u64,
+    org: i64,
+    done: bool,
+}
+
+impl Drop for Pending<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let mut st = self.slots.state.lock().unwrap();
+        match st.waiters.iter().position(|w| w.id == self.id) {
+            Some(i) => {
+                st.waiters.remove(i);
+            }
+            None => {
+                st.release(self.org, std::time::Duration::ZERO);
+                st.dispatch(self.slots.per_org, self.slots.total);
+            }
+        }
+    }
+}
+
+/// A query slot; dropping it frees the slot and gives it to the next
+/// waiting request.
+pub struct QuerySlot {
+    state: Arc<Mutex<FairState>>,
+    org: i64,
+    per_org: usize,
+    total: usize,
+    since: Instant,
+}
+
+impl Drop for QuerySlot {
+    fn drop(&mut self) {
+        let mut st = self.state.lock().unwrap();
+        st.release(self.org, self.since.elapsed());
+        st.dispatch(self.per_org, self.total);
     }
 }
 
@@ -439,22 +640,146 @@ mod tests {
     #[tokio::test]
     async fn query_slots() {
         let q = QuerySlots::new(Some(2), Some(3));
-        let a = q.acquire(1).await.unwrap();
-        let _b = q.acquire(1).await.unwrap();
-        assert_eq!(q.acquire(1).await.err(), Some(SlotRefused::Org));
-        let _c = q.acquire(2).await.unwrap();
-        assert_eq!(q.acquire(3).await.err(), Some(SlotRefused::Total));
+        let a = q.acquire(Pool::Scan, 1).await.unwrap();
+        let _b = q.acquire(Pool::Scan, 1).await.unwrap();
+        assert_eq!(q.acquire(Pool::Scan, 1).await.err(), Some(SlotRefused::Org));
+        let _c = q.acquire(Pool::Scan, 2).await.unwrap();
+        assert_eq!(
+            q.acquire(Pool::Scan, 3).await.err(),
+            Some(SlotRefused::Total)
+        );
+        // The other pools are separate, and the light one has no total.
+        let _d = q.acquire(Pool::Other, 3).await.unwrap();
+        let _e: Vec<_> = futures::future::join_all((10..20).map(|o| q.acquire(Pool::Light, o)))
+            .await
+            .into_iter()
+            .map(Result::unwrap)
+            .collect();
         drop(a);
-        assert!(q.acquire(1).await.is_ok());
+        assert!(q.acquire(Pool::Scan, 1).await.is_ok());
         // A slot freed while a request waits goes to that request.
-        let held = q.acquire(1).await.unwrap();
-        let wait = q.acquire(1);
+        let held = q.acquire(Pool::Scan, 1).await.unwrap();
+        let wait = q.acquire(Pool::Scan, 1);
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             drop(held);
         });
         assert!(wait.await.is_ok());
-        q.prune();
+        assert_eq!(q.waiting(), 0);
+    }
+
+    /// A freed slot goes to the org holding the fewest slots: an org with
+    /// one request waiting is served before an org's tenth, whatever the
+    /// order of arrival.
+    #[tokio::test]
+    async fn query_slots_are_fair_between_orgs() {
+        let q = Arc::new(QuerySlots::new(Some(10), Some(2)));
+        let first = q.acquire(Pool::Scan, 1).await.unwrap();
+        let second = q.acquire(Pool::Scan, 1).await.unwrap();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut tasks = Vec::new();
+        // Nine more requests of org 1, then one of org 2.
+        for org in [1, 1, 1, 1, 1, 1, 1, 1, 1, 2] {
+            let (q, order) = (q.clone(), order.clone());
+            tasks.push(tokio::spawn(async move {
+                let slot = q.acquire(Pool::Scan, org).await;
+                order.lock().unwrap().push(org);
+                if let Ok(s) = slot {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    drop(s);
+                }
+            }));
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(q.waiting(), 10);
+        drop(first);
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        assert_eq!(order.lock().unwrap().as_slice(), &[2]);
+        drop(second);
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert_eq!(order.lock().unwrap().len(), 10);
+
+        // One slot per org: org 1's next request waited longer, but org 2
+        // has not had a slot lately, so it goes first.
+        let q = Arc::new(QuerySlots::new(Some(1), Some(1)));
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let held = q.acquire(Pool::Scan, 1).await.unwrap();
+        let mut tasks = Vec::new();
+        for org in [1, 2] {
+            let (q, order) = (q.clone(), order.clone());
+            tasks.push(tokio::spawn(async move {
+                let s = q.acquire(Pool::Scan, org).await.unwrap();
+                order.lock().unwrap().push(org);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                drop(s);
+            }));
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        drop(held);
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert_eq!(order.lock().unwrap().as_slice(), &[2, 1]);
+
+        // Org 1 held its slots for long, org 2 briefly: org 2 goes first,
+        // although org 1 has waited longer.
+        let q = Arc::new(QuerySlots::new(Some(1), Some(1)));
+        drop(q.acquire(Pool::Scan, 2).await.unwrap());
+        let s = q.acquire(Pool::Scan, 1).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(s);
+        let held = q.acquire(Pool::Scan, 3).await.unwrap();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut tasks = Vec::new();
+        for org in [1, 2] {
+            let (q, order) = (q.clone(), order.clone());
+            tasks.push(tokio::spawn(async move {
+                let s = q.acquire(Pool::Scan, org).await.unwrap();
+                order.lock().unwrap().push(org);
+                drop(s);
+            }));
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        drop(held);
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert_eq!(order.lock().unwrap().as_slice(), &[2, 1]);
+    }
+
+    /// A request dropped while it waits leaves the queue, and one dropped
+    /// after it was granted gives its slot back.
+    #[tokio::test]
+    async fn dropped_waiters_free_their_place() {
+        let q = Arc::new(QuerySlots::new(Some(1), Some(1)));
+        let held = q.acquire(Pool::Other, 1).await.unwrap();
+        let q2 = q.clone();
+        let t = tokio::spawn(async move { q2.acquire(Pool::Other, 2).await.map(|_| ()) });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(q.waiting(), 1);
+        t.abort();
+        let _ = t.await;
+        assert_eq!(q.waiting(), 0);
+        drop(held);
+        // Granted, then dropped before it was used: the slot comes back.
+        let held = q.acquire(Pool::Other, 1).await.unwrap();
+        let mut fut = Box::pin(q.acquire(Pool::Other, 2));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut fut)
+                .await
+                .is_err()
+        );
+        drop(held);
+        drop(fut);
+        let _again = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            q.acquire(Pool::Other, 3),
+        )
+        .await
+        .expect("slot given back")
+        .unwrap();
     }
 
     #[test]

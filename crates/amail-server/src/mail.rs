@@ -4,6 +4,7 @@
 use crate::AppState;
 use crate::auth::Auth;
 use crate::error::{ApiError, ApiResult, Json, Path, Query};
+pub use crate::limits::Pool;
 use crate::render;
 use amail_proto::limits::{MAX_PAGE_BYTES, MAX_THREAD_BODY_BYTES, MAX_THREAD_MESSAGES};
 use amail_proto::{self as p, Address, Priority, TokenScope};
@@ -14,6 +15,11 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::{Stream, StreamExt, stream};
 use serde::Deserialize;
 use std::convert::Infallible;
+
+/// How long one search or archive request looks at further messages (see
+/// [`amail_proto::limits::SCAN_TIME_LIMIT_MS`]).
+pub const SCAN_TIME_LIMIT: std::time::Duration =
+    std::time::Duration::from_millis(amail_proto::limits::SCAN_TIME_LIMIT_MS);
 use tokio_stream::wrappers::BroadcastStream;
 
 /// Whether the caller may read a message: user tokens see everything sent
@@ -84,7 +90,7 @@ pub async fn inbox(
     };
     let entries = if query.limit > p::limits::SMALL_PAGE {
         let (store, seat_id, query) = (st.store.clone(), seat.id, query.clone());
-        limited(&st, &auth, async move {
+        limited(&st, &auth, Pool::Other, async move {
             Ok(store.inbox(seat_id, &query).await?)
         })
         .await?
@@ -164,7 +170,10 @@ pub async fn status(
         ));
     }
     let store = st.store.clone();
-    let rows = limited(&st, &auth, async move { Ok(store.recipients(id).await?) }).await?;
+    let rows = limited(&st, &auth, Pool::Other, async move {
+        Ok(store.recipients(id).await?)
+    })
+    .await?;
     let mut recipients: Vec<p::RecipientStatus> = Vec::new();
     for d in &rows {
         let delivery = render::delivery(d, &auth.org);
@@ -291,7 +300,7 @@ pub async fn thread(
     }
     let store = st.store.clone();
     let org_id = auth.org.id;
-    let mut found = limited(&st, &auth, async move {
+    let mut found = limited(&st, &auth, Pool::Other, async move {
         Ok(store
             .thread(id, org_id, MAX_THREAD_MESSAGES + 1, MAX_THREAD_BODY_BYTES)
             .await?)
@@ -423,7 +432,7 @@ pub async fn changes(
     let limit = q.limit.unwrap_or(500).clamp(1, 5000);
     let store = st.store.clone();
     let seat_id = seat.id;
-    let entries = limited(&st, &auth, async move {
+    let entries = limited(&st, &auth, Pool::Other, async move {
         Ok(store.changes(seat_id, since, limit).await?)
     })
     .await?;
@@ -629,10 +638,11 @@ pub async fn archive(
         thread_id: q.thread,
         before_id: q.before_id,
         limit,
+        time_limit: Some(SCAN_TIME_LIMIT),
     };
     let store = st.store.clone();
     let org_id = auth.org.id;
-    let page = limited(&st, &auth, async move {
+    let page = limited(&st, &auth, Pool::Scan, async move {
         Ok(store.archive(org_id, &query).await?)
     })
     .await?;
@@ -662,12 +672,13 @@ pub fn archive_response(
 }
 
 /// Run `f`, database work whose cost depends on the data, in one of the
-/// org's query slots ([`crate::config::Limits::org_queries`] per org,
-/// [`crate::config::Limits::queries`] in all). Without a free slot after a
-/// short wait the request gets 429 `too_many_queries`. The work runs in its
-/// own task, which holds the slot until the work ends: a client that drops
-/// the request does not free the slot while the database is still busy.
-pub async fn limited<T, F>(st: &AppState, auth: &Auth, f: F) -> ApiResult<T>
+/// org's query slots of `pool` ([`crate::config::Limits::org_queries`] per
+/// org, [`crate::config::Limits::queries`] in all except for
+/// [`Pool::Light`]). Without a free slot after a short wait the request
+/// gets 429 `too_many_queries`. The work runs in its own task, which holds
+/// the slot until the work ends: a client that drops the request does not
+/// free the slot while the database is still busy.
+pub async fn limited<T, F>(st: &AppState, auth: &Auth, pool: Pool, f: F) -> ApiResult<T>
 where
     T: Send + 'static,
     F: std::future::Future<Output = ApiResult<T>> + Send + 'static,
@@ -676,7 +687,7 @@ where
     let slot = st
         .limiters
         .queries
-        .acquire(auth.org.id)
+        .acquire(pool, auth.org.id)
         .await
         .map_err(|r| match r {
             SlotRefused::Org => ApiError::too_many(

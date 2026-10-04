@@ -185,7 +185,8 @@ it), newest first, without bodies, in pages of at most 2 MiB. Pass
 `next_before_id` as `before_id` to continue; when it is absent, nothing
 older matches. A page can be short, or even empty, and still have
 `next_before_id`: each request looks at no more than 50,000 of the org's
-messages, starting below `before_id`, and then stops.
+messages, starting below `before_id`, and starts no further step of
+messages after 100 ms; then it stops.
 
 Archive filters: `from` and `to` take a seat (`name`) or another org's
 address (`name@org`). For a seat of the org, `from` is its sent mail and
@@ -204,20 +205,26 @@ request looks at the 50,000 most recent messages before `before_id` (2,000
 when a term is shorter than three characters; `scan_limit` says which), so
 a search that finds few matches continues with `next_before_id`. Each hit
 has a snippet of the body around the first match. `mode` is always
-`"scan"`. Searches take one of the org's query slots (see
-[below](#limits-on-expensive-requests)).
+`"scan"`. A request also stops after 100 ms of
+looking (in steps of at most 5,000 messages and 4 MiB of body text divided
+by the number of terms) and answers with `next_before_id`, so a search of a
+large org may take several requests. Searches take one of the org's query
+slots (see [below](#limits-on-expensive-requests)).
 
 ### Limits on expensive requests
 
-Requests whose database cost depends on the data take one of the org's
-query slots: search, `GET /archive/messages`, `GET /threads/{id}` (after
-the check that the caller sees the thread), `/attention`, `/overview`,
-`/messages/{id}/status`, `/lists`, `/lists/{name}`, `/changes`, and
-`/inbox` and `/sent` pages of more than 100. On a public server an org has
-1 slot and the server 8 (`--max-org-queries`, `--max-queries`). A request
-that finds no free slot within 1 second gets 429 `too_many_queries` with
-`retry_after_ms`. A query that runs longer than 10 seconds is cancelled
-(503 `query_timeout`).
+Requests whose database cost depends on the data take a query slot of
+one of three pools: search and `GET /archive/messages` (search pool);
+`GET /threads/{id}` (after the check that the caller sees the thread),
+`/messages/{id}/status`, `/changes`, and `/inbox` and `/sent` pages of more
+than 100 (other pool); `/attention`, `/overview`, `/lists` and
+`/lists/{name}` (light pool). On a public server an org has 1 slot in each
+pool, and the search and other pools have 8 slots each over all orgs
+(`--max-org-queries`, `--max-queries`); the light pool has no limit over
+all orgs. A request that finds no free slot within 1 second gets 429
+`too_many_queries` with `retry_after_ms`. A freed slot goes first to an
+org that holds none and was served least recently. A query that runs
+longer than 10 seconds is cancelled (503 `query_timeout`).
 
 ### Webhook
 

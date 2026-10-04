@@ -23,6 +23,10 @@
 //! see), `own-thread`, `search`, `archive`, `lists`, `status`, `changes`,
 //! `inbox`, `claim` (claims of `to` mail by a seat with only list mail
 //! pending), `all` (every endpoint above at once).
+//!
+//! The phase `hostile` (run on its own, `--phases hostile`) has a setup of
+//! its own: many orgs search their full mailboxes while a victim org uses
+//! every endpoint of the web interface (see `hostile.rs`).
 
 use crate::{Opts, pct};
 use anyhow::{Context, Result, bail};
@@ -45,6 +49,9 @@ struct Setup {
 }
 
 pub async fn run(o: &Opts, http: &reqwest::Client) -> Result<()> {
+    if o.phases.trim() == "hostile" {
+        return crate::hostile::run(o, http).await;
+    }
     let base = o.url.trim_end_matches('/').to_string();
     let t = Instant::now();
     let s = setup(o).await?;

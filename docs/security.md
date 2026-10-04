@@ -168,6 +168,17 @@ seat with its jail on, the default: amail runs its host in a bwrap jail
 that hides the home directory, the runtime directory and other processes,
 so the points below that need those do not apply to it; it can still read
 the rest of the file system. With `dsh_jail = false` all the points apply.
+The jail mounts `/` read-only, a new `/dev` and `/proc`, and empty `tmpfs`
+mounts over the home directory, `/tmp` and `$XDG_RUNTIME_DIR`; it covers
+the Docker, Podman and containerd sockets with `/dev/null`; it mounts back
+writable the seat's working directory, its dsh home and the git paths its
+`git_access` allows; and it mounts back read-only the `amail`, `dsh` and
+Node.js installations, the repository's other git paths, the seat's
+profile, patch and endpoint directory, the node socket's directory, and
+git's configuration files `~/.gitconfig` and `config`, `ignore` and
+`attributes` in `~/.config/git` (or `$XDG_CONFIG_HOME/git`), each file on its own, never git's
+credential stores. The host has no controlling terminal and reads
+`/dev/null`. The full list is in the harness documentation.
 See [harness support](harnesses.md#deepseek-harness-dsh).) An agent that can run shell commands (Claude Code
 with `--dangerously-skip-permissions`, a Codex seat whose sandbox lets it
 read your home directory, or any agent whose commands you approve without
@@ -526,9 +537,9 @@ Rate and stream limits are counted per server instance.
 | `POST /claim` | at most 500 deliveries; `inline_body_max` and `preview_chars` at most 16,384 characters (a longer body is not inlined) |
 | `GET /changes` page | 500 by default, at most 5,000, and at most 2 MiB (`more` says what follows) |
 | `GET /archive/messages`, `GET /sent` page | 50 by default, at most 500, and at most 2 MiB |
-| `GET /archive/search` | 50 results by default, at most 200, and at most 2 MiB; at most 10 terms; each request looks at the org's 50,000 newest messages before its cursor (2,000 when a term is shorter than 3 characters) |
-| Messages one archive request looks at | 50,000 of the org's own, newest first (or of the thread, with `thread=`); then it answers with `next_before_id`. Filters by one of the org's seats (`from=`, `to=`) read that seat's mail directly |
-| Requests whose database cost depends on the data, in progress: search, archive, `GET /threads/{id}`, `/attention`, `/overview`, `/messages/{id}/status`, `/lists`, `/lists/{name}`, `/changes`, and `/inbox` and `/sent` pages of more than 100 | 1 per org and 8 over all orgs (*public*); a request waits up to 1 s for a slot, then gets 429 `too_many_queries`. A slot is held until the database work ends, also when the client gave up |
+| `GET /archive/search` | 50 results by default, at most 200, and at most 2 MiB; at most 10 terms; each request looks at most at the org's 50,000 newest messages before its cursor (2,000 when a term is shorter than 3 characters), in steps of at most 5,000 messages and 4 MiB of body text divided by the number of terms, and starts no step after 100 ms; then it answers with `next_before_id` |
+| Messages one archive request looks at | at most 50,000 of the org's own, newest first (or of the thread, with `thread=`), in steps of 5,000, and no step after 100 ms; then it answers with `next_before_id`. Filters by one of the org's seats (`from=`, `to=`) read that seat's mail directly |
+| Requests whose database cost depends on the data, in progress, in three pools: search (`/archive/search`, `/archive/messages`); other (`GET /threads/{id}`, `/messages/{id}/status`, `/changes`, and `/inbox` and `/sent` pages of more than 100); light (`/overview`, `/attention`, `/lists`, `/lists/{name}`, each with a fixed upper bound on its cost) | in each pool 1 per org (*public*); the search and the other pool also 8 each over all orgs (*public*), the light pool has no limit over all orgs. A request waits up to 1 s for a slot, then gets 429 `too_many_queries`; a freed slot goes to the org holding the fewest slots of the pool, then to the org served least recently. A slot is held until the database work ends, also when the client gave up |
 | One query of those requests | 10 s, then it is cancelled (503 `query_timeout`) |
 | `GET /pending`, `GET /counts` | read per-seat counters, kept in the transactions that change deliveries; their cost does not depend on the number of deliveries |
 | `GET /attention` | looks at the user seat's newest 5,000 deliveries; 500 items and 2 MiB |

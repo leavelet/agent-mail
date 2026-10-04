@@ -4,6 +4,7 @@
 use crate::AppState;
 use crate::auth::Auth;
 use crate::error::{ApiError, ApiResult, Json, Path, Query};
+use crate::mail::Pool;
 use crate::render;
 use amail_proto::limits::{MAX_PAGE_BYTES, MAX_SCAN_MESSAGES, SHORT_TERM_SCAN_MESSAGES};
 use amail_proto::{
@@ -103,11 +104,9 @@ pub async fn attention(
 ) -> ApiResult<Json<p::AttentionResponse>> {
     auth.require_user()?;
     let (st2, auth2) = (st.clone(), auth.clone());
-    let mut items = crate::mail::limited(
-        &st,
-        &auth,
-        async move { attention_items(&st2, &auth2).await },
-    )
+    let mut items = crate::mail::limited(&st, &auth, Pool::Light, async move {
+        attention_items(&st2, &auth2).await
+    })
     .await?;
     render::fit(&mut items, MAX_PAGE_BYTES, false);
     Ok(Json(p::AttentionResponse { items }))
@@ -117,8 +116,10 @@ pub async fn attention(
 pub async fn overview(State(st): State<AppState>, auth: Auth) -> ApiResult<Json<p::Overview>> {
     auth.require_user()?;
     let (st2, auth2) = (st.clone(), auth.clone());
-    let out =
-        crate::mail::limited(&st, &auth, async move { overview_of(&st2, &auth2).await }).await?;
+    let out = crate::mail::limited(&st, &auth, Pool::Light, async move {
+        overview_of(&st2, &auth2).await
+    })
+    .await?;
     Ok(Json(out))
 }
 
@@ -231,7 +232,7 @@ pub async fn sent(
     };
     let page = if limit > p::limits::SMALL_PAGE {
         let (store, org_id) = (st.store.clone(), auth.org.id);
-        crate::mail::limited(&st, &auth, async move {
+        crate::mail::limited(&st, &auth, Pool::Other, async move {
             Ok(store.archive(org_id, &query).await?)
         })
         .await?
@@ -277,9 +278,10 @@ pub async fn search(
         before_id: q.before_id,
         limit,
         scan,
+        time_limit: Some(crate::mail::SCAN_TIME_LIMIT),
     };
     let (store, org_id) = (st.store.clone(), auth.org.id);
-    let r = crate::mail::limited(&st, &auth, async move {
+    let r = crate::mail::limited(&st, &auth, Pool::Scan, async move {
         Ok(store.search(org_id, &query).await?)
     })
     .await?;
