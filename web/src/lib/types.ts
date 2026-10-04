@@ -109,6 +109,8 @@ export interface MessageResponse {
 export interface RecipientStatus extends Delivery {
   address: string;
   state: 'queued' | 'notified' | 'read' | 'acked';
+  /** Seats behind another org's list, counted without their names. */
+  members?: { seats: number; notified: number; read: number; acked: number };
 }
 
 export interface StatusResponse {

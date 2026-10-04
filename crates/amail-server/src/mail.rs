@@ -150,24 +150,99 @@ pub async fn status(
             "only the sender and the sender org's user can see delivery status",
         ));
     }
-    let recipients = st
-        .store
-        .recipients(id)
-        .await?
-        .iter()
-        .map(|d| {
-            let delivery = render::delivery(d, &auth.org);
-            p::RecipientStatus {
+    let rows = st.store.recipients(id).await?;
+    let mut recipients: Vec<p::RecipientStatus> = Vec::new();
+    for d in &rows {
+        let delivery = render::delivery(d, &auth.org);
+        let Some(group) = external_group(&m, &rows, d) else {
+            recipients.push(p::RecipientStatus {
                 address: delivery.seat.clone(),
                 state: p::delivery_state(&delivery).into(),
                 delivery,
+                members: None,
+            });
+            continue;
+        };
+        let i = match recipients
+            .iter()
+            .position(|r| r.members.is_some() && r.address == group)
+        {
+            Some(i) => i,
+            None => {
+                recipients.push(p::RecipientStatus {
+                    address: group.clone(),
+                    state: String::new(),
+                    delivery: p::Delivery {
+                        seat: group.clone(),
+                        seq: 0,
+                        mod_seq: 0,
+                        notified_via: None,
+                        ..delivery.clone()
+                    },
+                    members: Some(p::MemberCounts::default()),
+                });
+                recipients.len() - 1
             }
-        })
-        .collect();
+        };
+        let r = &mut recipients[i];
+        let c = r.members.as_mut().expect("group");
+        let first = c.seats == 0;
+        c.seats += 1;
+        c.notified += i64::from(delivery.notified_at.is_some());
+        c.read += i64::from(delivery.read_at.is_some());
+        c.acked += i64::from(delivery.acked_at.is_some());
+        // A time is shown only once every seat reached that state, and
+        // then it is the latest one.
+        let agg = |have: &mut Option<String>, new: &Option<String>| {
+            *have = match (first, have.take(), new) {
+                (true, _, n) => n.clone(),
+                (false, Some(a), Some(b)) => Some(a.max(b.clone())),
+                _ => None,
+            };
+        };
+        agg(&mut r.delivery.notified_at, &delivery.notified_at);
+        agg(&mut r.delivery.read_at, &delivery.read_at);
+        agg(&mut r.delivery.acked_at, &delivery.acked_at);
+    }
+    for r in &mut recipients {
+        if r.members.is_some() {
+            r.state = p::delivery_state(&r.delivery).into();
+        }
+    }
     Ok(Json(p::StatusResponse {
         message_id: id,
         recipients,
     }))
+}
+
+/// When a delivery reached a seat of another org through one of that org's
+/// lists, the list addresses it is counted under; `None` when the seat was
+/// named itself, is in the sender's org, or came through a list of the
+/// sender's org. Which seats stand behind another org's list, and when each
+/// of them read the mail, is that org's business.
+pub(crate) fn external_group(
+    m: &MessageRec,
+    all: &[amail_store::DeliveryRec],
+    d: &amail_store::DeliveryRec,
+) -> Option<String> {
+    if d.org_id == m.org_id {
+        return None;
+    }
+    let own = format!("{}@{}", d.seat_name, d.org_name);
+    let named = || m.to_addrs.iter().chain(&m.cc_addrs);
+    if named().any(|a| *a == own) {
+        return None;
+    }
+    let suffix = format!("@{}", d.org_name);
+    let lists: Vec<&str> = named()
+        .filter(|a| a.ends_with(&suffix))
+        .filter(|a| {
+            !all.iter()
+                .any(|x| x.org_id == d.org_id && format!("{}@{}", x.seat_name, x.org_name) == **a)
+        })
+        .map(String::as_str)
+        .collect();
+    (!lists.is_empty()).then(|| lists.join(", "))
 }
 
 /// The most messages `GET /v1/threads/{id}` answers (the newest ones).

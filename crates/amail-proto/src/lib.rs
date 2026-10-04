@@ -417,6 +417,20 @@ pub struct RecipientStatus {
     pub state: String,
     #[serde(flatten)]
     pub delivery: Delivery,
+    /// Set for the seats another org's list reached: they are counted
+    /// together under the list's address (`address`), without their names.
+    /// `state` and the times then describe the slowest of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub members: Option<MemberCounts>,
+}
+
+/// How many of the seats behind another org's list reached each state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberCounts {
+    pub seats: i64,
+    pub notified: i64,
+    pub read: i64,
+    pub acked: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

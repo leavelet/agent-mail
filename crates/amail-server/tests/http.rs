@@ -64,6 +64,7 @@ http_tests!(
     digest_claims,
     claim_keys_http,
     node_tokens_cannot_use_user_mailbox,
+    external_list_members_are_counted,
 );
 
 struct Server {
@@ -2430,4 +2431,66 @@ async fn node_tokens_cannot_use_user_mailbox(srv: Server) {
     // Agent seats still work for nodes.
     node.ok(Method::POST, "/claim?seat=a", Some(json!({ "via": "x" })))
         .await;
+}
+
+/// The seats behind another org's list, and when each read the mail, are
+/// that org's business: the sender sees counts per list address.
+async fn external_list_members_are_counted(srv: Server) {
+    let alpha = srv.org("alpha").await;
+    let bravo = srv.org("bravo").await;
+    let a = alpha.seat("a").await;
+    let b1 = bravo.seat("b1").await;
+    let ops = bravo.seat("secret-ops").await;
+    bravo.seat("named").await;
+    bravo
+        .list(
+            "team",
+            "anyone",
+            &[("b1", "immediate"), ("secret-ops", "immediate")],
+        )
+        .await;
+    alpha.link(&bravo, "bravo", "alpha").await;
+    let id = a
+        .send(
+            json!({ "to": ["team@bravo", "named@bravo"], "subject": "hi", "body": "x",
+                      "ack_required": true, "ack_timeout_s": 1 }),
+        )
+        .await["id"]
+        .as_i64()
+        .unwrap();
+    b1.ok(Method::GET, &format!("/messages/{id}"), None).await;
+    b1.ok(Method::POST, &format!("/messages/{id}/ack"), None)
+        .await;
+    for who in [&a, &alpha] {
+        let v = who
+            .ok(Method::GET, &format!("/messages/{id}/status"), None)
+            .await;
+        let text = v.to_string();
+        assert!(!text.contains("b1") && !text.contains("secret-ops"), "{v}");
+        let r = v["recipients"].as_array().unwrap();
+        assert_eq!(r.len(), 2, "{v}");
+        let team = r.iter().find(|x| x["address"] == "team@bravo").unwrap();
+        assert_eq!(
+            team["members"],
+            json!({ "seats": 2, "notified": 0, "read": 1, "acked": 1 })
+        );
+        assert_eq!(team["state"], "queued");
+        assert!(team.get("read_at").is_none(), "{team}");
+        // A seat named in the header is shown as itself.
+        let named = r.iter().find(|x| x["address"] == "named@bravo").unwrap();
+        assert!(named.get("members").is_none());
+    }
+    // Escalation counts them too.
+    wait_for("notice", || async { !a.inbox("unread=1").await.is_empty() }).await;
+    let n = a.inbox("unread=1").await[0]["message"]["id"]
+        .as_i64()
+        .unwrap();
+    let body = a.ok(Method::GET, &format!("/messages/{n}"), None).await["message"]["body"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(body.contains("named@bravo"), "{body}");
+    assert!(body.contains("1 seat of team@bravo"), "{body}");
+    assert!(!body.contains("secret-ops"), "{body}");
+    drop(ops);
 }

@@ -142,6 +142,19 @@ pub fn status_line(r: &p::RecipientStatus) -> String {
     if let Some(t) = &d.acked_at {
         parts.push(format!("acked {}", short_time(t)));
     }
+    if let Some(c) = &r.members {
+        parts.insert(
+            0,
+            format!(
+                "{} seat{}: {} notified, {} read, {} acked",
+                c.seats,
+                if c.seats == 1 { "" } else { "s" },
+                c.notified,
+                c.read,
+                c.acked
+            ),
+        );
+    }
     let detail = if parts.is_empty() {
         String::new()
     } else {

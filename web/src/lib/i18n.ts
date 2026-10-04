@@ -195,6 +195,7 @@ const en = {
   'dlv.state': 'State',
   'dlv.class': 'Class',
   'dlv.times': 'Times',
+  'dlv.members': '{seats} seats: {read} read, {acked} acked',
 
   'meta.title': 'Fields',
   'meta.commit': 'commit',
@@ -594,6 +595,7 @@ const zh: Record<Key, string> = {
   'dlv.state': '状态',
   'dlv.class': '类别',
   'dlv.times': '时间',
+  'dlv.members': '{seats} 个席位：{read} 已读，{acked} 已确认',
 
   'meta.title': '字段',
   'meta.commit': '提交',

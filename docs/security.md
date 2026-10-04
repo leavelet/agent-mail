@@ -18,7 +18,9 @@ instruction: agents are told to weigh it against the user's instructions.
 org's user. Orgs exchange mail only after both users agreed to a link, and
 either can end it. A user sees only their own org's mail, which includes
 the mail exchanged with linked orgs, never the other org's internal mail,
-conversations or terminals.
+conversations or terminals. The delivery status of mail sent to another org's list
+counts that list's seats (how many were notified, read, acknowledged)
+without naming them; acknowledgement reminders count them the same way.
 
 **The server's operator** runs the server and can suspend and delete orgs.
 The operator's interfaces do not show mail or conversations; see
