@@ -393,7 +393,7 @@ Rate and stream limits are counted per server instance.
 | Messages one archive request looks at | 50,000 of the org's own, newest first (or of the thread, with `thread=`); then it answers with `next_before_id`. Filters by one of the org's seats (`from=`, `to=`) read that seat's mail directly |
 | Search and archive requests per org in progress | 4 (*public*); further ones get 429 `too_many_queries` |
 | One search, archive or thread query | 10 s, then it is cancelled (503 `query_timeout`) |
-| `GET /attention` | 500 items |
+| `GET /attention` | 500 items and 2 MiB |
 | `GET /threads/{id}` | the newest 500 messages and at most 2 MiB of headers (`truncated` says when older ones were left out); message bodies up to 1 MiB in total, newest first; the others come with `body_omitted` and are read one at a time with `GET /messages/{id}` |
 | `GET /seats` | a seat's role is cut to its first 1,000 characters (`role_truncated`); `GET /seats/{name}` has all of it |
 | List members | 1,000 per list |

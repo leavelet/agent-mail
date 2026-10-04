@@ -255,7 +255,8 @@ async fn search_english_chinese_short_and_visibility(srv: Server) {
 
     // English, case-insensitive, subject or body, newest first.
     let r = acme.search("tokenizer").await;
-    assert_eq!(r["mode"], "index");
+    assert_eq!(r["mode"], "scan");
+    assert_eq!(r["scan_limit"], 50_000);
     assert_eq!(subjects(&r), vec!["Status", "Parser plan"]);
     assert!(
         r["messages"][1]["snippet"]
@@ -268,17 +269,15 @@ async fn search_english_chinese_short_and_visibility(srv: Server) {
         subjects(&acme.search("tokenizer AST").await),
         vec!["Parser plan"]
     );
-    // Chinese substrings of three or more characters use the index.
+    // Chinese substrings.
     let r = acme.search("迁移方案").await;
-    assert_eq!(r["mode"], "index");
     assert_eq!(subjects(&r), vec!["数据库迁移方案"]);
     assert_eq!(
         subjects(&acme.search("订单表").await),
         vec!["数据库迁移方案"]
     );
-    // Shorter queries scan recent mail and say so.
+    // Shorter queries look at fewer recent messages and say so.
     let r = acme.search("接口").await;
-    assert_eq!(r["mode"], "scan");
     assert_eq!(r["scan_limit"], 2000);
     assert_eq!(subjects(&r), vec!["Status", "数据库迁移方案"]);
     assert!(r.get("next_before_id").is_none());

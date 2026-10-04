@@ -1069,8 +1069,8 @@ pub struct SearchHit {
 }
 
 string_enum!(
-    /// How a search ran: through the full-text index, or as a bounded scan
-    /// of recent messages (some term shorter than three characters).
+    /// How a search ran. Servers now always answer `scan` (a bounded scan
+    /// of the org's recent messages); `index` is kept for older servers.
     SearchMode { Index => "index", Scan => "scan" }
 );
 
@@ -1080,7 +1080,7 @@ pub struct SearchResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_before_id: Option<i64>,
     pub mode: SearchMode,
-    /// In `scan` mode: how many of the most recent messages one page scans.
+    /// How many of the org's most recent messages one request looks at.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_limit: Option<i64>,
 }

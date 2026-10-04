@@ -102,9 +102,9 @@ pub async fn attention(
     auth: Auth,
 ) -> ApiResult<Json<p::AttentionResponse>> {
     auth.require_user()?;
-    Ok(Json(p::AttentionResponse {
-        items: attention_items(&st, &auth).await?,
-    }))
+    let mut items = attention_items(&st, &auth).await?;
+    render::fit(&mut items, MAX_PAGE_BYTES, false);
+    Ok(Json(p::AttentionResponse { items }))
 }
 
 /// `GET /v1/overview`: seats per state and recent mail volume.
