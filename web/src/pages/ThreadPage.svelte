@@ -1,18 +1,22 @@
 <script lang="ts">
   import Vis from '../components/Vis.svelte';
   import { tick } from 'svelte';
-  import { get, enc } from '../lib/api';
+  import { get, del, enc } from '../lib/api';
   import { t } from '../lib/ui.svelte';
   import { go, href } from '../lib/router.svelte';
-  import type { ThreadResponse } from '../lib/types';
+  import type { DeleteMailResponse, ThreadResponse } from '../lib/types';
   import MessageCard from '../components/MessageCard.svelte';
 
   let { id, focus }: { id: number; focus?: number } = $props();
   let data = $state.raw<ThreadResponse | null>(null);
   let error = $state<string | null>(null);
+  let note = $state<string | null>(null);
+  let reload = $state(0);
+  let deleting = $state(false);
 
   $effect(() => {
     const tid = id;
+    void reload;
     data = null;
     error = null;
     get<ThreadResponse>(`/v1/threads/${enc(String(tid))}`)
@@ -24,10 +28,32 @@
       .catch((e) => (error = e instanceof Error ? e.message : String(e)));
   });
 
+  // Web sessions are user sessions: the user may delete what the org may
+  // delete of the thread (the server decides which messages).
+  async function remove() {
+    if (deleting || !confirm(t('thread.confirmDelete'))) return;
+    deleting = true;
+    try {
+      let deleted = 0;
+      let r: DeleteMailResponse;
+      do {
+        r = await del<DeleteMailResponse>(`/v1/threads/${enc(String(id))}`);
+        deleted += r.deleted;
+      } while (r.more);
+      note = r.kept > 0 ? t('thread.deletedKept', { deleted, kept: r.kept }) : t('thread.deleted', { deleted });
+      reload++;
+    } catch (e) {
+      note = e instanceof Error ? e.message : String(e);
+    } finally {
+      deleting = false;
+    }
+  }
+
   const participants = $derived(data ? [...new Set(data.messages.map((m) => m.from))] : []);
 </script>
 
 <div class="page thread">
+  {#if note}<p class="faint">{note}</p>{/if}
   {#if error}
     <p class="error">{t('thread.notFound')} ({error})</p>
   {:else if !data}
@@ -38,6 +64,7 @@
       <span class="faint">{t('thread.title', { id: data.thread_id })} · {t('thread.messages', { n: data.messages.length })}</span>
       <span class="spacer"></span>
       <span class="parts">{#each participants as p}<a class="mono chip neutral" href={p.includes('@') ? undefined : href(['org', p])}>{p}</a>{/each}</span>
+      <button class="small danger" disabled={deleting} onclick={remove}>{t('thread.delete')}</button>
     </div>
     <div class="msgs">
       {#each data.messages as m (m.id)}

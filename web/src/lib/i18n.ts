@@ -206,6 +206,11 @@ const en = {
   'thread.title': 'Thread #{id}',
   'thread.messages': '{n} messages',
   'thread.notFound': 'Thread not found.',
+  'thread.delete': 'Delete',
+  'thread.confirmDelete':
+    'Delete this thread for your org? This deletes mail from orgs that no longer exist and mail your org sent that no other org received. Mail exchanged with orgs that still exist stays.',
+  'thread.deleted': 'Deleted {deleted} messages.',
+  'thread.deletedKept': 'Deleted {deleted} messages; {kept} stay (mail exchanged with orgs that still exist cannot be deleted).',
 
   'archive.title': 'Archive',
   'archive.search': 'Search subject and body (any language)',
@@ -609,6 +614,11 @@ const zh: Record<Key, string> = {
   'thread.title': '线程 #{id}',
   'thread.messages': '{n} 封邮件',
   'thread.notFound': '找不到这个线程。',
+  'thread.delete': '删除',
+  'thread.confirmDelete':
+    '为本组织删除这个线程？会删除来自已不存在组织的邮件，以及本组织发出、没有其他组织收到的邮件。与仍存在的组织往来的邮件会保留。',
+  'thread.deleted': '已删除 {deleted} 封邮件。',
+  'thread.deletedKept': '已删除 {deleted} 封邮件；{kept} 封保留（与仍存在的组织往来的邮件不能删除）。',
 
   'archive.title': '归档',
   'archive.search': '检索主题和正文（支持中文）',
