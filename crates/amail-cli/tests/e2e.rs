@@ -263,10 +263,18 @@ async fn run(backend: Backend) {
     let ra = lead.run(&["reply", &reply_id.to_string(), "--all", "-m", "Thanks"]);
     assert!(ra.contains("owner=1"), "{ra}");
 
-    // Status: one line per recipient.
+    // Status: one line per recipient, then what the states mean.
     let status = acme.run(&["status", &kickoff.to_string()]);
     let lines: Vec<&str> = status.lines().collect();
-    assert_eq!(lines.len(), 3, "{status}");
+    assert_eq!(lines.len(), 4, "{status}");
+    assert!(
+        lines[3].starts_with("(notified: the header was shown"),
+        "{status}"
+    );
+    assert!(
+        lines[3].contains("does not mean it was acted on"),
+        "{status}"
+    );
     assert!(lines[0].starts_with("lead queued [to digest]"), "{status}");
     assert!(lines[1].starts_with("w1 acked [to]"), "{status}");
     assert!(lines[2].starts_with("w2 queued [to]"), "{status}");

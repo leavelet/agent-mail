@@ -30,6 +30,11 @@ fn node(req: &Request, timeout: Duration) -> Result<Value> {
 /// The node's local policy as `ps`, `up` and `doctor` show it, from a
 /// `Ps`, `Up` or `Status` answer.
 pub fn policy_line(v: &Value) -> Option<String> {
+    policy_text(v).map(|t| format!("local policy: {t}"))
+}
+
+/// [`policy_line`] without its `local policy: ` label.
+pub fn policy_text(v: &Value) -> Option<String> {
     let p = v["local_policy"].as_str()?;
     let source = v["local_policy_source"]
         .as_str()
@@ -46,7 +51,7 @@ pub fn policy_line(v: &Value) -> Option<String> {
         }
         _ => "",
     };
-    Some(format!("local policy: {p}{source}: {what}"))
+    Some(format!("{p}{source}: {what}"))
 }
 
 fn ps_rows() -> Result<Vec<PsRow>> {

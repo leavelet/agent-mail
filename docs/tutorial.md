@@ -42,13 +42,22 @@ were given; this logs you in at the same time, so skip step 2:
 amail register https://mail.example.com --invite inv_... --org acme
 ```
 
+`amail register` prints your user token once and saves it as a login named
+`acme@mail.example.com`. That login becomes the current one: later `amail`
+commands on this computer, and the node, use the new org. If you had
+another current login, `amail register` prints its name; `amail profile use
+<name>` switches back. With `--no-save` it only prints the token and saves
+nothing.
+
 ## 2. Log in
 
 ```sh
 amail login http://127.0.0.1:8025 < owner.token
 ```
 
-The login is saved in `~/.config/amail/config.toml` (mode 0600). Every later
+The login is saved in `~/.config/amail/config.toml` (mode 0600), or in
+`$AMAIL_CONFIG_DIR/config.toml` when `AMAIL_CONFIG_DIR` is set (see the
+[reference](reference.md#configuration-of-the-command-line)). Every later
 command, and the node, uses it. `amail profile ls` lists saved logins if you
 have several.
 
@@ -64,7 +73,24 @@ amail node start
 amail node status
 ```
 
-`amail node start` prints where its log is; `amail node stop` stops it. To
+`amail node token --save` writes the token to that file (mode 0600) and
+does not print it. `amail node start` prints where its log is; `amail node
+stop` stops it. `amail node status` shows the local policy (see
+[security](security.md#trust-boundaries)) and the program the node starts
+for each harness, and whether it found it.
+
+**DeepSeek Harness seats** need two node options. `--dsh-env-file` names a
+file of `NAME=value` lines with the model provider's key (for example
+`DEEPSEEK_API_KEY=...`); the node gives these variables to dsh hosts only.
+`--dsh-bin` gives the path of the `dsh` launcher when it is not on `PATH`.
+`amail node start` takes the same options as `amail node`:
+
+```sh
+amail node start --dsh-env-file ~/dsh.env --dsh-bin /path/to/dsh
+```
+
+To change the options of a running node, stop it (`amail node stop`) and
+start it again. See [harness support](harnesses.md#deepseek-harness-dsh). To
 run it as a systemd user service instead, see
 [operations](operations.md#the-node-as-a-service).
 
@@ -82,9 +108,11 @@ a lead (`app-lead`) and a worker (`app-1`) in a group `app`, using the
 `../wordcount-seats/` and its own branch; the worker sends merge requests to
 its lead, the lead to the root, and the root merges into your main branch.
 
-Edit `[defaults]` to choose the harness and model for all seats, or set
-`harness` and `model` per seat (for example `{ name = "app-1", harness =
-"codex", model = "<a Codex model>" }`). The full format is in
+Edit `[defaults]` to choose the harness (`claude`, `codex` or `dsh`) and
+model for all seats, or set `harness` and `model` per seat (for example `{
+name = "app-1", harness = "codex", model = "<a Codex model>" }`). The
+commented `git_access` (Codex and dsh seats) and `dsh_jail` (dsh seats)
+lines show the sandbox settings and their defaults. The full format is in
 [team files](teams.md).
 
 Check the host and the file:
@@ -94,7 +122,9 @@ amail doctor
 ```
 
 Every line should say `ok` or `info`; a `warn` or `FAIL` line comes with a
-hint (for example: Codex's sandbox needs user namespaces).
+hint (for example: Codex's sandbox needs user namespaces). With the node
+running, doctor checks the programs the node starts; a harness that the
+team file uses and the node cannot find is a `warn` line.
 
 ## 5. Bring the team up
 
@@ -129,6 +159,10 @@ root      idle   amail-acme-main:0  0        3s ago  -
 
 **Claude Code's trust prompt.** The first time Claude Code opens a
 repository it asks whether to trust it, and amail does not answer for you.
+Answering it needs a terminal on the host that runs the node: a shell
+there (`amail attach`, below), or the node's optional browser terminal
+(`--web-terminal-port`, see [harness support](harnesses.md#zellij)). The
+web interface alone cannot answer it.
 If `amail ps` shows `trust-prompt` in the ATTENTION column, attach to one
 of those seats, answer the prompt, detach (`Ctrl-o d`), and restart the
 others, which were waiting at the same prompt:

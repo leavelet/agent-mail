@@ -495,6 +495,22 @@ pub struct HookOutcome {
     pub blocks_stop: bool,
 }
 
+/// After a restart, a seat's last activity (for `amail ps`) is the last
+/// write to its conversation log, until its next hook or launch.
+fn restore_activity(st: &mut State) {
+    for (seat, t) in &st.saved.transcripts {
+        let Some(s) = st.seats.get_mut(seat).filter(|s| s.last_activity == 0) else {
+            continue;
+        };
+        let modified = std::fs::metadata(&t.path).and_then(|m| m.modified());
+        if let Ok(ms) = modified.map(|m| {
+            m.duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis() as i64)
+        }) {
+            s.last_activity = ms;
+        }
+    }
+}
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -777,6 +793,7 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
         Some(Harness::Dsh) => Some(dsh.harness()),
         None => None,
     });
+    restore_activity(&mut st);
     let node = Arc::new(Node {
         server: ServerClient::new(&cfg.url, &cfg.token, cfg.hook_server_timeout)?,
         claude,
@@ -1991,6 +2008,22 @@ impl Node {
 
     fn status(&self) -> Value {
         let (policy, source) = (self.local_policy(), self.policy_source());
+        // Looked up before taking the lock (this reads the file system).
+        let harnesses: Vec<Value> = [
+            ("claude", &self.cfg.claude_bin),
+            ("codex", &self.cfg.codex_bin),
+            ("dsh", &self.cfg.dsh_bin),
+            ("zellij", &self.cfg.zellij_bin),
+        ]
+        .iter()
+        .map(|(h, bin)| {
+            json!({
+                "harness": h,
+                "bin": bin,
+                "path": crate::paths::find_program(bin),
+            })
+        })
+        .collect();
         let st = self.lock();
         let now = Instant::now();
         let mut seats: Vec<Value> = st
@@ -2043,6 +2076,13 @@ impl Node {
             "seats": seats,
             "local_policy": policy,
             "local_policy_source": source,
+            // The programs this node starts for each harness, and where it
+            // finds them (null: not found), for `amail node status` and
+            // `amail doctor`.
+            "harnesses": harnesses,
+            // Names only (the values are secrets): what dsh hosts get from
+            // `--dsh-env-file`.
+            "dsh_env": self.cfg.dsh_env.keys().collect::<Vec<_>>(),
         })
     }
 
@@ -2683,6 +2723,36 @@ pub fn request(socket: &std::path::Path, req: &Request, timeout: Duration) -> Re
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn activity_is_restored_from_the_conversation_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("session.jsonl");
+        std::fs::write(&log, "{}\n").unwrap();
+        let mut st = super::State::default();
+        st.seat("w1");
+        st.seat("w2");
+        st.seat("busy").last_activity = 42;
+        for seat in ["w1", "busy", "gone"] {
+            st.saved.transcripts.insert(
+                seat.into(),
+                crate::persist::TranscriptRef {
+                    harness: "claude".into(),
+                    path: log.to_string_lossy().into_owned(),
+                    session_id: None,
+                    base: None,
+                },
+            );
+        }
+        super::restore_activity(&mut st);
+        let now = super::now_ms();
+        let w1 = st.seats["w1"].last_activity;
+        assert!(w1 > now - 60_000 && w1 <= now, "{w1} vs {now}");
+        // No log: unknown; a seat with activity keeps it; no new seats.
+        assert_eq!(st.seats["w2"].last_activity, 0);
+        assert_eq!(st.seats["busy"].last_activity, 42);
+        assert!(!st.seats.contains_key("gone"));
+    }
+
     #[test]
     fn ts() {
         assert_eq!(super::ts(0), "1970-01-01T00:00:00.000Z");

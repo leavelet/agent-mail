@@ -119,6 +119,11 @@ pub fn message(m: &Message) -> String {
     out
 }
 
+/// What the delivery states mean, printed under `amail status`.
+pub const STATE_LEGEND: &str = "(notified: the header was shown to the agent; read: the whole body was \
+put into the agent's context, inline or by amail read, which does not mean it was acted on; \
+acked: the recipient acknowledged it)";
+
 /// `a read [to] notified 10:00 via hook, read 10:01`
 pub fn status_line(r: &p::RecipientStatus) -> String {
     let d: &Delivery = &r.delivery;

@@ -69,9 +69,9 @@ pub fn effective(node: Option<LocalPolicy>, team: Option<LocalPolicy>) -> LocalP
 
 /// The changes from `old` to `new`. `old_policy` stands for `old` when the
 /// node never reported (an earlier version that did not report used the
-/// restricted policy). Seats that were not reported before are listed only
-/// with settings other than the defaults; seats that are gone are not
-/// listed.
+/// restricted policy). A seat that was not reported before is listed when
+/// one of its settings is not the default, with all its settings; seats
+/// that are gone are not listed.
 pub(super) fn changes(
     old: Option<&Reported>,
     old_policy: Option<&str>,
@@ -87,12 +87,22 @@ pub(super) fn changes(
             new: new.local_policy.clone(),
         });
     }
+    let jail_default = "on";
     for (name, s) in &new.seats {
         let before = old.and_then(|o| o.seats.get(name));
+        // A seat not reported before is listed when any of its settings is
+        // not the default, and then with all of them (an unattended Codex
+        // seat with its git access, an unattended dsh seat with its jail).
+        let all = before.is_none()
+            && (s.permission_mode != PermissionMode::Default.as_str()
+                || s.git_access
+                    .as_deref()
+                    .is_some_and(|g| g != GitAccess::default().as_str())
+                || s.dsh_jail.as_deref().is_some_and(|j| j != jail_default));
         let mut field = |setting, was: Option<&str>, now: &str, default: &str| {
             let changed = match was {
                 Some(w) => w != now,
-                None => now != default,
+                None => all || now != default,
             };
             if changed {
                 out.push(SettingChange {
@@ -122,7 +132,7 @@ pub(super) fn changes(
                 NoticeSetting::DshJail,
                 before.and_then(|b| b.dsh_jail.as_deref()),
                 j,
-                "on",
+                jail_default,
             );
         }
     }
@@ -395,15 +405,52 @@ mod tests {
         };
         // A new dsh seat with the jail on (the default) is not news; off is.
         assert!(changes(None, Some("open"), &with("on")).is_empty());
+        // (listed with its permission mode, as all its settings are).
         let c = changes(None, Some("open"), &with("off"));
-        assert_eq!(c.len(), 1);
-        assert_eq!(c[0].setting, NoticeSetting::DshJail);
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[1].setting, NoticeSetting::DshJail);
         // A change either way is reported.
         let c = changes(Some(&with("off")), None, &with("on"));
         assert_eq!(
             (c[0].seat.as_deref(), c[0].old.as_deref(), c[0].new.as_str()),
             (Some("d"), Some("off"), "on")
         );
+    }
+
+    /// The first report of an unattended Codex or dsh seat names its git
+    /// access or jail too, though they are the defaults.
+    #[test]
+    fn first_report_names_all_settings_of_a_listed_seat() {
+        let seat = |p: &str, g: Option<&str>, j: Option<&str>| ReportedSeat {
+            permission_mode: p.into(),
+            git_access: g.map(str::to_string),
+            dsh_jail: j.map(str::to_string),
+        };
+        let new = Reported {
+            local_policy: "open".into(),
+            seats: [
+                ("cx".to_string(), seat("unattended", Some("worktree"), None)),
+                ("d".to_string(), seat("unattended", None, Some("on"))),
+                ("quiet".to_string(), seat("default", Some("worktree"), None)),
+            ]
+            .into(),
+        };
+        let c = changes(None, Some("open"), &new);
+        let shown: Vec<(&str, NoticeSetting, &str)> = c
+            .iter()
+            .map(|c| (c.seat.as_deref().unwrap(), c.setting, c.new.as_str()))
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                ("cx", NoticeSetting::PermissionMode, "unattended"),
+                ("cx", NoticeSetting::GitAccess, "worktree"),
+                ("d", NoticeSetting::PermissionMode, "unattended"),
+                ("d", NoticeSetting::DshJail, "on"),
+            ]
+        );
+        // Reported once, nothing is news any more.
+        assert!(changes(Some(&new), None, &new).is_empty());
     }
 
     #[test]

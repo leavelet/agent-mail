@@ -28,10 +28,10 @@ exit code.
 | command | |
 |---|---|
 | `amail login <url> [--name n]` | read a token (from stdin, or prompted without echo), check it, save it as a login and use it from now on (default name `<org>@<host>`) |
-| `amail register <url> --invite <code> --org <name> [--user-name owner] [--name n]` | register an org on a public server; saves the login and prints the user token once |
+| `amail register <url> --invite <code> --org <name> [--user-name owner] [--name n \| --no-save]` | register an org on a public server and print the user token once. It saves the token as a login (default name `<org>@<host>`) and makes that login the current one, so later commands go to the new org; it prints the name of the previous current login (switch back with `amail profile use <name>`). `--no-save` saves nothing and keeps the current login |
 | `amail profile ls` / `use <name>` / `rm <name>` | saved logins |
 | `amail init [-f amail.toml] [--force]` | write a commented sample team file |
-| `amail doctor [-f amail.toml]` | check the platform, server, token, node, harness and zellij versions, Codex socket path and sandbox, `bwrap` (for unattended dsh seats), Claude Code trust of this directory, and the team file; exits non-zero on a failure |
+| `amail doctor [-f amail.toml]` | check the platform, server, token, node, harness and zellij versions, Codex socket path and sandbox, `bwrap` (for unattended dsh seats), Claude Code trust of this directory, and the team file; exits non-zero on a failure. When the node runs, it checks the programs the node starts (`--claude-bin`, `--codex-bin`, `--dsh-bin`, `--zellij-bin`), else the ones on its own `PATH`. A missing harness is a warning when the team file or a seat on the server uses it; a dsh seat with a node started without `--dsh-env-file` is a warning too |
 
 ### Mail
 
@@ -42,7 +42,7 @@ exit code.
 | `amail read <id> [--peek]` | show a message; marks it read unless `--peek` |
 | `amail reply <id> [--all] [-m <body>]` | reply; subject and thread are inherited |
 | `amail ack <id>` | acknowledge |
-| `amail status <id>` | per-recipient delivery state of a message you sent |
+| `amail status <id>` | per-recipient delivery state of a message you sent, with the time of each step (see [concepts](concepts.md#delivery-states)) |
 | `amail thread <id>` | a thread, by thread id or the id of any message in it |
 | `amail who` | directory: seats, lists, linked orgs |
 | `amail focus on [--for 30m] [--seat s]` / `amail focus off` | hold all but urgent mail (user tokens: any seat) |
@@ -67,13 +67,13 @@ exit code.
 | command | |
 |---|---|
 | `amail node [options]` | run the node in the foreground |
-| `amail node start [options]` / `amail node stop` | run it in the background (log and pid in the state directory) / stop it |
-| `amail node token [--save]` | issue a node token (user token needed); `--save` writes it with the URL to `<state dir>/node.toml` |
-| `amail node status` | the node's view of its seats |
+| `amail node start [options]` / `amail node stop` | run it in the background with the same options (log and pid in the state directory; relative paths are made absolute) / stop it |
+| `amail node token [--save]` | issue a node token (user token needed) and print it; with `--save` it is written with the URL to `<state dir>/node.toml` (mode 0600) and not printed |
+| `amail node status` | the node's view of its seats, its local policy and where that comes from, the program it starts for each harness (and whether it was found), and the names of the variables `--dsh-env-file` sets |
 | `amail node web-token` | a login token for the node's browser terminal |
 | `amail run <seat> [--harness claude\|codex\|dsh] [--permission-mode default\|unattended] [--git-access worktree\|full\|off] [--dsh-jail on\|off] [-- args]` | start the seat's harness session in this terminal. `--permission-mode unattended` runs it without permission prompts; without the flag a seat placed by `amail up` uses its team file's `permission_mode` and any other seat keeps the prompts. The server's seat setting is not used. `--git-access` (Codex seats) sets what the sandbox may write in the git repository (see [harness support](harnesses.md)); without it a seat placed by `amail up` uses its team file's `git_access`, any other seat `worktree` |
 | `amail up [-f amail.toml] [--only g,s] [--no-start] [--prune]` | bring a team up from a team file ([team files](teams.md)) |
-| `amail down [--only g,s]` / `amail ps` | stop the team's sessions / one line per seat |
+| `amail down [--only g,s]` / `amail ps` | stop the team's sessions / one line per seat: state, zellij pane, pending mail, last activity (ACTIVE: the seat's last hook or launch; after a node restart, the last write to its conversation log until its next hook), and whether a person is needed |
 | `amail attach <group or seat>` / `amail sleep <seat>` / `amail wake <seat>` | attach to a group's zellij session / put a seat to sleep / start it now |
 
 Node options: `--url`, `--token` (`AMAIL_NODE_TOKEN`), `--state-dir`

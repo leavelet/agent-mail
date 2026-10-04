@@ -7,6 +7,7 @@ use crate::profiles::{self, Profile};
 use amail_proto as p;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -88,13 +89,15 @@ fn save_profile(name: &str, profile: Profile) -> Result<PathBuf> {
     cfg.save()
 }
 
-/// `amail register <url> --invite <code> --org <name>`.
+/// `amail register <url> --invite <code> --org <name>`. `save`: save the
+/// token as a login named so (default `<org>@<host>`) and make it the
+/// current one; `None` (`--no-save`): only print the token.
 pub async fn register(
     url: &str,
     invite: &str,
     org: &str,
     user_name: Option<String>,
-    name: Option<String>,
+    save: Option<Option<String>>,
     out: &Out,
 ) -> Result<()> {
     let url = url.trim().trim_end_matches('/').to_string();
@@ -115,24 +118,44 @@ pub async fn register(
         );
     }
     let r: p::RegisterResponse = serde_json::from_value(v.clone())?;
-    let name = name.unwrap_or_else(|| profiles::default_name(&url, &r.org));
-    let path = save_profile(
-        &name,
-        Profile {
-            url: url.clone(),
-            token: r.token.clone(),
-            org: Some(r.org.clone()),
-            scope: Some("user".into()),
-        },
-    )?;
-    out.show(&v, || {
-        eprintln!(
-            "registered org {} with your seat {}; logged in as profile {name} ({}).\n\
-             Your user token, shown once (keep it somewhere safe; it is also in that file):",
-            r.org,
-            r.user_seat,
+    let mut notes = vec![format!(
+        "registered org {} on {url} with your seat {}.",
+        r.org, r.user_seat
+    )];
+    let mut v = v;
+    if let Some(name) = save {
+        let name = name.unwrap_or_else(|| profiles::default_name(&url, &r.org));
+        let before = profiles::Config::load()
+            .ok()
+            .and_then(|c| c.current)
+            .filter(|c| *c != name);
+        let path = save_profile(
+            &name,
+            Profile {
+                url: url.clone(),
+                token: r.token.clone(),
+                org: Some(r.org.clone()),
+                scope: Some("user".into()),
+            },
+        )?;
+        notes.push(format!(
+            "Saved the token as login {name} in {} and made it the current login: \
+             later amail commands on this computer use this org.",
             path.display()
-        );
+        ));
+        if let Some(b) = &before {
+            notes.push(format!(
+                "Your previous current login was {b}; switch back with: amail profile use {b}"
+            ));
+        }
+        v["profile"] = json!(name);
+        v["previous_profile"] = json!(before);
+    } else {
+        notes.push("Nothing was saved (--no-save); log in later with: amail login <url>".into());
+    }
+    notes.push("Your user token, shown once (keep it somewhere safe):".into());
+    out.show(&v, || {
+        eprintln!("{}", notes.join("\n"));
         Ok(r.token.clone())
     })
 }
@@ -238,13 +261,20 @@ idle_sleep = "30m"                  # idle seats sleep (no process); mail wakes 
 # restart = "on-failure"            # or "never"
 
 [defaults]
-harness = "claude"                  # or "codex"
+harness = "claude"                  # or "codex", or "dsh" (DeepSeek Harness)
 model = "sonnet"
 # "unattended" runs agents without permission prompts (Claude Code:
-# --dangerously-skip-permissions; Codex: -a never with a sandbox). Use it
-# only in a repository you can afford to lose; "default" keeps the
-# harness's prompts (answer them with `amail attach <seat>`).
+# --dangerously-skip-permissions; Codex: -a never with a sandbox; dsh: its
+# host in a bwrap jail). Use it only in a repository you can afford to
+# lose; "default" keeps the harness's prompts (answer them with
+# `amail attach <seat>`).
 permission_mode = "unattended"
+# git_access = "worktree"           # Codex and dsh seats: what the sandbox may write
+#                                   # in git: "worktree" (default), "full" or "off"
+# dsh_jail = true                   # dsh seats: run unattended hosts in the bwrap
+#                                   # jail (default); false gives the agent your files
+# dsh seats need the node started with --dsh-env-file (the model provider's
+# key) and, when dsh is not on PATH, --dsh-bin. See docs/harnesses.md.
 
 [[seat]]
 name = "root"
@@ -257,6 +287,7 @@ lead = {{ name = "app-lead", role = "Leads the app group." }}
 workers = [
   {{ name = "app-1" }},
   # {{ name = "app-2", harness = "codex", model = "<a Codex model>" }},
+  # {{ name = "app-3", harness = "dsh", model = "deepseek-flash" }},
 ]
 "#
     )
@@ -375,6 +406,16 @@ fn claude_trusts(dir: &Path) -> Option<bool> {
     )
 }
 
+/// The first few of `names`, and how many more there are.
+fn some(names: &[String]) -> String {
+    const SHOWN: usize = 4;
+    let mut s = names[..names.len().min(SHOWN)].join(", ");
+    if names.len() > SHOWN {
+        s.push_str(&format!(" and {} more", names.len() - SHOWN));
+    }
+    s
+}
+
 /// `amail doctor`: check this host and the configuration; exits non-zero
 /// when something is broken.
 pub async fn doctor(profile: Option<&Path>, team_file: &Path, out: &Out) -> Result<bool> {
@@ -388,6 +429,23 @@ pub async fn doctor(profile: Option<&Path>, team_file: &Path, out: &Out) -> Resu
             "the node, amail run and amail up support Linux only; mail commands and the server work here".into()
         }),
     );
+
+    // The harnesses the team uses: in the team file here, and of the
+    // server's seats.
+    let mut used: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let team = team_file
+        .exists()
+        .then(|| amail_node::team::load(team_file));
+    if let Some(Ok(t)) = &team {
+        for s in &t.seats {
+            used.entry(s.harness.clone())
+                .or_default()
+                .push(format!("{} (team file)", s.name));
+        }
+        used.entry("zellij".into())
+            .or_default()
+            .push("amail up".into());
+    }
 
     // Server and token.
     match Client::from_config(profile) {
@@ -422,6 +480,16 @@ pub async fn doctor(profile: Option<&Path>, team_file: &Path, out: &Out) -> Resu
                     Some("is `amail serve` running, and is the URL right?".into()),
                 ),
             }
+            if let Ok(seats) = c.get::<Vec<p::Seat>>("/seats").await {
+                for s in seats {
+                    if let Some(h) = s.harness.filter(|_| s.kind == p::SeatKind::Agent) {
+                        let users = used.entry(h).or_default();
+                        if !users.iter().any(|u| u.starts_with(&format!("{} ", s.name))) {
+                            users.push(format!("{} (server)", s.name));
+                        }
+                    }
+                }
+            }
             match c.get::<p::WhoAmI>("/whoami").await {
                 Ok(me) => r.add(
                     Level::Ok,
@@ -449,15 +517,17 @@ pub async fn doctor(profile: Option<&Path>, team_file: &Path, out: &Out) -> Resu
 
     // The node.
     let sock = amail_node::paths::socket();
+    let mut node: Option<Value> = None;
     match amail_node::request(
         &sock,
         &amail_node::wire::Request::Status,
         Duration::from_secs(3),
     ) {
         Ok(v) => {
-            if let Some(l) = crate::team_cmd::policy_line(&v) {
+            if let Some(l) = crate::team_cmd::policy_text(&v) {
                 r.add(Level::Info, "local policy", l, None);
             }
+            node = Some(v.clone());
             r.add(
                 if v["connected"] == true {
                     Level::Ok
@@ -487,24 +557,79 @@ pub async fn doctor(profile: Option<&Path>, team_file: &Path, out: &Out) -> Resu
         ),
     }
 
-    // Harnesses and zellij.
+    // Harnesses and zellij: the programs the running node starts (else
+    // what it would find with this environment).
+    let node_bins: BTreeMap<String, (String, Option<String>)> = node
+        .as_ref()
+        .and_then(|v| v["harnesses"].as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|h| {
+            Some((
+                h["harness"].as_str()?.to_string(),
+                (
+                    h["bin"].as_str()?.to_string(),
+                    h["path"].as_str().map(str::to_string),
+                ),
+            ))
+        })
+        .collect();
     for (bin, prefix, label) in VERIFIED {
-        // The node finds dsh as AMAIL_DSH_BIN (or `amail node --dsh-bin`).
-        let path = match *bin {
-            "dsh" => std::env::var("AMAIL_DSH_BIN")
-                .ok()
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| "dsh".into()),
-            _ => bin.to_string(),
+        let users = used.get(*bin);
+        let (name, path) = match node_bins.get(*bin) {
+            Some((name, path)) => (name.clone(), path.clone()),
+            None => {
+                // The node finds dsh as AMAIL_DSH_BIN (or `amail node --dsh-bin`).
+                let name = match *bin {
+                    "dsh" => std::env::var("AMAIL_DSH_BIN")
+                        .ok()
+                        .filter(|v| !v.is_empty())
+                        .unwrap_or_else(|| "dsh".into()),
+                    _ => bin.to_string(),
+                };
+                let path = amail_node::paths::find_program(&name)
+                    .map(|p| p.to_string_lossy().into_owned());
+                (name, path)
+            }
         };
-        match version_of(&path) {
-            None => r.add(
+        let whose = if node_bins.contains_key(*bin) {
+            "the node's"
+        } else {
+            "on this PATH"
+        };
+        let version = path.as_deref().and_then(version_of);
+        match version {
+            None if path.is_some() => r.add(
                 Level::Info,
                 bin,
-                "not found",
+                format!(
+                    "{} ({whose}) did not print a version",
+                    path.as_deref().unwrap_or_default()
+                ),
+                None,
+            ),
+            None => r.add(
+                if users.is_some() {
+                    Level::Warn
+                } else {
+                    Level::Info
+                },
+                bin,
+                match users {
+                    Some(u) => format!(
+                        "{name} not found ({whose}); used by {}",
+                        some(u)
+                    ),
+                    None => format!("{name} not found ({whose})"),
+                },
                 Some(match *bin {
                     "zellij" => "amail up runs sessions in zellij: install it to run teams".into(),
-                    _ => format!("install it to run {bin} seats"),
+                    "dsh" => "install it, or start the node with --dsh-bin <path to dsh> \
+                              (amail node stop; amail node start --dsh-bin ...)"
+                        .into(),
+                    _ => format!(
+                        "install it to run {bin} seats, or start the node with --{bin}-bin <path>"
+                    ),
                 }),
             ),
             Some(v) if v.starts_with(prefix) => {
@@ -520,6 +645,38 @@ pub async fn doctor(profile: Option<&Path>, team_file: &Path, out: &Out) -> Resu
                         .into(),
                 ),
             ),
+        }
+    }
+    // dsh seats need the model provider's key.
+    if let (Some(users), Some(v)) = (used.get("dsh"), &node) {
+        let names: Vec<&str> = v["dsh_env"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        if names.is_empty() {
+            r.add(
+                Level::Warn,
+                "dsh key",
+                format!(
+                    "the node was started without --dsh-env-file; used by {}",
+                    some(users)
+                ),
+                Some(
+                    "dsh seats then have a provider key only if it is in the node's own \
+                     environment (which every session would see): put DEEPSEEK_API_KEY=... in a \
+                     file and start the node with --dsh-env-file <file>"
+                        .into(),
+                ),
+            );
+        } else {
+            r.add(
+                Level::Ok,
+                "dsh key",
+                format!("--dsh-env-file sets {}", names.join(" ")),
+                None,
+            );
         }
     }
 
@@ -646,8 +803,8 @@ pub async fn doctor(profile: Option<&Path>, team_file: &Path, out: &Out) -> Resu
     }
 
     // The team file here, if any.
-    if team_file.exists() {
-        match amail_node::team::load(team_file) {
+    if let Some(team) = team {
+        match team {
             Ok(t) => r.add(
                 Level::Ok,
                 "team file",

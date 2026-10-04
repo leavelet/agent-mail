@@ -39,15 +39,7 @@ agent 的会话存在的时间很短，它所占的职位却一直存在。`amai
 
 ## 快速开始（单机，SQLite）
 
-安装发布版二进制（Linux x86_64 和 aarch64）：
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/OWNER/agent-mail/main/install.sh | sh
-```
-
-脚本只通过 https 下载，并用发布里的 `SHA256SUMS` 校验压缩包。要确认压缩包由本仓库的发布流程构建，运行 `gh attestation verify <压缩包> --repo OWNER/agent-mail`，或者把另行取得的校验和作为 `AMAIL_SHA256` 传入。
-
-或者自己构建（Rust stable；网页界面需要 Node 20 以上）：
+从源码构建 `amail`（Rust stable；网页界面需要 Node 20 以上）：
 
 ```sh
 git clone https://github.com/OWNER/agent-mail && cd agent-mail
@@ -55,7 +47,17 @@ git clone https://github.com/OWNER/agent-mail && cd agent-mail
 cargo install --path crates/amail-cli        # 安装到 ~/.cargo/bin
 ```
 
+这些 URL 里的 `OWNER` 是占位符：仓库的所有者还没有确定。请换成你所用仓库的所有者（或者从你拿到这份代码的地方克隆）。
+
 没有构建网页时服务器照常工作，首页会说明如何构建界面。
+
+发布版二进制（Linux x86_64 和 aarch64）将用下面的脚本安装，前提是这个 URL 和 `install.sh` 里的 `OWNER` 已换成真正的所有者；在那之前，脚本会停下并说明原因：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/OWNER/agent-mail/main/install.sh | sh
+```
+
+脚本只通过 https 下载，并用发布里的 `SHA256SUMS` 校验压缩包。要确认压缩包由本仓库的发布流程构建，运行 `gh attestation verify <压缩包> --repo OWNER/agent-mail`，或者把另行取得的校验和作为 `AMAIL_SHA256` 传入。
 
 建立组织并启动服务器：
 
@@ -65,7 +67,7 @@ amail serve --db sqlite://amail.db --listen 127.0.0.1:8025 &
 amail login http://127.0.0.1:8025 < owner.token
 ```
 
-`amail login` 从标准输入读令牌（或者提示你输入），检查后保存到 `~/.config/amail/config.toml`（权限 0600），之后的命令都用它。
+`amail login` 从标准输入读令牌（或者提示你输入），检查后保存到 `~/.config/amail/config.toml`（权限 0600），之后的命令都用它。设置 `AMAIL_CONFIG_DIR` 可以把保存的登录放到别的目录（见[参考](docs/reference.md#configuration-of-the-command-line)）。
 
 两个席位互发一封信：
 
@@ -74,10 +76,18 @@ amail seat add alice --role "Writes the parser"
 amail seat add bob --role "Reviews changes"
 ALICE=$(amail seat token alice)
 BOB=$(amail seat token bob)
-
-AMAIL_URL=http://127.0.0.1:8025 AMAIL_TOKEN=$ALICE \
-  amail send --to bob -s "Parser ready" -m "Please review branch parser."
 ```
+
+以 `alice` 的身份：
+
+```console
+$ AMAIL_URL=http://127.0.0.1:8025 AMAIL_TOKEN=$ALICE \
+    amail send --to bob -s "Parser ready" -m "Please review branch parser."
+sent #1 thread 1 to 1 seat: bob=1
+not seen at once: bob offline (no session); sees it when one starts
+```
+
+第二行说明 `bob` 没有在运行的 agent 会话，所以信留在它的信箱里等待。
 
 以 `bob` 的身份：
 
@@ -90,7 +100,7 @@ $ amail read 1
 To: bob
 Subject: Parser ready
 
-Please review branch parser.
+  > Please review branch parser.
 $ echo "Looks good." | amail reply 1
 sent #2 thread 1 to 1 seat: alice=1
 not seen at once: alice offline (no session); sees it when one starts

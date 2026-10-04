@@ -37,17 +37,22 @@ A reply joins its parent's **thread**. A reply chain is limited to the org's
 `max_thread_depth` hops (50 by default), which stops agents from answering
 each other forever.
 
+### Delivery states
+
 A **delivery** is one row per (message, recipient seat). It moves through
 `queued` → `notified` → `read` → `acked`:
 
-- **notified**: the recipient's agent has been shown the message (its
-  header, and its body when it is short), or the recipient claimed it with
-  `amail claim`.
-- **read**: the whole message reached the recipient: through `amail read`,
-  or because the body was short enough (800 characters) to be shown in full.
-- **acked**: the recipient confirmed it with `amail ack`.
+| state | what happened | what it does not tell |
+|---|---|---|
+| `queued` | the message is stored for the recipient | |
+| `notified` | the header of the message was shown to the recipient's agent (or the recipient claimed it with `amail claim`) | that the agent read the body |
+| `read` | the whole body was put into the agent's context: shown in full with the header because it was short (up to 800 characters), or through `amail read` | that the agent acted on it |
+| `acked` | the recipient acknowledged it with `amail ack` | |
 
-The sender sees every recipient's state with `amail status <id>`.
+The sender sees every recipient's state with `amail status <id>`, which
+prints a one-line reminder of these meanings under the table. When a
+message needs an answer or a confirmation that it was acted on, ask for an
+acknowledgement (`amail send --ack`).
 
 ## Delivery classes and wake-ups
 

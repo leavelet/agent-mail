@@ -55,7 +55,24 @@ see [Harness support](docs/harnesses.md).
 
 ## Quick start (one machine, SQLite)
 
-Install a release binary (Linux x86_64 and aarch64):
+Build `amail` from source (Rust stable; Node 20+ for the web interface):
+
+```sh
+git clone https://github.com/OWNER/agent-mail && cd agent-mail
+(cd web && npm ci && npm run build)          # optional: embeds the web interface
+cargo install --path crates/amail-cli        # installs `amail` into ~/.cargo/bin
+```
+
+`OWNER` in these URLs is a placeholder: the repository's owner is not
+decided yet. Replace it with the owner of the repository you use (or clone
+from wherever you got this copy).
+
+Without the web build the server still works and its start page explains how
+to build the interface.
+
+Release binaries (Linux x86_64 and aarch64) will be installed with a
+script, once `OWNER` is replaced by the real owner in this URL and in
+`install.sh`; until then the script stops with a message that says so:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/OWNER/agent-mail/main/install.sh | sh
@@ -67,17 +84,6 @@ repository's release workflow, run `gh attestation verify <archive> --repo
 OWNER/agent-mail`, or pass a checksum you obtained separately as
 `AMAIL_SHA256`.
 
-or build it (Rust stable; Node 20+ for the web interface):
-
-```sh
-git clone https://github.com/OWNER/agent-mail && cd agent-mail
-(cd web && npm ci && npm run build)          # optional: embeds the web interface
-cargo install --path crates/amail-cli        # installs `amail` into ~/.cargo/bin
-```
-
-Without the web build the server still works and its start page explains how
-to build the interface.
-
 Create an org and start the server:
 
 ```sh
@@ -88,6 +94,8 @@ amail login http://127.0.0.1:8025 < owner.token
 
 `amail login` reads the token from stdin (or asks for it), checks it and
 saves it in `~/.config/amail/config.toml` (mode 0600). Later commands use it.
+Set `AMAIL_CONFIG_DIR` to keep saved logins in another directory (see the
+[reference](docs/reference.md#configuration-of-the-command-line)).
 
 Two seats exchange a message:
 
@@ -96,10 +104,19 @@ amail seat add alice --role "Writes the parser"
 amail seat add bob --role "Reviews changes"
 ALICE=$(amail seat token alice)
 BOB=$(amail seat token bob)
-
-AMAIL_URL=http://127.0.0.1:8025 AMAIL_TOKEN=$ALICE \
-  amail send --to bob -s "Parser ready" -m "Please review branch parser."
 ```
+
+As `alice`:
+
+```console
+$ AMAIL_URL=http://127.0.0.1:8025 AMAIL_TOKEN=$ALICE \
+    amail send --to bob -s "Parser ready" -m "Please review branch parser."
+sent #1 thread 1 to 1 seat: bob=1
+not seen at once: bob offline (no session); sees it when one starts
+```
+
+The second line says that no agent session runs for `bob`, so the mail
+waits in its mailbox.
 
 As `bob`:
 
@@ -112,7 +129,7 @@ $ amail read 1
 To: bob
 Subject: Parser ready
 
-Please review branch parser.
+  > Please review branch parser.
 $ echo "Looks good." | amail reply 1
 sent #2 thread 1 to 1 seat: alice=1
 not seen at once: alice offline (no session); sees it when one starts
