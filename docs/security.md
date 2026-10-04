@@ -424,7 +424,7 @@ Rate and stream limits are counted per server instance.
 | Mail stored per org | 1 GiB (*public*): every message the org sent counts its subject, body, `meta` and addresses plus 512 bytes, and 384 bytes per delivery (one per recipient seat, so a list counts once per member); mail of deleted orgs counts against the orgs that keep it; retention gives back the bytes of cleared bodies; a send over it is refused with 507 `storage_quota`, and an org at its quota can send nothing, not even an empty message |
 | Messages over all orgs | 500 per second (*public*) |
 | Requests per token or browser session | 200 per second, bursts of 400 (*public*); sign-ins count too |
-| Requests per org, all its tokens and browser sessions together | 500 per second, bursts of 1,000 (*public*); once the server knows a token's org, a request over the limit is refused before the database is asked |
+| Requests per org, all its tokens and browser sessions together | 500 per second, bursts of 1,000 (*public*); once the server knows a token's org, a request over the limit is refused before the database is asked, and the refusal (429) is sent after one second, so that a client that retries at once is slowed down |
 | Registration attempts per client address (IPv6: per /64 network) | 10 per hour, bursts of 5, failed ones included (*public*); in addition, all /64 networks of one IPv6 /48 together get 4 times that (40 per hour, bursts of 20), checked first |
 | Link requests per org | 20 per hour, bursts of 5 (*public*) |
 | Pending outgoing link requests per org | 1,000; a request not accepted within 30 days is dropped |

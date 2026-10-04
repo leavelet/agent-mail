@@ -156,11 +156,24 @@ async fn org_request_limit_counts_all_tokens(b: Backend, t: &str) {
             .to_string(),
         ..acme.clone()
     };
+    // At once, so that the bucket does not refill in between.
+    let started = Instant::now();
+    let tasks: Vec<_> = (0..24)
+        .map(|i| {
+            let c = if i % 2 == 0 {
+                acme.clone()
+            } else {
+                second.clone()
+            };
+            tokio::spawn(async move { c.call(Method::GET, "/whoami", None).await })
+        })
+        .collect();
     let mut codes = Vec::new();
-    for i in 0..24 {
-        let c = if i % 2 == 0 { &acme } else { &second };
-        codes.push(c.call(Method::GET, "/whoami", None).await);
+    for t in tasks {
+        codes.push(t.await.unwrap());
     }
+    // Refusals come late (a client that retries at once is slowed down).
+    assert!(started.elapsed().as_secs_f64() >= 0.9);
     let ok = codes.iter().filter(|(s, _)| s.is_success()).count();
     assert!((9..=12).contains(&ok), "{ok} of 24 served");
     let limited = codes
@@ -170,12 +183,10 @@ async fn org_request_limit_counts_all_tokens(b: Backend, t: &str) {
         })
         .count();
     assert_eq!(ok + limited, 24);
-    // Both tokens are refused now; the other org is served.
-    assert_eq!(
-        second.call(Method::GET, "/whoami", None).await.0,
-        StatusCode::TOO_MANY_REQUESTS
-    );
+    // The other org is served at once.
+    let t = Instant::now();
     other.get("/whoami").await;
+    assert!(t.elapsed().as_secs_f64() < 0.5);
 }
 
 /// While all of an org's query slots are taken, its requests whose cost
