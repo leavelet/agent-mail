@@ -303,8 +303,8 @@ impl QuerySlots {
     pub async fn acquire(&self, pool: Pool, org_id: i64) -> Result<QuerySlot, SlotRefused> {
         match pool {
             Pool::Scan => self.scan.acquire(org_id).await,
-            Pool::Other => self.scan.acquire(org_id).await,
-            Pool::Light => self.scan.acquire(org_id).await,
+            Pool::Other => self.other.acquire(org_id).await,
+            Pool::Light => self.light.acquire(org_id).await,
         }
     }
 

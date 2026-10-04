@@ -238,7 +238,10 @@ async fn measure(
                     let (ok, refused) = match r {
                         Ok(r) => {
                             let s = r.status();
-                            let _ = r.bytes().await;
+                            let body = r.bytes().await.unwrap_or_default();
+                            if !s.is_success() && std::env::var_os("BENCH_DEBUG").is_some() {
+                                eprintln!("{url}: {s} {}", String::from_utf8_lossy(&body));
+                            }
                             (s.is_success(), s.as_u16() == 429)
                         }
                         Err(_) => (false, false),
