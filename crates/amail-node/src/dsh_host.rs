@@ -51,13 +51,18 @@ pub struct HostArgs {
 /// listed; container engine sockets are replaced by `/dev/null` (a Unix
 /// socket can be connected to on a read-only mount, and the Docker socket
 /// would give root). The listed paths are mounted back, read-only or
-/// writable; paths that do not exist are skipped. The network is shared
-/// (the model API, the amail server).
+/// writable; paths that do not exist are skipped. `ro_files` are
+/// `(source, destination)` pairs of single files mounted read-only. The
+/// jailed process starts a new session, so it has no controlling terminal
+/// (`ioctl(TIOCSTI)` on the launching terminal is not possible). The
+/// network is shared (the model API, the amail server).
+#[allow(clippy::too_many_arguments)]
 pub fn jail_args(
     home: &str,
     runtime_dir: &str,
     rw: &[String],
     ro: &[String],
+    ro_files: &[(String, String)],
     empty_dirs: &[String],
     empty_files: &[String],
     empty_file: &str,
@@ -76,6 +81,7 @@ pub fn jail_args(
         "--tmpfs",
         "/tmp",
         "--die-with-parent",
+        "--new-session",
     ]
     .map(String::from)
     .to_vec();
@@ -98,9 +104,10 @@ pub fn jail_args(
         }
     }
     #[derive(Clone, Copy)]
-    enum M {
+    enum M<'a> {
         Ro,
         Rw,
+        RoFrom(&'a str),
         EmptyDir,
         EmptyFile,
     }
@@ -109,6 +116,7 @@ pub fn jail_args(
         .map(|p| (M::Ro, p))
         .chain(rw.iter().map(|p| (M::Rw, p)))
         .filter(|(_, p)| std::path::Path::new(p.as_str()).exists())
+        .chain(ro_files.iter().map(|(src, dst)| (M::RoFrom(src), dst)))
         .chain(empty_dirs.iter().map(|p| (M::EmptyDir, p)))
         .chain(empty_files.iter().map(|p| (M::EmptyFile, p)))
         .collect();
@@ -119,6 +127,7 @@ pub fn jail_args(
         match m {
             M::Ro => args.extend(["--ro-bind".into(), p.clone(), p]),
             M::Rw => args.extend(["--bind".into(), p.clone(), p]),
+            M::RoFrom(src) => args.extend(["--ro-bind".into(), src.to_string(), p]),
             M::EmptyDir => args.extend([
                 "--perms".into(),
                 "0555".into(),
@@ -143,22 +152,51 @@ const SOCKETS: &[&str] = &[
     "/run/containerd/containerd.sock",
 ];
 
-/// Paths a jailed host needs besides those amail lists: the Node.js
-/// runtime that runs `dsh` and the user's git configuration.
-fn runtime_paths(home: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    if let Some(node) = std::env::var_os("PATH").and_then(|p| {
+/// The Node.js installation that runs `dsh` (a path a jailed host needs
+/// besides those amail lists).
+fn node_root() -> Option<String> {
+    let node = std::env::var_os("PATH").and_then(|p| {
         p.to_string_lossy()
             .split(':')
             .map(|d| std::path::Path::new(d).join("node"))
             .find(|p| p.is_file())
-    }) && let Ok(real) = std::fs::canonicalize(node)
-        && let Some(root) = real.parent().and_then(|b| b.parent())
-    {
-        out.push(root.to_string_lossy().into_owned());
-    }
-    for rel in [".gitconfig", ".config/git"] {
-        out.push(format!("{home}/{rel}"));
+    })?;
+    let real = std::fs::canonicalize(node).ok()?;
+    Some(real.parent()?.parent()?.to_string_lossy().into_owned())
+}
+
+/// Names of git's credential stores (`git credential-store`), never mounted.
+const CREDENTIAL_FILES: &[&str] = &["credentials", ".git-credentials"];
+
+/// The user's git configuration files a jailed host gets, as `(source,
+/// destination)` pairs for read-only mounts: `~/.gitconfig` and, in git's
+/// configuration directory (`$XDG_CONFIG_HOME/git`, by default
+/// `~/.config/git`), `config`, `ignore` and `attributes`. Only these files
+/// are mounted, never their directory, so a credential store next to them
+/// (`~/.config/git/credentials`, `~/.git-credentials`) stays hidden. A
+/// symbolic link is resolved and only the regular file it points to is
+/// mounted, at the link's path; a link to a file named like a credential
+/// store is skipped. Files that do not exist are skipped.
+pub fn git_config_files(home: &str, xdg_config_home: Option<&str>) -> Vec<(String, String)> {
+    let config_dir = match xdg_config_home.filter(|d| d.starts_with('/')) {
+        Some(d) => format!("{}/git", d.trim_end_matches('/')),
+        None => format!("{home}/.config/git"),
+    };
+    let mut wanted = vec![format!("{home}/.gitconfig")];
+    wanted.extend(["config", "ignore", "attributes"].map(|f| format!("{config_dir}/{f}")));
+    let mut out = Vec::new();
+    for dest in wanted {
+        let Ok(real) = std::fs::canonicalize(&dest) else {
+            continue;
+        };
+        let credential = real
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| CREDENTIAL_FILES.contains(&n));
+        if !real.is_file() || credential {
+            continue;
+        }
+        out.push((real.to_string_lossy().into_owned(), dest));
     }
     out
 }
@@ -211,7 +249,9 @@ async fn run_inner(a: HostArgs) -> Result<i32> {
         // Fail closed: if bwrap cannot run, the host does not run.
         let home = std::env::var("HOME").unwrap_or_default();
         let mut ro = a.ro.clone();
-        ro.extend(runtime_paths(&home));
+        ro.extend(node_root());
+        let xdg_config = std::env::var("XDG_CONFIG_HOME").ok();
+        let git_files = git_config_files(&home, xdg_config.as_deref());
         let mut c = tokio::process::Command::new("bwrap");
         let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_default();
         let empty = a.endpoint.with_file_name("empty");
@@ -225,6 +265,7 @@ async fn run_inner(a: HostArgs) -> Result<i32> {
             &runtime,
             &a.rw,
             &ro,
+            &git_files,
             &a.empty_dirs,
             &a.empty_files,
             &empty.to_string_lossy(),
@@ -238,7 +279,10 @@ async fn run_inner(a: HostArgs) -> Result<i32> {
         c.args(args);
         c
     };
-    cmd.stdout(std::process::Stdio::piped())
+    // The host does not read its input; it does not get the terminal the
+    // seat was started in.
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     for (k, _) in std::env::vars_os() {
@@ -486,6 +530,7 @@ mod tests {
             "/nonexistent-runtime-dir",
             &[deep.clone(), work.clone(), format!("{d}/missing")],
             std::slice::from_ref(&d),
+            &[("/src/gitconfig".into(), format!("{d}/.gitconfig"))],
             &[format!("{deep}/hooks")],
             &[format!("{deep}/config")],
             "/e",
@@ -504,6 +549,117 @@ mod tests {
         assert!(s.contains(&format!("--tmpfs {deep}/hooks --remount-ro {deep}/hooks")));
         assert!(s.contains(&format!("--ro-bind /e {deep}/config")));
         assert!(pos(&format!("--bind {deep} {deep}")) < pos(&format!("{deep}/hooks")));
+        assert!(s.contains(&format!("--ro-bind /src/gitconfig {d}/.gitconfig")));
+        assert!(pos(&format!("--tmpfs {d} ")) < pos("/src/gitconfig"));
+        // No controlling terminal inside the jail.
+        assert!(args.iter().any(|a| a == "--new-session"), "{s}");
+    }
+
+    /// A fake home with git's configuration, a credential store next to it,
+    /// and symbolic links (a dotfiles directory; a link to a credential
+    /// store).
+    fn fake_git_home() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let h = dir.path().canonicalize().unwrap();
+        let w = |p: &str, c: &str| {
+            let p = h.join(p);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, c).unwrap();
+        };
+        w(".config/git/config", "[core]\n");
+        w(".config/git/attributes", "*.bin binary\n");
+        w(
+            ".config/git/credentials",
+            "https://u:fake-token@example.com\n",
+        );
+        w(".git-credentials", "https://u:fake-token2@example.com\n");
+        w("dotfiles/gitconfig", "[user]\n");
+        std::os::unix::fs::symlink("dotfiles/gitconfig", h.join(".gitconfig")).unwrap();
+        // `ignore` points at a credential store: not mounted.
+        std::os::unix::fs::symlink("../../.git-credentials", h.join(".config/git/ignore")).unwrap();
+        let home = h.to_string_lossy().into_owned();
+        (dir, home)
+    }
+
+    #[test]
+    fn git_config_only() {
+        let (_dir, h) = fake_git_home();
+        let files = git_config_files(&h, None);
+        assert_eq!(
+            files,
+            vec![
+                (format!("{h}/dotfiles/gitconfig"), format!("{h}/.gitconfig")),
+                (
+                    format!("{h}/.config/git/config"),
+                    format!("{h}/.config/git/config")
+                ),
+                (
+                    format!("{h}/.config/git/attributes"),
+                    format!("{h}/.config/git/attributes")
+                ),
+            ]
+        );
+        let s = jail_args(&h, "", &[], &[], &files, &[], &[], "/e").join(" ");
+        assert!(!s.contains("credentials"), "{s}");
+        assert!(!s.contains(&format!("{h}/.config/git ")), "{s}");
+        assert!(!s.contains("ignore"), "{s}");
+        // `$XDG_CONFIG_HOME/git` instead of `~/.config/git` when set.
+        let xdg = git_config_files(&h, Some(&format!("{h}/dotfiles/")));
+        assert_eq!(xdg.len(), 1);
+        std::fs::create_dir_all(format!("{h}/xdg/git")).unwrap();
+        std::fs::write(format!("{h}/xdg/git/config"), "").unwrap();
+        std::fs::write(format!("{h}/xdg/git/credentials"), "x").unwrap();
+        let xdg = git_config_files(&h, Some(&format!("{h}/xdg")));
+        assert_eq!(
+            xdg[1],
+            (format!("{h}/xdg/git/config"), format!("{h}/xdg/git/config"))
+        );
+        assert_eq!(xdg.len(), 2);
+    }
+
+    /// In a real jail with a fake home: git's configuration is readable,
+    /// its credential stores are not, and there is no controlling terminal.
+    #[test]
+    fn git_credentials_hidden_in_jail() {
+        let ok = std::process::Command::new("bwrap")
+            .args(["--ro-bind", "/", "/", "--", "true"])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            eprintln!("bwrap cannot run here: jail check skipped");
+            return;
+        }
+        let (_dir, h) = fake_git_home();
+        let files = git_config_files(&h, None);
+        let args = jail_args(&h, "", &[], &[], &files, &[], &[], "/e");
+        let script = format!(
+            "for f in .config/git/config .gitconfig .config/git/attributes \
+               .config/git/credentials .git-credentials .config/git/ignore dotfiles/gitconfig; do \
+               if cat {h}/$f >/dev/null 2>&1; then echo \"$f readable\"; else echo \"$f hidden\"; fi; done; \
+             if (: </dev/tty) 2>/dev/null; then echo tty; else echo no-tty; fi"
+        );
+        let out = std::process::Command::new("bwrap")
+            .args(&args)
+            .args(["--", "sh", "-c", &script])
+            .output()
+            .unwrap();
+        let out = String::from_utf8_lossy(&out.stdout);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                ".config/git/config readable",
+                ".gitconfig readable",
+                ".config/git/attributes readable",
+                ".config/git/credentials hidden",
+                ".git-credentials hidden",
+                ".config/git/ignore hidden",
+                "dotfiles/gitconfig hidden",
+                "no-tty",
+            ],
+            "{out}"
+        );
     }
 
     #[test]
