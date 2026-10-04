@@ -150,8 +150,9 @@ enum Cmd {
     Ack { id: i64 },
     /// Delivery state of each recipient of a message you sent.
     Status { id: i64 },
-    /// Show a thread (by thread id or the id of any message in it).
-    Thread { id: i64 },
+    /// Show a thread (by thread id or the id of any message in it), or
+    /// delete it (`amail thread delete <id>`).
+    Thread(ThreadCli),
     /// Directory: seats, lists and linked orgs.
     Who,
     /// Focus mode: only urgent mail reaches the seat until it ends.
@@ -294,6 +295,27 @@ enum Cmd {
     Sleep { seat: String },
     /// Start a sleeping or stopped seat now.
     Wake { seat: String },
+}
+
+#[derive(Args)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+struct ThreadCli {
+    #[command(subcommand)]
+    cmd: Option<ThreadCmd>,
+    /// The thread id, or the id of any message in it.
+    #[arg(required = true)]
+    id: Option<i64>,
+}
+
+#[derive(Subcommand)]
+enum ThreadCmd {
+    /// Delete what your org may delete of a thread (user token): mail from
+    /// orgs that no longer exist, and mail your org sent that no other org
+    /// received. Mail exchanged with orgs that still exist stays.
+    Delete {
+        /// The thread id, or the id of any message in it.
+        id: i64,
+    },
 }
 
 #[derive(Args)]
@@ -717,6 +739,8 @@ enum TokenCmd {
 #[derive(Subcommand)]
 enum OrgCmd {
     Show,
+    /// Delete all mail of deleted orgs that your org keeps (user token).
+    PurgeDeletedOrgs,
     /// Delete the org and all its data (seats, mail, lists, links, tokens).
     /// Asks you to type the org's name unless --confirm gives it.
     Delete {
@@ -1205,7 +1229,49 @@ async fn run(cli: Cli) -> Result<()> {
                 Ok(lines(&r.recipients, output::status_line))
             })
         }
-        Cmd::Thread { id } => {
+        Cmd::Thread(ThreadCli {
+            cmd: Some(ThreadCmd::Delete { id }),
+            ..
+        }) => {
+            let mut path = format!("/threads/{id}");
+            let mut deleted = 0;
+            let kept = loop {
+                let v = match c.raw(Method::DELETE, &path, None).await {
+                    Err(e)
+                        if is_not_found(&e)
+                            && deleted == 0
+                            && path.ends_with(&format!("/{id}")) =>
+                    {
+                        let m: p::MessageResponse =
+                            c.get(&format!("/messages/{id}?peek=1")).await?;
+                        let t = m.message.header.thread_id;
+                        if t == id {
+                            return Err(e);
+                        }
+                        path = format!("/threads/{t}");
+                        continue;
+                    }
+                    r => r?,
+                };
+                let r: p::DeleteMailResponse = parse(&v)?;
+                deleted += r.deleted;
+                if !r.more {
+                    break r.kept;
+                }
+            };
+            let v = json!({ "deleted": deleted, "kept": kept });
+            out.show(&v, || {
+                let mut s = format!("deleted {deleted} messages");
+                if kept > 0 {
+                    s.push_str(&format!(
+                        "; {kept} kept (mail exchanged with orgs that still exist cannot be deleted)"
+                    ));
+                }
+                Ok(s)
+            })
+        }
+        Cmd::Thread(ThreadCli { id, .. }) => {
+            let id = id.context("give a thread id")?;
             let v = match c.raw(Method::GET, &format!("/threads/{id}"), None).await {
                 Ok(v) => v,
                 Err(e) if is_not_found(&e) => {
@@ -1414,6 +1480,22 @@ async fn run(cli: Cli) -> Result<()> {
                 Ok(format!("deleted org {} and all its data", me.org))
             })
         }
+        Cmd::Org(OrgCmd::PurgeDeletedOrgs) => {
+            let mut deleted = 0;
+            loop {
+                let r: p::DeleteMailResponse = parse(
+                    &c.raw(Method::POST, "/archive/purge-deleted-orgs", None)
+                        .await?,
+                )?;
+                deleted += r.deleted;
+                if !r.more {
+                    break;
+                }
+            }
+            out.show(&json!({ "deleted": deleted }), || {
+                Ok(format!("deleted {deleted} messages of deleted orgs"))
+            })
+        }
         Cmd::Org(OrgCmd::Show) => {
             let v = c.raw(Method::GET, "/org", None).await?;
             out.show(&v, || org_text(&v))
@@ -1475,6 +1557,12 @@ fn org_text(v: &Value) -> Result<String> {
             " of {} ({:.0}%)",
             mib(q),
             o.stored_bytes as f64 * 100.0 / q.max(1) as f64
+        ));
+    }
+    if o.kept_bytes > 0 {
+        s.push_str(&format!(
+            "\nmail of deleted orgs: {} (not counted; `amail org purge-deleted-orgs` deletes it)",
+            mib(o.kept_bytes)
         ));
     }
     Ok(s)

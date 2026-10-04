@@ -45,6 +45,7 @@ pub async fn stats(
             messages_day: o.messages_day,
             last_activity: o.last_activity.map(ts),
             stored_bytes: o.stored_bytes,
+            kept_bytes: o.kept_bytes,
         });
     }
     Ok(Json(out))

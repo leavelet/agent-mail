@@ -207,6 +207,7 @@ pub fn org(o: &Org, storage_quota: Option<i64>) -> p::OrgInfo {
         digest_interval_min: o.digest_interval_min,
         webhook_url: o.webhook_url.clone(),
         stored_bytes: o.stored_bytes,
+        kept_bytes: o.kept_bytes,
         storage_quota_bytes: storage_quota,
     }
 }

@@ -301,8 +301,8 @@ pub async fn sweep(st: AppState) {
     }
 }
 
-/// Background (with a retention period): clear the bodies of old messages,
-/// a thousand at a time.
+/// Background (with a retention period): clear the bodies of old messages
+/// and delete the old mail of deleted orgs, a thousand at a time.
 pub async fn retention(st: AppState) {
     let Some(days) = st.config.retention_days else {
         return;
@@ -327,6 +327,27 @@ pub async fn retention(st: AppState) {
         if total > 0 {
             tracing::info!(
                 "retention: cleared the bodies of {total} messages older than {days} days"
+            );
+        }
+        // Mail of deleted orgs older than the period goes altogether.
+        let mut total = 0;
+        loop {
+            match st.store.expire_deleted_org_mail(cutoff, 1000).await {
+                Ok(n) => {
+                    total += n;
+                    if n < 1000 {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("retention: {e}");
+                    break;
+                }
+            }
+        }
+        if total > 0 {
+            tracing::info!(
+                "retention: deleted {total} messages of deleted orgs older than {days} days"
             );
         }
         tokio::time::sleep(st.config.retention_every).await;

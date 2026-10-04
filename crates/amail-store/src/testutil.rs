@@ -205,48 +205,111 @@ impl TestDb {
 }
 
 impl TestDb {
-    /// For every org: `(id, stored_bytes, the same count computed from
-    /// scratch)`. The second count comes from running the storage migration
-    /// (`0013_storage_deliveries.sql`) again in a transaction that is then
-    /// rolled back.
-    pub async fn storage_counts(&self) -> Vec<(i64, i64, i64)> {
-        const SQLITE: &str = include_str!("../migrations/sqlite/0013_storage_deliveries.sql");
-        const PG: &str = include_str!("../migrations/postgres/0013_storage_deliveries.sql");
-        const READ: &str = "SELECT id, stored_bytes FROM orgs ORDER BY id";
+    /// For every org: its `stored_bytes` and `kept_bytes`, and the same
+    /// two counts computed from scratch by [`RECOUNT`], in a transaction
+    /// that is then rolled back.
+    pub async fn storage_counts(&self) -> Vec<StorageCount> {
+        self.recounted(RECOUNT).await
+    }
+
+    /// Like [`Self::storage_counts`], but the counts computed again are
+    /// those of migration `0016_kept_bytes.sql` applied to the counts of
+    /// the rule before it (the kept mail added back to `stored_bytes`).
+    pub async fn storage_counts_after_0016(&self) -> Vec<StorageCount> {
+        const SQLITE: &str = include_str!("../migrations/sqlite/0016_kept_bytes.sql");
+        const PG: &str = include_str!("../migrations/postgres/0016_kept_bytes.sql");
+        let m = if self.url.starts_with("sqlite:") {
+            SQLITE
+        } else {
+            PG
+        };
+        // Without its first statement, which adds the column.
+        let (_, rest) = m.split_once("DEFAULT 0;").expect("0016 adds kept_bytes");
+        let sql = format!(
+            "UPDATE orgs SET stored_bytes = stored_bytes + kept_bytes, kept_bytes = 0;{rest}"
+        );
+        self.recounted(&sql).await
+    }
+
+    async fn recounted(&self, recount: &str) -> Vec<StorageCount> {
+        const READ: &str = "SELECT id, stored_bytes, kept_bytes FROM orgs ORDER BY id";
         // Concurrent sends wait until the counts are read: SQLite takes the
         // write lock at once, Postgres locks `orgs` (a send updates its
         // org's row last, so its rows are either all visible or none).
         macro_rules! run {
-            ($c:expr, $begin:expr, $recount:expr) => {{
+            ($c:expr, $begin:expr) => {{
                 sqlx::raw_sql($begin).execute(&mut $c).await.expect("begin");
-                let now: Vec<(i64, i64)> =
+                let now: Vec<(i64, i64, i64)> =
                     sqlx::query_as(READ).fetch_all(&mut $c).await.expect("read");
-                sqlx::raw_sql($recount)
+                sqlx::raw_sql(recount)
                     .execute(&mut $c)
                     .await
                     .expect("recount");
-                let new: Vec<(i64, i64)> =
+                let new: Vec<(i64, i64, i64)> =
                     sqlx::query_as(READ).fetch_all(&mut $c).await.expect("read");
                 sqlx::raw_sql("ROLLBACK")
                     .execute(&mut $c)
                     .await
                     .expect("rollback");
-                now.iter().zip(&new).map(|(a, b)| (a.0, a.1, b.1)).collect()
+                now.iter()
+                    .zip(&new)
+                    .map(|(a, b)| StorageCount {
+                        org_id: a.0,
+                        stored_bytes: a.1,
+                        kept_bytes: a.2,
+                        stored_recount: b.1,
+                        kept_recount: b.2,
+                    })
+                    .collect()
             }};
         }
         if self.url.starts_with("sqlite:") {
             let mut c = sqlx::SqliteConnection::connect(&self.url)
                 .await
                 .expect("connect");
-            run!(c, "BEGIN IMMEDIATE", SQLITE)
+            run!(c, "BEGIN IMMEDIATE")
         } else {
             let mut c = sqlx::PgConnection::connect(&self.url)
                 .await
                 .expect("connect");
-            run!(c, "BEGIN; LOCK TABLE orgs IN SHARE ROW EXCLUSIVE MODE", PG)
+            run!(c, "BEGIN; LOCK TABLE orgs IN SHARE ROW EXCLUSIVE MODE")
         }
     }
 }
+
+/// One org's storage counts and the same counted from scratch (see
+/// [`TestDb::storage_counts`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageCount {
+    pub org_id: i64,
+    pub stored_bytes: i64,
+    pub kept_bytes: i64,
+    pub stored_recount: i64,
+    pub kept_recount: i64,
+}
+
+/// The storage counts of every org from scratch, under the rule of
+/// `amail_store::message_bytes`: `stored_bytes` is the mail the org sent
+/// with all its deliveries; `kept_bytes` is, for each message of a deleted
+/// org that the org keeps deliveries of, the message's full bytes and the
+/// org's own deliveries of it. Deleted orgs count nothing. Portable
+/// between SQLite and Postgres.
+pub const RECOUNT: &str = "
+UPDATE orgs SET stored_bytes = 0, kept_bytes = 0;
+UPDATE orgs SET stored_bytes = COALESCE((
+    SELECT SUM(512 + octet_length(m.subject) + octet_length(m.body) + octet_length(m.meta)
+               + octet_length(m.to_addrs) + octet_length(m.cc_addrs)
+               + 384 * (SELECT COUNT(*) FROM deliveries d WHERE d.message_id = m.id))
+      FROM messages m WHERE m.org_id = orgs.id
+), 0), kept_bytes = COALESCE((
+    SELECT SUM(512 + octet_length(m.subject) + octet_length(m.body) + octet_length(m.meta)
+               + octet_length(m.to_addrs) + octet_length(m.cc_addrs)
+               + 384 * (SELECT COUNT(*) FROM deliveries d WHERE d.message_id = m.id AND d.org_id = orgs.id))
+      FROM messages m
+     WHERE m.org_id IN (SELECT o.id FROM orgs o WHERE o.deleted_at IS NOT NULL)
+       AND EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = m.id AND d.org_id = orgs.id)
+), 0) WHERE deleted_at IS NULL;
+";
 
 /// Replace the database name in a Postgres URL.
 pub fn with_database(url: &str, db: &str) -> String {

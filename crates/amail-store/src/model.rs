@@ -27,8 +27,12 @@ pub struct Org {
     /// Suspended by the operator: its tokens do not work and mail to it is
     /// refused.
     pub suspended_at: Option<i64>,
-    /// Bytes of the messages the org sent (see [`message_bytes`]).
+    /// Bytes of the messages the org sent (see [`message_bytes`]); its
+    /// sends are refused when they would take it over the storage quota.
     pub stored_bytes: i64,
+    /// Bytes of the mail of deleted orgs that the org keeps (see
+    /// [`message_bytes`]); not counted against the storage quota.
+    pub kept_bytes: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,10 +136,11 @@ pub struct NewMessage {
 /// adds [`amail_proto::limits::STORED_BYTES_PER_DELIVERY`].
 ///
 /// Who is charged: the sending org, for the message and all its deliveries
-/// (in any org). Once the sending org is deleted, each org that keeps
-/// deliveries of the message is charged the message's full bytes and its
-/// own deliveries. The SQL form of this rule is in the migration
-/// `0013_storage_deliveries.sql`.
+/// (in any org), in its `stored_bytes`. Once the sending org is deleted,
+/// each org that keeps deliveries of the message is charged the message's
+/// full bytes and its own deliveries in its `kept_bytes`, which is not
+/// counted against the quota. The SQL form of this rule is
+/// `testutil::RECOUNT`.
 pub fn message_bytes(subject: &str, body: &str, meta_db: &str, to_db: &str, cc_db: &str) -> i64 {
     amail_proto::limits::STORED_BYTES_PER_MESSAGE
         + (subject.len() + body.len() + meta_db.len() + to_db.len() + cc_db.len()) as i64
@@ -468,6 +473,21 @@ pub struct OrgStat {
     pub last_activity: Option<i64>,
     /// Bytes of the messages the org sent (see [`message_bytes`]).
     pub stored_bytes: i64,
+    /// Bytes of the mail of deleted orgs the org keeps.
+    pub kept_bytes: i64,
+}
+
+/// What [`crate::Store::delete_thread`] and
+/// [`crate::Store::purge_deleted_org_mail`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MailDeleted {
+    /// Messages the org no longer has.
+    pub deleted: i64,
+    /// Messages of the thread the org cannot delete: mail exchanged with
+    /// orgs that still exist.
+    pub kept: i64,
+    /// More could be deleted with another call.
+    pub more: bool,
 }
 
 /// What [`crate::Store::operator_stats`] reports.

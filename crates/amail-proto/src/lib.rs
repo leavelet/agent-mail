@@ -273,6 +273,10 @@ pub mod limits {
     pub const MAX_THREAD_BODY_BYTES: usize = 1024 * 1024;
     /// The most messages `GET /threads/{id}` answers (the newest ones).
     pub const MAX_THREAD_MESSAGES: i64 = 500;
+    /// The most messages one `DELETE /threads/{id}` or
+    /// `POST /archive/purge-deleted-orgs` deletes; the answer says whether
+    /// more remain.
+    pub const MAX_DELETE_MESSAGES: i64 = 1_000;
     /// Messages of the org one archive or search request looks at, newest
     /// first, before it answers with what it found and a cursor
     /// (`next_before_id`) to continue.
@@ -551,6 +555,21 @@ pub struct ThreadResponse {
     pub truncated: bool,
 }
 
+/// Response of `DELETE /v1/threads/{id}` and
+/// `POST /v1/archive/purge-deleted-orgs`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeleteMailResponse {
+    /// Messages the org no longer has.
+    pub deleted: i64,
+    /// Messages of the thread that stay: mail exchanged with orgs that
+    /// still exist (neither side can delete it).
+    #[serde(default)]
+    pub kept: i64,
+    /// More can be deleted: call again.
+    #[serde(default)]
+    pub more: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaimRequest {
     #[serde(default = "all_classes")]
@@ -814,9 +833,14 @@ pub struct OrgInfo {
     pub webhook_url: Option<String>,
     /// Bytes counted against the storage quota: each message the org sent
     /// (subject, body, meta, addresses and a fixed amount) with a fixed
-    /// amount per delivery, and the same for mail of deleted orgs it keeps.
+    /// amount per delivery.
     #[serde(default)]
     pub stored_bytes: i64,
+    /// Bytes of the mail of deleted orgs the org keeps, counted the same
+    /// way (the message and the org's own deliveries of it). Not counted
+    /// against the quota; retention deletes that mail, and the user can.
+    #[serde(default)]
+    pub kept_bytes: i64,
     /// The server's limit on `stored_bytes`; absent when there is none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_quota_bytes: Option<i64>,
@@ -1399,6 +1423,9 @@ pub struct OrgStatInfo {
     /// Bytes of the mail the org sent that the server stores.
     #[serde(default)]
     pub stored_bytes: i64,
+    /// Bytes of the mail of deleted orgs the org keeps.
+    #[serde(default)]
+    pub kept_bytes: i64,
 }
 
 /// Response of `GET /v1/operator/stats`.
