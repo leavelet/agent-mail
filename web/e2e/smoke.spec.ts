@@ -100,3 +100,23 @@ test('smoke: org, compose, reply, thread, delivery, search, mirror, needs-you', 
   await page.keyboard.press('a');
   await expect(item).toHaveCount(0);
 });
+
+test('a large thread: older bodies are loaded on request', async ({ page }) => {
+  const s = state();
+  await login(page, s.userToken, { lang: 'en' });
+  const root = await api<{ id: number }>(s.userToken, 'POST', '/messages', { to: ['owner'], subject: 'Large thread', body: 'root' });
+  // Five replies of 250 KB: the server sends the bodies of the newest four.
+  const big = (c: string) => c.repeat(250_000);
+  const ids: number[] = [];
+  for (const c of ['a', 'b', 'c', 'd', 'e']) {
+    const r = await api<{ id: number }>(s.userToken, 'POST', '/messages', { to: ['owner'], subject: 'part', body: big(c), in_reply_to: root.id });
+    ids.push(r.id);
+  }
+  await page.goto(`${s.base}/#/thread/${root.id}`);
+  const oldest = page.locator(`article[data-msg="${ids[0]}"]`);
+  await expect(oldest.getByTestId('body-omitted')).toBeVisible();
+  await expect(page.locator(`article[data-msg="${ids[4]}"] pre.body`)).toContainText('eeee');
+  await oldest.getByRole('button', { name: 'Show message' }).click();
+  await expect(oldest.locator('pre.body')).toContainText('aaaa');
+  await expect(oldest.getByTestId('body-omitted')).toHaveCount(0);
+});
