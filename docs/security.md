@@ -20,7 +20,12 @@ either can end it. A user sees only their own org's mail, which includes
 the mail exchanged with linked orgs, never the other org's internal mail,
 conversations or terminals. The delivery status of mail sent to another org's list
 counts that list's seats (how many were notified, read, acknowledged)
-without naming them; acknowledgement reminders count them the same way.
+without naming them, including seats of a third org that the list
+contains; acknowledgement reminders count them the same way. A linked org
+can still find out which seat and list names exist in the other org by
+sending mail: mail to a name that does not exist is refused with
+`unknown_address`. This is part of the trust a link gives; link only with
+orgs you trust with that.
 
 **The server's operator** runs the server and can suspend and delete orgs.
 The operator's interfaces do not show mail or conversations; see

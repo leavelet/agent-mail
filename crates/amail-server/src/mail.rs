@@ -220,11 +220,17 @@ pub async fn status(
     }))
 }
 
-/// When a delivery reached a seat of another org through one of that org's
-/// lists, the list addresses it is counted under; `None` when the seat was
+/// When a delivery reached a seat of another org through another org's
+/// list, the list addresses it is counted under; `None` when the seat was
 /// named itself, is in the sender's org, or came through a list of the
 /// sender's org. Which seats stand behind another org's list, and when each
 /// of them read the mail, is that org's business.
+///
+/// The list is not recorded with the delivery. A seat is counted under the
+/// named lists of its own org; failing those (a seat of a third org that a
+/// list includes), under every named list of another org. A seat of a third
+/// org that came through a list of the sender's org is then also counted,
+/// not named, when the message names another org's list as well.
 pub(crate) fn external_group(
     m: &MessageRec,
     all: &[amail_store::DeliveryRec],
@@ -238,15 +244,23 @@ pub(crate) fn external_group(
     if named().any(|a| *a == own) {
         return None;
     }
-    let suffix = format!("@{}", d.org_name);
+    // Addresses of other orgs that are not a seat that got the message.
+    let own_org = format!("@{}", m.org_name);
     let lists: Vec<&str> = named()
-        .filter(|a| a.ends_with(&suffix))
+        .filter(|a| a.contains('@') && !a.ends_with(&own_org))
         .filter(|a| {
             !all.iter()
-                .any(|x| x.org_id == d.org_id && format!("{}@{}", x.seat_name, x.org_name) == **a)
+                .any(|x| x.org_id != m.org_id && format!("{}@{}", x.seat_name, x.org_name) == **a)
         })
         .map(String::as_str)
         .collect();
+    let suffix = format!("@{}", d.org_name);
+    let same_org: Vec<&str> = lists
+        .iter()
+        .copied()
+        .filter(|a| a.ends_with(&suffix))
+        .collect();
+    let lists = if same_org.is_empty() { lists } else { same_org };
     (!lists.is_empty()).then(|| lists.join(", "))
 }
 

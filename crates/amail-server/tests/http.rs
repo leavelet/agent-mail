@@ -65,6 +65,7 @@ http_tests!(
     claim_keys_http,
     node_tokens_cannot_use_user_mailbox,
     external_list_members_are_counted,
+    third_org_list_members_are_counted,
     terminal_url_schemes,
 );
 
@@ -2494,6 +2495,44 @@ async fn external_list_members_are_counted(srv: Server) {
     assert!(body.contains("1 seat of team@bravo"), "{body}");
     assert!(!body.contains("secret-ops"), "{body}");
     drop(ops);
+}
+
+/// Seats of a third org that another org's list reaches are counted under
+/// that list's address too.
+async fn third_org_list_members_are_counted(srv: Server) {
+    let alpha = srv.org("alpha").await;
+    let bravo = srv.org("bravo").await;
+    let charlie = srv.org("charlie").await;
+    let a = alpha.seat("a").await;
+    bravo.seat("b1").await;
+    let c1 = charlie.seat("hidden-c1").await;
+    alpha.link(&bravo, "bravo", "alpha").await;
+    bravo.link(&charlie, "charlie", "bravo").await;
+    alpha.link(&charlie, "charlie", "alpha").await;
+    bravo
+        .list(
+            "team",
+            "anyone",
+            &[("b1", "immediate"), ("hidden-c1@charlie", "immediate")],
+        )
+        .await;
+    let sent = a
+        .send(json!({ "to": ["team@bravo"], "subject": "hi", "body": "x" }))
+        .await;
+    assert_eq!(sent["deliveries"], 2, "{sent}");
+    let id = sent["id"].as_i64().unwrap();
+    c1.ok(Method::GET, &format!("/messages/{id}"), None).await;
+    let v = a
+        .ok(Method::GET, &format!("/messages/{id}/status"), None)
+        .await;
+    assert!(!v.to_string().contains("hidden-c1"), "{v}");
+    let r = v["recipients"].as_array().unwrap();
+    assert_eq!(r.len(), 1, "{v}");
+    assert_eq!(r[0]["address"], "team@bravo");
+    assert_eq!(
+        r[0]["members"],
+        json!({ "seats": 2, "notified": 0, "read": 1, "acked": 0 })
+    );
 }
 
 /// The web interface links to a seat's terminal URL: only http(s) URLs

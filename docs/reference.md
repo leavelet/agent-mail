@@ -117,7 +117,7 @@ session cookie; with the cookie, everything but `GET` needs the header
 | `GET /messages/{id}` | full message; marks the caller's delivery read unless `peek=1` |
 | `POST /messages/{id}/ack` | acknowledge |
 | `POST /messages/{id}/read` | mark the caller's delivery read |
-| `GET /messages/{id}/status` | per-recipient state (the sender and the sender org's user only); seats reached through another org's list are counted under the list's address (`members`) |
+| `GET /messages/{id}/status` | per-recipient state (the sender and the sender org's user only); seats reached through another org's list, including seats of a third org that the list contains, are counted under the list's address (`members`) |
 | `GET /threads/{id}` | messages of a thread the caller may see, oldest first: at most the newest 500 and 2 MiB of headers, with `"truncated": true` when older ones were left out. Bodies are included newest first up to 1 MiB in total; a message whose body was left out has `"body_omitted": true` and an empty `body`; read it with `GET /messages/{id}?peek=1` |
 | `POST /claim` | `{classes, min_priority?, via, limit?, inline_body_max?, include_digest?, digest_only?, mark_inlined_read?, key?, preview_chars?}`: atomically mark pending deliveries notified and return them; concurrent claims never return the same delivery. `key` (chosen by the caller) makes the claim idempotent: a claim with a key the seat used in the last ten minutes takes nothing new and returns what the first one took. `inline_body_max` and `preview_chars` are capped at 16,384 characters |
 | `GET /changes` | `since` (a sequence number): deliveries created or changed since (`limit` ≤ 5000, at most 2 MiB); continue from `next` while `more` is true |
