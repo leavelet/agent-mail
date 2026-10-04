@@ -491,7 +491,11 @@ enum NodeCmd {
     },
 }
 
-#[derive(Args)]
+/// The options of `amail node`, shared with `amail node start` (which
+/// rebuilds the command line from them with [`node_args`]). A new option
+/// must also be added to `node_args`; the test `node_start_passes_every_option`
+/// fails until it is.
+#[derive(Args, Debug, Clone, PartialEq)]
 struct NodeArgs {
     /// Server URL (default: AMAIL_URL, then <state dir>/node.toml).
     #[arg(long)]
@@ -965,13 +969,14 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Node(NodeCli { cmd: None, run }) => {
             linux_only("amail node")?;
-            return node_daemon(run).await;
+            return node_daemon(run.absolutized()).await;
         }
         Cmd::Node(NodeCli {
             cmd: Some(NodeCmd::Start { run }),
             ..
         }) => {
             linux_only("amail node")?;
+            let run = run.absolutized();
             let state = run
                 .state_dir
                 .clone()
@@ -1710,7 +1715,9 @@ async fn serve(
     advertise_url: Option<String>,
     config: amail_server::config::Config,
 ) -> Result<()> {
+    use std::io::IsTerminal;
     tracing_subscriber::fmt()
+        .with_ansi(std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none())
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
@@ -1828,38 +1835,109 @@ fn linux_only(what: &str) -> Result<()> {
     }
 }
 
-/// The command line of `amail node` for `amail node start` (the token goes
-/// in the environment instead).
+/// A path made absolute against the current directory: the node's
+/// sessions run in other directories.
+fn absolute(p: &std::path::Path) -> PathBuf {
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    std::env::current_dir()
+        .map(|d| d.join(p))
+        .unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// A program name as given (looked up on PATH), or, when it names a file
+/// (contains a slash), that file's absolute path.
+fn absolute_bin(b: &str) -> String {
+    if b.contains('/') {
+        absolute(std::path::Path::new(b))
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        b.to_string()
+    }
+}
+
+impl NodeArgs {
+    /// Relative paths and program paths made absolute.
+    fn absolutized(mut self) -> NodeArgs {
+        for p in [
+            &mut self.state_dir,
+            &mut self.socket,
+            &mut self.dsh_env_file,
+            &mut self.codex_auth,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *p = absolute(p);
+        }
+        for b in [
+            &mut self.claude_bin,
+            &mut self.codex_bin,
+            &mut self.dsh_bin,
+            &mut self.zellij_bin,
+        ] {
+            *b = absolute_bin(b);
+        }
+        self
+    }
+}
+
+/// The command line of `amail node` for `amail node start`: every option
+/// of [`NodeArgs`] except the token, which goes in the environment instead.
 fn node_args(a: &NodeArgs) -> (Vec<String>, Option<String>) {
+    // Destructured so that a new field does not compile until it is
+    // handled here.
+    let NodeArgs {
+        url,
+        token,
+        state_dir,
+        socket,
+        label,
+        claude_bin,
+        codex_bin,
+        dsh_bin,
+        dsh_env_file,
+        zellij_bin,
+        start_limit,
+        codex_auth,
+        wake_window_ms,
+        wake_confirm_ms,
+        web_terminal_port,
+        web_terminal_url,
+        local_policy,
+    } = a;
     let mut v = Vec::new();
     let mut opt = |k: &str, val: Option<String>| {
         if let Some(x) = val {
-            v.push(k.to_string());
-            v.push(x);
+            v.push(format!("{k}={x}"));
         }
     };
-    opt("--url", a.url.clone());
-    opt("--label", a.label.clone());
-    opt("--claude-bin", Some(a.claude_bin.clone()));
-    opt("--codex-bin", Some(a.codex_bin.clone()));
-    opt("--zellij-bin", Some(a.zellij_bin.clone()));
-    opt("--start-limit", Some(a.start_limit.to_string()));
-    opt(
-        "--codex-auth",
-        a.codex_auth.as_ref().map(|p| p.display().to_string()),
-    );
-    opt("--wake-window-ms", Some(a.wake_window_ms.to_string()));
-    opt("--wake-confirm-ms", Some(a.wake_confirm_ms.to_string()));
+    let path = |p: &Option<PathBuf>| p.as_ref().map(|p| p.to_string_lossy().into_owned());
+    opt("--url", url.clone());
+    opt("--state-dir", path(state_dir));
+    opt("--socket", path(socket));
+    opt("--label", label.clone());
+    opt("--claude-bin", Some(claude_bin.clone()));
+    opt("--codex-bin", Some(codex_bin.clone()));
+    opt("--dsh-bin", Some(dsh_bin.clone()));
+    opt("--dsh-env-file", path(dsh_env_file));
+    opt("--zellij-bin", Some(zellij_bin.clone()));
+    opt("--start-limit", Some(start_limit.to_string()));
+    opt("--codex-auth", path(codex_auth));
+    opt("--wake-window-ms", Some(wake_window_ms.to_string()));
+    opt("--wake-confirm-ms", Some(wake_confirm_ms.to_string()));
     opt(
         "--web-terminal-port",
-        a.web_terminal_port.map(|p| p.to_string()),
+        web_terminal_port.map(|p| p.to_string()),
     );
-    opt("--web-terminal-url", a.web_terminal_url.clone());
+    opt("--web-terminal-url", web_terminal_url.clone());
     opt(
         "--local-policy",
-        a.local_policy.map(|p| p.as_str().to_string()),
+        local_policy.map(|p| p.as_str().to_string()),
     );
-    (v, a.token.clone())
+    (v, token.clone())
 }
 
 fn hostname() -> Option<String> {
@@ -1876,7 +1954,10 @@ fn hostname() -> Option<String> {
 }
 
 async fn node_daemon(a: NodeArgs) -> Result<()> {
+    use std::io::IsTerminal;
     tracing_subscriber::fmt()
+        // Colour only on a terminal: `amail node start` writes to a file.
+        .with_ansi(std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none())
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
@@ -2059,6 +2140,112 @@ fn run_seat(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// A value for every option of `amail node`.
+    const FULL: &[&str] = &[
+        "--url=http://127.0.0.1:19511",
+        "--token=amail_node_test",
+        "--state-dir=/tmp/amail-test/state",
+        "--socket=/tmp/amail-test/node.sock",
+        "--label=host one",
+        "--claude-bin=/opt/claude/bin/claude",
+        "--codex-bin=/opt/codex/codex",
+        "--dsh-bin=/opt/dsh/node_modules/.bin/dsh",
+        "--dsh-env-file=/tmp/amail-test/dsh.env",
+        "--zellij-bin=/opt/zellij",
+        "--start-limit=7",
+        "--codex-auth=/tmp/amail-test/auth.json",
+        "--wake-window-ms=1234",
+        "--wake-confirm-ms=5678",
+        "--web-terminal-port=19512",
+        "--web-terminal-url=https://term.example.com",
+        "--local-policy=restricted",
+    ];
+
+    fn parse_node(sub: &[&str], args: &[String]) -> NodeArgs {
+        let argv = ["amail", "node"]
+            .iter()
+            .chain(sub)
+            .map(|s| s.to_string())
+            .chain(args.iter().cloned());
+        match Cli::try_parse_from(argv).unwrap().cmd {
+            Cmd::Node(NodeCli { cmd: None, run }) => run,
+            Cmd::Node(NodeCli {
+                cmd: Some(NodeCmd::Start { run }),
+                ..
+            }) => *run,
+            _ => panic!("not a node command"),
+        }
+    }
+
+    fn option_names(c: &clap::Command) -> std::collections::BTreeSet<String> {
+        c.get_arguments()
+            .filter(|a| !a.is_global_set())
+            .filter_map(|a| a.get_long().map(str::to_string))
+            .filter(|l| l != "help")
+            .collect()
+    }
+
+    /// `amail node start` takes the options of `amail node` and passes all
+    /// of them to the background node.
+    #[test]
+    fn node_start_passes_every_option() {
+        let cli = Cli::command();
+        let node = cli.find_subcommand("node").unwrap();
+        let start = node.find_subcommand("start").unwrap();
+        let fg = option_names(node);
+        assert_eq!(fg, option_names(start), "amail node vs amail node start");
+        // FULL covers every option (add a value for a new one).
+        let given: std::collections::BTreeSet<String> = FULL
+            .iter()
+            .map(|a| {
+                a.trim_start_matches("--")
+                    .split('=')
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        let missing: Vec<_> = fg.difference(&given).collect();
+        assert!(missing.is_empty(), "no test value for {missing:?}");
+
+        let full: Vec<String> = FULL.iter().map(|s| s.to_string()).collect();
+        let a = parse_node(&[], &full);
+        assert_eq!(a, parse_node(&["start"], &full));
+        let (argv, token) = node_args(&a);
+        assert!(argv.iter().all(|x| !x.contains("amail_node_test")));
+        let mut b = parse_node(&[], &argv);
+        b.token = token;
+        assert_eq!(a, b);
+        // Defaults survive too.
+        let a = parse_node(&["start"], &["--token=t".into()]);
+        let (argv, token) = node_args(&a);
+        let mut b = parse_node(&[], &argv);
+        b.token = token;
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn node_paths_are_made_absolute() {
+        let a = parse_node(
+            &["start"],
+            &[
+                "--dsh-env-file=keys.env".into(),
+                "--dsh-bin=./bin/dsh".into(),
+                "--codex-bin=codex".into(),
+                "--state-dir=st".into(),
+            ],
+        )
+        .absolutized();
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(a.dsh_env_file, Some(cwd.join("keys.env")));
+        assert_eq!(a.dsh_bin, cwd.join("./bin/dsh").to_string_lossy());
+        assert_eq!(a.codex_bin, "codex");
+        assert_eq!(a.state_dir, Some(cwd.join("st")));
+    }
+
     #[test]
     fn db_urls_are_redacted() {
         assert_eq!(
