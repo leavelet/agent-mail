@@ -205,18 +205,36 @@ row and index entries, plus 384 bytes for each delivery (one per recipient
 seat, in any org; a list counts once per member). These two amounts are
 what Postgres 17 uses for a message and a delivery (about 470 and 360
 bytes); SQLite uses less (about 100 and 130). Mail an org received is
-counted for its sender while the sender exists; once the sender's org is
-deleted, each org that keeps that mail is charged its full bytes and its
-own deliveries of it. Acknowledgement reminders from the mail system are
-counted for their org but never refused. Retention gives back the bytes of
-the bodies it clears. A send that would go over the quota gets HTTP 507
-with the code `storage_quota`; an org at its quota can send nothing until
-retention frees space. Users see their count with `amail org show`;
-`amail admin stats` and `/admin` show it per org. Free space inside the
-database files is not counted, and the counts were computed again under
-these rules when the server was upgraded (migration 0013). Plan disk space
-for the number of orgs times the quota, and set a retention period so that
-old bodies are cleared.
+counted for its sender. Once the sender's org is deleted, each org that
+keeps that mail counts its full bytes and its own deliveries of it as
+`kept_bytes`, which is shown but not held against the quota: a linked org
+cannot fill another org's quota by sending to it and then deleting
+itself. Kept mail is bounded by what the deleted org's own quota allowed,
+retention deletes it once it is older than the retention period, and the
+receiving org's user can delete it. Acknowledgement reminders from the
+mail system are counted for their org but never refused. Retention gives
+back the bytes of the bodies it clears. A send that would go over the
+quota gets HTTP 507 with the code `storage_quota`; an org at its quota can
+send nothing until it is back under it.
+
+An org at its quota gets back under it without the operator: its user
+deletes the org's internal mail (mail no other org received, including
+mail from the mail system) with `amail thread delete` or the Delete button
+on a thread in the web interface, which gives back its full count (what
+retention has not already given back). What stays counted after that is
+mail exchanged with orgs that still exist, which neither side can delete:
+its bodies are given back as retention clears them, but each such message
+keeps counting 512 bytes, its subject, `meta` and addresses, and 384 bytes
+for each of its deliveries, until the other org is deleted (the message
+then has no delivery in another org and can be deleted). Without a
+retention period, bodies of that mail stay counted too. Users see both
+counts with `amail org show`; `amail admin stats` and `/admin` show them per
+org. Free space inside the database files is not counted. The counts were
+computed again under these rules when the server was upgraded (migrations
+0013 and 0016; 0016 moves the mail of deleted orgs from `stored_bytes` to
+`kept_bytes`). Plan disk space for the number of orgs times the quota, and
+set a retention period so that old bodies, and old mail of deleted orgs,
+are removed.
 
 ### Operating a public server
 
@@ -248,17 +266,37 @@ suspended org's open connections end within about 15 seconds.
 
 `--retention-days N` clears the bodies of messages older than N days (every
 10 minutes, a thousand at a time). Headers stay, so threads keep their
-structure; such messages are shown as expired. It is off by default and
-the web interface tells users when it is on.
+structure; such messages are shown as expired. Messages of deleted orgs
+older than N days are deleted altogether, with their deliveries (replies to
+them lose their parent), and the `kept_bytes` of the orgs that kept them go
+down accordingly. It is off by default and the web interface tells users
+when it is on.
+
+The user of an org (user tokens and the web interface; not agents) can
+delete mail with `amail thread delete <id>` (or the Delete button on a
+thread in the web interface) and `amail org purge-deleted-orgs`:
+
+- mail the org received from an org that no longer exists: the org's
+  deliveries of it go, and the message goes once no org keeps a delivery
+  of it;
+- mail the org sent that no other org has a delivery of: the org's internal
+  mail, including mail from the mail system such as acknowledgement
+  reminders and node notices. The message and its deliveries go.
+
+Mail exchanged with orgs that still exist cannot be deleted by either
+side; it stays until retention clears its bodies (its headers stay). Each
+call deletes at most 1,000 messages and says whether more remain; the CLI
+and the web interface call again until nothing more can be deleted.
 
 A user deletes their own org with `amail org delete` (asks for the org's
 name, or `--confirm <name>`) or in Admin → Settings. That removes its
 seats, mail, lists, links, tokens and browser sessions. Mail it sent that
 linked orgs received stays with them, shown as from `name@org (deleted org)`
 (in the addresses too), so that the receiving org keeps its archive and
-its replies keep their parent; that mail now counts against the storage
-quota of each org holding it and is removed when the last org holding it
-is deleted. The name is free again at once; a new org of that name sees none
+its replies keep their parent; that mail now counts in the `kept_bytes`
+of each org holding it (not against its storage quota) and is removed
+when retention reaches it, when the last org holding it deletes it, or
+when the last org holding it is deleted. The name is free again at once; a new org of that name sees none
 of the old mail. The operator can do the same with
 `amail admin org delete`.
 

@@ -152,7 +152,10 @@ in its system prompt. To run a real team, follow the [tutorial](docs/tutorial.md
 - **Deleting**: `amail org delete` (or Admin → Settings in the web
   interface) deletes your org with all its seats, mail, lists, links and
   tokens. Linked orgs keep the mail they received from it, shown as from a
-  deleted org. A server may also be
+  deleted org, and can delete it (`amail thread delete`, `amail org
+  purge-deleted-orgs`, or Delete on a thread in the web interface), as they
+  can their own internal mail; mail exchanged with orgs that still exist
+  cannot be deleted by either side. A server may also be
   configured to clear message bodies after a number of days (headers stay
   for the thread structure); the web interface says so when it is.
 
