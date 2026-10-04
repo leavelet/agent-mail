@@ -23,7 +23,7 @@
 //! [[group]]
 //! name = "backend"
 //! parent = "root"
-//! lead = { name = "be-lead", harness = "codex", model = "gpt-6.1-sol" }
+//! lead = { name = "be-lead", harness = "codex", model = "codex-model" }
 //! workers = { count = 3, prefix = "be" }   # be-1 .. be-3, reporting to be-lead
 //! ```
 
@@ -859,7 +859,7 @@ role = "Overall technical lead."
 [[group]]
 name = "backend"
 parent = "root"
-lead = { name = "be-lead", harness = "codex", model = "gpt-6.1-sol" }
+lead = { name = "be-lead", harness = "codex", model = "codex-model" }
 workers = { count = 3, prefix = "be" }
 
 [[group]]
@@ -886,7 +886,7 @@ cwd = "docs"
         );
         let be = t.seat("be-lead").unwrap();
         assert_eq!(be.harness, "codex");
-        assert_eq!(be.model.as_deref(), Some("gpt-6.1-sol"));
+        assert_eq!(be.model.as_deref(), Some("codex-model"));
         assert_eq!(be.parent.as_deref(), Some("root"));
         assert_eq!(be.group.as_deref(), Some("backend"));
         assert_eq!(be.permission_mode, Some(PermissionMode::Unattended));
@@ -985,7 +985,7 @@ parent = "root"
 lead = { name = "core-lead" }
 workers = [
   { name = "core-1" },
-  { name = "core-2", harness = "codex", model = "gpt-6.1-sol" },
+  { name = "core-2", harness = "codex", model = "codex-model" },
 ]
 [[group]]
 name = "app"

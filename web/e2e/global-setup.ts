@@ -193,7 +193,7 @@ async function setup(procs: ChildProcess[]): Promise<void> {
   const big: { name: string; parent?: string; harness: string; model: string; group?: string }[] = [{ name: 'chief', harness: 'claude', model: 'sonnet' }];
   for (let g = 0; g < 37; g++) {
     const lead = `team${String(g).padStart(2, '0')}-lead`;
-    big.push({ name: lead, parent: 'chief', harness: g % 3 ? 'claude' : 'codex', model: g % 3 ? 'sonnet' : 'gpt-6.1-sol', group: `team${g}` });
+    big.push({ name: lead, parent: 'chief', harness: g % 3 ? 'claude' : 'codex', model: g % 3 ? 'sonnet' : 'codex-model', group: `team${g}` });
     for (let w = 1; w <= 26; w++) big.push({ name: `team${String(g).padStart(2, '0')}-w${w}`, parent: lead, harness: 'claude', model: 'sonnet', group: `team${g}` });
   }
   // Parents first: the chief, then the leads, then the workers in parallel batches.
