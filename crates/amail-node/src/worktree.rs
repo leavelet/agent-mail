@@ -26,8 +26,29 @@ fn git(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Refuse a repository whose own git directory (`<repo>/.git`) contains a
+/// `commondir` file. Git never creates one there; with it, git run in the
+/// repository takes its config and hooks from the directory it names. A
+/// Codex seat's sandbox cannot keep such a file from being created (see the
+/// Codex adapter), so this is checked before amail runs git in the
+/// repository.
+pub fn check_git_dir(repo: &Path) -> Result<()> {
+    let dir = repo.join(".git");
+    if dir.is_dir() && dir.join("commondir").exists() {
+        bail!(
+            "{} contains a commondir file, which git does not create in a \
+             repository's git directory; git run in that repository would take \
+             its config and hooks from the directory it names. Check it and \
+             remove it first",
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
 /// Check that `repo` is a git repository with at least one commit.
 pub fn check_repo(repo: &Path) -> Result<()> {
+    check_git_dir(repo)?;
     git(repo, &["rev-parse", "--verify", "HEAD"])
         .with_context(|| format!("{} is not a git repository with a commit", repo.display()))?;
     Ok(())
@@ -91,6 +112,7 @@ pub struct WorktreeSpec {
 /// Create missing worktrees and branches from `base` (the main branch).
 /// Returns one line per change made.
 pub fn prepare(repo: &Path, base: &str, specs: &[WorktreeSpec]) -> Result<Vec<String>> {
+    check_git_dir(repo)?;
     let mut done = Vec::new();
     let existing = worktrees(repo)?;
     let existing: HashMap<PathBuf, Option<String>> =
@@ -161,6 +183,21 @@ mod tests {
         std::fs::write(dir.join("README"), "x\n").unwrap();
         run(&["add", "README"]);
         run(&["commit", "-q", "-m", "init"]);
+    }
+
+    /// A `commondir` file in the repository's own git directory would make
+    /// git take config and hooks from elsewhere: refused before running git.
+    #[test]
+    fn redirected_git_dir_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        check_repo(&repo).unwrap();
+        std::fs::write(repo.join(".git/commondir"), "/elsewhere\n").unwrap();
+        let e = check_repo(&repo).unwrap_err().to_string();
+        assert!(e.contains("commondir"), "{e}");
+        assert!(prepare(&repo, "main", &[]).is_err());
     }
 
     #[test]

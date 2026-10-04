@@ -135,7 +135,8 @@ later, outside the sandbox. What remains:
   checkout (not in its linked worktrees) then reads config and hooks from
   the directory the file names. Git never creates this file there. amail
   refuses to start a Codex seat while a git directory it grants contains
-  one. If you find one, remove it and look at the directory it names before
+  one, and `amail up` refuses to prepare worktrees in such a repository.
+  Git commands you run yourself do not check for it. If you find one, remove it and look at the directory it names before
   you run git in that checkout.
 - A seat can leave an unfinished rebase whose todo list contains `exec`
   lines; `git rebase --continue` runs them. Before you continue a rebase a
