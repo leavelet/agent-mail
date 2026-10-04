@@ -168,7 +168,8 @@ async fn dsh_hooks_and_wake(b: Backend) {
     let args: Vec<String> = serde_json::from_value(plan["args"].clone()).unwrap();
     assert_eq!(args[0], "dsh-host");
     let sep = args.iter().position(|a| a == "--").unwrap();
-    assert_eq!(&args[sep + 1..sep + 4], ["dsh", "web", "--no-open"]);
+    assert_eq!(&args[sep + 1..sep + 4], ["dsh", "web", "--patch"]);
+    assert_eq!(args[sep + 5], "--no-open");
     assert!(args.ends_with(&["--port".into(), "0".into()]), "{args:?}");
     let prompt = &args[args.iter().position(|a| a == "--prompt").unwrap() + 1];
     assert!(prompt.starts_with("[amail]"), "{prompt}");
@@ -182,6 +183,10 @@ async fn dsh_hooks_and_wake(b: Backend) {
             .ends_with("state/dsh-home")
     );
     let endpoint = env["AMAIL_DSH_ENDPOINT"].as_str().unwrap().to_string();
+    // The agent's commands find their token through a profile file (dsh
+    // keeps `*TOKEN*` variables from them).
+    let profile = std::fs::read_to_string(env["AMAIL_PROFILE"].as_str().unwrap()).unwrap();
+    assert!(profile.contains("token = \"amail_"), "{profile}");
     let patch_path = &args[args.iter().position(|a| a == "--patch").unwrap() + 1];
     let patch = std::fs::read_to_string(patch_path).unwrap();
     assert!(

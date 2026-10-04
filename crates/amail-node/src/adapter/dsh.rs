@@ -268,6 +268,15 @@ impl Dsh {
             .join(format!("{seat}.patch.yml"))
     }
 
+    /// The seat's `amail` profile (server URL and token).
+    fn seat_profile_path(&self, seat: &str) -> PathBuf {
+        self.env
+            .state_dir
+            .join("dsh")
+            .join("seats")
+            .join(format!("{seat}.toml"))
+    }
+
     fn hooks_path(&self) -> PathBuf {
         self.home().join("amail-hooks.json")
     }
@@ -490,6 +499,14 @@ impl Adapter for Dsh {
             serde_json::to_string_pretty(&Self::seat_patch(info))?
         );
         crate::persist::write_atomic(&patch, text.as_bytes(), 0o600)?;
+        // dsh removes variables with credential-shaped names (`*TOKEN*`,
+        // `*KEY*`, ...) from the environment of the agent's commands, so
+        // `AMAIL_TOKEN` would not reach them; a profile file does.
+        let profile = self.seat_profile_path(&info.seat);
+        let mut t = toml::Table::new();
+        t.insert("url".into(), self.env.server_url.clone().into());
+        t.insert("token".into(), info.token.clone().into());
+        crate::persist::write_atomic(&profile, toml::to_string(&t)?.as_bytes(), 0o600)?;
         let endpoint = self.endpoint_path(&info.seat);
         let mut args = vec![
             "dsh-host".to_string(),
@@ -504,8 +521,10 @@ impl Adapter for Dsh {
                 let start = if ctx.context_lost {
                     CONTEXT_LOST
                 } else {
-                    "[amail] This is the start of your session. Handle any new mail shown to \
-                     you. If there is none, say that you are ready and stop."
+                    "[amail] This is the start of your session. `amail` is ready to use \
+                     (`amail inbox`). Handle any new mail shown to you. If there is none, say \
+                     that you are ready and stop; do not explore outside your working \
+                     directory."
                 };
                 args.extend(["--prompt".into(), start.to_string()]);
             }
@@ -514,9 +533,10 @@ impl Adapter for Dsh {
             "--".into(),
             self.env.dsh_bin.clone(),
             "web".into(),
-            "--no-open".into(),
+            // A launcher flag: it must come before the app's own flags.
             "--patch".into(),
             patch.to_string_lossy().into_owned(),
+            "--no-open".into(),
         ]);
         if !ctx
             .extra
@@ -535,6 +555,10 @@ impl Adapter for Dsh {
             ("AMAIL_URL".to_string(), self.env.server_url.clone()),
             ("AMAIL_TOKEN".to_string(), info.token.clone()),
             (
+                "AMAIL_PROFILE".to_string(),
+                profile.to_string_lossy().into_owned(),
+            ),
+            (
                 crate::paths::SOCK_ENV.to_string(),
                 self.env.node_socket.to_string_lossy().into_owned(),
             ),
@@ -550,7 +574,7 @@ impl Adapter for Dsh {
             program: self.env.amail_exe.to_string_lossy().into_owned(),
             args,
             env,
-            unset_env: vec!["AMAIL_PROFILE".into(), "DSH_PERMISSION_MODE".into()],
+            unset_env: vec!["DSH_PERMISSION_MODE".into()],
             path_prepend: self.env.amail_dir().into_iter().collect(),
         })
     }

@@ -12,7 +12,8 @@
 //!   from `tool/call`);
 //! - `tool/call`: `data.name`, `data.arguments` (a JSON string);
 //! - `tool/result`: `data.message.content[].text`, `data.message.isError`;
-//! - `turn/end`: `data.reason.kind` (`completed`, `aborted`, `error`).
+//! - `turn/end`: `data.reason.kind` (`completed`; `aborted` or
+//!   `interrupted` when cancelled or cut off; `error`).
 //!
 //! Streaming, accounting and hook bookkeeping records are skipped.
 
@@ -128,7 +129,7 @@ impl Parser for DshParser {
                 let reason = d.get("reason").unwrap_or(&null);
                 Some(match str_at(reason, "kind") {
                     Some("completed") | None => Vec::new(),
-                    Some("aborted") => {
+                    Some("aborted" | "interrupted") => {
                         vec![event(ts, R::System, K::Notice, "turn interrupted", None)]
                     }
                     Some(k) => {
