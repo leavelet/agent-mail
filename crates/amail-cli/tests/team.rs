@@ -795,6 +795,13 @@ async fn seats_needing_a_person_show_in_ps(b: Backend) {
     else {
         return;
     };
+    // Like zellij, the multiplexer marks a pane exited a moment after its
+    // process ended; restarting a stuck seat must wait for that, not count
+    // it as a failed start.
+    h.mux
+        .as_ref()
+        .unwrap()
+        .set_exit_delay(Duration::from_millis(500));
     let _i: Vec<FakeInbox> = ["t1", "t2", "t3", "p"]
         .iter()
         .map(|s| inbox(&h, s))

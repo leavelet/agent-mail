@@ -57,6 +57,13 @@ pub(super) struct SupRt {
     probed_at: Option<Instant>,
     /// Needs a person: (tag, hint).
     blocked: Option<(String, String)>,
+    /// Counts launches; a probe result is used only for the launch it
+    /// looked at.
+    launch_gen: u64,
+    /// The pane's screen just before it was run again: the previous run's
+    /// output stays on it until the new session draws, and says nothing
+    /// about the new session.
+    old_screen: Option<String>,
 }
 
 pub fn uuid_v4() -> String {
@@ -227,6 +234,7 @@ pub(super) fn launched(
         st.save_dirty = true;
     }
     let rt = st.sup.entry(seat.to_string()).or_default();
+    rt.launch_gen += 1;
     rt.launched_at = Some(now);
     rt.resumed = resume.is_some();
     rt.hooked = false;
@@ -586,16 +594,33 @@ impl Node {
             argv: self.pane_argv(seat),
         };
         let opened_at = Instant::now();
+        let mut old_screen = None;
         let r = async {
             if let Some(p) = m.pane
-                && let Some(panes) = self.mux.panes(&m.mux_session).await?
-                && let Some(info) = panes.iter().find(|x| x.id == p && x.name == seat)
+                && self.pane_of(&m.mux_session, p, seat).await?.is_some()
             {
-                if !info.exited {
+                // The multiplexer marks a pane exited a moment after its
+                // process ended (the node may already have handled the
+                // exit, e.g. after a stop it asked for): wait for that.
+                let mut exited = false;
+                for _ in 0..30 {
+                    match self.pane_of(&m.mux_session, p, seat).await? {
+                        Some(true) => {
+                            exited = true;
+                            break;
+                        }
+                        Some(false) => tokio::time::sleep(Duration::from_millis(100)).await,
+                        None => break,
+                    }
+                }
+                if exited {
+                    old_screen = self.mux.screen(&m.mux_session, p).await.ok();
+                    self.mux.rerun(&m.mux_session, p).await?;
+                    return Ok(p);
+                }
+                if self.pane_of(&m.mux_session, p, seat).await?.is_some() {
                     bail!("its pane terminal_{p} is still running");
                 }
-                self.mux.rerun(&m.mux_session, p).await?;
-                return Ok(p);
             }
             self.mux.open(&m.mux_session, &m.tab, &spec).await
         }
@@ -616,6 +641,7 @@ impl Node {
                     rt.hooked = false;
                     rt.probed_at = None;
                 }
+                rt.old_screen = old_screen;
                 if let Some(m) = st.saved.managed.get_mut(seat) {
                     m.pane = Some(pane);
                     m.dormant = false;
@@ -632,12 +658,29 @@ impl Node {
         self.sup_kick.notify_one();
     }
 
+    /// Whether pane `pane` of `session`, named `seat`, exists, and if so
+    /// whether it has exited.
+    async fn pane_of(&self, session: &str, pane: u32, seat: &str) -> Result<Option<bool>> {
+        Ok(self.mux.panes(session).await?.and_then(|panes| {
+            panes
+                .iter()
+                .find(|x| x.id == pane && x.name == seat)
+                .map(|x| x.exited)
+        }))
+    }
+
     /// Check a starting seat's pane: did it exit before launching, or is it
     /// waiting for a person?
     async fn probe(self: Arc<Self>, seat: &str) {
         let Some(m) = self.lock().saved.managed.get(seat).cloned() else {
             return;
         };
+        let (gen0, old_screen) = self
+            .lock()
+            .sup
+            .get(seat)
+            .map(|r| (r.launch_gen, r.old_screen.clone()))
+            .unwrap_or_default();
         let lazy = self.lock().sup.get(seat).is_some_and(|r| r.resumed)
             && Harness::parse(&m.harness).is_some_and(|h| self.adapter(h).resume_is_lazy());
         let mut exited = None;
@@ -651,6 +694,7 @@ impl Node {
             }
             if exited.is_none()
                 && let Ok(screen) = self.mux.screen(&m.mux_session, p).await
+                && old_screen.as_ref() != Some(&screen)
             {
                 blocked = classify_screen(&screen, seat, &m.cwd);
             }
@@ -663,7 +707,9 @@ impl Node {
             .is_some_and(|t| t.elapsed() >= self.cfg.start_timeout);
         let rt = st.sup.entry(seat.to_string()).or_default();
         rt.probing = false;
-        if rt.hooked {
+        // The seat was launched again while the screen was read: what the
+        // probe saw belongs to the previous launch.
+        if rt.hooked || rt.launch_gen != gen0 {
             return;
         }
         if let Some(status) = exited {

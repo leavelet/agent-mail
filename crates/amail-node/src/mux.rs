@@ -650,6 +650,9 @@ pub struct ProcessMux {
     sessions: Mutex<HashMap<String, std::collections::BTreeMap<u32, FakePane>>>,
     /// What was typed into panes: `(session, pane, text)`, Enter as `"\n"`.
     pub typed: Mutex<Vec<(String, u32, String)>>,
+    /// How long after its process ended a pane is marked exited, in ms
+    /// (zellij takes a moment too).
+    exit_delay_ms: std::sync::atomic::AtomicU64,
 }
 
 impl ProcessMux {
@@ -660,7 +663,14 @@ impl ProcessMux {
             next: Mutex::new(0),
             sessions: Mutex::new(HashMap::new()),
             typed: Mutex::new(Vec::new()),
+            exit_delay_ms: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Mark panes exited only `d` after their process ended.
+    pub fn set_exit_delay(&self, d: Duration) {
+        self.exit_delay_ms
+            .store(d.as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn spawn(&self, session: &str, id: u32, p: &mut FakePane) -> Result<()> {
@@ -705,8 +715,14 @@ impl ProcessMux {
             });
         }
         let status = p.status.clone();
+        let delay = self
+            .exit_delay_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
         tokio::spawn(async move {
             let s = child.wait().await.ok().and_then(|s| s.code());
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
             *status.lock().unwrap() = Some(s);
         });
         Ok(())
