@@ -325,7 +325,7 @@ On Postgres (server on 2 cores, database on 4, public-mode limits) the
 other org's median latencies stayed within 1.6 times their idle values for
 every endpoint; before these limits they reached 10 to 60 seconds. Run
 once; on SQLite, where the database works on the server's cores, a flood
-of `GET /pending` (200 seats) still tripled them.
+of `GET /pending` (200 seats) still raised them three to ten times.
 
 Search and the archive start from the org's own messages, so their cost
 does not grow with other orgs' mail. Measured on the same host with 500,000
