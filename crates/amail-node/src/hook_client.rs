@@ -20,7 +20,6 @@
 use crate::wire::{HOOK_ENV, HookResponse, Request};
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -90,7 +89,7 @@ fn exchange(harness: &str, socket: &Path, deadline: Instant) -> Result<String, S
     let mut line = serde_json::to_vec(&req).map_err(|e| e.to_string())?;
     line.push(b'\n');
 
-    let mut sock = UnixStream::connect(socket).map_err(|e| format!("connect: {e}"))?;
+    let mut sock = crate::paths::connect_node(socket).map_err(|e| format!("connect: {e}"))?;
     sock.set_write_timeout(Some(remaining(deadline)?))
         .map_err(|e| e.to_string())?;
     sock.write_all(&line).map_err(|e| format!("write: {e}"))?;

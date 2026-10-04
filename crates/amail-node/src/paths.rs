@@ -1,6 +1,6 @@
 //! Default locations of the node socket and state directory.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Environment variable naming the node socket.
 pub const SOCK_ENV: &str = "AMAIL_NODE_SOCK";
@@ -13,7 +13,9 @@ pub fn uid() -> u32 {
 }
 
 /// `$AMAIL_NODE_SOCK`, else `$XDG_RUNTIME_DIR/amail/node.sock`, else
-/// `/tmp/amail-<uid>/node.sock`.
+/// `<state dir>/run/node.sock` (see [`state_dir`]). There is no fallback to
+/// a shared directory such as `/tmp`, where another user could create the
+/// directory first.
 pub fn socket() -> PathBuf {
     if let Some(p) = std::env::var_os(SOCK_ENV).filter(|v| !v.is_empty()) {
         return PathBuf::from(p);
@@ -21,8 +23,96 @@ pub fn socket() -> PathBuf {
     let base = std::env::var_os("XDG_RUNTIME_DIR")
         .filter(|v| !v.is_empty())
         .map(|d| PathBuf::from(d).join("amail"))
-        .unwrap_or_else(|| PathBuf::from(format!("/tmp/amail-{}", uid())));
+        .unwrap_or_else(|| state_dir().join("run"));
     base.join("node.sock")
+}
+
+fn untrusted(what: &str, path: &Path, why: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!("refusing {what} {}: {why}", path.display()),
+    )
+}
+
+/// Check that a directory can hold the node socket: a real directory (not a
+/// symbolic link) owned by this user that no other user can write to.
+pub fn check_socket_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::symlink_metadata(dir)?;
+    if !m.is_dir() {
+        return Err(untrusted("socket directory", dir, "not a directory"));
+    }
+    if m.uid() != uid() {
+        return Err(untrusted("socket directory", dir, "owned by another user"));
+    }
+    if m.mode() & 0o022 != 0 {
+        return Err(untrusted(
+            "socket directory",
+            dir,
+            "writable by other users (expected mode 0700)",
+        ));
+    }
+    Ok(())
+}
+
+/// Check the node socket before connecting: its directory passes
+/// [`check_socket_dir`], and the socket is a socket owned by this user.
+pub fn check_node_socket(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    check_socket_dir(dir)?;
+    let m = std::fs::symlink_metadata(path)?;
+    if !m.file_type().is_socket() {
+        return Err(untrusted("node socket", path, "not a socket"));
+    }
+    if m.uid() != uid() {
+        return Err(untrusted("node socket", path, "owned by another user"));
+    }
+    Ok(())
+}
+
+/// The process id and user id of the peer of a connected Unix socket
+/// (`SO_PEERCRED`), as they were when it connected.
+pub fn peer_cred(fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result<(u32, u32)> {
+    use std::os::fd::AsRawFd;
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // SAFETY: `cred` and `len` are valid for writes of the sizes given.
+    let r = unsafe {
+        libc::getsockopt(
+            fd.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((cred.pid as u32, cred.uid))
+}
+
+/// Connect to the node socket at `path`, after [`check_node_socket`], and
+/// make sure the process listening on it runs as this user. A socket that
+/// another user put in place is refused, so its answers (which can name
+/// commands to run) are never used.
+pub fn connect_node(path: &Path) -> std::io::Result<std::os::unix::net::UnixStream> {
+    use std::os::fd::AsFd;
+    check_node_socket(path)?;
+    let s = std::os::unix::net::UnixStream::connect(path)?;
+    let (_, peer) = peer_cred(s.as_fd())?;
+    if peer != uid() {
+        return Err(untrusted("node socket", path, "served by another user"));
+    }
+    Ok(s)
 }
 
 /// `$AMAIL_STATE_DIR`, else `$XDG_DATA_HOME/amail`, else

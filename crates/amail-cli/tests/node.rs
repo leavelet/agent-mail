@@ -810,7 +810,15 @@ async fn server_down_answers_nothing(b: Backend) {
     assert!(ok && out.is_empty());
     assert!(dt < Duration::from_millis(1000), "{dt:?}");
     // A node that accepts and never answers: the client gives up at its budget.
-    let silent = h.dir.path().join("silent.sock");
+    // (In a directory only the user can write to: clients refuse others.)
+    let private = h.dir.path().join("private");
+    std::fs::create_dir(&private).unwrap();
+    std::fs::set_permissions(
+        &private,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    let silent = private.join("silent.sock");
     let l = std::os::unix::net::UnixListener::bind(&silent).unwrap();
     let hold = std::thread::spawn(move || {
         let c = l.accept();
@@ -1453,4 +1461,56 @@ async fn lost_claim_answer_is_recovered(b: Backend) {
         );
     }
     assert_eq!(h.status().await["seats"][0]["stashed"], 0);
+}
+
+/// A node socket in a directory other users can write to (where another
+/// user could have put it, such as a shared `/tmp` directory) is refused by
+/// every client: the commands its answers name are never run.
+#[test]
+fn untrusted_socket_is_refused() {
+    use std::io::{BufRead, Write};
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let shared = dir.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let sock = shared.join("node.sock");
+    let marker = dir.path().join("ran");
+    let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let m = marker.display().to_string();
+    std::thread::spawn(move || {
+        for c in listener.incoming() {
+            // Answers both node requests and hook requests.
+            let Ok(mut c) = c else { return };
+            let mut line = String::new();
+            let _ = std::io::BufReader::new(&c).read_line(&mut line);
+            let cmd = vec!["/bin/sh".to_string(), "-c".into(), format!("touch {m}")];
+            let resp = json!({"commands": [cmd], "program": "/bin/sh",
+                              "args": ["-c", format!("touch {m}")], "env": {}, "stdout": "x"});
+            let _ = writeln!(c, "{resp}");
+        }
+    });
+    for args in [
+        vec!["attach", "w1"],
+        vec!["run", "w1", "--harness", "claude"],
+        vec!["ps"],
+    ] {
+        let out = std::process::Command::new(BIN)
+            .args(&args)
+            .env("AMAIL_NODE_SOCK", &sock)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{args:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("writable by other users"), "{args:?}: {err}");
+    }
+    // The hook client prints nothing.
+    let (out, _, _) = run_hook(&sock, "claude", &[], "{}", None);
+    assert_eq!(out, "");
+    assert!(!marker.exists());
+    // The same socket in a private directory is used.
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (out, _, _) = run_hook(&sock, "claude", &[], "{}", None);
+    assert_eq!(out, "x");
 }

@@ -553,6 +553,7 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
         std::os::unix::fs::PermissionsExt::from_mode(0o700),
     )
     .with_context(|| format!("securing {}", sock_dir.display()))?;
+    crate::paths::check_socket_dir(sock_dir)?;
     if cfg.socket.exists() {
         if tokio::net::UnixStream::connect(&cfg.socket).await.is_ok() {
             bail!("a node is already listening on {}", cfg.socket.display());
@@ -2089,7 +2090,7 @@ async fn web_terminal_loop(zellij: String, state_dir: PathBuf, port: u16) {
 /// Ask a running node (as `amail run` and the CLI do).
 pub fn request(socket: &std::path::Path, req: &Request, timeout: Duration) -> Result<Value> {
     use std::io::{BufRead, Write};
-    let mut s = std::os::unix::net::UnixStream::connect(socket).with_context(|| {
+    let mut s = crate::paths::connect_node(socket).with_context(|| {
         format!(
             "connecting to the amail node at {} (is `amail node` running?)",
             socket.display()

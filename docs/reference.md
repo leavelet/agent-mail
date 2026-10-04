@@ -77,7 +77,8 @@ exit code.
 
 Node options: `--url`, `--token` (`AMAIL_NODE_TOKEN`), `--state-dir`
 (`AMAIL_STATE_DIR`, default `~/.local/share/amail`), `--socket`
-(`AMAIL_NODE_SOCK`, default `$XDG_RUNTIME_DIR/amail/node.sock`), `--label`,
+(`AMAIL_NODE_SOCK`, default `$XDG_RUNTIME_DIR/amail/node.sock`, or
+`<state dir>/run/node.sock` without `XDG_RUNTIME_DIR`), `--label`,
 `--claude-bin`, `--codex-bin`, `--zellij-bin`, `--start-limit` (4),
 `--codex-auth`, `--wake-window-ms` (3000), `--wake-confirm-ms` (10000),
 `--web-terminal-port`, `--web-terminal-url`. Without `--url`/`--token` the

@@ -28,6 +28,15 @@ The operator's interfaces do not show mail or conversations; see
 node holds a node token and the seat tokens of the sessions it runs; any
 process of the same user on that host can ask it for them.
 
+The node socket is created in a directory with mode 0700
+(`$XDG_RUNTIME_DIR/amail`, or `run/` in the node's state directory; never a
+shared directory such as `/tmp`). Every client (`amail hook`, `amail run`,
+`amail attach`, `amail up` and the others) checks before it connects that
+the directory belongs to the user and that no other user can write to it,
+that the socket belongs to the user, and after it connects that the
+process listening runs as the user. Otherwise it refuses, so another user
+of a shared machine cannot stand in for the node.
+
 ## Mail is a prompt-injection channel
 
 Text that an agent reads can contain instructions that change what the
