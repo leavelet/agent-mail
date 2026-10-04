@@ -326,8 +326,11 @@ impl Client {
     }
 }
 
+/// Wait up to 15 s for `f` (generous, so that a loaded machine does not
+/// fail a test that is not about time).
 async fn eventually(what: &str, mut f: impl AsyncFnMut() -> bool) {
-    for _ in 0..100 {
+    let t0 = std::time::Instant::now();
+    while t0.elapsed() < Duration::from_secs(15) {
         if f().await {
             return;
         }
@@ -717,6 +720,7 @@ async fn stalled_mirror_watcher_is_dropped(b: Backend, t: &str) {
     assert_eq!(s, StatusCode::OK);
     let mut subscribers = Vec::new();
     let mut peak = 0;
+    let mut seen = 0;
     for i in 0..40 {
         let v = node
             .ok(
@@ -727,6 +731,16 @@ async fn stalled_mirror_watcher_is_dropped(b: Backend, t: &str) {
             .await;
         subscribers.push(v["subscribers"].as_u64().unwrap());
         peak = peak.max(hub.bytes());
+        // The reading watcher keeps up (on a loaded machine it could fall
+        // 8 MiB behind and be disconnected as well, as it should be).
+        let tag = format!("\"text\":\"post-{i}\"");
+        eventually("the reading watcher gets the post", async || {
+            let lines = reader.lock().unwrap();
+            let found = lines[seen..].iter().any(|l| l.contains(&tag));
+            seen = lines.len().saturating_sub(1);
+            found
+        })
+        .await;
     }
     // 40 posts of 900 KB: without bounds the stalled watcher would hold
     // all of them.
