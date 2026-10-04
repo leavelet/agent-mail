@@ -93,7 +93,13 @@ impl Server {
         Some(Server {
             base,
             db,
-            http: reqwest::Client::new(),
+            // A request that gets no answer fails the test where it was
+            // made instead of holding up the whole run (event streams are
+            // read for at most 10 s).
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap(),
         })
     }
 
