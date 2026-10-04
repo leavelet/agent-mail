@@ -81,6 +81,7 @@ impl AppState {
     pub fn set_config(&mut self, cfg: config::Config) {
         self.http = netguard::webhook_client(cfg.webhook_private_targets, None);
         self.limiters = Arc::new(limits::Limiters::new(&cfg.limits));
+        self.mirror = Arc::new(transcript::MirrorHub::with_limit(cfg.limits.mirror_bytes));
         self.config = Arc::new(cfg);
     }
 

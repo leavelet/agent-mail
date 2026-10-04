@@ -178,8 +178,12 @@ stream) the node that hosts the seat, and the node reads the session's
 transcript file (Claude Code JSONL or a Codex rollout), sends the last 200
 entries and then follows the file. The node stops 30 seconds after the last
 browser left. Mail injected by the system is shown apart from what a person
-typed. The server keeps at most the last 1,000 entries (4 MB) of a watched
+typed. The server keeps at most the last 1,000 entries (4 MiB) of a watched
 seat in memory and nothing once nobody watches; only user tokens can watch.
+Each watcher has a queue of at most 8 MiB; a watcher that stops reading is
+disconnected when its queue is full. A seat holds at most 16 MiB, and all
+mirrors of an instance at most the `--max-mirror-mb` limit (see
+[security](security.md#resource-limits)).
 
 ## Code layout
 

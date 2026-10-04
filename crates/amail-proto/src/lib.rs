@@ -259,6 +259,31 @@ pub mod limits {
     /// Browser sessions per token; signing in once more ends the oldest.
     pub const MAX_SESSIONS_PER_TOKEN: i64 = 20;
 
+    // --- conversation mirror (server memory, per server instance) ---
+
+    /// Largest body of one transcript post (`POST /seats/{name}/transcript`,
+    /// HTTP 413 beyond). Nodes split their batches to fit.
+    pub const MAX_TRANSCRIPT_POST_BYTES: usize = 1024 * 1024;
+    /// Events in one transcript post (the newest are kept).
+    pub const MAX_TRANSCRIPT_POST_EVENTS: usize = 1000;
+    /// Characters of one transcript event's text (longer texts are cut).
+    pub const MAX_TRANSCRIPT_TEXT_CHARS: usize = 16_000;
+    /// Characters of each text field of a transcript status (longer ones
+    /// are cut).
+    pub const MAX_TRANSCRIPT_STATUS_CHARS: usize = 2_000;
+    /// Events of a watched seat kept for watchers that join later.
+    pub const MIRROR_REPLAY_EVENTS: usize = 1000;
+    /// Bytes of those events (the oldest go first).
+    pub const MIRROR_REPLAY_BYTES: usize = 4 * 1024 * 1024;
+    /// Bytes waiting to be sent to one watcher. A watcher that falls
+    /// further behind is disconnected; it reconnects and starts again from
+    /// the replay events.
+    pub const MIRROR_WATCHER_BYTES: usize = 8 * 1024 * 1024;
+    /// Bytes of one watched seat: its replay events plus what waits to be
+    /// sent to all its watchers. Beyond it, the watchers furthest behind
+    /// are disconnected.
+    pub const MIRROR_SEAT_BYTES: usize = 16 * 1024 * 1024;
+
     /// Characters of `s`, or an error naming `field` and the limit.
     pub fn check_chars(field: &str, s: &str, max: usize) -> Result<(), String> {
         if s.chars().count() > max {

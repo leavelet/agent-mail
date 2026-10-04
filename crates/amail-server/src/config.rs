@@ -37,6 +37,11 @@ pub struct Limits {
     /// Webhook notices of one org being sent at the same time; further
     /// notices are dropped while that many are in flight.
     pub org_webhooks_in_flight: Option<usize>,
+    /// Bytes held by all conversation mirrors of the instance (replay
+    /// events and what waits to be sent to watchers). Beyond it, the
+    /// watcher furthest behind is disconnected or the largest replay buffer
+    /// shortened, whichever holds more.
+    pub mirror_bytes: Option<usize>,
 }
 
 impl Limits {
@@ -53,6 +58,7 @@ impl Limits {
             link_requests_per_hour: Some(20.0),
             registrations_per_hour: Some(10.0),
             org_webhooks_in_flight: Some(16),
+            mirror_bytes: Some(256 * 1024 * 1024),
         }
     }
 }

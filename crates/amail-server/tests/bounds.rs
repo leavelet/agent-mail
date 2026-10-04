@@ -41,6 +41,9 @@ bound_tests!(
     revocation_ends_streams,
     rotation_ends_sessions,
     sessions_per_token_are_capped,
+    mirror_post_size_is_capped,
+    stalled_mirror_watcher_is_dropped,
+    mirror_memory_limit,
 );
 
 /// Start a server; `None` (test skipped) when Postgres is not configured.
@@ -559,4 +562,194 @@ async fn sessions_per_token_are_capped(b: Backend, t: &str) {
             "session {i}"
         );
     }
+}
+
+// --- conversation-mirror memory -------------------------------------------------
+
+/// A server whose mirror hub the test can inspect.
+async fn start_with_hub(
+    b: Backend,
+    t: &str,
+    cfg: Config,
+) -> Option<(Server, Arc<amail_server::transcript::MirrorHub>)> {
+    let hub = Arc::new(Mutex::new(None));
+    let h = hub.clone();
+    let srv = Server::start(b, t, cfg, move |st| {
+        *h.lock().unwrap() = Some(st.mirror.clone());
+    })
+    .await?;
+    let hub = hub.lock().unwrap().take().unwrap();
+    Some((srv, hub))
+}
+
+/// A watcher that sends its request and never reads the answer.
+async fn stalled_watcher(srv: &Server, token: &str, seat: &str) -> tokio::net::TcpStream {
+    let addr: std::net::SocketAddr = srv.base.trim_start_matches("http://").parse().unwrap();
+    let sock = tokio::net::TcpSocket::new_v4().unwrap();
+    sock.set_recv_buffer_size(4096).unwrap();
+    let mut s = sock.connect(addr).await.unwrap();
+    use tokio::io::AsyncWriteExt;
+    s.write_all(
+        format!(
+            "GET /v1/seats/{seat}/transcript HTTP/1.1\r\nHost: {addr}\r\n\
+             Authorization: Bearer {token}\r\nAccept: text/event-stream\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .unwrap();
+    s
+}
+
+/// A post of `n` events of 15,000 characters (about 15 KB each).
+fn big_post(n: usize, tag: &str) -> Value {
+    let ev = json!({ "role": "assistant", "kind": "text", "text": "A".repeat(15_000) });
+    let mut events = vec![ev; n];
+    events.push(json!({ "role": "assistant", "kind": "text", "text": tag }));
+    json!({ "node": "n1", "events": events })
+}
+
+/// A transcript post larger than the limit is refused with a clear error;
+/// one just under it is accepted.
+async fn mirror_post_size_is_capped(b: Backend, t: &str) {
+    use amail_proto::limits::MAX_TRANSCRIPT_POST_BYTES;
+    let srv = start!(b, t, public());
+    let acme = srv.org("acme").await;
+    acme.seat("w").await;
+    let node = acme.node().await;
+    let (s, _w) = acme.stream("/seats/w/transcript").await;
+    assert_eq!(s, StatusCode::OK);
+    let n = MAX_TRANSCRIPT_POST_BYTES / 15_050;
+    let ok = big_post(n, "fits");
+    assert!(serde_json::to_vec(&ok).unwrap().len() <= MAX_TRANSCRIPT_POST_BYTES);
+    node.ok(Method::POST, "/seats/w/transcript", Some(ok)).await;
+    let (s, v) = node
+        .call(
+            Method::POST,
+            "/seats/w/transcript",
+            Some(big_post(n + 5, "big")),
+        )
+        .await;
+    assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+    assert_eq!(v["error"]["code"], "too_large", "{v}");
+    // Above the general request limit too.
+    let (s, v) = node
+        .call(
+            Method::POST,
+            "/seats/w/transcript",
+            Some(big_post(200, "huge")),
+        )
+        .await;
+    assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
+    assert_eq!(v["error"]["code"], "too_large", "{v}");
+}
+
+/// A watcher that stops reading is disconnected once its queue is full,
+/// and the mirror's memory stays bounded; a watcher that reads keeps
+/// getting everything.
+async fn stalled_mirror_watcher_is_dropped(b: Backend, t: &str) {
+    use amail_proto::limits::{MIRROR_SEAT_BYTES, MIRROR_WATCHER_BYTES};
+    let Some((srv, hub)) = start_with_hub(b, t, public()).await else {
+        return;
+    };
+    let acme = srv.org("acme").await;
+    acme.seat("w").await;
+    let node = acme.node().await;
+    let _stalled = stalled_watcher(&srv, &acme.token, "w").await;
+    eventually("the stalled watcher is subscribed", async || {
+        !hub.watched(1).is_empty()
+    })
+    .await;
+    let (s, reader) = acme.stream("/seats/w/transcript").await;
+    assert_eq!(s, StatusCode::OK);
+    let mut subscribers = Vec::new();
+    let mut peak = 0;
+    for i in 0..40 {
+        let v = node
+            .ok(
+                Method::POST,
+                "/seats/w/transcript",
+                Some(big_post(60, &format!("post-{i}"))),
+            )
+            .await;
+        subscribers.push(v["subscribers"].as_u64().unwrap());
+        peak = peak.max(hub.bytes());
+    }
+    // 40 posts of 900 KB: without bounds the stalled watcher would hold
+    // all of them.
+    assert!(
+        peak <= MIRROR_SEAT_BYTES,
+        "mirror memory peaked at {peak} bytes"
+    );
+    assert!(
+        subscribers.ends_with(&[1, 1]),
+        "the stalled watcher is disconnected: {subscribers:?}"
+    );
+    assert!(subscribers[0] == 2, "{subscribers:?}");
+    eventually("the reading watcher gets every post", async || {
+        joined(&reader).contains("post-39")
+    })
+    .await;
+    assert!(!closed(&reader));
+    assert!(hub.bytes() <= MIRROR_WATCHER_BYTES, "{}", hub.bytes());
+}
+
+/// The limit over all seats: stalled watchers are disconnected and replay
+/// buffers shortened; watchers that read keep getting everything.
+async fn mirror_memory_limit(b: Backend, t: &str) {
+    const LIMIT: usize = 6 * 1024 * 1024;
+    let mut cfg = public();
+    cfg.limits.mirror_bytes = Some(LIMIT);
+    let Some((srv, hub)) = start_with_hub(b, t, cfg).await else {
+        return;
+    };
+    let acme = srv.org("acme").await;
+    let node = acme.node().await;
+    let mut stalled = Vec::new();
+    let mut readers = Vec::new();
+    for seat in ["a", "b", "c"] {
+        acme.seat(seat).await;
+        stalled.push(stalled_watcher(&srv, &acme.token, seat).await);
+        let (s, r) = acme.stream(&format!("/seats/{seat}/transcript")).await;
+        assert_eq!(s, StatusCode::OK);
+        readers.push(r);
+    }
+    eventually("all watchers are subscribed", async || {
+        hub.watched(1).len() == 3
+    })
+    .await;
+    let mut peak = 0;
+    for i in 0..8 {
+        for seat in ["a", "b", "c"] {
+            node.ok(
+                Method::POST,
+                &format!("/seats/{seat}/transcript"),
+                Some(big_post(60, &format!("{seat}-{i}"))),
+            )
+            .await;
+            peak = peak.max(hub.bytes());
+        }
+    }
+    assert!(peak <= LIMIT, "mirror memory peaked at {peak} bytes");
+    for seat in ["a", "b", "c"] {
+        let v = node
+            .ok(
+                Method::POST,
+                &format!("/seats/{seat}/transcript"),
+                Some(json!({ "node": "n1", "events": [] })),
+            )
+            .await;
+        assert_eq!(v["subscribers"], 1, "stalled watcher of {seat} is gone");
+    }
+    for (seat, r) in ["a", "b", "c"].iter().zip(&readers) {
+        let last = format!("{seat}-7");
+        eventually("readers get the last post", async || {
+            joined(r).contains(&last)
+        })
+        .await;
+    }
+    // A new watcher still gets in.
+    let (s, _) = acme.stream("/seats/a/transcript").await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(hub.bytes() <= LIMIT, "{}", hub.bytes());
 }

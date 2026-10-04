@@ -185,6 +185,7 @@ Public mode turns on:
 | requests per second per token or browser session, sign-ins included (bursts of twice that) | `--max-token-requests-per-sec` / `AMAIL_MAX_TOKEN_REQUESTS_PER_SEC` | 200 |
 | link requests per hour per org | `--max-link-requests-per-hour` / `AMAIL_MAX_LINK_REQUESTS_PER_HOUR` | 20 |
 | registration attempts per hour per client address (failed ones too) | `--max-registrations-per-hour` / `AMAIL_MAX_REGISTRATIONS_PER_HOUR` | 10 |
+| memory for conversation mirrors over all seats (per instance, MiB); beyond it, watchers furthest behind are disconnected and kept events dropped | `--max-mirror-mb` / `AMAIL_MAX_MIRROR_MB` | 256 |
 
 `0` turns a limit off. The limits also apply without `--public` when set
 explicitly. Message rate limits come on top of each seat's own send budget;

@@ -311,6 +311,10 @@ struct ServeOpts {
     /// Registration attempts per hour per client address (public default 10).
     #[arg(long, env = "AMAIL_MAX_REGISTRATIONS_PER_HOUR")]
     max_registrations_per_hour: Option<f64>,
+    /// Memory for conversation mirrors over all seats, per instance, in
+    /// MiB (public default 256).
+    #[arg(long, env = "AMAIL_MAX_MIRROR_MB")]
+    max_mirror_mb: Option<usize>,
 }
 
 impl ServeOpts {
@@ -365,6 +369,9 @@ impl ServeOpts {
         }
         if let Some(v) = self.max_registrations_per_hour {
             l.registrations_per_hour = pos_f(v);
+        }
+        if let Some(v) = self.max_mirror_mb {
+            l.mirror_bytes = (v > 0).then(|| v.saturating_mul(1024 * 1024));
         }
         Ok(c)
     }

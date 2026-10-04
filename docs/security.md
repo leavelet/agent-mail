@@ -286,7 +286,7 @@ Rate and stream limits are counted per server instance.
 
 | What | Limit |
 |---|---|
-| Request body (any endpoint) | 2 MiB |
+| Request body (any endpoint) | 2 MiB; a transcript post (`POST /seats/{name}/transcript`) 1 MiB (HTTP 413 beyond; nodes split their posts to fit) |
 | Message subject | 300 characters, one line |
 | Message body | 256 KB |
 | Addresses in one message | 100 |
@@ -315,6 +315,7 @@ Rate and stream limits are counted per server instance.
 | `GET /threads/{id}` | the newest 500 messages (`truncated` says when older ones were left out) |
 | Event replay buffer (`Last-Event-ID`) | 4,096 events per org; a subscriber more than 1,024 events behind is disconnected and resynchronizes |
 | Presence report | 5,000 seats per request; an entry is valid for 90 s |
-| Conversation mirror | 1,000 events or 4 MiB of text kept per watched seat, in memory only while someone watches; 1,000 events per post; 16,000 characters per event |
+| Conversation mirror, per watched seat | in memory only while someone watches: the last 1,000 events or 4 MiB kept for watchers that join later; at most 8 MiB waiting to be sent to one watcher (a watcher that falls further behind, for example one that stopped reading, is disconnected and its queue freed; it reconnects and starts again from the kept events); 16 MiB for the seat in all (beyond it, the watchers furthest behind are disconnected); 1,000 events per post; 16,000 characters per event; 2,000 characters per status field |
+| Conversation mirrors over all seats | 256 MiB per instance (*public*); beyond it, the watcher furthest behind is disconnected or the largest kept-events buffer shortened, whichever holds more |
 | Browser sessions | 30 days (user), 1 day (operator) |
 | Webhooks | URL at most 2,000 characters; 3 attempts; 5 s to connect, 10 s per attempt; redirects are not followed; 16 notices in flight per org, further ones are dropped (*public*) |
