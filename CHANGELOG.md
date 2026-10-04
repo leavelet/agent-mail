@@ -303,6 +303,20 @@ Changes users will notice in this review:
   git's credential stores are not visible; it runs the host in a new
   session with `/dev/null` as input, so jailed processes have no
   controlling terminal.
+- With the failed-turn fixes: a node's report of failing turns is one
+  section of the report's single notice mail and counts against the
+  org's daily notice budget like any other report; deleting a thread or
+  purging deleted orgs' mail gives each seat that lost deliveries a
+  `mailbox` event, also when the mail was shown in a turn that has not
+  ended (releasing it after a failed turn then releases nothing); the
+  failed-turn flag (migration 0017) comes after this review's migrations.
+- A request body declared larger than 2 MiB is read and dropped (up to
+  16 MiB, for at most 5 s) before the 413 answer, so that the client gets
+  the answer instead of a reset connection.
+- The node opens its event stream with an HTTP client of its own. With
+  one client for everything, a request made just after the stream opened
+  could, rarely, wait behind the stream until its timeout: the HTTP
+  client can hand out a connection whose answer is still being read.
 
 Changes users will notice in this review:
 

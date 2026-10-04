@@ -375,8 +375,10 @@ deliveries that turn showed to "not notified, not read"
 and wakes the seat again after 30 s, then 60 s. After three failed turns
 in a row it stops waking the seat for that mail (the mail stays unread
 and comes with the seat's next turn), keeps the seat flagged
-(`turn-failed`, with the harness's error text) and sends the user one
-system mail. `amail wake <seat>` (or Wake in the web interface) lets the
+(`turn-failed`, with the harness's error text) and reports it to the
+user once by system mail (as part of the node's next notice report, so
+it counts against the org's daily notice budget; see
+[security](security.md#resource-limits)). `amail wake <seat>` (or Wake in the web interface) lets the
 node deliver the mail again until the next failure; a turn that ends
 normally clears the flag. A turn the person interrupts is not a failure,
 and its mail counts as delivered.
