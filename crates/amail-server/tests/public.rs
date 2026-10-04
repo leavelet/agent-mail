@@ -38,6 +38,7 @@ public_tests!(
     registration_with_invites,
     register_then_first_mail,
     registration_rate_limit_by_client_address,
+    registration_rate_limit_per_ipv6_48,
     token_rotation_and_reset,
     seat_and_send_limits,
     stream_request_and_link_limits,
@@ -523,6 +524,51 @@ async fn registration_rate_limit_by_client_address(b: Backend, t: &str) {
     };
     assert_eq!(reg2("203.0.113.1").await, StatusCode::FORBIDDEN);
     assert_eq!(reg2("203.0.113.2").await, StatusCode::TOO_MANY_REQUESTS);
+}
+
+/// IPv6 clients are limited per /64 and, together, per /48: many /64
+/// networks of one /48 cannot fill the limiter. A /64 that is out of
+/// attempts does not use up its /48's.
+async fn registration_rate_limit_per_ipv6_48(b: Backend, t: &str) {
+    let mut cfg = public();
+    cfg.limits.registrations_per_hour = Some(2.0); // a burst of one per /64
+    cfg.trusted_proxies = vec!["127.0.0.1".parse().unwrap()];
+    let srv = start!(b, t, cfg);
+    let reg = |ip: String| {
+        let srv = &srv;
+        async move {
+            srv.raw(
+                Method::POST,
+                "/register",
+                Some(json!({ "invite": "inv_x", "org": "acme" })),
+                &[("X-Forwarded-For", ip.as_str())],
+            )
+            .await
+            .0
+        }
+    };
+    assert_eq!(reg("2001:db8:1:1::1".into()).await, StatusCode::FORBIDDEN);
+    for _ in 0..5 {
+        assert_eq!(
+            reg("2001:db8:1:1::2".into()).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+    // The /48 allows four times the per-/64 burst.
+    for n in 2..=4 {
+        assert_eq!(
+            reg(format!("2001:db8:1:{n}::1")).await,
+            StatusCode::FORBIDDEN,
+            "/64 number {n}"
+        );
+    }
+    assert_eq!(
+        reg("2001:db8:1:5::1".into()).await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    // Other /48 networks and IPv4 clients are not affected.
+    assert_eq!(reg("2001:db8:2:1::1".into()).await, StatusCode::FORBIDDEN);
+    assert_eq!(reg("203.0.113.1".into()).await, StatusCode::FORBIDDEN);
 }
 
 async fn token_rotation_and_reset(b: Backend, t: &str) {

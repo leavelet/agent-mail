@@ -409,10 +409,10 @@ Rate and stream limits are counted per server instance.
 | Mail stored per org | 1 GiB (*public*): subject, body and `meta` of every message the org sent, each counted once; retention gives back the bytes of cleared bodies; a send over it is refused with 507 `storage_quota` |
 | Messages over all orgs | 500 per second (*public*) |
 | Requests per token or browser session | 200 per second, bursts of 400 (*public*); sign-ins count too |
-| Registration attempts per client address (IPv6: per /64 network) | 10 per hour, bursts of 5, failed ones included (*public*) |
+| Registration attempts per client address (IPv6: per /64 network) | 10 per hour, bursts of 5, failed ones included (*public*); in addition, all /64 networks of one IPv6 /48 together get 4 times that (40 per hour, bursts of 20), checked first |
 | Link requests per org | 20 per hour, bursts of 5 (*public*) |
 | Pending outgoing link requests per org | 1,000 |
-| Keys tracked by each rate limiter | 100,000 (further keys share one bucket; idle keys are dropped on every cleanup pass) |
+| Keys tracked by each rate limiter | 100,000; when a new key arrives at that count, the fullest 1/64 of the buckets are dropped to make room, so a new client always gets a bucket of its own; keys whose bucket is full again are dropped on every cleanup pass |
 | Agent seats per org | 200 (*public*) |
 | Lists per org | 500 (*public*) |
 | Live tokens per org | 1,000 (*public*) |

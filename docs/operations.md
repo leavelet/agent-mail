@@ -184,7 +184,7 @@ Public mode turns on:
 | open event streams per org (event streams and conversation mirrors) | `--max-org-streams` / `AMAIL_MAX_ORG_STREAMS` | 32 |
 | requests per second per token or browser session, sign-ins included (bursts of twice that) | `--max-token-requests-per-sec` / `AMAIL_MAX_TOKEN_REQUESTS_PER_SEC` | 200 |
 | link requests per hour per org | `--max-link-requests-per-hour` / `AMAIL_MAX_LINK_REQUESTS_PER_HOUR` | 20 |
-| registration attempts per hour per client address (failed ones too) | `--max-registrations-per-hour` / `AMAIL_MAX_REGISTRATIONS_PER_HOUR` | 10 |
+| registration attempts per hour per client address (failed ones too; IPv6 per /64, and 4 times that per /48) | `--max-registrations-per-hour` / `AMAIL_MAX_REGISTRATIONS_PER_HOUR` | 10 |
 | memory for conversation mirrors over all seats (per instance, MiB); beyond it, watchers furthest behind are disconnected and kept events dropped | `--max-mirror-mb` / `AMAIL_MAX_MIRROR_MB` | 256 |
 | mail stored per org, in MiB (see below) | `--max-org-storage-mb` / `AMAIL_MAX_ORG_STORAGE_MB` | 1024 |
 | search and archive requests per org in progress at the same time | `--max-org-queries` / `AMAIL_MAX_ORG_QUERIES` | 4 |

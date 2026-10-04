@@ -263,6 +263,10 @@ pub mod limits {
     /// are cut there and marked `role_truncated`. `GET /seats/{name}` has
     /// the whole role.
     pub const LIST_ROLE_CHARS: usize = 1_000;
+    /// Registrations from one IPv6 /48 network, as a multiple of the
+    /// per-address limit (`registrations_per_hour`, which keys IPv6 clients
+    /// by /64). A request this limit refuses creates no per-/64 entry.
+    pub const REGISTRATION_NET48_FACTOR: f64 = 4.0;
 
     // --- what the node reads (so a server cannot exhaust its memory) ---
 
