@@ -323,8 +323,8 @@ org's latency: it gives one org about 2,000,000 delivery rows (with
 `--rows`) and lets it call one endpoint after another from 128 loops over
 64 tokens, while it measures the other org's inbox reads, sends and claims.
 On Postgres (server on 2 cores, database on 4, public-mode limits) the
-other org's median latencies stayed within 1.6 times their idle values for
-every endpoint; before these limits they reached 10 to 60 seconds. Run
+other org's median latencies stayed within 1.7 times their idle values for
+every endpoint (two runs: at most 1.6 and 1.7 times, at most 20 ms); before these limits they reached 10 to 60 seconds. Run
 once; on SQLite, where the database works on the server's cores, a flood
 of `GET /pending` (200 seats) still raised them three to ten times.
 
