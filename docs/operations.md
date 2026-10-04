@@ -86,15 +86,25 @@ binary, into a small Debian image running as a non-root user) and a
 `docker-compose.yml` with the server and Postgres, a data volume and health
 checks.
 
+Compose needs `POSTGRES_PASSWORD` (letters and digits: it goes into a URL)
+and reads the other settings from the same place. Keep them in a file
+outside the repository and name it with `--env-file` on every `docker
+compose` command:
+
 ```sh
-cp .env.example .env            # set POSTGRES_PASSWORD (letters and digits)
-docker compose up -d --build
-docker compose exec amail amail admin create-org acme
+cp .env.example ~/amail.env     # set POSTGRES_PASSWORD
+docker compose --env-file ~/amail.env up -d --build
+docker compose --env-file ~/amail.env exec amail amail admin create-org acme
 ```
 
+Or copy it to `.env` in the repository directory, which `docker compose`
+reads without `--env-file`; or set the variables in the shell
+(`POSTGRES_PASSWORD=... docker compose up -d --build`). The build itself
+writes nothing into the repository directory.
+
 The server is published on `127.0.0.1:${AMAIL_PORT:-8025}` only. Every
-setting of the table above can be set in `.env` (see `.env.example`), for
-example `AMAIL_PUBLIC=true`. An empty `AMAIL_MAX_*=`,
+setting of the table above can be set in the env file (see `.env.example`),
+for example `AMAIL_PUBLIC=true`. An empty `AMAIL_MAX_*=`,
 `AMAIL_RETENTION_DAYS=` or `AMAIL_WEBHOOK_PRIVATE_TARGETS=` counts as not
 set (the default applies). For the single-container image with SQLite:
 
@@ -367,7 +377,8 @@ pg_restore --no-owner -d amail_restored amail-2026-10-04.dump
 ```
 
 and point `--db` at the restored database. With Docker Compose:
-`docker compose exec postgres pg_dump -U amail -Fc amail > amail.dump`.
+`docker compose --env-file ~/amail.env exec postgres pg_dump -U amail -Fc amail > amail.dump`
+(without `--env-file` when the settings are in `.env`).
 
 What a backup holds: everything in the [data notice](../README.md#your-data-on-an-amail-server),
 including token hashes. Keep backups as private as the database.

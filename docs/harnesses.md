@@ -206,7 +206,10 @@ instructions and the seat's role) and the model (for example
 **The model provider's key.** Give it with `amail node --dsh-env-file
 <file>` (`AMAIL_DSH_ENV_FILE`): a file of `NAME=value` lines, for example
 `DEEPSEEK_API_KEY=...`. The node reads the file when it starts and passes
-these variables only to dsh hosts. A key in the node's own environment
+these variables only to dsh hosts. `amail node start` takes the same
+options (`amail node start --dsh-env-file <file> --dsh-bin <path>`), and
+`amail node status` shows the dsh program the node uses and the names of
+the variables the file sets. A key in the node's own environment
 would reach every process the node starts, including Claude Code and
 Codex sessions. dsh removes variables with credential-shaped names
 (`*KEY*`, `*TOKEN*`, `*SECRET*`, `*PASSWORD*`) from the environment of the
