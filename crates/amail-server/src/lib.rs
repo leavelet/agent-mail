@@ -3,6 +3,7 @@
 pub mod activity;
 pub mod attention;
 pub mod auth;
+mod bodylimit;
 pub mod cluster;
 pub mod commands;
 pub mod config;
@@ -270,6 +271,7 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(|| async { "ok" }))
         .fallback(web::static_file)
         .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BYTES))
+        .layer(axum::middleware::from_fn(bodylimit::layer))
         .layer(axum::middleware::from_fn(web::headers))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

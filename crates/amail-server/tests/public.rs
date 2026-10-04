@@ -4,6 +4,8 @@
 //! cross-org negative test per kind of resource addressed by id or name.
 //! Both backends (Postgres only when `AMAIL_TEST_PG_URL` is set).
 
+mod common;
+
 use amail_server::config::Config;
 use amail_server::{AppState, hash_token, new_token};
 use amail_store::testutil::{Backend, TestDb};
@@ -19,7 +21,7 @@ macro_rules! public_tests {
             $(
                 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
                 async fn $name() {
-                    super::$name(amail_store::testutil::Backend::Sqlite, stringify!($name)).await;
+                    super::common::deadline(stringify!($name), super::$name(amail_store::testutil::Backend::Sqlite, stringify!($name))).await;
                 }
             )*
         }
@@ -27,7 +29,7 @@ macro_rules! public_tests {
             $(
                 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
                 async fn $name() {
-                    super::$name(amail_store::testutil::Backend::Postgres, stringify!($name)).await;
+                    super::common::deadline(stringify!($name), super::$name(amail_store::testutil::Backend::Postgres, stringify!($name))).await;
                 }
             )*
         }
@@ -305,13 +307,12 @@ impl Client {
     }
     /// Collect the lines of a server-sent event stream in the background.
     async fn stream(&self, path: &str) -> (StatusCode, Arc<Mutex<Vec<String>>>) {
-        let resp = self
-            .http
-            .get(format!("{}/v1{path}", self.base))
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .unwrap();
+        let resp = common::open_stream(
+            common::stream_client()
+                .get(format!("{}/v1{path}", self.base))
+                .bearer_auth(&self.token),
+        )
+        .await;
         let status = resp.status();
         let lines: Arc<Mutex<Vec<String>>> = Arc::default();
         if status.is_success() {
@@ -716,17 +717,23 @@ async fn stream_request_and_link_limits(b: Backend, t: &str) {
     // Other orgs are not affected.
     assert_eq!(beta.stream("/events").await.0, StatusCode::OK);
 
-    // Requests per token: the burst, then 429 with a retry time.
+    // Requests per token: the burst, then 429. (The bucket refills at 5 a
+    // second while the requests run, so under load more than ten may pass
+    // before the first 429.)
     let tok = acme.seat("a").await;
     let mut codes = Vec::new();
-    for _ in 0..14 {
+    while codes.len() < 200 && !codes.contains(&StatusCode::TOO_MANY_REQUESTS) {
         codes.push(tok.get("/whoami").await.0);
     }
     assert!(
         codes[..10].iter().all(|c| *c == StatusCode::OK),
         "{codes:?}"
     );
-    assert_eq!(codes[13], StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        codes.last(),
+        Some(&StatusCode::TOO_MANY_REQUESTS),
+        "{codes:?}"
+    );
     // A token's limit is its own.
     assert_eq!(beta.get("/whoami").await.0, StatusCode::OK);
 

@@ -12,6 +12,14 @@ use std::time::Duration;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_instances_share_state() {
+    deadline(
+        "two_instances_share_state",
+        two_instances_share_state_body(),
+    )
+    .await;
+}
+
+async fn two_instances_share_state_body() {
     let Some(db) = Db::new(Backend::Postgres, "two_instances_share_state").await else {
         return;
     };
@@ -168,6 +176,14 @@ async fn two_instances_share_state() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sqlite_refuses_a_second_instance() {
+    deadline(
+        "sqlite_refuses_a_second_instance",
+        sqlite_refuses_a_second_instance_body(),
+    )
+    .await;
+}
+
+async fn sqlite_refuses_a_second_instance_body() {
     let Some(db) = Db::new(Backend::Sqlite, "sqlite_refuses_a_second_instance").await else {
         return;
     };

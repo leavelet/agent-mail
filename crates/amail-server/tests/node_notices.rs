@@ -2,6 +2,8 @@
 //! own org's user seat, written from fixed texts. Both backends (Postgres
 //! only when `AMAIL_TEST_PG_URL` is set).
 
+mod common;
+
 use amail_server::config::Config;
 use amail_server::{AppState, hash_token, new_token};
 use amail_store::testutil::{Backend, TestDb};
@@ -14,7 +16,7 @@ macro_rules! notice_tests {
             $(
                 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
                 async fn $name() {
-                    super::$name(amail_store::testutil::Backend::Sqlite, stringify!($name)).await;
+                    super::common::deadline(stringify!($name), super::$name(amail_store::testutil::Backend::Sqlite, stringify!($name))).await;
                 }
             )*
         }
@@ -22,7 +24,7 @@ macro_rules! notice_tests {
             $(
                 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
                 async fn $name() {
-                    super::$name(amail_store::testutil::Backend::Postgres, stringify!($name)).await;
+                    super::common::deadline(stringify!($name), super::$name(amail_store::testutil::Backend::Postgres, stringify!($name))).await;
                 }
             )*
         }

@@ -3,6 +3,8 @@
 //! carry a bounded amount of body text; listing pages are bounded in bytes.
 //! Both backends (Postgres only when `AMAIL_TEST_PG_URL` is set).
 
+mod common;
+
 use amail_proto::limits::{MAX_PAGE_BYTES, MAX_THREAD_BODY_BYTES};
 use amail_server::config::Config;
 use amail_server::{AppState, hash_token, new_token};
@@ -17,7 +19,7 @@ macro_rules! query_tests {
             $(
                 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
                 async fn $name() {
-                    super::$name(amail_store::testutil::Backend::Sqlite, stringify!($name)).await;
+                    super::common::deadline(stringify!($name), super::$name(amail_store::testutil::Backend::Sqlite, stringify!($name))).await;
                 }
             )*
         }
@@ -25,7 +27,7 @@ macro_rules! query_tests {
             $(
                 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
                 async fn $name() {
-                    super::$name(amail_store::testutil::Backend::Postgres, stringify!($name)).await;
+                    super::common::deadline(stringify!($name), super::$name(amail_store::testutil::Backend::Postgres, stringify!($name))).await;
                 }
             )*
         }

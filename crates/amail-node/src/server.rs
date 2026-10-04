@@ -55,9 +55,20 @@ pub struct ServerClient {
     base: String,
     token: String,
     http: reqwest::Client,
+    /// For the event stream only: a client (and connection pool) of its
+    /// own. The HTTP/1 client can put a connection back into its pool when
+    /// the answer's head arrives although the answer's body is still being
+    /// read (its "ready for another request" signal can be set while a
+    /// request is on the way). For a short answer the next request then
+    /// waits until that body ends; behind the event stream, whose body does
+    /// not end, it would wait until its timeout.
+    stream_http: reqwest::Client,
     /// Timeout of requests made while a hook waits.
     fast: Duration,
 }
+
+/// How long the event stream's request waits for the answer's head.
+const EVENTS_HEAD_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Bytes of an error answer kept for the message.
 const ERROR_BODY_MAX: usize = 4096;
@@ -104,15 +115,18 @@ fn enc(s: &str) -> String {
 
 impl ServerClient {
     pub fn new(base: &str, token: &str, fast: Duration) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .no_proxy()
-            .connect_timeout(Duration::from_secs(5))
-            .pool_idle_timeout(Duration::from_secs(60))
-            .build()?;
+        let client = || {
+            reqwest::Client::builder()
+                .no_proxy()
+                .connect_timeout(Duration::from_secs(5))
+                .pool_idle_timeout(Duration::from_secs(60))
+                .build()
+        };
         Ok(ServerClient {
             base: base.trim_end_matches('/').to_string(),
             token: token.to_string(),
-            http,
+            http: client()?,
+            stream_http: client()?,
             fast,
         })
     }
@@ -280,11 +294,21 @@ impl ServerClient {
         &self,
         last_event_id: Option<&str>,
     ) -> Result<impl futures::Stream<Item = Result<SseEvent>> + use<>> {
-        let mut rb = self.req(reqwest::Method::GET, "/events");
+        let mut rb = self
+            .stream_http
+            .get(format!("{}/v1/events", self.base))
+            .bearer_auth(&self.token);
         if let Some(id) = last_event_id {
             rb = rb.header("Last-Event-ID", id);
         }
-        let resp = rb.send().await?;
+        let resp = tokio::time::timeout(EVENTS_HEAD_TIMEOUT, rb.send())
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "the event stream did not answer within {} s",
+                    EVENTS_HEAD_TIMEOUT.as_secs()
+                )
+            })??;
         if !resp.status().is_success() {
             let status = resp.status();
             bail!("HTTP {}: {}", status, error_text(resp).await);
@@ -484,6 +508,104 @@ mod tests {
         let c = ServerClient::new(&base, "t", Duration::from_secs(5)).unwrap();
         let e = c.pending(None).await.unwrap_err();
         assert!(e.to_string().contains("larger than"), "{e}");
+    }
+
+    /// A raw HTTP/1.1 server with keep-alive: `/v1/events` answers with an
+    /// event stream that never ends, anything else with an empty pending
+    /// list.
+    async fn stream_server() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
+                            match s.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                            continue;
+                        };
+                        let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                        buf.drain(..end + 4);
+                        if head.contains("/v1/events") {
+                            let _ = s
+                                .write_all(
+                                    b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\n\
+                                      transfer-encoding: chunked\r\n\r\n",
+                                )
+                                .await;
+                            // Never ends.
+                            let _ = s.read(&mut chunk).await;
+                            return;
+                        }
+                        let body = r#"{"seats":[]}"#;
+                        let answer = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                             content-length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if s.write_all(answer.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// The node asks for pending mail, opens its event stream, and asks
+    /// again: the second request must get its answer. With one connection
+    /// pool for both, about one round in a few thousand put the stream's
+    /// connection back into the pool when its head arrived, and the second
+    /// request waited behind the stream until its timeout. Several runtimes
+    /// at once (as the node's tasks run) make that likely enough to see in
+    /// a few thousand rounds; with a pool of its own for the stream it
+    /// cannot happen.
+    #[test]
+    fn requests_after_the_event_stream_get_answers() {
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 500;
+        let stuck = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let threads: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let stuck = stuck.clone();
+                std::thread::spawn(move || {
+                    let rt = tokio::runtime::Builder::new_multi_thread()
+                        .worker_threads(2)
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    rt.block_on(async move {
+                        let base = stream_server().await;
+                        for _ in 0..ROUNDS {
+                            let c = ServerClient::new(&base, "t", Duration::from_secs(5)).unwrap();
+                            c.pending(None).await.unwrap();
+                            let events = c.events(None).await.unwrap();
+                            let next =
+                                tokio::time::timeout(Duration::from_secs(5), c.pending(None)).await;
+                            if !matches!(next, Ok(Ok(_))) {
+                                stuck.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            drop(events);
+                        }
+                    });
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(
+            stuck.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "requests after the event stream went unanswered"
+        );
     }
 
     #[test]

@@ -15,6 +15,18 @@ use std::time::{Duration, Instant};
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_amail");
 
+/// Longest time one test may take. A test that waits on an event stream,
+/// or on a request that never gets an answer, fails with this message
+/// instead of hanging the run.
+pub const TEST_DEADLINE: Duration = Duration::from_secs(300);
+
+/// Run the test `f`, failing it if it is not done within [`TEST_DEADLINE`].
+pub async fn deadline(name: &str, f: impl std::future::Future<Output = ()>) {
+    if tokio::time::timeout(TEST_DEADLINE, f).await.is_err() {
+        panic!("test {name} did not finish within {TEST_DEADLINE:?}");
+    }
+}
+
 /// A fresh database for one test.
 pub struct Db {
     pub url: String,

@@ -5,6 +5,8 @@
 
 #![allow(dead_code)]
 
+mod common;
+
 use amail_server::config::Config;
 use amail_server::{AppState, hash_token, new_token};
 use amail_store::testutil::{Backend, TestDb};
@@ -20,7 +22,7 @@ macro_rules! bound_tests {
             $(
                 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
                 async fn $name() {
-                    super::$name(amail_store::testutil::Backend::Sqlite, stringify!($name)).await;
+                    super::common::deadline(stringify!($name), super::$name(amail_store::testutil::Backend::Sqlite, stringify!($name))).await;
                 }
             )*
         }
@@ -28,7 +30,7 @@ macro_rules! bound_tests {
             $(
                 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
                 async fn $name() {
-                    super::$name(amail_store::testutil::Backend::Postgres, stringify!($name)).await;
+                    super::common::deadline(stringify!($name), super::$name(amail_store::testutil::Backend::Postgres, stringify!($name))).await;
                 }
             )*
         }
@@ -42,6 +44,7 @@ bound_tests!(
     rotation_ends_sessions,
     sessions_per_token_are_capped,
     mirror_post_size_is_capped,
+    oversized_body_gets_its_answer,
     stalled_mirror_watcher_is_dropped,
     mirror_memory_limit,
     storage_quota,
@@ -295,13 +298,12 @@ impl Client {
     }
     /// Collect the lines of a server-sent event stream in the background.
     async fn stream(&self, path: &str) -> (StatusCode, Arc<Mutex<Vec<String>>>) {
-        let resp = self
-            .http
-            .get(format!("{}/v1{path}", self.base))
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .unwrap();
+        let resp = common::open_stream(
+            common::stream_client()
+                .get(format!("{}/v1{path}", self.base))
+                .bearer_auth(&self.token),
+        )
+        .await;
         let status = resp.status();
         let lines: Arc<Mutex<Vec<String>>> = Arc::default();
         if status.is_success() {
@@ -654,6 +656,45 @@ async fn mirror_post_size_is_capped(b: Backend, t: &str) {
         .await;
     assert_eq!(s, StatusCode::PAYLOAD_TOO_LARGE, "{v}");
     assert_eq!(v["error"]["code"], "too_large", "{v}");
+}
+
+/// A request body larger than the request limit is read and dropped
+/// before the 413 answer, so that the client gets the answer: closing a
+/// connection with unread request bytes in it makes the system reset it,
+/// and the client saw "broken pipe" instead (about 1 in 100 runs of
+/// `mirror_post_size_is_capped` under load). Here the client writes all of
+/// a body of 6 MiB, more than the socket buffers hold, before it reads.
+async fn oversized_body_gets_its_answer(b: Backend, t: &str) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let srv = start!(b, t, public());
+    let acme = srv.org("acme").await;
+    acme.seat("w").await;
+    let node = acme.node().await;
+    let addr: std::net::SocketAddr = srv.base.trim_start_matches("http://").parse().unwrap();
+    let body = vec![b'x'; 6 << 20];
+    for path in ["/v1/seats/w/transcript", "/v1/messages"] {
+        let mut s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head = format!(
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {}\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+            node.token,
+            body.len()
+        );
+        let io = async {
+            s.write_all(head.as_bytes()).await?;
+            s.write_all(&body).await?;
+            let mut answer = Vec::new();
+            s.read_to_end(&mut answer).await?;
+            std::io::Result::Ok(answer)
+        };
+        let answer = tokio::time::timeout(Duration::from_secs(30), io)
+            .await
+            .expect("no answer within 30 s")
+            .unwrap_or_else(|e| panic!("{path}: {e}"));
+        let text = String::from_utf8_lossy(&answer);
+        assert!(text.starts_with("HTTP/1.1 413 "), "{path}: {text}");
+        assert!(text.contains(r#""code":"too_large""#), "{path}: {text}");
+    }
 }
 
 /// A watcher that stops reading is disconnected once its queue is full,

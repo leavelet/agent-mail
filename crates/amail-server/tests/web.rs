@@ -3,6 +3,8 @@
 //! commands, the transcript relay and the embedded app. Both backends
 //! (Postgres only when `AMAIL_TEST_PG_URL` is set).
 
+mod common;
+
 use amail_server::{AppState, hash_token, new_token};
 use amail_store::testutil::{Backend, TestDb};
 use futures::StreamExt;
@@ -18,7 +20,7 @@ macro_rules! web_tests {
                 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
                 async fn $name() {
                     if let Some(srv) = super::Server::start(amail_store::testutil::Backend::Sqlite, stringify!($name)).await {
-                        super::$name(srv).await;
+                        super::common::deadline(stringify!($name), super::$name(srv)).await;
                     }
                 }
             )*
@@ -28,7 +30,7 @@ macro_rules! web_tests {
                 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
                 async fn $name() {
                     if let Some(srv) = super::Server::start(amail_store::testutil::Backend::Postgres, stringify!($name)).await {
-                        super::$name(srv).await;
+                        super::common::deadline(stringify!($name), super::$name(srv)).await;
                     }
                 }
             )*
@@ -81,14 +83,8 @@ impl Server {
         Some(Server {
             base,
             db,
-            // No idle connections: with keep-alive connections next to
-            // several open event streams, a request occasionally waited
-            // forever for a pooled connection (seen about once in 25 runs
-            // of transcript_relay, in the HTTP client, not the server).
-            http: reqwest::Client::builder()
-                .pool_max_idle_per_host(0)
-                .build()
-                .unwrap(),
+            // Event streams use clients of their own (`Client::stream`).
+            http: reqwest::Client::new(),
             state,
         })
     }
@@ -176,13 +172,12 @@ impl Client {
             .await
     }
     async fn stream(&self, path: &str) -> reqwest::Response {
-        let r = self
-            .http
-            .get(format!("{}/v1{path}", self.base))
-            .bearer_auth(&self.token)
-            .send()
-            .await
-            .unwrap();
+        let r = common::open_stream(
+            common::stream_client()
+                .get(format!("{}/v1{path}", self.base))
+                .bearer_auth(&self.token),
+        )
+        .await;
         assert_eq!(r.status(), StatusCode::OK, "GET {path}");
         r
     }

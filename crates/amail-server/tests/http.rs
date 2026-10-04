@@ -1,6 +1,8 @@
 //! HTTP integration tests against a real server on a random port, for both
 //! backends (Postgres only when `AMAIL_TEST_PG_URL` is set).
 
+mod common;
+
 use amail_server::{AppState, hash_token, new_token};
 use amail_store::testutil::{Backend, TestDb};
 use futures::StreamExt;
@@ -15,7 +17,7 @@ macro_rules! http_tests {
                 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
                 async fn $name() {
                     if let Some(srv) = super::Server::start(amail_store::testutil::Backend::Sqlite, stringify!($name)).await {
-                        super::$name(srv).await;
+                        super::common::deadline(stringify!($name), super::$name(srv)).await;
                     }
                 }
             )*
@@ -25,7 +27,7 @@ macro_rules! http_tests {
                 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
                 async fn $name() {
                     if let Some(srv) = super::Server::start(amail_store::testutil::Backend::Postgres, stringify!($name)).await {
-                        super::$name(srv).await;
+                        super::common::deadline(stringify!($name), super::$name(srv)).await;
                     }
                 }
             )*
@@ -94,8 +96,8 @@ impl Server {
             base,
             db,
             // A request that gets no answer fails the test where it was
-            // made instead of holding up the whole run (event streams are
-            // read for at most 10 s).
+            // made instead of holding up the whole run. (Event streams use
+            // clients of their own: `common::stream_client`.)
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -1102,19 +1104,18 @@ async fn events_sse(srv: Server) {
     let a = user.seat("a").await;
     let _b = user.seat("b").await;
     let open = |c: &Client, query: &str, last: Option<&str>| {
-        let mut req = srv
-            .http
+        let mut req = common::stream_client()
             .get(format!("{}/v1/events{query}", srv.base))
             .bearer_auth(&c.token);
         if let Some(l) = last {
             req = req.header("Last-Event-ID", l);
         }
-        req.send()
+        common::open_stream(req)
     };
 
-    let sub_a = open(&a, "", None).await.unwrap();
+    let sub_a = open(&a, "", None).await;
     assert_eq!(sub_a.status(), StatusCode::OK);
-    let sub_user = open(&user, "", None).await.unwrap();
+    let sub_user = open(&user, "", None).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     user.send(json!({ "to": ["b"], "subject": "1", "body": "" }))
         .await;
@@ -1139,7 +1140,7 @@ async fn events_sse(srv: Server) {
 
     // Replay after Last-Event-ID; reading a message also produces an event.
     a.ok(Method::GET, &format!("/messages/{m}"), None).await;
-    let ev = sse_collect(open(&user, "", Some(&first_id)).await.unwrap(), 2).await;
+    let ev = sse_collect(open(&user, "", Some(&first_id)).await, 2).await;
     assert_eq!(
         ev.iter().map(|e| e.1.clone()).collect::<Vec<_>>(),
         vec![
@@ -1157,10 +1158,10 @@ async fn events_sse(srv: Server) {
             .into(),
         ..user.clone()
     };
-    let ev = sse_collect(open(&node, "?seat=a", Some(&first_id)).await.unwrap(), 2).await;
+    let ev = sse_collect(open(&node, "?seat=a", Some(&first_id)).await, 2).await;
     assert!(ev.iter().all(|e| e.1["seat"] == "a"));
     // Unknown Last-Event-ID: snapshot of every seat's counter.
-    let ev = sse_collect(open(&user, "", Some("stale-1")).await.unwrap(), 3).await;
+    let ev = sse_collect(open(&user, "", Some("stale-1")).await, 3).await;
     let mut snap: Vec<Value> = ev.into_iter().map(|e| e.1).collect();
     snap.sort_by_key(|v| v["seat"].as_str().unwrap().to_string());
     assert_eq!(
@@ -1173,7 +1174,7 @@ async fn events_sse(srv: Server) {
     );
     // A seat token cannot subscribe to another seat.
     assert_eq!(
-        open(&a, "?seat=b", None).await.unwrap().status(),
+        open(&a, "?seat=b", None).await.status(),
         StatusCode::FORBIDDEN
     );
 }
@@ -1545,20 +1546,18 @@ async fn presence_reports(srv: Server) {
     let a = user.seat("a").await;
     let _b = user.seat("b").await;
     let node = node_token(&user).await;
-    let events = srv
-        .http
-        .get(format!("{}/v1/events", srv.base))
-        .bearer_auth(&user.token)
-        .send()
-        .await
-        .unwrap();
-    let seat_events = srv
-        .http
-        .get(format!("{}/v1/events", srv.base))
-        .bearer_auth(&a.token)
-        .send()
-        .await
-        .unwrap();
+    let events = common::open_stream(
+        common::stream_client()
+            .get(format!("{}/v1/events", srv.base))
+            .bearer_auth(&user.token),
+    )
+    .await;
+    let seat_events = common::open_stream(
+        common::stream_client()
+            .get(format!("{}/v1/events", srv.base))
+            .bearer_auth(&a.token),
+    )
+    .await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     let r = node
         .ok(

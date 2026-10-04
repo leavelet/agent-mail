@@ -15,7 +15,7 @@ macro_rules! node_tests {
             $(
                 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
                 async fn $name() {
-                    super::$name(amail_store::testutil::Backend::Sqlite).await;
+                    crate::common::deadline(stringify!($name), super::$name(amail_store::testutil::Backend::Sqlite)).await;
                 }
             )*
         }
@@ -23,7 +23,7 @@ macro_rules! node_tests {
             $(
                 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
                 async fn $name() {
-                    super::$name(amail_store::testutil::Backend::Postgres).await;
+                    crate::common::deadline(stringify!($name), super::$name(amail_store::testutil::Backend::Postgres)).await;
                 }
             )*
         }
@@ -1156,13 +1156,19 @@ struct Sse {
 impl Sse {
     async fn open(api: &Api, path: &str) -> Sse {
         use futures::StreamExt;
-        let r = api
-            .http
-            .get(format!("{}/v1{path}", api.base))
-            .bearer_auth(&api.token)
-            .send()
-            .await
-            .unwrap();
+        // A client of its own: the HTTP/1 client can put a connection back
+        // into its pool while the answer's body is still being read, and a
+        // request behind an event stream would wait for ever.
+        let r = tokio::time::timeout(
+            Duration::from_secs(30),
+            reqwest::Client::new()
+                .get(format!("{}/v1{path}", api.base))
+                .bearer_auth(&api.token)
+                .send(),
+        )
+        .await
+        .expect("no answer to a stream request within 30 s")
+        .unwrap();
         assert!(r.status().is_success(), "GET {path}: {}", r.status());
         Sse {
             stream: r.bytes_stream().map(|c| c.map(|b| b.to_vec())).boxed(),
