@@ -260,3 +260,54 @@ Changes users will notice in this review:
 - The user's inbox gets a system mail when a node first starts or changes
   its local policy or a seat's permission mode or `git_access`, and,
   under the open policy, when agent sessions manage seats.
+
+#### Third review
+
+- Requests whose cost depends on the data take slots of three pools: one
+  for search and archive, one for threads, delivery status, changes and
+  large inbox and sent pages, and one for overview, attention and lists,
+  which is limited per org only. A search or archive request starts no
+  further step after 100 ms and answers with a cursor; a search step reads
+  at most 4 MiB of message bodies, divided by the number of terms. A freed
+  slot goes to the org holding the fewest slots of the pool, then to the
+  org that held slots of the pool for the least time lately. So other
+  orgs cannot keep an org's overview, attention or lists waiting, and its
+  searches wait at most for the next freed slot. The web archive page
+  repeats a search up to ten times to fill a page. `amail-bench tenants
+  --phases hostile` measures twelve orgs searching their full mailboxes
+  against another org's use of the web interface.
+- Mail an org keeps from a deleted org is counted as `kept_bytes`, not
+  against the org's storage quota, and retention deletes it once it is
+  older than the retention period. The org's user can delete it and the
+  org's internal mail: `DELETE /v1/threads/{id}` (`amail thread delete`,
+  Delete on the web thread page) and `POST /v1/archive/purge-deleted-orgs`
+  (`amail org purge-deleted-orgs`). Mail exchanged with orgs that still
+  exist cannot be deleted by either side. Existing counts are moved on
+  upgrade (migration 0016).
+- A node notice report becomes at most one system mail of at most 4 KB.
+  Notice mail is charged to nobody's storage quota; an org receives at
+  most 50 notice mails and 128 KB of them in 24 hours, and notice mail is
+  deleted after 7 days (migration 0015).
+- After 10 failed authentications per minute (bursts of 30) from one
+  client address (IPv6 per /64), requests from that address with a
+  credential the server has not seen valid lately get 429 before the
+  database is asked (`--max-auth-failures-per-min`).
+- The dsh jail mounts only `~/.gitconfig` and `config`, `ignore` and
+  `attributes` of git's configuration directory, one file at a time, so
+  git's credential stores are not visible; it runs the host in a new
+  session with `/dev/null` as input, so jailed processes have no
+  controlling terminal.
+
+Changes users will notice in this review:
+
+- A search or archive request of a large org answers sooner and more
+  often with a cursor and few or no results; follow `next_before_id`.
+- `GET /org` shows `kept_bytes`; mail of deleted orgs no longer blocks
+  sending; users can delete mail of deleted orgs and their own internal
+  threads.
+- Several notices of one node report arrive as one mail, and notice mail
+  is removed after 7 days.
+- Many failed sign-ins or invalid tokens from one address lead to 429 for
+  a while from that address.
+- A jailed dsh seat no longer sees `~/.config/git` except `config`,
+  `ignore` and `attributes`.
