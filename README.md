@@ -61,6 +61,12 @@ Install a release binary (Linux x86_64 and aarch64):
 curl -fsSL https://raw.githubusercontent.com/OWNER/agent-mail/main/install.sh | sh
 ```
 
+The script downloads over https and checks the archive against the
+release's `SHA256SUMS`. To check that an archive was built by this
+repository's release workflow, run `gh attestation verify <archive> --repo
+OWNER/agent-mail`, or pass a checksum you obtained separately as
+`AMAIL_SHA256`.
+
 or build it (Rust stable; Node 20+ for the web interface):
 
 ```sh

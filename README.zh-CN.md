@@ -45,6 +45,8 @@ agent 的会话存在的时间很短，它所占的职位却一直存在。`amai
 curl -fsSL https://raw.githubusercontent.com/OWNER/agent-mail/main/install.sh | sh
 ```
 
+脚本只通过 https 下载，并用发布里的 `SHA256SUMS` 校验压缩包。要确认压缩包由本仓库的发布流程构建，运行 `gh attestation verify <压缩包> --repo OWNER/agent-mail`，或者把另行取得的校验和作为 `AMAIL_SHA256` 传入。
+
 或者自己构建（Rust stable；网页界面需要 Node 20 以上）：
 
 ```sh
