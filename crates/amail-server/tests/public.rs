@@ -2054,12 +2054,12 @@ async fn link_requests_expire(b: Backend, t: &str) {
     // Everything was made more than LINK_REQUEST_DAYS ago.
     let age = (amail_proto::limits::LINK_REQUEST_DAYS + 1) * 86_400_000;
     srv.db
-        .exec(&format!("UPDATE links SET created_at = created_at - {age}"))
+        .exec(&[format!("UPDATE links SET created_at = created_at - {age}")])
         .await;
     srv.db
-        .exec(&format!(
+        .exec(&[format!(
             "UPDATE link_requests SET created_at = created_at - {age}"
-        ))
+        )])
         .await;
     srv.db.store.cleanup().await.unwrap();
     // The active link stays; both pending requests are gone.

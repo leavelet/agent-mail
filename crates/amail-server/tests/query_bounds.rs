@@ -339,8 +339,9 @@ async fn concurrent_queries_are_limited(b: Backend, t: &str) {
     let srv = start!(b, t, cfg);
     let big = srv.org("big").await;
     srv.fill("big", BIG, "filler").await;
+    // More than one slot can serve while the others wait for one.
     let mut tasks = Vec::new();
-    for _ in 0..8 {
+    for _ in 0..32 {
         let c = big.clone();
         tasks.push(tokio::spawn(async move {
             c.call(Method::GET, "/archive/search?q=zzzz", None).await

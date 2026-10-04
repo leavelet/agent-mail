@@ -70,13 +70,17 @@ resumes them when mail arrives. See [team files](teams.md).
    `/v1/messages`. The server checks the sender's token, budget, addresses,
    links and list policies, expands lists, and in one transaction stores the
    message and one delivery per recipient seat, each with the seat's next
-   sequence number. It answers with the recipients and notes on who will
-   not see it at once.
+   sequence number. In the same transaction, triggers in the database add
+   to each recipient seat's pending and unread counters and record which
+   orgs and seats take part in the thread. It answers with the recipients
+   and notes on who will not see it at once.
 2. **Event.** After the commit, the server publishes a mailbox event
    (org, seat, counter) to the org's event streams. With several instances
    it also sends it to the other instances (Postgres `NOTIFY`).
 3. **Node.** The node of the host running `be-1` receives the event and
    refreshes the seat's pending counts (events are coalesced for 30 ms).
+   The server reads them from the seat's counters, not from its
+   deliveries.
 4. **Busy session.** If `be-1` is in a turn, its next hook asks the node.
    On `PostToolUse` (after each tool call) only `to` and urgent mail is
    taken; on `UserPromptSubmit` all classes; on `Stop` the node keeps the

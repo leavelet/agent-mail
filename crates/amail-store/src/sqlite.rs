@@ -306,15 +306,19 @@ SELECT m.id, m.thread_id, d.seat_id, d.org_id, d.seq
  ORDER BY d.seat_id";
 
 /// Binds: $1..$8 as `claim_select!` ($8: the idempotency key or NULL), $9
-/// now, $10 via, $11 read_body_max (-1: none). The candidates are numbered
+/// now, $10 via, $11 read_body_max (-1: none). The gate comes first in a
+/// `CROSS JOIN` (SQLite keeps that order), so that when the seat's counters
+/// say nothing can match, no delivery is read. The candidates are numbered
 /// 1..n in `temp.claim_ids` (seq order) and get mod_seq lo+1..lo+n. With a
 /// key the seat used before, nothing is claimed and that claim's deliveries
 /// are returned (the writer is the only one, so the check cannot race).
 const CLAIM_SQL: &str = concat!(
     "DELETE FROM temp.claim_ids;
-INSERT INTO temp.claim_ids (id) ",
+INSERT INTO temp.claim_ids (id) SELECT c.id FROM (",
+    claim_gate!(),
+    ") gate CROSS JOIN (",
     claim_select!(),
-    ";
+    ") c ORDER BY (SELECT seq FROM deliveries WHERE id = c.id);
 UPDATE seats SET last_seq = last_seq + (SELECT COUNT(*) FROM temp.claim_ids) WHERE id = $1;
 UPDATE deliveries SET notified_at = $9, notified_via = $10,
        read_at = CASE WHEN $11 >= 0

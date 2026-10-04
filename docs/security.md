@@ -424,6 +424,7 @@ Rate and stream limits are counted per server instance.
 | Mail stored per org | 1 GiB (*public*): every message the org sent counts its subject, body, `meta` and addresses plus 512 bytes, and 384 bytes per delivery (one per recipient seat, so a list counts once per member); mail of deleted orgs counts against the orgs that keep it; retention gives back the bytes of cleared bodies; a send over it is refused with 507 `storage_quota`, and an org at its quota can send nothing, not even an empty message |
 | Messages over all orgs | 500 per second (*public*) |
 | Requests per token or browser session | 200 per second, bursts of 400 (*public*); sign-ins count too |
+| Requests per org, all its tokens and browser sessions together | 500 per second, bursts of 1,000 (*public*); once the server knows a token's org, a request over the limit is refused before the database is asked |
 | Registration attempts per client address (IPv6: per /64 network) | 10 per hour, bursts of 5, failed ones included (*public*); in addition, all /64 networks of one IPv6 /48 together get 4 times that (40 per hour, bursts of 20), checked first |
 | Link requests per org | 20 per hour, bursts of 5 (*public*) |
 | Pending outgoing link requests per org | 1,000; a request not accepted within 30 days is dropped |
@@ -439,10 +440,11 @@ Rate and stream limits are counted per server instance.
 | `GET /archive/messages`, `GET /sent` page | 50 by default, at most 500, and at most 2 MiB |
 | `GET /archive/search` | 50 results by default, at most 200, and at most 2 MiB; at most 10 terms; each request looks at the org's 50,000 newest messages before its cursor (2,000 when a term is shorter than 3 characters) |
 | Messages one archive request looks at | 50,000 of the org's own, newest first (or of the thread, with `thread=`); then it answers with `next_before_id`. Filters by one of the org's seats (`from=`, `to=`) read that seat's mail directly |
-| Search and archive requests per org in progress | 4 (*public*); further ones get 429 `too_many_queries` |
-| One search, archive or thread query | 10 s, then it is cancelled (503 `query_timeout`) |
-| `GET /attention` | 500 items and 2 MiB |
-| `GET /threads/{id}` | the newest 500 messages and at most 2 MiB of headers (`truncated` says when older ones were left out); message bodies up to 1 MiB in total, newest first; the others come with `body_omitted` and are read one at a time with `GET /messages/{id}` |
+| Requests whose database cost depends on the data, in progress: search, archive, `GET /threads/{id}`, `/attention`, `/overview`, `/messages/{id}/status`, `/lists`, `/lists/{name}`, `/changes`, and `/inbox` and `/sent` pages of more than 100 | 1 per org and 8 over all orgs (*public*); a request waits up to 1 s for a slot, then gets 429 `too_many_queries`. A slot is held until the database work ends, also when the client gave up |
+| One query of those requests | 10 s, then it is cancelled (503 `query_timeout`) |
+| `GET /pending`, `GET /counts` | read per-seat counters, which the database keeps in the transactions that change deliveries; their cost does not depend on the number of deliveries |
+| `GET /attention` | looks at the user seat's newest 5,000 deliveries; 500 items and 2 MiB |
+| `GET /threads/{id}` | whether the caller sees the thread is checked first, with index lookups, so a thread the caller cannot see costs what a missing one does; then the newest 500 messages and at most 2 MiB of headers (`truncated` says when older ones were left out); message bodies up to 1 MiB in total, newest first; the others come with `body_omitted` and are read one at a time with `GET /messages/{id}` |
 | `GET /seats` | a seat's role is cut to its first 1,000 characters (`role_truncated`); `GET /seats/{name}` has all of it |
 | List members | 1,000 per list |
 | Event replay buffer (`Last-Event-ID`) | 4,096 events per org; a subscriber more than 1,024 events behind is disconnected and resynchronizes |

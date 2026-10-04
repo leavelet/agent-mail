@@ -236,6 +236,8 @@ async fn send_inner(
         }
         e => e.into(),
     })?;
+    st.activity
+        .record(std::iter::once(org.id).chain(sent.seqs.iter().map(|b| b.org_id)));
 
     let mut by_org: HashMap<i64, Vec<(String, i64)>> = HashMap::new();
     for b in &sent.seqs {

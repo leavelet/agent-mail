@@ -114,16 +114,32 @@ macro_rules! entry_select_body {
 /// Binds: seat_id, mode mask (1 immediate, 2 digest), to, cc, list,
 /// urgent_only, limit, and an idempotency key: when the seat already used
 /// that key, nothing is a candidate (SQLite; Postgres binds NULL and checks
-/// the key first).
+/// the key first). The seat's counters are checked first (`claim_gate!`;
+/// Postgres evaluates it once, before reading deliveries), so a claim of a
+/// kind of mail the seat has none of pending reads no deliveries.
 macro_rules! claim_select {
     () => {
-        "SELECT d.id FROM deliveries d JOIN messages m ON m.id = d.message_id \
-         WHERE d.seat_id = $1 AND d.notified_at IS NULL \
-         AND ((($2 & 1) <> 0 AND d.mode = 'immediate') OR (($2 & 2) <> 0 AND d.mode = 'digest')) \
+        concat!(
+            "SELECT d.id FROM deliveries d JOIN messages m ON m.id = d.message_id \
+         WHERE d.seat_id = $1 AND d.notified_at IS NULL AND EXISTS (",
+            claim_gate!(),
+            ") AND ((($2 & 1) <> 0 AND d.mode = 'immediate') OR (($2 & 2) <> 0 AND d.mode = 'digest')) \
          AND (($3 AND d.class = 'to') OR ($4 AND d.class = 'cc') OR ($5 AND d.class = 'list')) \
          AND (NOT $6 OR m.priority = 'urgent') \
          AND NOT EXISTS (SELECT 1 FROM claim_keys k WHERE k.seat_id = $1 AND k.key = $8) \
          ORDER BY d.seq LIMIT $7"
+        )
+    };
+}
+
+/// The seat (`$1`) if its counters say it has deliveries pending that a
+/// claim with these binds (see `claim_select!`) could take.
+macro_rules! claim_gate {
+    () => {
+        "SELECT 1 FROM seats g WHERE g.id = $1 AND ( \
+         (($2 & 1) <> 0 AND (($3 AND g.pending_to > 0) OR ($4 AND g.pending_cc > 0) \
+           OR ($5 AND g.pending_list > 0)) AND (NOT $6 OR g.pending_urgent > 0)) \
+         OR (($2 & 2) <> 0 AND g.pending_digest > 0))"
     };
 }
 
@@ -1056,13 +1072,11 @@ macro_rules! impl_store_common {
                 r.map(SeatRow::into_seat).transpose()
             }
 
+            /// From the seats' counters (kept by triggers on `deliveries`).
             pub async fn counts(c: &mut Conn, org_id: i64, seat_id: Option<i64>) -> Result<Vec<CountRec>> {
                 let rows: Vec<(i64, String, i64, i64, i64, Option<i64>)> = sqlx::query_as(
-                    "SELECT s.id, s.name, s.last_seq, \
-                     (SELECT COUNT(*) FROM deliveries d WHERE d.seat_id = s.id AND d.read_at IS NULL \
-                       AND d.mode <> 'archive') AS unread, \
-                     (SELECT COUNT(*) FROM deliveries d WHERE d.seat_id = s.id AND d.notified_at IS NULL \
-                       AND d.mode = 'immediate') AS pending, s.focus_until \
+                    "SELECT s.id, s.name, s.last_seq, s.unread, \
+                     s.pending_to + s.pending_cc + s.pending_list AS pending, s.focus_until \
                      FROM seats s WHERE s.org_id = $1 AND s.deleted_at IS NULL AND ($2 IS NULL OR s.id = $2) \
                      ORDER BY s.name",
                 )
@@ -1081,19 +1095,27 @@ macro_rules! impl_store_common {
             /// Deliveries to the user seat that wait for the user: ack
             /// requested and not given, or unread `to` mail (directly or
             /// through a list in To, immediate mode) the user has not
-            /// answered (sent nothing later in the thread).
+            /// answered (sent nothing later in the thread). Only the seat's
+            /// newest [`amail_proto::limits::MAX_ATTENTION_SCAN`] deliveries
+            /// are looked at; each is checked with index lookups.
             pub async fn attention(c: &mut Conn, user_seat_id: i64, limit: i64) -> Result<Vec<Entry>> {
                 let rows: Vec<EntryRow> = sqlx::query_as(concat!(
-                    entry_select!(),
-                    " WHERE d.seat_id = $1 AND d.mode <> 'archive' AND m.sender_seat_id <> $1 AND ( \
+                    "SELECT ", deliv_cols!(), ", ", msg_cols!(), ", '' AS body FROM \
+                     (SELECT * FROM deliveries WHERE seat_id = $1 ORDER BY seq DESC LIMIT $3) d",
+                    deliv_joins!(),
+                    " JOIN messages m ON m.id = d.message_id",
+                    msg_joins!(),
+                    " WHERE d.mode <> 'archive' AND m.sender_seat_id <> $1 AND ( \
                        (m.ack_required AND d.acked_at IS NULL) \
-                       OR (d.class = 'to' AND d.mode = 'immediate' AND d.read_at IS NULL AND NOT EXISTS ( \
-                           SELECT 1 FROM messages r WHERE r.thread_id = m.thread_id \
-                           AND r.sender_seat_id = $1 AND r.id > m.id))) \
+                       OR (d.class = 'to' AND d.mode = 'immediate' AND d.read_at IS NULL AND ( \
+                           SELECT r.id FROM messages r WHERE r.thread_id = m.thread_id AND r.org_id = ds.org_id \
+                           AND r.sender_seat_id = $1 AND r.id > m.id \
+                           ORDER BY r.thread_id, r.org_id, r.sender_seat_id, r.id LIMIT 1) IS NULL)) \
                      ORDER BY d.seq LIMIT $2"
                 ))
                 .bind(user_seat_id)
                 .bind(limit)
+                .bind(amail_proto::limits::MAX_ATTENTION_SCAN)
                 .fetch_all(&mut *c)
                 .await?;
                 collect(rows, EntryRow::into_entry)
@@ -1110,23 +1132,38 @@ macro_rules! impl_store_common {
                 .await?)
             }
 
-            pub async fn message_count(c: &mut Conn, org_id: i64, since: i64) -> Result<i64> {
-                // The org's ids from the window start on (each from its
-                // index), counted up to the scan bound.
-                let Some(lo) = id_at(c, since - ID_TIME_MARGIN_MS).await? else {
-                    return Ok(0);
-                };
-                Ok(sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM (SELECT v.id FROM (SELECT id FROM messages WHERE org_id = $1 AND id >= $2 \
-                     UNION SELECT message_id FROM deliveries WHERE org_id = $1 AND message_id >= $2) v \
-                     LIMIT $4) w JOIN messages m ON m.id = w.id WHERE m.created_at >= $3",
+            /// Messages the org sent or received from minute `since` on (see
+            /// `org_activity`).
+            pub async fn activity(c: &mut Conn, org_id: i64, since: i64) -> Result<i64> {
+                let n: Option<i64> = sqlx::query_scalar(
+                    "SELECT CAST(SUM(messages) AS BIGINT) FROM org_activity WHERE org_id = $1 AND minute >= $2",
                 )
                 .bind(org_id)
-                .bind(lo)
                 .bind(since)
-                .bind(MAX_SCAN_MESSAGES)
                 .fetch_one(&mut *c)
-                .await?)
+                .await?;
+                Ok(n.unwrap_or(0))
+            }
+
+            /// Add `(org, minute, messages)` counts, in key order (two
+            /// instances adding at once cannot deadlock).
+            pub async fn add_activity(c: &mut Conn, counts: &[(i64, i64, i64)]) -> Result<()> {
+                let mut v = counts.to_vec();
+                v.sort_unstable();
+                for chunk in v.chunks(300) {
+                    let rows: Vec<String> = (0..chunk.len()).map(|i| format!("({})", placeholders(i * 3 + 1, 3))).collect();
+                    let sql = format!(
+                        "INSERT INTO org_activity (org_id, minute, messages) VALUES {} \
+                         ON CONFLICT (org_id, minute) DO UPDATE SET messages = org_activity.messages + excluded.messages",
+                        rows.join(", ")
+                    );
+                    let mut q = sqlx::query(&sql);
+                    for (org, minute, n) in chunk {
+                        q = q.bind(*org).bind(*minute).bind(*n);
+                    }
+                    q.execute(&mut *c).await?;
+                }
+                Ok(())
             }
 
             /// The window of the (at most) `n` newest messages visible to
@@ -1541,17 +1578,39 @@ macro_rules! impl_store_common {
                 Ok(r.is_some())
             }
 
+            /// One lookup in `thread_seats` and one in `messages_thread_sender`.
+            /// (Each as a subquery ordered like its index, so that both
+            /// planners read the index whatever their statistics say.)
             pub async fn seat_in_thread(c: &mut Conn, seat_id: i64, thread_id: i64) -> Result<bool> {
-                let r: Option<i64> = sqlx::query_scalar(
-                    "SELECT CAST(1 AS BIGINT) FROM messages WHERE thread_id = $1 AND sender_seat_id = $2 \
-                     UNION ALL SELECT CAST(1 AS BIGINT) FROM deliveries d JOIN messages m ON m.id = d.message_id \
-                     WHERE m.thread_id = $1 AND d.seat_id = $2 LIMIT 1",
+                let r: (Option<i64>, Option<i64>) = sqlx::query_as(
+                    "SELECT (SELECT t.seat_id FROM thread_seats t, seats s WHERE s.id = $2 \
+                             AND t.thread_id = $1 AND t.org_id = s.org_id AND t.seat_id = $2 \
+                             ORDER BY t.thread_id, t.org_id, t.seat_id LIMIT 1), \
+                            (SELECT m.id FROM messages m, seats s WHERE s.id = $2 \
+                             AND m.thread_id = $1 AND m.org_id = s.org_id AND m.sender_seat_id = $2 \
+                             ORDER BY m.thread_id, m.org_id, m.sender_seat_id, m.id LIMIT 1)",
                 )
                 .bind(thread_id)
                 .bind(seat_id)
-                .fetch_optional(&mut *c)
+                .fetch_one(&mut *c)
                 .await?;
-                Ok(r.is_some())
+                Ok(r.0.is_some() || r.1.is_some())
+            }
+
+            /// Whether the org sent or received a message of the thread: one
+            /// lookup in `thread_seats` and one in `messages_thread_sender`.
+            pub async fn org_sees_thread(c: &mut Conn, org_id: i64, thread_id: i64) -> Result<bool> {
+                let r: (Option<i64>, Option<i64>) = sqlx::query_as(
+                    "SELECT (SELECT seat_id FROM thread_seats WHERE thread_id = $1 AND org_id = $2 \
+                             ORDER BY thread_id, org_id, seat_id LIMIT 1), \
+                            (SELECT id FROM messages WHERE thread_id = $1 AND org_id = $2 \
+                             ORDER BY thread_id, org_id, sender_seat_id, id LIMIT 1)",
+                )
+                .bind(thread_id)
+                .bind(org_id)
+                .fetch_one(&mut *c)
+                .await?;
+                Ok(r.0.is_some() || r.1.is_some())
             }
 
             pub async fn delivery(c: &mut Conn, message_id: i64, seat_id: i64) -> Result<Option<DeliveryRec>> {
@@ -1567,6 +1626,10 @@ macro_rules! impl_store_common {
             }
 
             pub async fn thread(c: &mut Conn, thread_id: i64, org_id: i64, limit: i64, body_bytes: usize) -> Result<Vec<ThreadMessage>> {
+                // A thread the org cannot see costs what a missing one does.
+                if !org_sees_thread(c, org_id, thread_id).await? {
+                    return Ok(Vec::new());
+                }
                 let w = thread_window(c, thread_id, i64::MAX, MAX_SCAN_MESSAGES).await?;
                 let Some(lo) = w.lo else {
                     return Ok(Vec::new());
@@ -1617,33 +1680,29 @@ macro_rules! impl_store_common {
                 Ok(out)
             }
 
+            /// With `unread_only`, the query names `read_at IS NULL` itself, so
+            /// that it reads the `deliveries_unread` index and its cost
+            /// follows the page size, not the seat's read mail.
             pub async fn inbox(c: &mut Conn, seat_id: i64, q: &InboxQuery) -> Result<Vec<Entry>> {
+                let unread = if q.unread_only { " AND d.read_at IS NULL" } else { "" };
                 let rows: Vec<EntryRow> = if let Some(before) = q.before_seq {
-                    let mut rows: Vec<EntryRow> = sqlx::query_as(concat!(
-                        entry_select!(),
-                        " WHERE d.seat_id = $1 AND d.seq < $2 AND (NOT $3 OR d.read_at IS NULL) \
-                         ORDER BY d.seq DESC LIMIT $4"
-                    ))
-                    .bind(seat_id)
-                    .bind(before)
-                    .bind(q.unread_only)
-                    .bind(q.limit)
-                    .fetch_all(&mut *c)
-                    .await?;
+                    let sql = format!("{} WHERE d.seat_id = $1 AND d.seq < $2{unread} ORDER BY d.seq DESC LIMIT $3", entry_select!());
+                    let mut rows: Vec<EntryRow> = sqlx::query_as(&sql)
+                        .bind(seat_id)
+                        .bind(before)
+                        .bind(q.limit)
+                        .fetch_all(&mut *c)
+                        .await?;
                     rows.reverse();
                     rows
                 } else {
-                    sqlx::query_as(concat!(
-                        entry_select!(),
-                        " WHERE d.seat_id = $1 AND d.seq > $2 AND (NOT $3 OR d.read_at IS NULL) \
-                         ORDER BY d.seq LIMIT $4"
-                    ))
-                    .bind(seat_id)
-                    .bind(q.after_seq.unwrap_or(0))
-                    .bind(q.unread_only)
-                    .bind(q.limit)
-                    .fetch_all(&mut *c)
-                    .await?
+                    let sql = format!("{} WHERE d.seat_id = $1 AND d.seq > $2{unread} ORDER BY d.seq LIMIT $3", entry_select!());
+                    sqlx::query_as(&sql)
+                        .bind(seat_id)
+                        .bind(q.after_seq.unwrap_or(0))
+                        .bind(q.limit)
+                        .fetch_all(&mut *c)
+                        .await?
                 };
                 collect(rows, EntryRow::into_entry)
             }
@@ -1957,21 +2016,15 @@ macro_rules! impl_store_common {
                 Ok(n > 0)
             }
 
+            /// From the seats' counters (kept by triggers on `deliveries`).
             pub async fn pending(c: &mut Conn, org_id: i64, seat_id: Option<i64>) -> Result<Vec<PendingRec>> {
                 let rows: Vec<PendingRow> = sqlx::query_as(
                     "SELECT s.id AS seat_id, s.name AS seat_name, s.kind, s.last_seq, s.focus_until, \
-                     COALESCE(SUM(CASE WHEN d.mode = 'immediate' AND d.class = 'to' THEN 1 ELSE 0 END), 0) AS to_n, \
-                     COALESCE(SUM(CASE WHEN d.mode = 'immediate' AND d.class = 'cc' THEN 1 ELSE 0 END), 0) AS cc_n, \
-                     COALESCE(SUM(CASE WHEN d.mode = 'immediate' AND d.class = 'list' THEN 1 ELSE 0 END), 0) AS list_n, \
-                     COALESCE(SUM(CASE WHEN d.mode = 'immediate' AND m.priority = 'urgent' THEN 1 ELSE 0 END), 0) AS urgent_n, \
-                     COALESCE(SUM(CASE WHEN d.mode = 'digest' THEN 1 ELSE 0 END), 0) AS digest_n, \
-                     MIN(CASE WHEN d.mode = 'digest' THEN m.created_at END) AS digest_since \
-                     FROM seats s \
-                     LEFT JOIN deliveries d ON d.seat_id = s.id AND d.notified_at IS NULL \
-                       AND d.mode IN ('immediate', 'digest') \
-                     LEFT JOIN messages m ON m.id = d.message_id \
-                     WHERE s.org_id = $1 AND s.deleted_at IS NULL AND ($2 IS NULL OR s.id = $2) \
-                     GROUP BY s.id, s.name, s.kind, s.last_seq, s.focus_until ORDER BY s.name",
+                     s.pending_to AS to_n, s.pending_cc AS cc_n, s.pending_list AS list_n, \
+                     s.pending_urgent AS urgent_n, s.pending_digest AS digest_n, \
+                     s.pending_digest_since AS digest_since \
+                     FROM seats s WHERE s.org_id = $1 AND s.deleted_at IS NULL AND ($2 IS NULL OR s.id = $2) \
+                     ORDER BY s.name",
                 )
                 .bind(org_id)
                 .bind(seat_id)
@@ -2221,6 +2274,10 @@ macro_rules! impl_store_common {
                 sqlx::query("DELETE FROM link_requests WHERE created_at < $1").bind(cutoff).execute(&mut *c).await?;
                 sqlx::query("DELETE FROM links WHERE state IN ('requested', 'invited') AND created_at < $1")
                     .bind(cutoff)
+                    .execute(&mut *c)
+                    .await?;
+                sqlx::query("DELETE FROM org_activity WHERE minute < $1")
+                    .bind((now - 2 * 86_400_000) / 60_000)
                     .execute(&mut *c)
                     .await?;
                 Ok(())
@@ -2635,6 +2692,15 @@ macro_rules! impl_store_common {
                             .await?;
                     }
                 }
+                // Deleting its deliveries changes its seats' counters
+                // (triggers): take the seats in id order first, as sending
+                // does, so that a concurrent send cannot deadlock with this.
+                if matches!(DIALECT, Dialect::Postgres) {
+                    sqlx::query("SELECT id FROM seats WHERE org_id = $1 ORDER BY id FOR NO KEY UPDATE")
+                        .bind(org_id)
+                        .execute(&mut *c)
+                        .await?;
+                }
                 // Its deliveries go; their senders are no longer charged
                 // for them (counted on the rows actually deleted, so a send
                 // committed meanwhile on Postgres is counted right).
@@ -2674,7 +2740,7 @@ macro_rules! impl_store_common {
                 }
                 // After its deliveries are gone, the mail it sent that no
                 // other org received has no deliveries left.
-                let steps: [&str; 17] = [
+                let steps: [&str; 19] = [
                     "DELETE FROM web_sessions WHERE token_id IN (SELECT id FROM tokens WHERE org_id = $1)",
                     "DELETE FROM tokens WHERE org_id = $1",
                     "DELETE FROM claim_keys WHERE seat_id IN (SELECT id FROM seats WHERE org_id = $1)",
@@ -2683,6 +2749,8 @@ macro_rules! impl_store_common {
                     "DELETE FROM mirror_watch WHERE org_id = $1",
                     "DELETE FROM node_streams WHERE org_id = $1",
                     "UPDATE messages SET ack_due = NULL WHERE org_id = $1 AND ack_due IS NOT NULL",
+                    "DELETE FROM thread_seats WHERE org_id = $1",
+                    "DELETE FROM org_activity WHERE org_id = $1",
                     "UPDATE messages SET parent_id = NULL WHERE parent_id IN (SELECT id FROM messages \
                      WHERE org_id = $1 AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = messages.id))",
                     "DELETE FROM messages WHERE org_id = $1 \
@@ -3067,7 +3135,7 @@ macro_rules! impl_store_common {
             }
 
             async fn lists(&self, org_id: i64) -> $crate::Result<Vec<$crate::List>> {
-                run!(self.read, |c| q::lists(c, org_id).await)
+                run!(self.read_query, |c| q::lists(c, org_id).await)
             }
 
             async fn delete_list(&self, org_id: i64, name: &str) -> $crate::Result<()> {
@@ -3139,6 +3207,10 @@ macro_rules! impl_store_common {
                 run!(self.read, |c| q::seat_in_thread(c, seat_id, thread_id).await)
             }
 
+            async fn org_sees_thread(&self, org_id: i64, thread_id: i64) -> $crate::Result<bool> {
+                run!(self.read, |c| q::org_sees_thread(c, org_id, thread_id).await)
+            }
+
             async fn delivery(&self, message_id: i64, seat_id: i64) -> $crate::Result<Option<$crate::DeliveryRec>> {
                 run!(self.read, |c| q::delivery(c, message_id, seat_id).await)
             }
@@ -3194,7 +3266,7 @@ macro_rules! impl_store_common {
             }
 
             async fn recipients(&self, message_id: i64) -> $crate::Result<Vec<$crate::DeliveryRec>> {
-                run!(self.read, |c| q::recipients(c, message_id).await)
+                run!(self.read_query, |c| q::recipients(c, message_id).await)
             }
 
             async fn archive(&self, org_id: i64, query: &$crate::ArchiveQuery) -> $crate::Result<$crate::ArchivePage> {
@@ -3243,11 +3315,16 @@ macro_rules! impl_store_common {
             }
 
             async fn attention(&self, user_seat_id: i64, limit: i64) -> $crate::Result<Vec<$crate::Entry>> {
-                run!(self.read, |c| q::attention(c, user_seat_id, limit).await)
+                run!(self.read_query, |c| q::attention(c, user_seat_id, limit).await)
             }
 
-            async fn message_count(&self, org_id: i64, since: i64) -> $crate::Result<i64> {
-                run!(self.read_query, |c| q::message_count(c, org_id, since).await)
+            async fn activity(&self, org_id: i64, since_minute: i64) -> $crate::Result<i64> {
+                run!(self.read, |c| q::activity(c, org_id, since_minute).await)
+            }
+
+            async fn add_activity(&self, counts: &[(i64, i64, i64)]) -> $crate::Result<()> {
+                let counts = counts.to_vec();
+                run!(self.write, |c| q::add_activity(c, &counts).await)
             }
 
             async fn search(&self, org_id: i64, query: &$crate::SearchQuery) -> $crate::Result<$crate::SearchResult> {

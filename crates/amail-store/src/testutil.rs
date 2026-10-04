@@ -84,19 +84,53 @@ pub async fn open(backend: Backend, test: &str) -> Option<TestDb> {
 }
 
 impl TestDb {
-    /// Run one SQL statement directly on the database (for tests that must
-    /// change what the store does not let them change, such as timestamps).
-    pub async fn exec(&self, sql: &str) {
+    /// Run SQL statements directly on the database (bulk test data), then
+    /// update the planner's statistics.
+    pub async fn exec(&self, statements: &[String]) {
         if self.url.starts_with("sqlite:") {
             let mut c = sqlx::SqliteConnection::connect(&self.url)
                 .await
                 .expect("connect");
-            sqlx::query(sql).execute(&mut c).await.expect("exec");
+            for s in statements {
+                sqlx::raw_sql(s).execute(&mut c).await.expect(s);
+            }
+            sqlx::raw_sql("ANALYZE")
+                .execute(&mut c)
+                .await
+                .expect("analyze");
         } else {
             let mut c = sqlx::PgConnection::connect(&self.url)
                 .await
                 .expect("connect");
-            sqlx::query(sql).execute(&mut c).await.expect("exec");
+            for s in statements {
+                sqlx::raw_sql(s).execute(&mut c).await.expect(s);
+            }
+            sqlx::raw_sql("ANALYZE")
+                .execute(&mut c)
+                .await
+                .expect("analyze");
+        }
+    }
+
+    /// Rows of a query whose columns are all integers (`BIGINT`), in order.
+    pub async fn rows_i64(&self, sql: &str) -> Vec<Vec<i64>> {
+        use sqlx::Row;
+        if self.url.starts_with("sqlite:") {
+            let mut c = sqlx::SqliteConnection::connect(&self.url)
+                .await
+                .expect("connect");
+            let rows = sqlx::query(sql).fetch_all(&mut c).await.expect(sql);
+            rows.iter()
+                .map(|r| (0..r.len()).map(|i| r.get::<i64, _>(i)).collect())
+                .collect()
+        } else {
+            let mut c = sqlx::PgConnection::connect(&self.url)
+                .await
+                .expect("connect");
+            let rows = sqlx::query(sql).fetch_all(&mut c).await.expect(sql);
+            rows.iter()
+                .map(|r| (0..r.len()).map(|i| r.get::<i64, _>(i)).collect())
+                .collect()
         }
     }
 

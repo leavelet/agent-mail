@@ -139,6 +139,12 @@ pub struct Limiters {
     pub org_send: Option<Buckets<i64>>,
     /// Keyed by `(is_session, id)`: a token id or a browser session's token.
     pub token_requests: Option<Buckets<(u8, i64)>>,
+    /// Requests of each org, all its tokens and sessions together.
+    pub org_requests: Option<Buckets<i64>>,
+    /// The org of each token or session (by hash) seen lately, so that a
+    /// request of an org over its request limit is refused before the
+    /// database is asked who sent it.
+    pub credential_orgs: CredentialOrgs,
     pub link_requests: Option<Buckets<i64>>,
     pub registrations: Option<Buckets<String>>,
     /// Registrations per IPv6 /48 network, checked before the per-address
@@ -153,8 +159,9 @@ pub struct Limiters {
     /// Webhook notices in flight per (receiving org, sending org), for mail
     /// from another org.
     pub webhooks_from: Arc<StreamCount<(i64, i64)>>,
-    /// Search and archive requests in flight per org.
-    pub queries: Arc<StreamCount>,
+    /// Requests whose database cost depends on the data (search, archive,
+    /// threads, ...) in flight, per org and in all.
+    pub queries: QuerySlots,
 }
 
 impl Limiters {
@@ -163,6 +170,8 @@ impl Limiters {
             global_send: l.global_send_per_sec.map(|r| Buckets::new(r, r)),
             org_send: l.org_send_per_sec.map(|r| Buckets::new(r, r)),
             token_requests: l.token_requests_per_sec.map(|r| Buckets::new(r, r * 2.0)),
+            org_requests: l.org_requests_per_sec.map(|r| Buckets::new(r, r * 2.0)),
+            credential_orgs: CredentialOrgs::default(),
             link_requests: l
                 .link_requests_per_hour
                 .map(|n| Buckets::per_hour(n, (n / 4.0).max(1.0))),
@@ -179,7 +188,7 @@ impl Limiters {
             webhooks_from: Arc::new(StreamCount::new(
                 l.org_webhooks_in_flight.map(|n| (n / 4).max(1)),
             )),
-            queries: Arc::new(StreamCount::new(l.org_queries)),
+            queries: QuerySlots::new(l.org_queries, l.queries),
         }
     }
 
@@ -194,6 +203,9 @@ impl Limiters {
         if let Some(b) = &self.token_requests {
             b.prune();
         }
+        if let Some(b) = &self.org_requests {
+            b.prune();
+        }
         if let Some(b) = &self.link_requests {
             b.prune();
         }
@@ -203,6 +215,106 @@ impl Limiters {
         if let Some(b) = &self.registration_nets {
             b.prune();
         }
+        self.queries.prune();
+    }
+}
+
+/// Credential hash -> org, for at most [`MAX_KEYS`] credentials (when full,
+/// it starts over). Only used to refuse early: a request is accepted only
+/// after the database has checked its credential.
+#[derive(Default)]
+pub struct CredentialOrgs {
+    map: Mutex<HashMap<String, i64>>,
+}
+
+impl CredentialOrgs {
+    pub fn get(&self, hash: &str) -> Option<i64> {
+        self.map.lock().unwrap().get(hash).copied()
+    }
+
+    pub fn insert(&self, hash: &str, org_id: i64) {
+        let mut m = self.map.lock().unwrap();
+        if m.len() >= MAX_KEYS && !m.contains_key(hash) {
+            m.clear();
+        }
+        m.insert(hash.to_string(), org_id);
+    }
+}
+
+/// Slots for requests whose database cost depends on the data: at most
+/// `per_org` of one org and `total` of all orgs run at a time. A request
+/// waits up to [`QUERY_SLOT_WAIT`] for a slot.
+pub struct QuerySlots {
+    per_org: Option<usize>,
+    orgs: Mutex<HashMap<i64, Arc<tokio::sync::Semaphore>>>,
+    total: Option<Arc<tokio::sync::Semaphore>>,
+}
+
+/// How long a request waits for a query slot before it is refused.
+pub const QUERY_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A query slot; dropping it frees the slot.
+pub struct QuerySlot {
+    _org: Option<tokio::sync::OwnedSemaphorePermit>,
+    _total: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+/// Which limit refused a query slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotRefused {
+    Org,
+    Total,
+}
+
+impl QuerySlots {
+    pub fn new(per_org: Option<usize>, total: Option<usize>) -> Self {
+        QuerySlots {
+            per_org,
+            orgs: Mutex::new(HashMap::new()),
+            total: total.map(|n| Arc::new(tokio::sync::Semaphore::new(n))),
+        }
+    }
+
+    /// Take a slot for the org, waiting up to [`QUERY_SLOT_WAIT`] in all.
+    pub async fn acquire(&self, org_id: i64) -> Result<QuerySlot, SlotRefused> {
+        let deadline = tokio::time::Instant::now() + QUERY_SLOT_WAIT;
+        let org = match self.per_org {
+            None => None,
+            Some(n) => {
+                let sem = self
+                    .orgs
+                    .lock()
+                    .unwrap()
+                    .entry(org_id)
+                    .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(n)))
+                    .clone();
+                match tokio::time::timeout_at(deadline, sem.acquire_owned()).await {
+                    Ok(Ok(p)) => Some(p),
+                    _ => return Err(SlotRefused::Org),
+                }
+            }
+        };
+        let total = match &self.total {
+            None => None,
+            Some(sem) => match tokio::time::timeout_at(deadline, sem.clone().acquire_owned()).await
+            {
+                Ok(Ok(p)) => Some(p),
+                _ => return Err(SlotRefused::Total),
+            },
+        };
+        Ok(QuerySlot {
+            _org: org,
+            _total: total,
+        })
+    }
+
+    /// Forget orgs with no slot in use.
+    pub fn prune(&self) {
+        let Some(n) = self.per_org else { return };
+        self.orgs
+            .lock()
+            .unwrap()
+            .retain(|_, s| Arc::strong_count(s) > 1 || s.available_permits() < n);
     }
 }
 
@@ -315,6 +427,27 @@ mod tests {
         // emptied keys are still limited.
         let limited = (0..999).filter(|k| b.check(k).is_err()).count();
         assert!(limited >= 900, "{limited}");
+    }
+
+    #[tokio::test]
+    async fn query_slots() {
+        let q = QuerySlots::new(Some(2), Some(3));
+        let a = q.acquire(1).await.unwrap();
+        let _b = q.acquire(1).await.unwrap();
+        assert_eq!(q.acquire(1).await.err(), Some(SlotRefused::Org));
+        let _c = q.acquire(2).await.unwrap();
+        assert_eq!(q.acquire(3).await.err(), Some(SlotRefused::Total));
+        drop(a);
+        assert!(q.acquire(1).await.is_ok());
+        // A slot freed while a request waits goes to that request.
+        let held = q.acquire(1).await.unwrap();
+        let wait = q.acquire(1);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            drop(held);
+        });
+        assert!(wait.await.is_ok());
+        q.prune();
     }
 
     #[test]

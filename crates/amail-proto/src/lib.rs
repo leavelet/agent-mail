@@ -264,10 +264,18 @@ pub mod limits {
     /// first, before it answers with what it found and a cursor
     /// (`next_before_id`) to continue.
     pub const MAX_SCAN_MESSAGES: i64 = 50_000;
+    /// `GET /inbox` and `GET /sent` pages of up to this many entries are
+    /// served without one of the org's query slots; larger pages, and every
+    /// `GET /changes` page, take one.
+    pub const SMALL_PAGE: i64 = 100;
+    /// Deliveries of the user seat that `GET /attention` (and the count in
+    /// `GET /overview`) looks at, newest first.
+    pub const MAX_ATTENTION_SCAN: i64 = 5_000;
     /// Messages a search with a term shorter than three characters looks at.
     pub const SHORT_TERM_SCAN_MESSAGES: i64 = 2_000;
-    /// Postgres cancels a search, archive or thread query that runs longer
-    /// than this (`statement_timeout`); the request fails with 503
+    /// The database cancels a query of the endpoints under the per-org
+    /// query limit (search, archive, threads, attention, delivery status,
+    /// lists) that runs longer than this; the request fails with 503
     /// `query_timeout`.
     pub const QUERY_TIMEOUT_MS: u64 = 10_000;
     /// Members of one list.

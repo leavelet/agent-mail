@@ -314,6 +314,10 @@ struct ServeOpts {
     /// default 200).
     #[arg(long, env = "AMAIL_MAX_TOKEN_REQUESTS_PER_SEC")]
     max_token_requests_per_sec: Option<f64>,
+    /// Requests per second per org, all its tokens and browser sessions
+    /// together, bursts of twice that (public default 500).
+    #[arg(long, env = "AMAIL_MAX_ORG_REQUESTS_PER_SEC")]
+    max_org_requests_per_sec: Option<f64>,
     /// Link requests per hour per org (public default 20).
     #[arg(long, env = "AMAIL_MAX_LINK_REQUESTS_PER_HOUR")]
     max_link_requests_per_hour: Option<f64>,
@@ -329,10 +333,15 @@ struct ServeOpts {
     /// 0: no limit).
     #[arg(long, env = "AMAIL_MAX_ORG_STORAGE_MB")]
     max_org_storage_mb: Option<i64>,
-    /// Search and archive requests per org in progress at the same time
-    /// (public default 4; 0: no limit).
+    /// Search, archive and other requests whose cost depends on the data
+    /// (threads, attention, overview, delivery status, lists) per org in
+    /// progress at the same time (public default 1; 0: no limit).
     #[arg(long, env = "AMAIL_MAX_ORG_QUERIES")]
     max_org_queries: Option<usize>,
+    /// The same over all orgs (public default 8; 0: no limit). Keep it
+    /// below the database pool size (`--max-connections`).
+    #[arg(long, env = "AMAIL_MAX_QUERIES")]
+    max_queries: Option<usize>,
 }
 
 impl ServeOpts {
@@ -382,6 +391,9 @@ impl ServeOpts {
         if let Some(v) = self.max_token_requests_per_sec {
             l.token_requests_per_sec = pos_f(v);
         }
+        if let Some(v) = self.max_org_requests_per_sec {
+            l.org_requests_per_sec = pos_f(v);
+        }
         if let Some(v) = self.max_link_requests_per_hour {
             l.link_requests_per_hour = pos_f(v);
         }
@@ -396,6 +408,9 @@ impl ServeOpts {
         }
         if let Some(v) = self.max_org_queries {
             l.org_queries = (v > 0).then_some(v);
+        }
+        if let Some(v) = self.max_queries {
+            l.queries = (v > 0).then_some(v);
         }
         Ok(c)
     }

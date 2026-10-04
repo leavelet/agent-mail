@@ -113,14 +113,14 @@ session cookie; with the cookie, everything but `GET` needs the header
 | | |
 |---|---|
 | `POST /messages` | send `{to, cc, subject, body, in_reply_to?, priority?, ack_required?, ack_timeout_s?, meta?}`; the answer lists each address with its seat count (and for a list in `To`, `wakes`: its members notified at once) and `notes` on recipients that will not see it at once. 507 `storage_quota` when the message, with one fixed amount per delivery, does not fit in the org's storage quota (always when the org is at its quota) |
-| `GET /inbox` | `seat`, `unread`, `after_seq`, `before_seq`, `limit` (≤ 1000); headers only. A page is at most 2 MiB: when it was cut, `"truncated": true`, and the next page starts after the last entry (with `before_seq`: before the first) |
+| `GET /inbox` | `seat`, `unread`, `after_seq`, `before_seq`, `limit` (≤ 1000); headers only. A page is at most 2 MiB: when it was cut, `"truncated": true`, and the next page starts after the last entry (with `before_seq`: before the first). A page of more than 100 takes one of the org's query slots (see [below](#limits-on-expensive-requests)) |
 | `GET /messages/{id}` | full message; marks the caller's delivery read unless `peek=1` |
 | `POST /messages/{id}/ack` | acknowledge |
 | `POST /messages/{id}/read` | mark the caller's delivery read |
 | `GET /messages/{id}/status` | per-recipient state (the sender and the sender org's user only); seats reached through another org's list, including seats of a third org that the list contains, are counted under the list's address (`members`) |
-| `GET /threads/{id}` | messages of a thread the caller may see, oldest first: at most the newest 500 and 2 MiB of headers, with `"truncated": true` when older ones were left out. Bodies are included newest first up to 1 MiB in total; a message whose body was left out has `"body_omitted": true` and an empty `body`; read it with `GET /messages/{id}?peek=1` |
+| `GET /threads/{id}` | messages of a thread the caller may see, oldest first (404 for a thread the caller cannot see, as for a missing one): at most the newest 500 and 2 MiB of headers, with `"truncated": true` when older ones were left out. Bodies are included newest first up to 1 MiB in total; a message whose body was left out has `"body_omitted": true` and an empty `body`; read it with `GET /messages/{id}?peek=1` |
 | `POST /claim` | `{classes, min_priority?, via, limit?, inline_body_max?, include_digest?, digest_only?, mark_inlined_read?, key?, preview_chars?}`: atomically mark pending deliveries notified and return them; concurrent claims never return the same delivery. `key` (chosen by the caller) makes the claim idempotent: a claim with a key the seat used in the last ten minutes takes nothing new and returns what the first one took. `inline_body_max` and `preview_chars` are capped at 16,384 characters |
-| `GET /changes` | `since` (a sequence number): deliveries created or changed since (`limit` ≤ 5000, at most 2 MiB); continue from `next` while `more` is true |
+| `GET /changes` | `since` (a sequence number): deliveries created or changed since (`limit` ≤ 5000, at most 2 MiB); continue from `next` while `more` is true. Takes one of the org's query slots |
 | `GET /events` | server-sent events: `mailbox` `{"seat","seq"}` per mailbox change (supports `Last-Event-ID`), `presence`, and for node tokens `command` (`{op: "transcript"\|"sleep"\|"wake", seat, lease_ms?, backfill?, node?}`) |
 | `PUT /focus`, `DELETE /focus` | `seat=` (user tokens; seat tokens: their own): focus `{for_s?, until?}`, or end it |
 | `GET /sent` | `seat`, `before_id`, `limit` (≤ 500): messages a seat sent, newest first; paged like the archive |
@@ -147,9 +147,9 @@ session cookie; with the cookie, everything but `GET` needs the header
 | | |
 |---|---|
 | `POST /session`; `DELETE /session` | sign a browser in with `{token}` (user or operator tokens; needs `X-Amail-Csrf: 1`) / out |
-| `GET /overview` | user tokens: agent seats per state, seats needing a person, messages in the last hour and day (counted up to 50,000), the user's unread count, the size of the attention queue |
+| `GET /overview` | user tokens: agent seats per state, seats needing a person, messages the org sent or received in the last hour and day (counted per minute, so a window starts at the beginning of its first minute; another server instance's counts appear within about a second), the user's unread count, the size of the attention queue |
 | `GET /counts` | user tokens: per seat (or `seat=`), `unread` and `pending` |
-| `GET /attention` | user tokens: what waits for the user ([concepts](concepts.md#the-users-queue-needs-you)) |
+| `GET /attention` | user tokens: what waits for the user ([concepts](concepts.md#the-users-queue-needs-you)), among the user seat's newest 5,000 deliveries |
 | `GET /pending` | node and user tokens: per seat, pending deliveries by class, urgent count, digest counts, `focus_until`, the seat's counter |
 | `POST /presence` | node tokens: `{node?, seats: [{seat, state, wake_failed?, harness?, since?, attention?, attention_hint?, terminal_url?}]}` (at most 5,000 seats); valid for 90 s |
 | `GET /seats/{name}/launch` | node and user tokens: harness, model, role, parent, permission mode (informational; the node does not use it) and a new seat token; the token of the seat's previous launch is revoked |
@@ -191,9 +191,20 @@ request looks at the 50,000 most recent messages before `before_id` (2,000
 when a term is shorter than three characters; `scan_limit` says which), so
 a search that finds few matches continues with `next_before_id`. Each hit
 has a snippet of the body around the first match. `mode` is always
-`"scan"`. At most 4 searches and archive requests of one org run at a time
-on a public server (further ones get 429 `too_many_queries`), and a query
-that runs longer than 10 seconds is cancelled (503 `query_timeout`).
+`"scan"`. Searches take one of the org's query slots (see
+[below](#limits-on-expensive-requests)).
+
+### Limits on expensive requests
+
+Requests whose database cost depends on the data take one of the org's
+query slots: search, `GET /archive/messages`, `GET /threads/{id}` (after
+the check that the caller sees the thread), `/attention`, `/overview`,
+`/messages/{id}/status`, `/lists`, `/lists/{name}`, `/changes`, and
+`/inbox` and `/sent` pages of more than 100. On a public server an org has
+1 slot and the server 8 (`--max-org-queries`, `--max-queries`). A request
+that finds no free slot within 1 second gets 429 `too_many_queries` with
+`retry_after_ms`. A query that runs longer than 10 seconds is cancelled
+(503 `query_timeout`).
 
 ### Webhook
 

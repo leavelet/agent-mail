@@ -173,11 +173,16 @@ pub trait Store: Send + Sync + 'static {
     async fn message(&self, id: i64) -> Result<Option<MessageRec>>;
     /// True if the message was sent by `org_id` or delivered to one of its seats.
     async fn org_sees_message(&self, org_id: i64, message_id: i64) -> Result<bool>;
-    /// True if the seat sent or received any message in the thread.
+    /// True if the seat sent or received any message in the thread (index
+    /// lookups only, whatever the thread's size).
     async fn seat_in_thread(&self, seat_id: i64, thread_id: i64) -> Result<bool>;
+    /// True if the org sent or received any message in the thread (index
+    /// lookups only, whatever the thread's size).
+    async fn org_sees_thread(&self, org_id: i64, thread_id: i64) -> Result<bool>;
     async fn delivery(&self, message_id: i64, seat_id: i64) -> Result<Option<DeliveryRec>>;
     /// Messages of a thread visible to `org_id`: the newest `limit`, oldest
-    /// first. Bodies are loaded newest first while their total stays within
+    /// first; nothing (after one index lookup) when the org sees no
+    /// message of the thread. Bodies are loaded newest first while their total stays within
     /// `body_bytes`; the others are left out. Only the newest
     /// [`amail_proto::limits::MAX_SCAN_MESSAGES`] messages of the thread
     /// (of all orgs) are looked at.
@@ -243,11 +248,14 @@ pub trait Store: Send + Sync + 'static {
     /// Unread and pending counts of every live seat (or only `seat_id`).
     async fn counts(&self, org_id: i64, seat_id: Option<i64>) -> Result<Vec<CountRec>>;
     /// Deliveries to the user seat that wait for the user (see the server's
-    /// `/v1/attention`), oldest first.
+    /// `/v1/attention`), oldest first, among the seat's newest
+    /// [`amail_proto::limits::MAX_ATTENTION_SCAN`] deliveries.
     async fn attention(&self, user_seat_id: i64, limit: i64) -> Result<Vec<Entry>>;
-    /// Messages visible to the org created at or after `since`, counted up
-    /// to [`amail_proto::limits::MAX_SCAN_MESSAGES`].
-    async fn message_count(&self, org_id: i64, since: i64) -> Result<i64>;
+    /// Messages the org sent or received from minute `since_minute` (minutes
+    /// since the Unix epoch) on, as added with [`Store::add_activity`].
+    async fn activity(&self, org_id: i64, since_minute: i64) -> Result<i64>;
+    /// Add `(org_id, minute, messages)` to the per-minute message counts.
+    async fn add_activity(&self, counts: &[(i64, i64, i64)]) -> Result<()>;
     /// Substring search over the most recent messages visible to the org
     /// (`q.scan` of them before `q.before_id`), newest first.
     async fn search(&self, org_id: i64, q: &SearchQuery) -> Result<SearchResult>;

@@ -82,7 +82,15 @@ pub async fn inbox(
         before_seq: q.before_seq,
         limit: q.limit.unwrap_or(50).clamp(1, 1000),
     };
-    let entries = st.store.inbox(seat.id, &query).await?;
+    let entries = if query.limit > p::limits::SMALL_PAGE {
+        let (store, seat_id, query) = (st.store.clone(), seat.id, query.clone());
+        limited(&st, &auth, async move {
+            Ok(store.inbox(seat_id, &query).await?)
+        })
+        .await?
+    } else {
+        st.store.inbox(seat.id, &query).await?
+    };
     let mut entries: Vec<p::InboxEntry> = entries
         .iter()
         .map(|e| render::entry(e, &auth.org))
@@ -155,7 +163,8 @@ pub async fn status(
             "only the sender and the sender org's user can see delivery status",
         ));
     }
-    let rows = st.store.recipients(id).await?;
+    let store = st.store.clone();
+    let rows = limited(&st, &auth, async move { Ok(store.recipients(id).await?) }).await?;
     let mut recipients: Vec<p::RecipientStatus> = Vec::new();
     for d in &rows {
         let delivery = render::delivery(d, &auth.org);
@@ -270,18 +279,24 @@ pub async fn thread(
     Path(id): Path<i64>,
 ) -> ApiResult<Json<p::ThreadResponse>> {
     let seat = auth.mail_seat()?;
-    if auth.scope == TokenScope::Seat && !st.store.seat_in_thread(seat.id, id).await? {
+    // Whether the caller sees the thread is a few index lookups, so a
+    // thread it cannot see costs what a missing one does; only then is the
+    // thread loaded.
+    let visible = match auth.scope {
+        TokenScope::Seat => st.store.seat_in_thread(seat.id, id).await?,
+        _ => st.store.org_sees_thread(auth.org.id, id).await?,
+    };
+    if !visible {
         return Err(ApiError::not_found(format!("no thread {id}")));
     }
-    let mut found = st
-        .store
-        .thread(
-            id,
-            auth.org.id,
-            MAX_THREAD_MESSAGES + 1,
-            MAX_THREAD_BODY_BYTES,
-        )
-        .await?;
+    let store = st.store.clone();
+    let org_id = auth.org.id;
+    let mut found = limited(&st, &auth, async move {
+        Ok(store
+            .thread(id, org_id, MAX_THREAD_MESSAGES + 1, MAX_THREAD_BODY_BYTES)
+            .await?)
+    })
+    .await?;
     if found.is_empty() {
         return Err(ApiError::not_found(format!("no thread {id}")));
     }
@@ -406,7 +421,12 @@ pub async fn changes(
     let seat = auth.mailbox(&st, q.seat.as_deref()).await?;
     let since = q.since.unwrap_or(0);
     let limit = q.limit.unwrap_or(500).clamp(1, 5000);
-    let entries = st.store.changes(seat.id, since, limit).await?;
+    let store = st.store.clone();
+    let seat_id = seat.id;
+    let entries = limited(&st, &auth, async move {
+        Ok(store.changes(seat_id, since, limit).await?)
+    })
+    .await?;
     let full = entries.len() as i64 == limit;
     let mut entries: Vec<p::InboxEntry> = entries
         .iter()
@@ -610,8 +630,12 @@ pub async fn archive(
         before_id: q.before_id,
         limit,
     };
-    let _slot = query_slot(&st, &auth)?;
-    let page = st.store.archive(auth.org.id, &query).await?;
+    let store = st.store.clone();
+    let org_id = auth.org.id;
+    let page = limited(&st, &auth, async move {
+        Ok(store.archive(org_id, &query).await?)
+    })
+    .await?;
     Ok(Json(archive_response(page, &auth.org)))
 }
 
@@ -637,14 +661,46 @@ pub fn archive_response(
     }
 }
 
-/// One of the org's search or archive requests in flight; 429 when the org
-/// has as many as its limit.
-pub fn query_slot(st: &AppState, auth: &Auth) -> ApiResult<crate::limits::StreamGuard> {
-    st.limiters.queries.open(auth.org.id).ok_or_else(|| {
-        ApiError::too_many(
-            "too_many_queries",
-            "this org has too many search and archive requests in progress",
-            1000,
-        )
+/// Run `f`, database work whose cost depends on the data, in one of the
+/// org's query slots ([`crate::config::Limits::org_queries`] per org,
+/// [`crate::config::Limits::queries`] in all). Without a free slot after a
+/// short wait the request gets 429 `too_many_queries`. The work runs in its
+/// own task, which holds the slot until the work ends: a client that drops
+/// the request does not free the slot while the database is still busy.
+pub async fn limited<T, F>(st: &AppState, auth: &Auth, f: F) -> ApiResult<T>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = ApiResult<T>> + Send + 'static,
+{
+    use crate::limits::SlotRefused;
+    let slot = st
+        .limiters
+        .queries
+        .acquire(auth.org.id)
+        .await
+        .map_err(|r| match r {
+            SlotRefused::Org => ApiError::too_many(
+                "too_many_queries",
+                "this org has too many search, archive and similar requests in progress",
+                1000,
+            ),
+            SlotRefused::Total => ApiError::too_many(
+                "too_many_queries",
+                "the server has too many search, archive and similar requests in progress",
+                1000,
+            ),
+        })?;
+    tokio::spawn(async move {
+        let out = f.await;
+        drop(slot);
+        out
+    })
+    .await
+    .unwrap_or_else(|e| {
+        Err(ApiError::new(
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            format!("query task failed: {e}"),
+        ))
     })
 }
