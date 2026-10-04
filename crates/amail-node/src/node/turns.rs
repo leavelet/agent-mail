@@ -333,8 +333,8 @@ impl Node {
                         if resp.released.len() < r.messages.len() {
                             tracing::warn!(
                                 "seat {}: {} of {} message(s) of a failed turn could not be \
-                                 marked not read again (acknowledged meanwhile, or the claim \
-                                 is too old)",
+                                 marked not read again (acknowledged or deleted meanwhile, \
+                                 or the claim is too old)",
                                 r.seat,
                                 r.messages.len() - resp.released.len(),
                                 r.messages.len()

@@ -246,7 +246,7 @@ const en = {
   'archive.until': 'Until',
   'archive.apply': 'Apply',
   'archive.empty': 'No messages match.',
-  'archive.scanNote': 'Each page searches the next {n} messages, newest first. Load more to search further back.',
+  'archive.scanNote': 'This search reads the messages one by one, newest first, and has not reached the oldest yet. Load more to search older mail.',
   'archive.results': 'Results for “{q}”',
   'archive.timeline': 'Timeline of the org’s mail',
 
@@ -702,7 +702,7 @@ const zh: Record<Key, string> = {
   'archive.until': '截止',
   'archive.apply': '应用',
   'archive.empty': '没有符合条件的邮件。',
-  'archive.scanNote': '每页按时间从新到旧检索接下来的 {n} 封邮件。加载更多可以继续往前检索。',
+  'archive.scanNote': '这次检索按时间从新到旧逐封读取邮件，还没有读到最早的邮件。加载更多可以继续检索更早的邮件。',
   'archive.results': '“{q}”的检索结果',
   'archive.timeline': '全组织邮件时间线',
 

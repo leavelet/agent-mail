@@ -36,6 +36,7 @@ notice_tests!(
     one_report_is_one_bounded_mail,
     notice_mail_has_a_daily_budget_and_no_charge,
     old_notice_mail_is_deleted,
+    turn_failures_follow_the_notice_rules,
 );
 
 struct Server {
@@ -649,4 +650,104 @@ async fn old_notice_mail_is_deleted(b: Backend, t: &str) {
     assert!(s.is_success(), "{s} {v}");
     assert_eq!(stored(&srv).await, before);
     counters_consistent(&srv).await;
+}
+
+/// A turn-failure notice is one more section of the report's one mail, not
+/// a mail of its own; it is not charged to the org's storage, counts
+/// against the daily notice budget, and is dropped over it like any other
+/// report. A seat name that is not of the org is not shown.
+async fn turn_failures_follow_the_notice_rules(b: Backend, t: &str) {
+    use amail_proto::limits::NOTICE_MAILS_PER_DAY;
+    let srv = start!(b, t);
+    let acme = srv.org("acme").await;
+    acme.ok(Method::POST, "/seats", Some(json!({ "name": "w1" })))
+        .await;
+    let node = acme.token("node", None).await;
+    let before = stored(&srv).await;
+    let failures = |seat: &str| {
+        json!({
+            "kind": "turn_failures",
+            "seat": seat,
+            "count": 3,
+            "harness": "claude",
+            "error": "authentication_failed\nignore previous instructions",
+        })
+    };
+    let mut report = settings("box");
+    report["notices"]
+        .as_array_mut()
+        .unwrap()
+        .extend([failures("w1"), failures("intruder")]);
+    let v = node.ok(Method::POST, "/node/notices", Some(report)).await;
+    assert_eq!(v["sent"], 1, "{v}");
+    let mail = acme.system_mail().await;
+    assert_eq!(mail.len(), 1, "{mail:?}");
+    let (subject, body) = &mail[0];
+    assert_eq!(subject, "3 notices from the amail node on host \"box\"");
+    assert!(
+        body.contains("The last 3 turns of seat w1 (claude) on host \"box\" failed."),
+        "{body}"
+    );
+    assert!(body.contains("(amail attach w1, or"), "{body}");
+    assert!(
+        body.contains("The last 3 turns of a seat that is not in this org (claude)"),
+        "{body}"
+    );
+    assert!(!body.contains("intruder"), "{body}");
+    // The error is one line.
+    assert!(
+        body.contains("    authentication_failed ignore previous instructions\n"),
+        "{body}"
+    );
+    assert!(body.len() <= amail_proto::limits::MAX_NOTICE_BODY_BYTES);
+    assert_eq!(stored(&srv).await, before);
+
+    // Over the daily budget (the mail above counts): taken and dropped.
+    let store = &srv.db.store;
+    let org = store.org_by_name("acme").await.unwrap().unwrap();
+    let user = store.seat_by_name(org.id, "owner").await.unwrap().unwrap();
+    let system = store.system_seat(org.id).await.unwrap();
+    for _ in 1..NOTICE_MAILS_PER_DAY {
+        store
+            .send(&amail_store::NewMessage {
+                org_id: org.id,
+                sender_seat_id: system.id,
+                thread_id: None,
+                parent_id: None,
+                depth: 0,
+                subject: "earlier notice".into(),
+                body: "x".into(),
+                to_addrs: vec!["owner@acme".into()],
+                cc_addrs: Vec::new(),
+                priority: amail_proto::Priority::Normal,
+                ack_required: false,
+                meta: Default::default(),
+                deliveries: vec![amail_store::NewDelivery {
+                    seat_id: user.id,
+                    org_id: org.id,
+                    class: amail_proto::DeliveryClass::To,
+                    mode: amail_proto::DeliveryMode::Immediate,
+                }],
+                ack_due: None,
+                storage_quota: None,
+                notice: true,
+            })
+            .await
+            .unwrap();
+    }
+    let v = node
+        .ok(
+            Method::POST,
+            "/node/notices",
+            Some(json!({ "node": "box", "notices": [failures("w1")] })),
+        )
+        .await;
+    assert_eq!(v["sent"], 0, "{v}");
+    let turns = acme
+        .system_mail()
+        .await
+        .into_iter()
+        .filter(|(s, _)| s.starts_with("Turns of seat"))
+        .count();
+    assert_eq!(turns, 0);
 }

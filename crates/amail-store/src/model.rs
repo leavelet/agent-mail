@@ -493,7 +493,7 @@ pub struct OrgStat {
 
 /// What [`crate::Store::delete_thread`] and
 /// [`crate::Store::purge_deleted_org_mail`] did.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MailDeleted {
     /// Messages the org no longer has.
     pub deleted: i64,
@@ -504,6 +504,9 @@ pub struct MailDeleted {
     pub more: bool,
     /// Purge: the `before` of the next call.
     pub next_before_id: Option<i64>,
+    /// The new counter of each seat that lost deliveries (in seat id
+    /// order), so that its mailbox clients and its node look again.
+    pub seqs: Vec<SeqBump>,
 }
 
 /// What [`crate::Store::operator_stats`] reports.

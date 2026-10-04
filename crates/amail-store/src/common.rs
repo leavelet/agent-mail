@@ -3155,8 +3155,8 @@ macro_rules! impl_store_common {
                 for (id, kind) in deletable.into_iter().take(limit.max(0) as usize) {
                     if *kind == 1 { own.push(*id) } else { theirs.push(*id) }
                 }
-                let deleted = delete_mail(c, Some(org_id), &own, &theirs).await?;
-                Ok(Some(MailDeleted { deleted, kept, more, next_before_id: None }))
+                let (deleted, seqs) = delete_mail(c, Some(org_id), &own, &theirs).await?;
+                Ok(Some(MailDeleted { deleted, kept, more, next_before_id: None, seqs }))
             }
 
             /// Delete, for org `org_id`, up to `limit` messages of deleted
@@ -3219,8 +3219,8 @@ macro_rules! impl_store_common {
                         break;
                     }
                 }
-                let deleted = delete_mail(c, Some(org_id), &[], &ids).await?;
-                Ok(MailDeleted { deleted, kept: 0, more: next.is_some(), next_before_id: next })
+                let (deleted, seqs) = delete_mail(c, Some(org_id), &[], &ids).await?;
+                Ok(MailDeleted { deleted, kept: 0, more: next.is_some(), next_before_id: next, seqs })
             }
 
             /// Retention: delete up to `limit` messages of deleted orgs
@@ -3235,7 +3235,7 @@ macro_rules! impl_store_common {
                 .bind(limit)
                 .fetch_all(&mut *c)
                 .await?;
-                Ok(delete_mail(c, None, &[], &ids).await? as u64)
+                Ok(delete_mail(c, None, &[], &ids).await?.0 as u64)
             }
 
             /// Delete mail, with exact storage counts:
@@ -3258,10 +3258,13 @@ macro_rules! impl_store_common {
             /// first (as sending and deleting an org do), then the messages
             /// and their replies in id order, and the orgs' rows last.
             /// Returns the number of messages the org (with `None`: anyone)
-            /// no longer has.
-            async fn delete_mail(c: &mut Conn, org: Option<i64>, own: &[i64], theirs: &[i64]) -> Result<i64> {
+            /// no longer has and, with `Some` org, the new counter of each
+            /// seat that lost deliveries (a delivery that goes may be
+            /// pending, or shown in a turn that is still going on: the
+            /// seat's clients and node look at the mailbox again).
+            async fn delete_mail(c: &mut Conn, org: Option<i64>, own: &[i64], theirs: &[i64]) -> Result<(i64, Vec<SeqBump>)> {
                 if own.is_empty() && theirs.is_empty() {
-                    return Ok(0);
+                    return Ok((0, Vec::new()));
                 }
                 let per_delivery = amail_proto::limits::STORED_BYTES_PER_DELIVERY;
                 let all: Vec<i64> = own.iter().chain(theirs).copied().collect();
@@ -3426,7 +3429,19 @@ macro_rules! impl_store_common {
                     .execute(&mut *c)
                     .await?;
                 }
-                Ok(deleted.len() as i64)
+                // (Seats are bumped in id order; on Postgres they are locked
+                // already.)
+                let mut seqs = Vec::new();
+                if org.is_some() {
+                    let mut seats: Vec<(i64, i64)> = gone.iter().map(|(_, o, s)| (*s, *o)).collect();
+                    seats.sort_unstable();
+                    seats.dedup();
+                    for (seat_id, org_id) in seats {
+                        let seq = bump_seq(c, seat_id, 1).await?;
+                        seqs.push(SeqBump { org_id, seat_id, seq });
+                    }
+                }
+                Ok((deleted.len() as i64, seqs))
             }
 
             /// The orgs charged for message `id` sent by org `sender` (see

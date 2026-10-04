@@ -1504,11 +1504,45 @@ async fn user_deletes_threads(b: Backend, t: &str) {
     assert_eq!(v, json!({ "deleted": 0, "kept": 2, "more": false }));
     assert_eq!((bytes(&acme).await, bytes(&gam).await), before);
 
+    // b's node has shown i1 to b in a turn that is still going on (a keyed
+    // claim), and b's event stream is open.
+    let b_node = acme.node().await;
+    let claimed = b_node
+        .ok(
+            Method::POST,
+            "/claim?seat=b",
+            Some(json!({ "via": "turn", "key": "turn-1" })),
+        )
+        .await;
+    let shown: Vec<i64> = claimed["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["message"]["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(shown, vec![i1]);
+    let (s, b_events) = bb.stream("/events").await;
+    assert_eq!(s, StatusCode::OK);
+
     // acme's internal thread goes, with its exact charge.
     let (stored2, _) = bytes(&acme).await;
     let unread1 = unread(&acme).await;
     let v = acme.ok(Method::DELETE, &path(t3), None).await;
     assert_eq!(v, json!({ "deleted": 2, "kept": 0, "more": false }));
+    // b's mailbox changed: its stream says so, and the failed turn's
+    // release finds nothing left to release.
+    eventually("b hears of the deletion", async || {
+        joined(&b_events).contains(r#""seat":"b","#)
+    })
+    .await;
+    let v = b_node
+        .ok(
+            Method::POST,
+            "/claim/release?seat=b",
+            Some(json!({ "key": "turn-1", "messages": [i1] })),
+        )
+        .await;
+    assert_eq!(v, json!({ "seat": "b", "released": [] }));
     let internal = charge("internal", 3, "", &["b@acme"], &["owner@acme"], 2)
         + charge("Re: internal", 3, "", &["a@acme"], &[], 1);
     assert_eq!(bytes(&acme).await, (stored2 - internal, 0));

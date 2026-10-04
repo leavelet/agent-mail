@@ -81,7 +81,7 @@ for (const { theme, lang } of combos) {
     await shot(page, 'archive-search-chinese', theme, lang);
 
     await page.goto(`${s.base}/#/archive?q=${encodeURIComponent('迁移')}`);
-    await expect(page.locator('p[data-mode="scan"]')).toBeVisible();
+    await expect(page.locator('.results[data-mode="scan"] .mrow').first()).toBeVisible();
     await shot(page, 'archive-search-short-scan', theme, lang);
 
     await page.goto(`${s.base}/#/compose?to=be-lead`);

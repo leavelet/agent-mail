@@ -18,10 +18,20 @@ pub struct DirectoryHub {
 
 impl DirectoryHub {
     /// Hand an event to this instance's subscribers of the org.
+    /// The org's channel goes once its last subscriber has gone, so that
+    /// the map holds only orgs with open event streams.
     pub fn deliver(&self, org_id: i64, ev: DirectoryEvent) {
-        if let Some(tx) = self.orgs.lock().unwrap().get(&org_id) {
-            let _ = tx.send(ev);
+        let mut orgs = self.orgs.lock().unwrap();
+        if let Some(tx) = orgs.get(&org_id)
+            && tx.send(ev).is_err()
+        {
+            orgs.remove(&org_id);
         }
+    }
+
+    /// Orgs with a channel (for tests).
+    pub fn orgs(&self) -> usize {
+        self.orgs.lock().unwrap().len()
     }
 
     pub fn subscribe(&self, org_id: i64) -> broadcast::Receiver<DirectoryEvent> {
@@ -67,5 +77,10 @@ mod tests {
             rx.try_recv(),
             Err(broadcast::error::TryRecvError::Closed)
         ));
+        // A channel without subscribers goes with the next event.
+        drop(other);
+        assert_eq!(hub.orgs(), 1);
+        hub.deliver(2, event("seat", "c", "created"));
+        assert_eq!(hub.orgs(), 0);
     }
 }

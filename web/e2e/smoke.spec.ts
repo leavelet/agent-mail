@@ -69,8 +69,10 @@ test('smoke: org, compose, reply, thread, delivery, search, mirror, needs-you', 
   await expect(page.locator('.results[data-mode="scan"] .mrow')).toContainText('数据库迁移方案');
   await page.locator('input[data-search]').fill('迁移');
   await page.keyboard.press('Enter');
-  await expect(page.locator('[data-mode="scan"]').first()).toBeVisible();
+  await expect(page.locator('.results[data-mode="scan"]')).toBeVisible();
   await expect(page.locator('.results .mrow')).toContainText('数据库迁移方案');
+  // The org's few messages were all searched: no note about older mail.
+  await expect(page.locator('p[data-mode="scan"]')).toHaveCount(0);
 
   // The conversation mirror of be-1 (hosted by the real node), with a live line.
   await page.goto(`${s.base}/#/org/be-1`);

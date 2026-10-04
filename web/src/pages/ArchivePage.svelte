@@ -24,7 +24,6 @@
   let rows = $state.raw<MailRow[]>([]);
   let next = $state<number | undefined>(undefined);
   let mode = $state<'index' | 'scan' | null>(null);
-  let scanLimit = $state<number | undefined>(undefined);
   let error = $state<string | null>(null);
   let loading = $state(false);
 
@@ -71,7 +70,6 @@
           got = [...got, ...r.messages.map(fromHit)];
           cursor = r.next_before_id;
           mode = r.mode;
-          scanLimit = r.scan_limit;
           if (!cursor || got.length >= PAGE) break;
         }
         rows = beforeId ? [...rows, ...got] : got;
@@ -128,8 +126,10 @@
       <button type="submit">{t('archive.apply')}</button>
     </form>
   {/if}
-  {#if mode === 'scan'}
-    <p class="scan" role="note" data-mode="scan">ⓘ {t('archive.scanNote', { n: scanLimit ?? 0 })}</p>
+  {#if mode === 'scan' && next}
+    <!-- Only while older mail is left to search: a search that read all of
+         the org's mail has nothing to add. -->
+    <p class="scan" role="note" data-mode="scan">ⓘ {t('archive.scanNote')}</p>
   {/if}
   {#if error}<p class="error">{error}</p>{/if}
   <div class="card results" data-mode={mode ?? 'timeline'}>

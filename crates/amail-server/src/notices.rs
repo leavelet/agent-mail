@@ -265,10 +265,7 @@ fn render(n: &NodeNotice, host: &str, seats: &HashSet<String>) -> Section {
                 format!("Turns of a seat are failing on host {host}")
             };
             let (attach, wake) = if named {
-                (
-                    format!("amail attach {seat}"),
-                    format!("amail wake {seat}"),
-                )
+                (format!("amail attach {seat}"), format!("amail wake {seat}"))
             } else {
                 ("amail attach".to_string(), "amail wake".to_string())
             };

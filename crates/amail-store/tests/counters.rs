@@ -34,10 +34,23 @@ macro_rules! store_tests {
     };
 }
 
-store_tests!(counters_follow_deliveries, thread_visibility_lookups);
+store_tests!(
+    counters_follow_deliveries,
+    thread_visibility_lookups,
+    released_and_deleted_claims
+);
 
-/// The counters of every seat as kept, and as counted over the deliveries.
+/// The counters of every seat as kept, and as counted over the deliveries,
+/// and every org's stored and kept bytes as counted from scratch.
 async fn check(db: &TestDb) {
+    for c in db.storage_counts().await {
+        assert_eq!(
+            (c.stored_bytes, c.kept_bytes),
+            (c.stored_recount, c.kept_recount),
+            "org {}: storage counts",
+            c.org_id
+        );
+    }
     let kept = db
         .rows_i64(
             "SELECT id, pending_to, pending_cc, pending_list, pending_urgent, pending_digest, unread, \
@@ -290,4 +303,92 @@ async fn thread_visibility_lookups(db: TestDb) {
         ))
         .await;
     assert_eq!(left[0][0], 0);
+}
+
+/// A failed turn releases the mail of its claim: the counters and storage
+/// counts follow. The user deletes a thread whose mail a seat has claimed
+/// in a turn that is still going on: the deliveries go, the seat's counter
+/// moves (so that its node and clients look again), and releasing or
+/// replaying the claim afterwards finds nothing of the deleted mail.
+async fn released_and_deleted_claims(db: TestDb) {
+    let s = &db.store;
+    let (acme, owner) = s.create_org("acme", "owner", "h1").await.unwrap();
+    let a = s
+        .create_seat(
+            acme.id,
+            &NewSeat {
+                name: "a".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for i in 0..4 {
+        let mut m = msg(acme.id, owner.id, &[(&a, C::To, M::Immediate)]);
+        if i == 3 {
+            m.priority = Priority::Urgent;
+        }
+        ids.push(s.send(&m).await.unwrap());
+    }
+    check(&db).await;
+    let mut f = claim(&[C::To], false, false);
+    f.limit = 10;
+    f.key = Some("turn-1".into());
+    let (taken, _) = s.claim(a.id, &f).await.unwrap();
+    assert_eq!(taken.len(), 4);
+    check(&db).await;
+    // Failed turn: two of the four go back to pending, unread.
+    let (released, bump) = s
+        .release_claim(a.id, "turn-1", &[ids[0].message_id, ids[3].message_id])
+        .await
+        .unwrap();
+    assert_eq!(released, vec![ids[0].message_id, ids[3].message_id]);
+    assert!(bump.is_some());
+    check(&db).await;
+    let p = s.pending(acme.id, Some(a.id)).await.unwrap();
+    assert_eq!((p[0].to, p[0].urgent), (2, 1));
+    // Released twice: nothing more.
+    let (again, _) = s
+        .release_claim(a.id, "turn-1", &[ids[0].message_id])
+        .await
+        .unwrap();
+    assert!(again.is_empty());
+    check(&db).await;
+
+    // Claimed again in a new turn; the user deletes the thread of message 1
+    // (internal mail) while that turn goes on.
+    f.key = Some("turn-2".into());
+    let (taken, _) = s.claim(a.id, &f).await.unwrap();
+    assert_eq!(taken.len(), 2);
+    let before = s.seat_seqs(acme.id).await.unwrap();
+    let seq_before = before.iter().find(|r| r.0 == a.id).unwrap().2;
+    let done = s
+        .delete_thread(acme.id, ids[0].thread_id, 1000)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(done.deleted, 1);
+    assert_eq!(done.seqs.len(), 1);
+    assert_eq!(done.seqs[0].seat_id, a.id);
+    assert!(done.seqs[0].seq > seq_before);
+    check(&db).await;
+    // The turn fails: its other message is released, the deleted one is
+    // not there to release.
+    let (released, _) = s
+        .release_claim(a.id, "turn-2", &[ids[0].message_id, ids[3].message_id])
+        .await
+        .unwrap();
+    assert_eq!(released, vec![ids[3].message_id]);
+    check(&db).await;
+    // A replay of the first turn's claim returns what is left of it.
+    f.key = Some("turn-1".into());
+    let (replay, _) = s.claim(a.id, &f).await.unwrap();
+    let mut left: Vec<i64> = replay.iter().map(|e| e.message.id).collect();
+    left.sort_unstable();
+    assert_eq!(
+        left,
+        vec![ids[1].message_id, ids[2].message_id, ids[3].message_id]
+    );
+    check(&db).await;
 }

@@ -11,6 +11,29 @@ use amail_proto::limits::MAX_DELETE_MESSAGES;
 use amail_proto::{self as p};
 use axum::extract::State;
 
+/// Tell the mailbox streams of the seats that lost deliveries: a pending
+/// delivery that went no longer wakes the seat, and a node whose seat was
+/// shown the mail in a turn finds it gone (releasing it after a failed turn
+/// then releases nothing).
+async fn publish(st: &AppState, org_id: i64, d: &amail_store::MailDeleted) {
+    if d.seqs.is_empty() {
+        return;
+    }
+    let names: std::collections::HashMap<i64, String> = match st.store.seats(org_id).await {
+        Ok(seats) => seats.into_iter().map(|s| (s.id, s.name)).collect(),
+        Err(e) => {
+            tracing::warn!("org {org_id}: seats after deleting mail: {e}");
+            return;
+        }
+    };
+    let events: Vec<(String, i64)> = d
+        .seqs
+        .iter()
+        .filter_map(|b| names.get(&b.seat_id).map(|n| (n.clone(), b.seq)))
+        .collect();
+    st.bus.publish(org_id, &events);
+}
+
 fn response(d: amail_store::MailDeleted) -> p::DeleteMailResponse {
     p::DeleteMailResponse {
         deleted: d.deleted,
@@ -40,6 +63,7 @@ pub async fn delete_thread(
     })
     .await?
     .ok_or_else(|| ApiError::not_found(format!("no thread {id}")))?;
+    publish(&st, org_id, &done).await;
     if done.deleted > 0 {
         tracing::info!(
             "org {}: deleted {} messages of thread {id}",
@@ -78,6 +102,7 @@ pub async fn purge_deleted_orgs(
             .await?)
     })
     .await?;
+    publish(&st, org_id, &done).await;
     if done.deleted > 0 {
         tracing::info!(
             "org {}: deleted {} messages of deleted orgs",
