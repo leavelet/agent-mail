@@ -44,6 +44,11 @@ org, and serves the local hook clients over a Unix socket. It:
   `offline`) and what needs a person;
 - relays a seat's conversation to the server while someone watches it.
 
+It answers each request on its socket according to the process that sent
+it: a session gets only its own seat's mail and credentials, and requests
+meant for the person are refused to sessions (see
+[security](security.md#trust-boundaries)).
+
 **Hook client (`amail hook <harness>`).** The command the harnesses run on
 their hook events. It forwards the hook's input to the node over the Unix
 socket and prints the node's answer. It never fails the harness: if the node

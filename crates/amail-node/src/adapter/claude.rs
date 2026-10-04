@@ -36,6 +36,7 @@ const UNSET: &[&str] = &[
     "CLAUDE_CODE_SESSION_ID",
     "CLAUDE_PID",
     "AMAIL_PROFILE",
+    crate::wire::CODEX_PASS_ENV,
 ];
 
 pub struct Claude {

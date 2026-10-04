@@ -47,6 +47,7 @@ node_tests!(
     focus_holds_mail,
     digest_at_natural_points,
     lost_claim_answer_is_recovered,
+    socket_checks_callers,
 );
 
 use amail_store::testutil::Backend;
@@ -335,12 +336,16 @@ async fn claude_ignores_internal_agents(b: Backend) {
 /// Codex: hooks of unregistered sessions are ignored; the launch marker in the
 /// first prompt registers the session; then every row of the state table.
 async fn codex_registration_and_rows(b: Backend) {
-    let Some(h) = setup(b, "codex_registration_and_rows", Opts::default()).await else {
+    let opts = Opts {
+        check_callers: Some(true),
+        ..Opts::default()
+    };
+    let Some(h) = setup(b, "codex_registration_and_rows", opts).await else {
         return;
     };
     h.seat("cx", "codex").await;
     let sid = "00000000-0000-7000-8000-00000000c0de";
-    let env: Vec<(String, String)> = vec![(
+    let mut env: Vec<(String, String)> = vec![(
         "CODEX_HOME".into(),
         h.dir
             .path()
@@ -405,6 +410,20 @@ async fn codex_registration_and_rows(b: Backend) {
             .unwrap()
             .ends_with("state/codex-home")
     );
+    // Codex hooks run in the shared app-server, whose environment holds the
+    // node's Codex pass (so does the launch environment). Without it the
+    // node does not act on them.
+    let pass = plan["env"]["AMAIL_CODEX_PASS"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(pass.len(), 64);
+    let no_pass = with(
+        codex("UserPromptSubmit"),
+        &[("session_id", json!(sid)), ("prompt", json!(prompt))],
+    );
+    assert_eq!(h.hook("codex", env.clone(), no_pass).await, Value::Null);
+    env.push(("AMAIL_CODEX_PASS".into(), pass.clone()));
     // Forbidden flags are refused.
     let bad = h
         .node
@@ -527,17 +546,31 @@ async fn codex_registration_and_rows(b: Backend) {
     h.hook("codex", env.clone(), start).await;
     assert_eq!(h.state("cx").await, "busy");
 
-    // Tool commands in the session get the seat's credentials from the node.
-    let cred = h
-        .node
-        .as_ref()
-        .unwrap()
-        .node
-        .handle(amail_node::wire::Request::Credentials {
+    // Tool commands in the session get the seat's credentials from the node,
+    // with the Codex pass; the thread id alone is not enough.
+    let cred = socket_request(
+        &h.sock,
+        amail_node::wire::Request::Credentials {
             codex_thread: sid.into(),
-        })
-        .await;
+            pass: Some(pass.clone()),
+        },
+    )
+    .await;
     assert_eq!(cred["seat"], "cx");
+    for pass in [None, Some("0".repeat(64))] {
+        let refused = socket_request(
+            &h.sock,
+            amail_node::wire::Request::Credentials {
+                codex_thread: sid.into(),
+                pass,
+            },
+        )
+        .await;
+        assert!(refused["token"].is_null(), "{refused}");
+        assert!(refused["error"].is_string(), "{refused}");
+    }
+    // Node status does not name the thread.
+    assert!(!h.status().await.to_string().contains(sid));
     let me = h
         .api
         .with_token(cred["token"].as_str().unwrap())
@@ -551,6 +584,7 @@ async fn codex_registration_and_rows(b: Backend) {
         .node
         .handle(amail_node::wire::Request::Credentials {
             codex_thread: "nope".into(),
+            pass: Some(pass.clone()),
         })
         .await;
     assert!(none.get("error").is_some());
@@ -1545,4 +1579,213 @@ fn untrusted_socket_is_refused() {
     std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o700)).unwrap();
     let (out, _, _) = run_hook(&sock, "claude", &[], "{}", None);
     assert_eq!(out, "x");
+}
+
+/// The node socket serves a request according to the process that sends it
+/// (the caller's process id comes from the socket). A seat's session gets
+/// its own mail but not another seat's, and cannot launch seats or read
+/// node status; a process the node did not launch cannot act as a seat;
+/// Codex credentials need the node's Codex pass and are never given to a
+/// Claude Code session; a launch records the process that asked.
+async fn socket_checks_callers(b: Backend) {
+    // Fake harness binaries; caller checks on.
+    let opts = Opts {
+        supervise: true,
+        ..Opts::default()
+    };
+    let Some(h) = setup(b, "socket_checks_callers", opts).await else {
+        return;
+    };
+    assert!(h.cfg.check_callers);
+    h.seat("w1", "claude").await;
+    h.seat("w2", "claude").await;
+    h.seat("cx", "codex").await;
+    let work = h.dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    // Seat w1's session, started the way a person starts one.
+    let mut session = std::process::Command::new(BIN);
+    session
+        .args(["run", "w1", "--socket"])
+        .arg(&h.sock)
+        .current_dir(&work)
+        .env("FAKE_AMAIL", BIN)
+        .env("AMAIL_HOOK_TIMEOUT_MS", "5000")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    for k in [
+        "AMAIL_SEAT",
+        "AMAIL_TOKEN",
+        "AMAIL_PROFILE",
+        "AMAIL_CODEX_PASS",
+    ] {
+        session.env_remove(k);
+    }
+    let mut session = session.spawn().unwrap();
+    h.wait("w1 started", || async { h.state("w1").await == "idle" })
+        .await;
+
+    // A Codex seat with a registered thread. Its session process is a
+    // stand-in that does nothing.
+    let mut stand_in = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let plan = h
+        .node
+        .as_ref()
+        .unwrap()
+        .node
+        .handle(amail_node::wire::Request::Launch {
+            seat: "cx".into(),
+            cwd: work.to_string_lossy().into(),
+            pid: stand_in.id(),
+            harness: None,
+            extra: vec![],
+            pane: None,
+            mux_session: None,
+        })
+        .await;
+    let pass = plan["env"]["AMAIL_CODEX_PASS"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let prompt = plan["args"].as_array().unwrap().last().unwrap().clone();
+    let tid = "00000000-0000-7000-8000-0000000000c1";
+    let first = with(
+        codex("UserPromptSubmit"),
+        &[("session_id", json!(tid)), ("prompt", prompt)],
+    );
+    h.hook(
+        "codex",
+        vec![("AMAIL_CODEX_PASS".into(), pass.clone())],
+        first,
+    )
+    .await;
+    h.wait("cx registered", || async { h.state("cx").await == "busy" })
+        .await;
+
+    let m1 = h.api.send(&["w1"], &[], "mail for w1", false).await;
+    h.api.send(&["w2"], &[], "mail for w2", false).await;
+    h.wait_pending("w1", 1, 0, 0).await;
+    h.wait_pending("w2", 1, 0, 0).await;
+
+    // A process the node did not launch cannot act as w1.
+    let up = claude("UserPromptSubmit");
+    let env = vec![("AMAIL_SEAT".to_string(), "w1".to_string())];
+    assert_eq!(h.hook("claude", env, up.clone()).await, Value::Null);
+
+    // Inside w1's session, as an agent's tool command would.
+    std::fs::write(h.dir.path().join("up.json"), up.to_string()).unwrap();
+    let script = format!(
+        r#"B="$FAKE_AMAIL"
+cd '{dir}'
+mkdir -p nocfg
+export AMAIL_CONFIG_DIR="$PWD/nocfg" XDG_CONFIG_HOME="$PWD/nocfg"
+timeout 10 "$B" run w2 --harness claude; echo "run-exit=$?"
+timeout 10 "$B" node status; echo "status-exit=$?"
+timeout 10 "$B" ps; echo "ps-exit=$?"
+AMAIL_SEAT=w2 "$B" hook claude < up.json > w2.out; echo "w2-hook-bytes=$(wc -c < w2.out)"
+"$B" hook claude < up.json > w1.out; echo "w1-hook-bytes=$(wc -c < w1.out)"
+env -u AMAIL_TOKEN CODEX_THREAD_ID={tid} AMAIL_CODEX_PASS={pass} timeout 10 "$B" inbox; echo "codex-cred-exit=$?"
+"#,
+        dir = h.dir.path().display(),
+    );
+    let fake = h.fake.clone();
+    std::fs::write(fake.join("w1.run"), script).unwrap();
+    h.wait("the session ran the commands", || async {
+        fake.join("w1.ran").exists()
+    })
+    .await;
+    let ran = std::fs::read_to_string(fake.join("w1.ran")).unwrap();
+    for want in [
+        "run-exit=1",
+        "status-exit=1",
+        "ps-exit=1",
+        "w2-hook-bytes=0",
+        "codex-cred-exit=1",
+        "this request is for the person, not for agent sessions",
+    ] {
+        assert!(ran.contains(want), "missing {want:?} in:\n{ran}");
+    }
+    // No token was printed (tokens start with `amail_`).
+    assert!(!ran.contains("amail_"), "{ran}");
+    // w2's mail was not touched; w1's session got its own.
+    let p = &h.seat_status("w2").await["pending"];
+    assert_eq!(p["to"], 1, "{p}");
+    let w1_out: Value =
+        serde_json::from_str(&std::fs::read_to_string(h.dir.path().join("w1.out")).unwrap())
+            .unwrap();
+    assert_eq!(injected_ids(&hook_text(&w1_out).unwrap()), vec![m1]);
+
+    // Outside the sessions: Codex credentials need the pass.
+    let req = |pass: Option<String>| amail_node::wire::Request::Credentials {
+        codex_thread: tid.into(),
+        pass,
+    };
+    let refused = socket_request(&h.sock, req(None)).await;
+    assert!(refused["token"].is_null(), "{refused}");
+    let cred = socket_request(&h.sock, req(Some(pass.clone()))).await;
+    assert_eq!(cred["seat"], "cx", "{cred}");
+
+    // A process that runs with the node's Codex home (Codex runs agents'
+    // commands in its app-server, under that home) is a session too.
+    let out = std::process::Command::new(BIN)
+        .args(["node", "status"])
+        .env("AMAIL_NODE_SOCK", &h.sock)
+        .env("CODEX_HOME", h.dir.path().join("state/codex-home"))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("for the person"),
+        "{out:?}"
+    );
+    // Without it, the same command is the person's.
+    let out = std::process::Command::new(BIN)
+        .args(["node", "status"])
+        .env("AMAIL_NODE_SOCK", &h.sock)
+        .env_remove("CODEX_HOME")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+
+    // A person's launch: allowed; the process that asked becomes the
+    // session, whatever pid the request names.
+    let plan = socket_request(
+        &h.sock,
+        amail_node::wire::Request::Launch {
+            seat: "w2".into(),
+            cwd: work.to_string_lossy().into(),
+            pid: 1,
+            harness: Some("claude".into()),
+            extra: vec![],
+            pane: None,
+            mux_session: None,
+        },
+    )
+    .await;
+    assert!(plan["env"]["AMAIL_TOKEN"].is_string(), "{plan}");
+    let state = h.dir.path().join("state/node-state.json");
+    h.wait("the launch is saved", || async {
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+        saved["roots"]["w2"]["pid"] == std::process::id()
+    })
+    .await;
+    // This process now counts as w2's session: requests for the person are
+    // refused to it.
+    let st = socket_request(&h.sock, amail_node::wire::Request::Status).await;
+    assert!(
+        st["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("for the person"),
+        "{st}"
+    );
+
+    session.kill().ok();
+    session.wait().ok();
+    stand_in.kill().ok();
+    stand_in.wait().ok();
 }

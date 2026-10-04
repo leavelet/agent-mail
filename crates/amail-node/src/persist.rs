@@ -1,5 +1,6 @@
 //! The node's durable state: Codex session registrations, launch
-//! reservations, and the seat tokens handed out at launch.
+//! reservations, the seat tokens handed out at launch, and the session
+//! processes the node launched.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -44,6 +45,26 @@ pub struct Saved {
     /// (the server then returns what they took), by key.
     #[serde(default)]
     pub claim_retries: BTreeMap<String, ClaimRetry>,
+    /// Seat -> the process of its most recently launched session (the
+    /// `amail run` process, which becomes the harness). Requests on the node
+    /// socket are tied to a seat through it.
+    #[serde(default)]
+    pub roots: BTreeMap<String, SessionRoot>,
+    /// The value of `AMAIL_CODEX_PASS` that the node's Codex sessions (their
+    /// shared app-server, its hooks and tool commands) hold; see
+    /// [`crate::wire::CODEX_PASS_ENV`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_pass: Option<String>,
+}
+
+/// A session process the node launched (see [`Saved::roots`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionRoot {
+    pub harness: String,
+    pub pid: u32,
+    /// The process start time, which guards against pid reuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_start: Option<u64>,
 }
 
 /// A claim to retry (see [`Saved::claim_retries`]).

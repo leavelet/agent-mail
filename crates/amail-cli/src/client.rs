@@ -158,7 +158,8 @@ fn is_saved_name(p: &Path) -> bool {
 
 /// Inside a Codex session, tool commands run in the shared Codex daemon and
 /// do not see the session's environment; the node knows which seat owns the
-/// thread (`CODEX_THREAD_ID`) and holds its token.
+/// thread (`CODEX_THREAD_ID`) and holds its token. It answers only requests
+/// that carry the node's Codex pass, which the daemon's environment holds.
 fn node_credentials() -> Option<amail_node::wire::Credentials> {
     let thread = std::env::var("CODEX_THREAD_ID")
         .ok()
@@ -167,6 +168,7 @@ fn node_credentials() -> Option<amail_node::wire::Credentials> {
         &amail_node::paths::socket(),
         &amail_node::wire::Request::Credentials {
             codex_thread: thread,
+            pass: std::env::var(amail_node::wire::CODEX_PASS_ENV).ok(),
         },
         std::time::Duration::from_secs(5),
     )

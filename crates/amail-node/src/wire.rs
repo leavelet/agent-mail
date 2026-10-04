@@ -5,6 +5,13 @@ use amail_proto::PermissionMode;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Environment variable that holds the node's Codex pass: a random value
+/// the node gives to its Codex sessions (in the environment of the shared
+/// Codex app-server, where their hooks and tool commands run) and requires
+/// with their hook and credential requests. It is the same for all Codex
+/// seats of a node.
+pub const CODEX_PASS_ENV: &str = "AMAIL_CODEX_PASS";
+
 /// Environment variables the hook client forwards to the node. Hooks of
 /// some harnesses run in a daemon, so most of these may be absent.
 pub const HOOK_ENV: &[&str] = &[
@@ -12,6 +19,7 @@ pub const HOOK_ENV: &[&str] = &[
     "CLAUDE_CODE_MESSAGING_SOCKET",
     "CLAUDE_PID",
     "CODEX_HOME",
+    CODEX_PASS_ENV,
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,10 +37,12 @@ pub enum Request {
         budget_ms: Option<u64>,
     },
     /// `amail run`: prepare a session for `seat` and say how to start it.
+    /// Refused from processes of the sessions the node launched.
     Launch {
         seat: String,
         cwd: String,
         /// The pid of `amail run`, which becomes the harness's pid on exec.
+        /// On the socket the node uses the connecting process's pid instead.
         pid: u32,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         harness: Option<String>,
@@ -50,9 +60,16 @@ pub enum Request {
         permission_mode: Option<PermissionMode>,
     },
     /// Mail credentials for the seat that owns a harness thread (for agents
-    /// whose tool commands do not inherit the launch environment).
-    Credentials { codex_thread: String },
-    /// Node state, for people and tests.
+    /// whose tool commands do not inherit the launch environment). `pass`
+    /// is the caller's `AMAIL_CODEX_PASS`.
+    Credentials {
+        codex_thread: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pass: Option<String>,
+    },
+    /// Node state, for people and tests. This and the requests below are
+    /// for the person: the node refuses them from processes of the
+    /// sessions it launched.
     Status,
     /// `amail up`: supervise these seats (replacing earlier placements of
     /// the same seats) and, with `start`, start the ones not running (only

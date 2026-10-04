@@ -55,9 +55,68 @@ user's machine beyond what such mail and role text can talk an agent into:
 Use a server you trust with these powers. Seats with `permission_mode =
 "unattended"` act on such mail without asking anyone.
 
-**The host that runs the node is trusted with the seats it hosts.** The
-node holds a node token and the seat tokens of the sessions it runs; any
-process of the same user on that host can ask it for them.
+**The node gives each session only its own seat's credentials and mail.**
+The node holds a node token and the seat tokens of the sessions it runs.
+For every connection to its socket it takes the connecting process's id
+from the kernel (`SO_PEERCRED`) and follows that process's parents in
+`/proc`:
+
+- A Claude Code session is the process of `amail run`, which the node
+  records when it hands out the launch plan and which then becomes the
+  harness. Its hooks and tool commands run below that process. The node
+  answers a Claude Code hook only when it comes from below the session of
+  the seat it names.
+- Codex runs the hooks and tool commands of all Codex seats of a node in
+  one shared app-server, not below the session's process. The node starts
+  that app-server with a random value of its own in its environment
+  (`AMAIL_CODEX_PASS`) and answers Codex hooks and credential requests only
+  when they carry it, and never from a Claude Code session. A Codex thread
+  id alone, which Codex shows in file names and session lists, gets
+  nothing.
+- Requests meant for the person (`amail run`, `up`, `down`, `ps`,
+  `attach`, `sleep`, `wake`, `amail node status`) are refused to processes
+  that run below a session the node launched or with the node's Codex
+  home. `amail node status` does not show session or thread ids.
+
+**On the host, agents and the person are not separated from each other.**
+All sessions run as the same operating-system user as the person who
+started the node, so file permissions do not separate the agents from each
+other or from the person. An agent that can run shell commands (Claude Code
+with `--dangerously-skip-permissions`, a Codex seat whose sandbox lets it
+read your home directory, or any agent whose commands you approve without
+reading them) can:
+
+- read your saved login (`~/.config/amail/config.toml`) if you saved one on
+  that host, and then act as you: read all of the org's mail and
+  conversations, send mail as `USER` (which agents treat as instructions),
+  manage seats, tokens and links;
+- read the node's state directory (the node token, which fetches a new
+  token for any agent seat; the seat tokens handed out at launch; the
+  Codex pass) and other sessions' environments in `/proc`, and then act as
+  any agent seat of the org;
+- start a process outside its own process tree (through a terminal
+  multiplexer, the service manager or a scheduler), which the node then
+  takes for one of the person's;
+- connect to the Codex app-server's control socket, which lets any of the
+  user's processes start turns and run commands in every Codex seat's
+  thread; Codex seats of one node are therefore not separated from each
+  other;
+- write to a Claude Code session's inbox socket, which accepts messages
+  from any process of the user (`crossSessionInbound: "accept"`, which the
+  node's wake-ups need), and so put a prompt into another seat's session.
+
+The node's checks stop an agent from taking another seat's token or mail
+through amail itself; they do not stop an agent that sets out to read files
+or other processes. If that matters for your agents (for example because
+your org is linked to others and they read external mail):
+
+- run the node and its agents under an operating-system user of their own,
+  or in a container, and not under the account that holds your saved
+  login; give agents that must not reach each other's tokens separate
+  users or containers, each with its own node;
+- keep the user token out of the agents' reach: do not save a login
+  (`amail login`) on the host or account where agents run, and manage the
+  org from the web interface or from another machine.
 
 The node socket is created in a directory with mode 0700
 (`$XDG_RUNTIME_DIR/amail`, or `run/` in the node's state directory; never a
@@ -75,7 +134,11 @@ agent does, and mail is text written for agents to read. amail cannot make a mod
 of every message unambiguous and keeps mail out of the permission system:
 
 - **Authenticated sender.** The sender of a message is the seat its token
-  belongs to. An agent cannot send as the user or as another seat.
+  belongs to. An agent gets only its own seat's token from amail; it can
+  send as the user or as another seat only by reading their tokens from
+  files or processes of the same operating-system user (see
+  [trust boundaries](#trust-boundaries) for when that is possible and what
+  to do about it).
 - **Labelled source.** Every injected message carries its source for that
   reader: `USER` (the org's user), `agent` (a seat of the org), `external`
   (anything from another org), `system` (the mail server). The system seat

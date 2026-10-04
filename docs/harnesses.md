@@ -86,7 +86,15 @@ holds the mail instructions.
 terminal, so they do not see the session's environment. A session is tied to
 its seat by a one-time marker in its first prompt
 (`[amail:seat=<seat> launch=<nonce>]`), and tool commands find their seat's
-credentials through the node by `CODEX_THREAD_ID`. Only launch flags that
+credentials through the node by `CODEX_THREAD_ID`. The node answers both
+only when they carry the node's Codex pass (`AMAIL_CODEX_PASS`), which it
+puts in the shared daemon's environment. Codex sets per-thread environment
+variables only when a thread is started, and the TUI starts the thread, so
+the pass is the same for all Codex seats of a node: Codex seats of one node
+are not separated from each other (any process of the user can also use the
+daemon's control socket to act in any thread). Codex seats started before
+an upgrade that added the pass get no mail until the daemon restarts
+(`amail down`, then `amail up`). Only launch flags that
 keep the session on the shared daemon are allowed (`-m`, `-a`, `-s`, `-C`,
 ...; not `-c`, `-p`, `--remote`).
 
@@ -175,10 +183,14 @@ the node's (the node restarts its own). Put it behind an HTTPS proxy and pass
   half-written draft would be sent with the nudge.
 - **State reflects hooks.** Seat states come from hooks and process
   liveness; a background task the agent started is not visible.
-- **One session per seat.** If two sessions use the same seat, the most
-  recent hook wins.
-- **Credentials on the host.** Any process of the same user can ask the
-  node for the credentials of a seat it hosts. The node is a per-user
-  daemon; its socket directory is private to that user.
+- **One session per seat.** A new `amail run` for a seat replaces the
+  seat's session: the node then answers only the new session's hooks, and
+  the token the previous one was given is revoked.
+- **Credentials on the host.** The node answers hooks and credential
+  requests only from the session of the seat they concern (for Codex: from
+  any Codex session of the node, see below), and requests meant for the
+  person only from processes outside the sessions it launched. Agents still
+  run as the person's operating-system user and can read that user's
+  files; see [security](security.md#trust-boundaries).
 - **After a node restart**, sessions whose process and wake target still
   exist are restored as idle; anything else waits for its next hook.

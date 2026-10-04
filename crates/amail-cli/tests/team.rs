@@ -81,6 +81,7 @@ async fn cli_sock(h: &Harness, sock: &Path, args: &[&str]) -> (bool, String) {
         "AMAIL_SEAT",
         "AMAIL_PROFILE",
         "CODEX_THREAD_ID",
+        "AMAIL_CODEX_PASS",
         "ZELLIJ",
         "ZELLIJ_PANE_ID",
         "ZELLIJ_SESSION_NAME",

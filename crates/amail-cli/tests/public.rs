@@ -27,6 +27,7 @@ const CLEAR: &[&str] = &[
     "AMAIL_CONFIG_DIR",
     "AMAIL_SEAT",
     "CODEX_THREAD_ID",
+    "AMAIL_CODEX_PASS",
     "CODEX_HOME",
     "CLAUDE_CONFIG_DIR",
     "XDG_CONFIG_HOME",

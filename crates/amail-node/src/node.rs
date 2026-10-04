@@ -17,6 +17,11 @@
 //! When the server is unreachable every hook gets an empty answer; local
 //! state is kept and re-synchronized on reconnect. Live sessions, Codex
 //! registrations and undelivered mail are persisted in the state directory.
+//!
+//! Requests on the socket are checked against the process that sent them
+//! (see [`caller`]): a seat's hooks and credentials are served only to that
+//! seat's session, and requests for the person only to processes outside
+//! the sessions the node launched.
 
 use crate::adapter::{Adapter, AdapterEnv, Event, Harness, Hook, LaunchCtx, Output};
 use crate::persist::{self, LiveSession, Reservation, Saved, SessionReg};
@@ -35,6 +40,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Notify, OnceCell};
 
+mod caller;
 mod mirror;
 mod supervise;
 
@@ -98,6 +104,10 @@ pub struct Config {
     pub web_terminal: Option<WebTerminal>,
     /// Use this digest interval instead of the org's (for tests).
     pub digest_every: Option<Duration>,
+    /// Check who sends each socket request (see [`caller`]). Only tests
+    /// that drive the socket from processes the node did not launch turn
+    /// this off.
+    pub check_callers: bool,
 }
 
 /// The node's browser terminal: a `zellij web` server of its own (on its
@@ -146,6 +156,7 @@ impl Config {
             mirror_poll: Duration::from_millis(500),
             web_terminal: None,
             digest_every: None,
+            check_callers: true,
         }
     }
 }
@@ -573,6 +584,24 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
     let listener = tokio::net::UnixListener::bind(&cfg.socket)
         .with_context(|| format!("binding {}", cfg.socket.display()))?;
 
+    let state_file = cfg.state_dir.join("node-state.json");
+    let mut st = State {
+        saved: persist::load(&state_file),
+        ..Default::default()
+    };
+    let codex_pass = match &st.saved.codex_pass {
+        Some(p) => p.clone(),
+        None => {
+            let p = hex::encode(rand::random::<[u8; 32]>());
+            st.saved.codex_pass = Some(p.clone());
+            st.save_dirty = true;
+            p
+        }
+    };
+    // Sessions that ended while the node was down.
+    let before = st.saved.roots.len();
+    st.saved.roots.retain(|_, r| alive(r.pid, r.pid_start));
+    st.save_dirty |= st.saved.roots.len() != before;
     let env = AdapterEnv {
         state_dir: cfg.state_dir.clone(),
         amail_exe: cfg.amail_exe.clone(),
@@ -581,14 +610,10 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
         claude_bin: cfg.claude_bin.clone(),
         codex_bin: cfg.codex_bin.clone(),
         codex_auth: cfg.codex_auth.clone(),
+        codex_pass,
     };
     let claude: Arc<dyn Adapter> = Arc::new(crate::adapter::claude::Claude::new(env.clone()));
     let codex: Arc<dyn Adapter> = Arc::new(crate::adapter::codex::Codex::new(env));
-    let state_file = cfg.state_dir.join("node-state.json");
-    let mut st = State {
-        saved: persist::load(&state_file),
-        ..Default::default()
-    };
     // Live sessions survive restarts. One whose process (and wake target) is
     // still there is assumed idle: a wake-up that reaches a busy session is
     // harmless (it is handled after the current turn).
@@ -799,6 +824,11 @@ impl Node {
     }
 
     async fn serve_conn(self: Arc<Self>, stream: tokio::net::UnixStream) {
+        // The connecting process, as the kernel reports it.
+        let peer = stream
+            .peer_cred()
+            .ok()
+            .map(|c| (c.pid().unwrap_or(0).max(0) as u32, c.uid()));
         let (r, mut w) = stream.into_split();
         let mut line = String::new();
         let mut reader = BufReader::new(r);
@@ -808,13 +838,41 @@ impl Node {
             _ => return,
         }
         let started = Instant::now();
-        let resp = match serde_json::from_str::<Request>(&line) {
+        let req = serde_json::from_str::<Request>(&line);
+        let caller = match (&req, self.cfg.check_callers) {
+            (Ok(r), true) => match peer {
+                Some((pid, uid)) if pid > 0 && uid == crate::paths::uid() => {
+                    let for_person =
+                        !matches!(r, Request::Hook { .. } | Request::Credentials { .. });
+                    Some(self.caller(pid, for_person))
+                }
+                _ => {
+                    let _ = w
+                        .write_all(b"{\"error\":\"cannot identify the calling process\"}\n")
+                        .await;
+                    return;
+                }
+            },
+            _ => None,
+        };
+        let resp = match req {
             Ok(Request::Hook {
                 harness,
                 env,
                 input,
                 budget_ms,
             }) => {
+                if let Some(c) = &caller
+                    && !self.hook_allowed(c, &harness, &env)
+                {
+                    tracing::warn!(
+                        "refused a {harness} hook from process {}: not a session this node \
+                         launched for the seat it names",
+                        c.pid
+                    );
+                    let _ = w.write_all(b"{\"stdout\":\"\"}\n").await;
+                    return;
+                }
                 let deadline = budget_ms
                     .map(|b| started + Duration::from_millis(b).saturating_sub(LATE_MARGIN));
                 let out = self.hook_outcome(&harness, &env, &input, deadline).await;
@@ -837,7 +895,16 @@ impl Node {
                 }
                 return;
             }
-            Ok(req) => self.handle(req).await,
+            Ok(req) => match &caller {
+                None => self.handle(req).await,
+                Some(c) => match self.authorize(c, req) {
+                    Ok(req) => self.handle(req).await,
+                    Err(e) => {
+                        tracing::warn!("refused a request from process {}: {e}", c.pid);
+                        json!({"error": e})
+                    }
+                },
+            },
             Err(e) => json!({"error": format!("bad request: {e}")}),
         };
         let mut out = resp.to_string();
@@ -878,7 +945,7 @@ impl Node {
                 Ok(plan) => serde_json::to_value(plan).unwrap_or_default(),
                 Err(e) => json!({"error": format!("{e:#}")}),
             },
-            Request::Credentials { codex_thread } => match self.credentials(&codex_thread) {
+            Request::Credentials { codex_thread, .. } => match self.credentials(&codex_thread) {
                 Some(c) => serde_json::to_value(c).unwrap_or_default(),
                 None => json!({"error": "no seat is registered for this thread"}),
             },
@@ -895,6 +962,44 @@ impl Node {
             Request::Wake { seat } => self.sup_wake(&seat),
             Request::Ps => self.sup_ps(),
             Request::Locate { target } => self.sup_locate(&target),
+        }
+    }
+
+    /// Check a request (other than a hook) against its sender; returns the
+    /// request to serve, with a launch's pid set to the sender's.
+    fn authorize(&self, caller: &caller::Caller, req: Request) -> Result<Request, String> {
+        match req {
+            Request::Hook { .. } => Ok(req),
+            Request::Credentials { codex_thread, pass } => {
+                if caller.is_claude() || !self.codex_pass_ok(pass.as_deref()) {
+                    return Err("credentials are given only to the seat's own Codex session".into());
+                }
+                Ok(Request::Credentials { codex_thread, pass })
+            }
+            _ if caller.is_session() => Err(
+                "this request is for the person, not for agent sessions: run it outside \
+                 the sessions this node launched"
+                    .into(),
+            ),
+            Request::Launch {
+                seat,
+                cwd,
+                harness,
+                extra,
+                pane,
+                mux_session,
+                ..
+            } => Ok(Request::Launch {
+                seat,
+                cwd,
+                // `amail run` becomes the harness: its process is the session.
+                pid: caller.pid,
+                harness,
+                extra,
+                pane,
+                mux_session,
+            }),
+            req => Ok(req),
         }
     }
 
@@ -1475,6 +1580,20 @@ impl Node {
                 context_lost,
             })
             .await?;
+        {
+            // The process that asked becomes the session: requests from it
+            // and its child processes are tied to this seat.
+            let mut st = self.lock();
+            st.saved.roots.insert(
+                seat.to_string(),
+                persist::SessionRoot {
+                    harness: h.as_str().to_string(),
+                    pid,
+                    pid_start: proc_start(pid),
+                },
+            );
+            st.save_dirty = true;
+        }
         let plan = LaunchPlan { notice, ..plan };
         if managed.is_some() {
             let lazy = self.adapter(h).resume_is_lazy();
@@ -1524,8 +1643,10 @@ impl Node {
                     "harness": s.harness.map(Harness::as_str),
                     "state": s.state,
                     "since": ts(s.since),
+                    // Without session ids or wake targets: they name a
+                    // session to the harness's own interfaces.
                     "session": s.session.as_ref().map(|x| json!({
-                        "id": x.id, "pid": x.pid.map(|p| p.0), "target": x.target,
+                        "pid": x.pid.map(|p| p.0),
                     })),
                     "pending": {"to": s.pending.to, "cc": s.pending.cc, "list": s.pending.list, "urgent": s.pending.urgent},
                     "stashed": s.stash.len(),

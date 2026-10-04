@@ -94,6 +94,8 @@ pub struct AdapterEnv {
     pub codex_bin: String,
     /// The `auth.json` the dedicated Codex home links to.
     pub codex_auth: PathBuf,
+    /// The node's Codex pass ([`crate::wire::CODEX_PASS_ENV`]).
+    pub codex_pass: String,
 }
 
 impl AdapterEnv {

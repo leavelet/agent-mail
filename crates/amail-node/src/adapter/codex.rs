@@ -236,7 +236,7 @@ impl Codex {
     }
 
     pub fn home(&self) -> PathBuf {
-        self.env.state_dir.join("codex-home")
+        home_in(&self.env.state_dir)
     }
 
     fn config_path(&self) -> PathBuf {
@@ -422,7 +422,8 @@ impl Codex {
 
     /// Start the home's app-server daemon if it is not running. The daemon
     /// is the environment hooks and agent tool commands run in, so it gets
-    /// the node socket and server URL and none of a seat's variables.
+    /// the node socket, the server URL and the node's Codex pass, and none
+    /// of a seat's variables.
     pub async fn ensure_daemon(&self) -> Result<()> {
         let _g = self.lock.lock().await;
         if self.daemon_up().await.is_ok() {
@@ -434,6 +435,7 @@ impl Codex {
             .env(crate::paths::SOCK_ENV, &self.env.node_socket)
             .env("AMAIL_URL", &self.env.server_url)
             .env("PATH", self.env.path_with_amail())
+            .env(crate::wire::CODEX_PASS_ENV, &self.env.codex_pass)
             .env_remove("AMAIL_SEAT")
             .env_remove("AMAIL_TOKEN")
             .env_remove("AMAIL_PROFILE")
@@ -514,6 +516,11 @@ impl Codex {
     pub fn marker(seat: &str, nonce: &str) -> String {
         format!("[amail:seat={seat} launch={nonce}]")
     }
+}
+
+/// The dedicated Codex home in a node state directory.
+pub fn home_in(state_dir: &Path) -> PathBuf {
+    state_dir.join("codex-home")
 }
 
 /// Processes of this user whose environment contains `entry` exactly.
@@ -725,6 +732,11 @@ impl Adapter for Codex {
             (
                 crate::paths::SOCK_ENV.to_string(),
                 self.env.node_socket.to_string_lossy().into_owned(),
+            ),
+            // For a daemon the TUI starts itself (see `ensure_daemon`).
+            (
+                crate::wire::CODEX_PASS_ENV.to_string(),
+                self.env.codex_pass.clone(),
             ),
         ]);
         Ok(LaunchPlan {

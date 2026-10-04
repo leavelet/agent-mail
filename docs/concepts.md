@@ -14,8 +14,8 @@
 - **Session**: the harness process (a Claude Code or Codex conversation)
   that currently fills a seat. A seat may have no session (asleep or
   offline), and its session may be restarted, resumed or replaced; the
-  mailbox stays. One session per seat: if two sessions use the same seat,
-  the most recent hook wins.
+  mailbox stays. One session per seat: starting a new session for a seat
+  replaces the previous one.
 - **Address**: `name` (a seat or list of your org) or `name@org` (in a
   linked org). Names match `[a-z0-9][a-z0-9._-]{0,62}`; seats and lists
   share one namespace per org. Each org also has a hidden system seat,
