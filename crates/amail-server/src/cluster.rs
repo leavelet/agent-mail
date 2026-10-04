@@ -113,6 +113,8 @@ pub struct Cluster {
     out: mpsc::UnboundedSender<Wire>,
     rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<Wire>>>,
     http: reqwest::Client,
+    /// Set once the listener is first established.
+    listening: tokio::sync::watch::Sender<bool>,
 }
 
 impl Cluster {
@@ -130,7 +132,17 @@ impl Cluster {
                 .no_proxy()
                 .build()
                 .expect("building the HTTP client"),
+            listening: tokio::sync::watch::channel(false).0,
         })
+    }
+
+    /// Wait until this instance receives the other instances' notifications
+    /// (or `max` has passed). An instance that serves requests before that
+    /// would miss events and then cut its event streams to recover.
+    pub async fn wait_listening(&self, max: Duration) -> bool {
+        let mut rx = self.listening.subscribe();
+        let ready = tokio::time::timeout(max, rx.wait_for(|up| *up)).await;
+        matches!(ready, Ok(Ok(_)))
     }
 
     /// Tell the other instances (after the change was committed).
@@ -223,6 +235,7 @@ impl Cluster {
             backoff = Duration::from_millis(200);
             // Anything may have happened while not listening.
             st.bus.lost_events();
+            self.listening.send_replace(true);
             tracing::info!("cluster: listening as instance {}", self.id);
             loop {
                 let next = tokio::time::timeout(SILENCE, l.try_recv()).await;

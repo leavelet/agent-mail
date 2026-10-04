@@ -176,6 +176,13 @@ pub async fn serve(
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     let tasks = start_background(&state);
+    // Accept requests only once the other instances' notifications arrive
+    // here; connections wait in the listener's backlog meanwhile.
+    if let Some(c) = &state.cluster
+        && !c.wait_listening(std::time::Duration::from_secs(15)).await
+    {
+        tracing::warn!("cluster: not listening yet; serving anyway");
+    }
     let r = axum::serve(listener, router(state.clone()))
         .with_graceful_shutdown(shutdown)
         .await;
