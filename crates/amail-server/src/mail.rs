@@ -406,6 +406,34 @@ pub async fn claim(
     }))
 }
 
+/// `POST /v1/claim/release` (node tokens): see [`p::ReleaseRequest`].
+pub async fn release(
+    State(st): State<AppState>,
+    auth: Auth,
+    Query(q): Query<SeatParam>,
+    Json(req): Json<p::ReleaseRequest>,
+) -> ApiResult<Json<p::ReleaseResponse>> {
+    if auth.scope != p::TokenScope::Node {
+        return Err(ApiError::forbidden("requires a node token"));
+    }
+    let seat = auth.mailbox(&st, q.seat.as_deref()).await?;
+    if req.key.is_empty() || req.key.len() > 100 {
+        return Err(ApiError::bad_request("key must be 1..=100 characters"));
+    }
+    if req.messages.len() > 500 {
+        return Err(ApiError::bad_request("at most 500 messages"));
+    }
+    let (released, bump) = st
+        .store
+        .release_claim(seat.id, &req.key, &req.messages)
+        .await?;
+    publish(&st, &seat.name, bump);
+    Ok(Json(p::ReleaseResponse {
+        seat: seat.name,
+        released,
+    }))
+}
+
 #[derive(Deserialize)]
 pub struct ChangesParams {
     seat: Option<String>,

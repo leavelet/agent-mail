@@ -391,7 +391,8 @@ pub struct RecipientNote {
     pub seat: String,
     /// `dormant` (asleep; `to` and urgent mail start it), `offline` (no
     /// session), `focus` (only urgent mail until `until`), `wake_failed`
-    /// (its session does not answer wake-ups).
+    /// (its session does not answer wake-ups), `turn_failed` (its last turn
+    /// ended in an error).
     pub state: String,
     /// Mail of this class and priority starts or wakes the seat now.
     pub wakes: bool,
@@ -549,6 +550,26 @@ pub struct ThreadResponse {
     /// 500 messages, and headers of at most [`limits::MAX_PAGE_BYTES`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
+}
+
+/// Body of `POST /v1/claim/release?seat=` (node tokens): the harness turn
+/// that showed these messages of a keyed claim failed, so their deliveries
+/// go back to "not notified, not read" (unless acknowledged meanwhile) and
+/// are delivered again.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReleaseRequest {
+    /// The claim's idempotency key ([`ClaimRequest::key`]).
+    pub key: String,
+    /// Message ids of the claim's deliveries to release.
+    pub messages: Vec<i64>,
+}
+
+/// Response of `POST /v1/claim/release`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ReleaseResponse {
+    pub seat: String,
+    /// Message ids whose deliveries were released.
+    pub released: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -920,6 +941,24 @@ pub struct FocusResponse {
     pub capped: bool,
 }
 
+/// The last turn of a seat ended in a failure: the harness reported an
+/// error (model or API error), or the session process ended during the
+/// turn. A turn interrupted by the person is not a failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnFailure {
+    /// What the harness reported, with control characters removed and at
+    /// most [`limits::MAX_HINT_CHARS`] characters.
+    pub reason: String,
+    /// When the last failed turn ended (RFC 3339).
+    pub at: String,
+    /// Failed turns in a row.
+    pub count: u32,
+    /// The node shows the mail of the failed turns to the seat again.
+    /// `false` once it stopped after too many failures in a row; the seat
+    /// then needs a person.
+    pub retrying: bool,
+}
+
 /// A seat's session state as shown in the directory and the event stream.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Presence {
@@ -946,6 +985,9 @@ pub struct Presence {
     /// A browser terminal for the seat's session, if its node serves one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_url: Option<String>,
+    /// The seat's last turn failed (see [`TurnFailure`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_failed: Option<TurnFailure>,
     /// Some node of the org has its event stream open, so commands (sleep,
     /// wake, transcript) can reach it. Set by the server when rendering.
     #[serde(default)]
@@ -971,6 +1013,8 @@ pub struct PresenceUpdate {
     pub attention_hint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_failed: Option<TurnFailure>,
 }
 
 /// Body of `POST /v1/presence` (node tokens).
@@ -1126,6 +1170,9 @@ pub struct Overview {
     /// Seats whose presence carries an `attention` tag.
     pub needs_person: i64,
     pub wake_failed: i64,
+    /// Seats whose last turn failed.
+    #[serde(default)]
+    pub turn_failed: i64,
     /// Messages the org can see, created in the last hour / day.
     pub mail_last_hour: i64,
     pub mail_last_day: i64,
@@ -1184,6 +1231,9 @@ pub struct AttentionItem {
     pub hint: Option<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub wake_failed: bool,
+    /// The seat's last turn failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_failed: Option<TurnFailure>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

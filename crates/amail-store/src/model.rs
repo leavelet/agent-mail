@@ -326,6 +326,7 @@ pub struct PresenceRec {
     pub attention: Option<String>,
     pub attention_hint: Option<String>,
     pub terminal_url: Option<String>,
+    pub turn_failed: Option<amail_proto::TurnFailure>,
 }
 
 impl PresenceRec {
@@ -338,6 +339,7 @@ impl PresenceRec {
             && self.attention == next.attention
             && self.attention_hint == next.attention_hint
             && self.terminal_url == next.terminal_url
+            && self.turn_failed == next.turn_failed
     }
 }
 

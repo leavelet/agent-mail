@@ -201,6 +201,7 @@ pub fn router(state: AppState) -> Router {
         .route("/threads/{id}", get(mail::thread))
         .route("/inbox", get(mail::inbox))
         .route("/claim", post(mail::claim))
+        .route("/claim/release", post(mail::release))
         .route("/changes", get(mail::changes))
         .route("/events", get(mail::events))
         .route("/archive/messages", get(mail::archive))

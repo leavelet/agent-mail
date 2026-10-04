@@ -17,6 +17,12 @@ mod sqlite;
 pub mod testutil;
 
 pub use model::*;
+
+/// How long a claim's idempotency key is kept: a retried claim with the
+/// key returns what the first one took, and the claim can be released
+/// (see [`Store::release_claim`]) for this long. It covers the longest
+/// harness turn a released claim is expected to span.
+pub const CLAIM_KEY_TTL_MS: i64 = 6 * 3_600_000;
 pub use postgres::PgStore;
 pub use sqlite::SqliteStore;
 
@@ -215,6 +221,17 @@ pub trait Store: Send + Sync + 'static {
     /// the two claims run concurrently. A retry after a lost response thus
     /// gets the same batch.
     async fn claim(&self, seat_id: i64, f: &ClaimFilter) -> Result<(Vec<Entry>, Option<SeqBump>)>;
+    /// Undo part of a keyed claim (the claim's key is kept for
+    /// [`CLAIM_KEY_TTL_MS`]): the seat's deliveries of `message_ids` that
+    /// the claim with `key` took become "not notified, not read" again,
+    /// unless acknowledged meanwhile. Returns the message ids released.
+    /// Used when the harness turn that showed them failed.
+    async fn release_claim(
+        &self,
+        seat_id: i64,
+        key: &str,
+        message_ids: &[i64],
+    ) -> Result<(Vec<i64>, Option<SeqBump>)>;
     /// Deliveries created or changed after `since` (by `mod_seq`), ascending.
     async fn changes(&self, seat_id: i64, since: i64, limit: i64) -> Result<Vec<Entry>>;
     /// All deliveries of a message, across orgs.

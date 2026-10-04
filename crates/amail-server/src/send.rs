@@ -315,6 +315,7 @@ async fn notes(
             Some(p) if p.state == SeatState::Offline => "offline",
             Some(p) if p.state == SeatState::Dormant => "dormant",
             Some(p) if p.wake_failed => "wake_failed",
+            Some(p) if p.turn_failed.is_some() => "turn_failed",
             Some(_) => continue,
         };
         out.push(RecipientNote {

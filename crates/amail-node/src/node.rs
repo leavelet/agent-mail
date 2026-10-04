@@ -1243,6 +1243,7 @@ impl Node {
         let Some((seat, registered)) = self.identify(&*adapter, env, &hook) else {
             return HookOutcome::default();
         };
+        tracing::debug!("seat {seat}: {} hook {}", h.as_str(), hook.name);
         if registered && let Some(sid) = hook.session_id.clone() {
             let (a, s) = (adapter.clone(), seat.clone());
             tokio::spawn(async move { a.registered(&sid, &s).await });
@@ -2445,6 +2446,7 @@ impl Node {
                             }
                             _ => None,
                         },
+                        turn_failed: None,
                     });
                 }
                 (out, names)

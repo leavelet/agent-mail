@@ -57,6 +57,7 @@ conformance!(
     seat_permission_mode,
     claim_marks_inlined_read,
     claim_keys_concurrent,
+    claim_release,
     presence_store,
     send_budget_exact,
     ack_steps_taken_once,
@@ -1530,6 +1531,63 @@ async fn claim_keys_concurrent(s: S) {
     assert_eq!(s.claim(b.id, &f).await.unwrap().0.len(), 1);
 }
 
+/// A keyed claim's deliveries go back to "not notified, not read" when
+/// released, except acknowledged ones and messages the claim did not take.
+async fn claim_release(s: S) {
+    let (o, user) = org(&s, "acme").await;
+    let a = seat(&s, o.id, "a").await;
+    let mut ids = Vec::new();
+    for i in 0..4 {
+        let m = msg(o.id, user.id, &format!("m{i}"), &[(&a, C::To)]);
+        ids.push(s.send(&m).await.unwrap().message_id);
+    }
+    let mut f = filter(&[C::To]);
+    f.limit = 3;
+    f.key = Some("k1".into());
+    f.read_body_max = Some(1000);
+    let (got, _) = s.claim(a.id, &f).await.unwrap();
+    assert_eq!(got.len(), 3);
+    let before = s.seat_seqs(o.id).await.unwrap();
+    let a_before = before.iter().find(|x| x.0 == a.id).unwrap().2;
+    // Acknowledged meanwhile: kept.
+    s.ack(ids[1], a.id).await.unwrap();
+    let (released, bump) = s
+        .release_claim(a.id, "k1", &[ids[0], ids[1], ids[3]])
+        .await
+        .unwrap();
+    // ids[3] was not taken by this claim.
+    assert_eq!(released, vec![ids[0]]);
+    assert!(bump.unwrap().seq > a_before);
+    let d0 = s.delivery(ids[0], a.id).await.unwrap().unwrap();
+    assert!(d0.notified_at.is_none() && d0.read_at.is_none());
+    assert!(d0.notified_via.is_none());
+    let d1 = s.delivery(ids[1], a.id).await.unwrap().unwrap();
+    assert!(d1.notified_at.is_some() && d1.acked_at.is_some());
+    let d2 = s.delivery(ids[2], a.id).await.unwrap().unwrap();
+    assert!(d2.notified_at.is_some());
+    // Counted as pending again: a new claim takes it (and the untouched one).
+    let (again, _) = s.claim(a.id, &filter(&[C::To])).await.unwrap();
+    let mut got: Vec<i64> = again.iter().map(|e| e.message.id).collect();
+    got.sort();
+    assert_eq!(got, vec![ids[0], ids[3]]);
+    // Unknown key, or another seat: nothing.
+    assert!(
+        s.release_claim(a.id, "nope", &[ids[0]])
+            .await
+            .unwrap()
+            .0
+            .is_empty()
+    );
+    let b = seat(&s, o.id, "b").await;
+    assert!(
+        s.release_claim(b.id, "k1", &[ids[2]])
+            .await
+            .unwrap()
+            .0
+            .is_empty()
+    );
+}
+
 async fn presence_store(s: S) {
     use amail_proto::SeatState;
     let (o, _) = org(&s, "acme").await;
@@ -1545,6 +1603,7 @@ async fn presence_store(s: S) {
         attention: None,
         attention_hint: None,
         terminal_url: None,
+        turn_failed: None,
     };
     let now = now_ms();
     let changed = s
@@ -1581,6 +1640,21 @@ async fn presence_store(s: S) {
         .await
         .unwrap();
     assert_eq!(changed.len(), 1);
+    // A turn failure is stored and is a change.
+    let mut failed = rec("a", SeatState::Idle, now);
+    failed.turn_failed = Some(amail_proto::TurnFailure {
+        reason: "model error".into(),
+        at: "2026-10-05T00:00:00.000Z".into(),
+        count: 2,
+        retrying: true,
+    });
+    let changed = s
+        .put_presence(o.id, &[failed.clone()], 90_000)
+        .await
+        .unwrap();
+    assert_eq!(changed.len(), 1);
+    let p = s.presence(o.id, Some("a")).await.unwrap();
+    assert_eq!(p[0].turn_failed, failed.turn_failed);
     // Deleted seats have no presence; the system seat never shows.
     s.delete_seat(o.id, "a").await.unwrap();
     assert!(s.presence(o.id, None).await.unwrap().is_empty());

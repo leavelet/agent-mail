@@ -39,7 +39,7 @@ pub async fn presences(st: &AppState, org_id: i64) -> ApiResult<HashMap<String, 
 fn seat_items(presence: &HashMap<String, Presence>) -> Vec<AttentionItem> {
     presence
         .iter()
-        .filter(|(_, p)| p.attention.is_some() || p.wake_failed)
+        .filter(|(_, p)| p.attention.is_some() || p.wake_failed || p.turn_failed.is_some())
         .map(|(name, p)| AttentionItem {
             kind: AttentionKind::Seat,
             since: p.since.clone(),
@@ -50,9 +50,14 @@ fn seat_items(presence: &HashMap<String, Presence>) -> Vec<AttentionItem> {
             attention: p
                 .attention
                 .clone()
+                .or_else(|| p.turn_failed.as_ref().map(|_| "turn-failed".to_string()))
                 .or_else(|| p.wake_failed.then(|| "wake-failed".to_string())),
-            hint: p.attention_hint.clone(),
+            hint: p
+                .attention_hint
+                .clone()
+                .or_else(|| p.turn_failed.as_ref().map(|t| t.reason.clone())),
             wake_failed: p.wake_failed,
+            turn_failed: p.turn_failed.clone(),
         })
         .collect()
 }
@@ -79,6 +84,7 @@ async fn attention_items(st: &AppState, auth: &Auth) -> ApiResult<Vec<AttentionI
             attention: None,
             hint: None,
             wake_failed: false,
+            turn_failed: None,
         };
         if e.message.priority == Priority::Urgent {
             urgent.push(item);
@@ -148,6 +154,9 @@ async fn overview_of(st: &AppState, auth: &Auth) -> ApiResult<p::Overview> {
         }
         if pr.is_some_and(|p| p.wake_failed) {
             out.wake_failed += 1;
+        }
+        if pr.is_some_and(|p| p.turn_failed.is_some()) {
+            out.turn_failed += 1;
         }
     }
     let now = amail_store::now_ms();
