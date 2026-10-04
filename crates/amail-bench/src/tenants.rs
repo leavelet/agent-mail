@@ -474,6 +474,23 @@ async fn setup(o: &Opts) -> Result<Setup> {
              WHERE org_id = {org}"
         ));
     }
+    // On a server that keeps per-seat counters, bring them up to date: the
+    // deliveries above did not come through sending.
+    let recount = format!(
+        "UPDATE seats SET \
+         pending_to = (SELECT COUNT(*) FROM deliveries d WHERE d.seat_id = seats.id AND d.notified_at IS NULL AND d.mode = 'immediate' AND d.class = 'to'), \
+         pending_cc = (SELECT COUNT(*) FROM deliveries d WHERE d.seat_id = seats.id AND d.notified_at IS NULL AND d.mode = 'immediate' AND d.class = 'cc'), \
+         pending_list = (SELECT COUNT(*) FROM deliveries d WHERE d.seat_id = seats.id AND d.notified_at IS NULL AND d.mode = 'immediate' AND d.class = 'list'), \
+         pending_urgent = (SELECT COUNT(*) FROM deliveries d JOIN messages m ON m.id = d.message_id WHERE d.seat_id = seats.id \
+           AND d.notified_at IS NULL AND d.mode = 'immediate' AND m.priority = 'urgent'), \
+         pending_digest = (SELECT COUNT(*) FROM deliveries d WHERE d.seat_id = seats.id AND d.notified_at IS NULL AND d.mode = 'digest'), \
+         unread = (SELECT COUNT(*) FROM deliveries d WHERE d.seat_id = seats.id AND d.read_at IS NULL AND d.mode <> 'archive'), \
+         pending_digest_since = (SELECT MIN(m.created_at) FROM deliveries d JOIN messages m ON m.id = d.message_id \
+           WHERE d.seat_id = seats.id AND d.notified_at IS NULL AND d.mode = 'digest') \
+         WHERE org_id IN ({}, {})",
+        atk.id, vic.id
+    );
+    let has_counters = "SELECT pending_to FROM seats LIMIT 1";
     sql.push("ANALYZE".into());
     let t = Instant::now();
     if o.db.starts_with("sqlite:") {
@@ -489,6 +506,9 @@ async fn setup(o: &Opts) -> Result<Setup> {
                 .await
                 .with_context(|| q.clone())?;
         }
+        if sqlx::raw_sql(has_counters).execute(&mut c).await.is_ok() {
+            sqlx::raw_sql(&recount).execute(&mut c).await?;
+        }
     } else {
         use sqlx::Connection;
         let mut c = sqlx::PgConnection::connect(&o.db).await?;
@@ -497,6 +517,9 @@ async fn setup(o: &Opts) -> Result<Setup> {
                 .execute(&mut c)
                 .await
                 .with_context(|| q.clone())?;
+        }
+        if sqlx::raw_sql(has_counters).execute(&mut c).await.is_ok() {
+            sqlx::raw_sql(&recount).execute(&mut c).await?;
         }
     }
     eprintln!(

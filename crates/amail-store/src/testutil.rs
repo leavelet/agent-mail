@@ -112,6 +112,30 @@ impl TestDb {
         }
     }
 
+    /// Recount the pending and unread counters of the org's seats from
+    /// their deliveries, and record their threads, after deliveries were
+    /// inserted directly (sending keeps both; on Postgres a direct insert
+    /// does not).
+    pub async fn recount_seats(&self, org_id: i64) {
+        self.exec(&[
+            format!("UPDATE seats SET \
+ pending_to = (SELECT COUNT(*) FROM deliveries d WHERE d.seat_id = seats.id AND d.notified_at IS NULL AND d.mode = 'immediate' AND d.class = 'to'), \
+ pending_cc = (SELECT COUNT(*) FROM deliveries d WHERE d.seat_id = seats.id AND d.notified_at IS NULL AND d.mode = 'immediate' AND d.class = 'cc'), \
+ pending_list = (SELECT COUNT(*) FROM deliveries d WHERE d.seat_id = seats.id AND d.notified_at IS NULL AND d.mode = 'immediate' AND d.class = 'list'), \
+ pending_urgent = (SELECT COUNT(*) FROM deliveries d JOIN messages m ON m.id = d.message_id WHERE d.seat_id = seats.id AND d.notified_at IS NULL AND d.mode = 'immediate' AND m.priority = 'urgent'), \
+ pending_digest = (SELECT COUNT(*) FROM deliveries d WHERE d.seat_id = seats.id AND d.notified_at IS NULL AND d.mode = 'digest'), \
+ unread = (SELECT COUNT(*) FROM deliveries d WHERE d.seat_id = seats.id AND d.read_at IS NULL AND d.mode <> 'archive'), \
+ pending_digest_since = (SELECT MIN(m.created_at) FROM deliveries d JOIN messages m ON m.id = d.message_id WHERE d.seat_id = seats.id AND d.notified_at IS NULL AND d.mode = 'digest') WHERE org_id = {org_id}"),
+            format!(
+                "INSERT INTO thread_seats (thread_id, org_id, seat_id) \
+                 SELECT DISTINCT m.thread_id, d.org_id, d.seat_id FROM deliveries d \
+                 JOIN messages m ON m.id = d.message_id WHERE d.org_id = {org_id} \
+                 ON CONFLICT DO NOTHING"
+            ),
+        ])
+            .await;
+    }
+
     /// Rows of a query whose columns are all integers (`BIGINT`), in order.
     pub async fn rows_i64(&self, sql: &str) -> Vec<Vec<i64>> {
         use sqlx::Row;

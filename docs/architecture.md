@@ -70,9 +70,10 @@ resumes them when mail arrives. See [team files](teams.md).
    `/v1/messages`. The server checks the sender's token, budget, addresses,
    links and list policies, expands lists, and in one transaction stores the
    message and one delivery per recipient seat, each with the seat's next
-   sequence number. In the same transaction, triggers in the database add
-   to each recipient seat's pending and unread counters and record which
-   orgs and seats take part in the thread. It answers with the recipients
+   sequence number. In the same transaction each recipient seat's pending
+   and unread counters grow, and the seats are recorded as taking part in
+   the thread (claims, reads and acknowledgements change the counters
+   through triggers in the database). It answers with the recipients
    and notes on who will not see it at once.
 2. **Event.** After the commit, the server publishes a mailbox event
    (org, seat, counter) to the org's event streams. With several instances

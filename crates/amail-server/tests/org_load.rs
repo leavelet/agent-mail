@@ -317,6 +317,7 @@ async fn counts_do_not_grow_with_deliveries(b: Backend, t: &str) {
             ),
         ])
         .await;
+    srv.db.recount_seats(big.org_id).await;
     let p = big.get("/pending?seat=s00").await;
     assert_eq!(p["seats"][0]["to"], 10_000, "{p}");
     let c = big.get("/counts?seat=s00").await;

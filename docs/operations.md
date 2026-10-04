@@ -304,7 +304,7 @@ over all orgs (`--max-org-queries`, `--max-queries`): search, archive,
 more than 100 entries. Each runs until its database work ends, also when the
 client gave up, and each query is cancelled after 10 seconds. Everything else
 is a bounded index lookup. `GET /pending` and `GET /counts` read per-seat
-counters that the database keeps in the transactions that change
+counters kept in the transactions that change
 deliveries, and `/overview` counts recent mail per org and minute, so these
 answers cost the same for an org with millions of deliveries as for an
 empty one.
