@@ -570,7 +570,7 @@ impl Adapter for Codex {
         if let Some(m) = &info.model {
             args.extend(["-m".to_string(), m.clone()]);
         }
-        if info.permission_mode == Some(PermissionMode::Unattended) {
+        if ctx.permission_mode == PermissionMode::Unattended {
             // No `-s`: the sandbox comes from the `amail` permissions profile
             // (workspace + network + the seat's git directories).
             args.extend(["-a", "never"].map(String::from));
@@ -610,6 +610,7 @@ impl Adapter for Codex {
             env,
             unset_env: UNSET.iter().map(|s| s.to_string()).collect(),
             path_prepend: self.env.amail_dir().into_iter().collect(),
+            notice: None,
         })
     }
 

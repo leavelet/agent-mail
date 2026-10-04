@@ -81,9 +81,20 @@ role_file = "roles/docs.md"
 `permission_mode = "unattended"` runs agents without permission prompts
 (Claude Code: `--dangerously-skip-permissions`; Codex: `-a never` inside its
 sandbox, see [harness support](harnesses.md)). Use it only in a repository
-you can afford to lose. With `"default"` the harness asks as usual; answer
-in the seat's pane (`amail attach <seat>`); such seats show `awaiting` and
-appear in the web interface's queue.
+you can afford to lose. With `"default"`, or without `permission_mode`, the
+harness asks as usual; answer in the seat's pane (`amail attach <seat>`);
+such seats show `awaiting` and appear in the web interface's queue.
+
+The team file is what decides the permission mode: `amail up` hands it to
+the node, which applies it at each start of the seat's session (a change
+takes effect at the next start). `amail up` also writes it into the seat's
+settings on the server, but only for display: a permission mode set on the
+server (in the web interface or with `amail seat set`) does not change how
+the node starts a session, so a server cannot turn off your prompts. When
+the server says `unattended` and the team file does not, the node keeps
+the prompts and logs a notice. After upgrading from a version where the
+server's setting decided, run `amail up` once so that the node learns each
+seat's mode from the team file.
 
 ## Templates
 

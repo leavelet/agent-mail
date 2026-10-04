@@ -51,7 +51,7 @@ exit code.
 
 | command | |
 |---|---|
-| `amail seat add <name> [--parent p] [--role r] [--harness claude\|codex] [--model m] [--display-name d] [--permission-mode default\|unattended]` | create a seat |
+| `amail seat add <name> [--parent p] [--role r] [--harness claude\|codex] [--model m] [--display-name d] [--permission-mode default\|unattended]` | create a seat (the permission mode is stored for display; launches take it from the team file or `amail run --permission-mode`) |
 | `amail seat set/ls/rm/token` | change, list, delete a seat; issue a seat token |
 | `amail list create <name> [--policy anyone\|members\|user_only] [--description d]` | create a list |
 | `amail list ls [name]` / `rm` / `add <list> <members...> [--mode immediate\|digest\|archive]` / `remove` | lists and members |
@@ -70,7 +70,7 @@ exit code.
 | `amail node token [--save]` | issue a node token (user token needed); `--save` writes it with the URL to `<state dir>/node.toml` |
 | `amail node status` | the node's view of its seats |
 | `amail node web-token` | a login token for the node's browser terminal |
-| `amail run <seat> [-- args]` | start the seat's harness session in this terminal |
+| `amail run <seat> [--harness claude\|codex] [--permission-mode default\|unattended] [-- args]` | start the seat's harness session in this terminal. `--permission-mode unattended` runs it without permission prompts; without the flag a seat placed by `amail up` uses its team file's `permission_mode` and any other seat keeps the prompts. The server's seat setting is not used |
 | `amail up [-f amail.toml] [--only g,s] [--no-start] [--prune]` | bring a team up from a team file ([team files](teams.md)) |
 | `amail down [--only g,s]` / `amail ps` | stop the team's sessions / one line per seat |
 | `amail attach <group or seat>` / `amail sleep <seat>` / `amail wake <seat>` | attach to a group's zellij session / put a seat to sleep / start it now |
@@ -152,7 +152,7 @@ session cookie; with the cookie, everything but `GET` needs the header
 | `GET /attention` | user tokens: what waits for the user ([concepts](concepts.md#the-users-queue-needs-you)) |
 | `GET /pending` | node and user tokens: per seat, pending deliveries by class, urgent count, digest counts, `focus_until`, the seat's counter |
 | `POST /presence` | node tokens: `{node?, seats: [{seat, state, wake_failed?, harness?, since?, attention?, attention_hint?, terminal_url?}]}` (at most 5,000 seats); valid for 90 s |
-| `GET /seats/{name}/launch` | node and user tokens: harness, model, role, parent, permission mode and a new seat token; the token of the seat's previous launch is revoked |
+| `GET /seats/{name}/launch` | node and user tokens: harness, model, role, parent, permission mode (informational; the node does not use it) and a new seat token; the token of the seat's previous launch is revoked |
 | `POST /seats/{name}/sleep`, `POST /seats/{name}/wake` | user tokens: ask the node hosting the seat; 202, or 409 `node_offline` |
 | `GET /seats/{name}/transcript` | user tokens: the seat's conversation as server-sent events: `status`, `reset`, `events` |
 | `POST /seats/{name}/transcript` | node tokens: `{node?, reset, status?, events}` for the watchers of the seat |

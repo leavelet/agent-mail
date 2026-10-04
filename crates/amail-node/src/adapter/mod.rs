@@ -7,7 +7,7 @@ pub mod claude;
 pub mod codex;
 
 use crate::wire::LaunchPlan;
-use amail_proto::{LaunchInfo, SeatState};
+use amail_proto::{LaunchInfo, PermissionMode, SeatState};
 use anyhow::Result;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -116,7 +116,12 @@ impl AdapterEnv {
 
 /// Inputs of [`Adapter::launch`].
 pub struct LaunchCtx<'a> {
+    /// What the server says about the seat. Its `permission_mode` is not
+    /// used; see `permission_mode` below.
     pub info: &'a LaunchInfo,
+    /// The permission mode chosen on this machine (team file or `amail run`
+    /// flag). Only `Unattended` turns off the harness's permission prompts.
+    pub permission_mode: PermissionMode,
     pub cwd: &'a str,
     pub extra: &'a [String],
     /// One-time registration nonce, for adapters that register sessions.

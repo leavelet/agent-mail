@@ -368,6 +368,7 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
                 mux_session: format!("amail-{}-{g}", me.org),
                 tab,
                 paste_fallback: plan.paste_fallback,
+                permission_mode: plan.permission_mode,
             }
         })
         .collect();

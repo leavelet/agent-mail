@@ -1,6 +1,7 @@
 //! The node socket protocol: one JSON request per line, one JSON response
 //! per line, one request per connection.
 
+use amail_proto::PermissionMode;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -42,6 +43,11 @@ pub enum Request {
         pane: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mux_session: Option<String>,
+        /// The permission mode chosen on this machine (`amail run
+        /// --permission-mode`). A supervised seat without it uses the mode
+        /// from its team file. The server's value is never used.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        permission_mode: Option<PermissionMode>,
     },
     /// Mail credentials for the seat that owns a harness thread (for agents
     /// whose tool commands do not inherit the launch environment).
@@ -91,6 +97,11 @@ pub struct SeatPlacement {
     /// that is safe (see the node).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub paste_fallback: bool,
+    /// The seat's `permission_mode` from the team file. It decides whether
+    /// the harness runs without permission prompts; `None` keeps the
+    /// harness's normal prompting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<PermissionMode>,
 }
 
 /// A row of `amail ps`.
@@ -143,6 +154,10 @@ pub struct LaunchPlan {
     /// Directories to put in front of `PATH` (so agents find `amail`).
     #[serde(default)]
     pub path_prepend: Vec<String>,
+    /// Something the person starting the session should know (printed by
+    /// `amail run` before it starts the harness).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -23,8 +23,8 @@ use crate::persist::{self, LiveSession, Reservation, Saved, SessionReg};
 use crate::server::{ClaimSpec, ServerClient};
 use crate::wire::{Credentials, LaunchPlan, Request};
 use amail_proto::{
-    DeliveryClass, InboxEntry, MailboxEvent, PendingCounts, PresenceReport, PresenceUpdate,
-    Priority, SeatState,
+    DeliveryClass, InboxEntry, MailboxEvent, PendingCounts, PermissionMode, PresenceReport,
+    PresenceUpdate, Priority, SeatState,
 };
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -471,6 +471,16 @@ fn claim_key() -> String {
     hex::encode(rand::random::<[u8; 12]>())
 }
 
+/// A model name the node passes to a harness: it cannot be read as an
+/// option, and has no spaces or control characters.
+fn valid_model(m: &str) -> bool {
+    !m.is_empty()
+        && m.len() <= 200
+        && !m.starts_with('-')
+        && m.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-:/@[]+".contains(c))
+}
+
 /// RFC 3339 to Unix ms.
 fn parse_ts(s: &str) -> Option<i64> {
     s.parse::<jiff::Timestamp>()
@@ -851,6 +861,7 @@ impl Node {
                 extra,
                 pane,
                 mux_session,
+                permission_mode,
             } => match self
                 .launch(
                     &seat,
@@ -860,6 +871,7 @@ impl Node {
                     &extra,
                     pane,
                     mux_session,
+                    permission_mode,
                 )
                 .await
             {
@@ -1384,10 +1396,38 @@ impl Node {
         extra: &[String],
         pane: Option<u32>,
         mux_session: Option<String>,
+        permission_mode: Option<PermissionMode>,
     ) -> Result<LaunchPlan> {
         let managed = self.lock().saved.managed.get(seat).cloned();
         let harness = harness.or(managed.as_ref().map(|m| m.harness.as_str()));
-        let info = self.server.launch(seat).await?;
+        let mut info = self.server.launch(seat).await?;
+        if info.seat != seat {
+            bail!("the server answered for seat {:?}, not {seat:?}", info.seat);
+        }
+        // The permission mode is decided on this machine: the `amail run`
+        // flag, else the team file of a supervised seat, else the harness's
+        // normal prompting. The server's value is only reported.
+        let mode = permission_mode
+            .or(managed.as_ref().and_then(|m| m.permission_mode))
+            .unwrap_or(PermissionMode::Default);
+        let notice = (info.permission_mode == Some(PermissionMode::Unattended)
+            && mode != PermissionMode::Unattended)
+            .then(|| {
+                format!(
+                    "seat {seat}: the server's seat settings say permission_mode \
+                     \"unattended\", but this machine did not choose it, so the \
+                     session keeps the harness's permission prompts. To run it \
+                     without prompts, set permission_mode in the team file and run \
+                     amail up, or use amail run --permission-mode unattended."
+                )
+            });
+        if let Some(n) = &notice {
+            tracing::warn!("{n}");
+        }
+        info.permission_mode = Some(mode);
+        if let Some(m) = info.model.take_if(|m| !valid_model(m)) {
+            tracing::warn!("seat {seat}: ignoring the server's model {m:?}");
+        }
         let name = harness
             .map(str::to_string)
             .or_else(|| info.harness.clone())
@@ -1426,6 +1466,7 @@ impl Node {
             .adapter(h)
             .launch(&LaunchCtx {
                 info: &info,
+                permission_mode: mode,
                 cwd,
                 extra,
                 nonce: &nonce,
@@ -1434,6 +1475,7 @@ impl Node {
                 context_lost,
             })
             .await?;
+        let plan = LaunchPlan { notice, ..plan };
         if managed.is_some() {
             let lazy = self.adapter(h).resume_is_lazy();
             let mut st = self.lock();

@@ -204,6 +204,12 @@ enum Cmd {
         /// Override the seat's harness (`claude` or `codex`).
         #[arg(long)]
         harness: Option<String>,
+        /// `unattended` runs the harness without permission prompts;
+        /// `default` keeps them. Without it, a seat supervised by the node
+        /// uses its team file's `permission_mode`, any other seat `default`.
+        /// The server's seat setting is never used.
+        #[arg(long, value_parser = parse_permission_mode)]
+        permission_mode: Option<p::PermissionMode>,
         /// The node socket (default: AMAIL_NODE_SOCK, then the standard path).
         #[arg(long)]
         socket: Option<PathBuf>,
@@ -515,7 +521,9 @@ enum SeatCmd {
         model: Option<String>,
         #[arg(long)]
         display_name: Option<String>,
-        /// `default` or `unattended` (run without permission prompts).
+        /// `default` or `unattended`, stored for display. Launches take the
+        /// permission mode from the team file or `amail run
+        /// --permission-mode`, not from this setting.
         #[arg(long)]
         permission_mode: Option<String>,
     },
@@ -663,13 +671,20 @@ fn main() -> ExitCode {
     if let Cmd::Run {
         seat,
         harness,
+        permission_mode,
         socket,
         extra,
     } = &cli.cmd
     {
-        return match linux_only("amail run")
-            .and_then(|()| run_seat(seat, harness.clone(), socket.clone(), extra.clone()))
-        {
+        return match linux_only("amail run").and_then(|()| {
+            run_seat(
+                seat,
+                harness.clone(),
+                *permission_mode,
+                socket.clone(),
+                extra.clone(),
+            )
+        }) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {}", text::multiline(&format!("{e:#}")));
@@ -1540,6 +1555,11 @@ async fn serve(
     Ok(())
 }
 
+fn parse_permission_mode(s: &str) -> Result<p::PermissionMode, String> {
+    s.parse()
+        .map_err(|_| format!("{s:?}: expected \"default\" or \"unattended\""))
+}
+
 fn parse_meta(items: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
     let mut m = std::collections::BTreeMap::new();
     for it in items {
@@ -1757,6 +1777,7 @@ fn wait_for_terminal_size(seat: &str) {
 fn run_seat(
     seat: &str,
     harness: Option<String>,
+    permission_mode: Option<p::PermissionMode>,
     socket: Option<PathBuf>,
     extra: Vec<String>,
 ) -> Result<()> {
@@ -1780,10 +1801,14 @@ fn run_seat(
             extra,
             pane,
             mux_session,
+            permission_mode,
         },
         std::time::Duration::from_secs(180),
     )?;
     let plan: amail_node::wire::LaunchPlan = serde_json::from_value(v)?;
+    if let Some(n) = &plan.notice {
+        eprintln!("amail: {}", text::multiline(n));
+    }
     let mut cmd = std::process::Command::new(&plan.program);
     cmd.args(&plan.args);
     for k in &plan.unset_env {

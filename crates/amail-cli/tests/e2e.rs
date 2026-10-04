@@ -482,7 +482,7 @@ async fn run(backend: Backend) {
             .success()
     );
 
-    // Seat settings, including the permission mode used by `amail run`.
+    // Seat settings, including the permission mode (shown, not used to launch).
     let set = acme.run(&[
         "seat",
         "set",

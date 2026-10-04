@@ -386,9 +386,11 @@ async fn codex_registration_and_rows(b: Backend) {
             extra: vec![],
             pane: None,
             mux_session: None,
+            permission_mode: Some(amail_proto::PermissionMode::Unattended),
         })
         .await;
     assert!(plan.get("error").is_none(), "{plan}");
+    assert!(plan.get("notice").is_none(), "{plan}");
     let args: Vec<String> = serde_json::from_value(plan["args"].clone()).unwrap();
     // No `-s`: the sandbox comes from the home's `amail` permissions profile.
     assert_eq!(&args[..4], ["-m", "test-model", "-a", "never"]);
@@ -417,11 +419,41 @@ async fn codex_registration_and_rows(b: Backend) {
             extra: vec!["-c".into(), "model=x".into()],
             pane: None,
             mux_session: None,
+            permission_mode: None,
         })
         .await;
     assert!(
         bad["error"].as_str().unwrap().contains("not allowed"),
         "{bad}"
+    );
+    // The server's seat settings say "unattended", but this machine did
+    // not choose it: the session keeps its approval prompts.
+    let prompting = h
+        .node
+        .as_ref()
+        .unwrap()
+        .node
+        .handle(amail_node::wire::Request::Launch {
+            seat: "cx".into(),
+            cwd: cwd.to_string_lossy().into(),
+            pid: std::process::id(),
+            harness: None,
+            extra: vec![],
+            pane: None,
+            mux_session: None,
+            permission_mode: None,
+        })
+        .await;
+    assert!(prompting.get("error").is_none(), "{prompting}");
+    let args: Vec<String> = serde_json::from_value(prompting["args"].clone()).unwrap();
+    assert_eq!(&args[..2], ["-m", "test-model"]);
+    assert!(!args.iter().any(|a| a == "-a" || a == "never"), "{args:?}");
+    assert!(
+        prompting["notice"]
+            .as_str()
+            .unwrap()
+            .contains("keeps the harness's permission prompts"),
+        "{prompting}"
     );
     // The home's config: hooks, trust entries, mail instructions, project trust.
     let config =

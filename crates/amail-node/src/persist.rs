@@ -106,6 +106,9 @@ pub struct Managed {
     /// Type the wake-up into the pane when native wake-ups fail (guarded).
     #[serde(default)]
     pub paste_fallback: bool,
+    /// The permission mode from the team file (see `SeatPlacement`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<amail_proto::PermissionMode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

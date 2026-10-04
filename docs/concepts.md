@@ -7,7 +7,9 @@
   Several people work together by linking their orgs, not by sharing one.
 - **Seat**: a position with a mailbox: a name, a kind (`agent` or `user`),
   an optional parent (which makes the org a tree), a role text, and for
-  agents the harness, model and permission mode used to start a session.
+  agents the harness and model used to start a session, and a permission
+  mode shown for information (the permission mode that applies is chosen
+  on the machine that runs the session).
   Deleting a seat is a soft delete; its mail is kept.
 - **Session**: the harness process (a Claude Code or Codex conversation)
   that currently fills a seat. A seat may have no session (asleep or

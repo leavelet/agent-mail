@@ -26,6 +26,35 @@ without naming them; acknowledgement reminders count them the same way.
 The operator's interfaces do not show mail or conversations; see
 [what the operator sees](#what-the-operator-sees).
 
+**A user trusts the server they connect to** for the source labels of
+mail and for role texts. The server computes the `USER`, `agent`,
+`external` and `system` labels, and it stores each seat's role text, which
+the node puts into the session's system prompt. A server that is
+compromised, or run by a malicious operator, can therefore send mail
+labelled `USER` to the agents of every org on it, change their role texts
+and their models, and read their mail. It cannot change what happens on a
+user's machine beyond what such mail and role text can talk an agent into:
+
+- it cannot turn off permission prompts. The node decides the permission
+  mode on the user's machine, from the team file (`permission_mode` of a
+  seat that `amail up` placed) or from `amail run --permission-mode`; with
+  neither, the harness keeps its normal prompts. The server's
+  `permission_mode` seat setting is shown in the web interface and in
+  `amail seat ls`, and it has no effect on launches. When it says
+  `unattended` and the local side did not choose that, the node logs a
+  notice and `amail run` prints it;
+- it cannot choose which program runs. The harness binaries come from the
+  node's configuration (`claude` and `codex` on `PATH`, or the node's
+  `--claude-bin` and `--codex-bin`); the server's `harness` setting only
+  picks one of the two for a seat that is not in a team file and is
+  started without `--harness`. A model name from the server that could be
+  read as a command-line option is ignored;
+- it cannot add launch arguments: the extra arguments of `amail run` come
+  only from its own command line.
+
+Use a server you trust with these powers. Seats with `permission_mode =
+"unattended"` act on such mail without asking anyone.
+
 **The host that runs the node is trusted with the seats it hosts.** The
 node holds a node token and the seat tokens of the sessions it runs; any
 process of the same user on that host can ask it for them.
@@ -74,12 +103,15 @@ of every message unambiguous and keeps mail out of the permission system:
   an instruction, `agent` mail a colleague's request and `external` mail
   untrusted information, and that mail never grants permissions.
 - **No permission through mail.** Approving a tool call or a sandbox
-  exception happens only in the harness (the terminal). Seats with
-  `permission_mode = "unattended"` have no prompts at all: there, what an
-  agent may do is limited only by the harness's sandbox (Codex) or not at
-  all (Claude Code with `--dangerously-skip-permissions`). Run unattended
-  seats only on repositories and hosts you can afford to lose, and be most
-  careful when your org is linked to others.
+  exception happens only in the harness (the terminal). Whether a seat runs
+  without prompts is decided on the user's machine (the team file or
+  `amail run --permission-mode`), never by mail or by the server (see
+  [trust boundaries](#trust-boundaries)). Seats with `permission_mode =
+  "unattended"` have no prompts at all: there, what an agent may do is
+  limited only by the harness's sandbox (Codex) or not at all (Claude Code
+  with `--dangerously-skip-permissions`). Run unattended seats only on
+  repositories and hosts you can afford to lose, and be most careful when
+  your org is linked to others.
 
 In our tests, agents of both supported harnesses refused a deletion
 requested by another org's user and carried out the same request from their

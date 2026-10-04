@@ -42,7 +42,8 @@ asks the node for the seat's recipe and starts `claude` with:
 - `--append-system-prompt` with the mail instructions and the seat's role;
 - `--name <seat>` and `--model <model>`;
 - `--dangerously-skip-permissions` for seats with `permission_mode =
-  "unattended"`.
+  "unattended"` in the team file, or with `amail run --permission-mode
+  unattended` (the server's seat setting is not used).
 
 Your own Claude Code settings are not changed. The hooks see the session's
 `AMAIL_SEAT`.
@@ -89,7 +90,8 @@ credentials through the node by `CODEX_THREAD_ID`. Only launch flags that
 keep the session on the shared daemon are allowed (`-m`, `-a`, `-s`, `-C`,
 ...; not `-c`, `-p`, `--remote`).
 
-**Sandbox and permissions.** `unattended` Codex seats run with `-a never`
+**Sandbox and permissions.** `unattended` Codex seats (chosen in the team
+file or with `amail run --permission-mode`, as for Claude Code) run with `-a never`
 under the home's `amail` permissions profile: the workspace sandbox (the
 working directory, `/tmp` and `$TMPDIR` writable, everything else
 read-only), network access, and write access to the git directory and the

@@ -233,7 +233,7 @@ impl Adapter for Claude {
             args.push("--model".into());
             args.push(m.clone());
         }
-        if info.permission_mode == Some(PermissionMode::Unattended) {
+        if ctx.permission_mode == PermissionMode::Unattended {
             args.push("--dangerously-skip-permissions".into());
         }
         args.extend(ctx.extra.iter().cloned());
@@ -255,6 +255,7 @@ impl Adapter for Claude {
             env,
             unset_env: UNSET.iter().map(|s| s.to_string()).collect(),
             path_prepend: self.env.amail_dir().into_iter().collect(),
+            notice: None,
         })
     }
 }
