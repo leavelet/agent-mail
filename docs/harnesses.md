@@ -341,6 +341,31 @@ all your zellij sessions and can attach to those that allow web sharing.
 the node's (the node restarts its own). Put it behind an HTTPS proxy and pass
 `--web-terminal-url` to reach it from another host.
 
+## Failed turns
+
+A turn can end in a failure: the model provider answers with an error (an
+invalid or missing key, a rate limit, an unknown model, a server error),
+or the session process ends during the turn. The node then returns the
+deliveries that turn showed to "not notified, not read"
+(`POST /v1/claim/release`), so the sender's `amail status` is true again,
+and wakes the seat again after 30 s, then 60 s. After three failed turns
+in a row it stops waking the seat for that mail (the mail stays unread
+and comes with the seat's next turn), keeps the seat flagged
+(`turn-failed`, with the harness's error text) and sends the user one
+system mail. `amail wake <seat>` (or Wake in the web interface) lets the
+node deliver the mail again until the next failure; a turn that ends
+normally clears the flag. A turn the person interrupts is not a failure,
+and its mail counts as delivered.
+
+How each harness's failed turns are found:
+
+| harness | signal |
+|---|---|
+| Claude Code | the `StopFailure` hook, sent instead of `Stop` when a turn ends in an API error. Claude Code 2.1.289 sends `error` (the error type, e.g. `authentication_failed`) and `last_assistant_message` (the text shown); its documentation names `error_type` and `error_message`, which are read as well. Pressing Esc fires no hook, so an interrupted turn is seen only when the next turn starts |
+| Codex | Codex hooks have no failure event (0.160: `Stop` and `Interrupt` only). The node asks the shared app-server how the turn ended (`thread/turns/list`; status `failed` with the error message): about a second after `Stop` or `Interrupt`, and when a busy seat has sent no hook for 30 s. This path was tested only with a stand-in app-server, not with a real failing Codex session |
+| dsh | the wrapper (`amail dsh-host`) follows the session log; a `turn/end` with reason `error` (with dsh's message) or `interrupted` (a turn whose host stopped during it) is reported as a failed turn; `aborted` (cancelled in the GUI) and other reasons count as an interruption. dsh 0.2.0-rc.2 sends no `Stop` for a failed turn |
+| all | the session process ends while the seat is busy (supervised seats: the pane's process exits other than with status 0; other seats: the process the hooks named is gone) |
+
 ## Limitations common to all harnesses
 
 - **Mail cannot interrupt.** A busy agent sees mail only between tool calls

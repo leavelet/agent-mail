@@ -202,6 +202,10 @@ pub fn seat_line(s: &p::Seat) -> String {
         if p.wake_failed {
             out.push_str(" wake_failed");
         }
+        if let Some(t) = &p.turn_failed {
+            out.push_str(&format!(" turn_failed={}", t.count));
+            out.push_str(&quoted("turn_error", &Some(t.reason.clone())));
+        }
     }
     if let Some(t) = &s.focus_until {
         out.push_str(&format!(" focus_until={}", short_time(t)));
@@ -280,6 +284,11 @@ fn note(n: &p::RecipientNote) -> String {
             }
         }
         "wake_failed" => "does not answer wake-ups; a person may need to look".to_string(),
+        "turn_failed" => {
+            "its last turn failed (a harness or model error); it gets the mail when a turn \
+             works again, and a person may need to look"
+                .to_string()
+        }
         other => l(other).into_owned(),
     };
     format!("{} {what}", l(&n.seat))

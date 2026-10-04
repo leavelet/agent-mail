@@ -2102,6 +2102,17 @@ fn node_status_text(v: &Value) -> Result<String> {
         if s["wake_failed"].as_bool() == Some(true) {
             line.push_str(" wake_failed");
         }
+        if let Some(n) = s["turn_failed"]["count"].as_u64() {
+            line.push_str(&format!(
+                " turn_failed={n}{} ({})",
+                if s["turn_failed"]["retrying"] == false {
+                    " not-retrying"
+                } else {
+                    ""
+                },
+                output::l(s["turn_failed"]["reason"].as_str().unwrap_or(""))
+            ));
+        }
         out.push(line);
     }
     Ok(out.join("\n"))

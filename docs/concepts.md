@@ -49,6 +49,19 @@ A **delivery** is one row per (message, recipient seat). It moves through
 | `read` | the whole body was put into the agent's context: shown in full with the header because it was short (up to 800 characters), or through `amail read` | that the agent acted on it |
 | `acked` | the recipient acknowledged it with `amail ack` | |
 
+`read` says what was put into the agent's context, not that the agent
+handled it.
+
+**Failed turns.** When the harness turn that showed a message fails (a
+model or API error, or the session process ends during the turn), the
+node returns the deliveries that turn showed to `queued` (not notified,
+not read) and delivers them again with a later turn; acknowledged ones are
+kept. After three failed turns in a row it stops waking the seat for them,
+flags the seat (`turn failed` in `amail ps`, the web interface and the
+user's queue) and tells the user once by system mail. A turn interrupted
+by the person is not a failure. Details per harness are in
+[harnesses](harnesses.md#failed-turns).
+
 The sender sees every recipient's state with `amail status <id>`, which
 prints a one-line reminder of these meanings under the table. When a
 message needs an answer or a confirmation that it was acted on, ask for an
