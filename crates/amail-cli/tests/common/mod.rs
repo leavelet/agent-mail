@@ -27,6 +27,8 @@ const CLEAR_ENV: &[&str] = &[
     "AMAIL_TOKEN",
     "AMAIL_PROFILE",
     "CODEX_THREAD_ID",
+    "AMAIL_DSH_ENDPOINT",
+    "DSH_HOME",
 ];
 
 pub fn fixture(harness: &str, name: &str) -> Value {

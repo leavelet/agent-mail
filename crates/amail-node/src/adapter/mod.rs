@@ -5,6 +5,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod dsh;
 
 use crate::wire::LaunchPlan;
 use amail_proto::{LaunchInfo, SeatState};
@@ -17,6 +18,8 @@ use std::path::PathBuf;
 pub enum Harness {
     Claude,
     Codex,
+    /// DeepSeek Harness.
+    Dsh,
 }
 
 impl Harness {
@@ -24,6 +27,7 @@ impl Harness {
         match s.trim().to_ascii_lowercase().as_str() {
             "claude" | "claude-code" | "claude_code" => Some(Harness::Claude),
             "codex" => Some(Harness::Codex),
+            "dsh" | "deepseek" | "deepseek-harness" => Some(Harness::Dsh),
             _ => None,
         }
     }
@@ -32,6 +36,7 @@ impl Harness {
         match self {
             Harness::Claude => "claude",
             Harness::Codex => "codex",
+            Harness::Dsh => "dsh",
         }
     }
 }
@@ -92,6 +97,7 @@ pub struct AdapterEnv {
     pub server_url: String,
     pub claude_bin: String,
     pub codex_bin: String,
+    pub dsh_bin: String,
     /// The `auth.json` the dedicated Codex home links to.
     pub codex_auth: PathBuf,
 }
@@ -142,6 +148,12 @@ pub trait Adapter: Send + Sync + 'static {
 
     /// The seat, if the hook environment names it.
     fn seat_from_env(&self, env: &BTreeMap<String, String>) -> Option<String>;
+
+    /// Whether the node acts on this hook at all (a harness process may
+    /// also serve sessions that are not the seat's).
+    fn accepts(&self, _env: &BTreeMap<String, String>, _hook: &Hook) -> bool {
+        true
+    }
 
     /// Whether sessions are tied to seats by a registration marker in their
     /// first prompt (see [`Adapter::registration_marker`]).

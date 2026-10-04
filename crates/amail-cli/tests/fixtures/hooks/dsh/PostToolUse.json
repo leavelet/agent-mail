@@ -1,0 +1,15 @@
+{
+ "session_id": "session-00000000-0000-4000-8000-00000000d5d5",
+ "transcript_path": null,
+ "cwd": "/tmp/amail-fixture/work",
+ "model": "dsh",
+ "permission_mode": "default",
+ "hook_event_name": "PostToolUse",
+ "turn_id": "1",
+ "tool_name": "bash",
+ "tool_input": {
+  "command": "ls"
+ },
+ "tool_response": "a.txt\n",
+ "tool_use_id": "call_00_x"
+}

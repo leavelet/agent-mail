@@ -11,6 +11,7 @@ pub const HOOK_ENV: &[&str] = &[
     "CLAUDE_CODE_MESSAGING_SOCKET",
     "CLAUDE_PID",
     "CODEX_HOME",
+    "AMAIL_DSH_ENDPOINT",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

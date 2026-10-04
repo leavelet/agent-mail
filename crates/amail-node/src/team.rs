@@ -279,6 +279,7 @@ fn harness_name(s: &str) -> Option<&'static str> {
     match s.trim().to_ascii_lowercase().as_str() {
         "claude" | "claude-code" | "claude_code" => Some("claude"),
         "codex" => Some("codex"),
+        "dsh" | "deepseek" | "deepseek-harness" => Some("dsh"),
         _ => None,
     }
 }
@@ -386,7 +387,7 @@ pub fn parse(text: &str, base: &Path) -> Result<Team, TeamError> {
             })?;
         let harness = harness_name(&harness_raw).ok_or_else(|| {
             TeamError(format!(
-                "{what}: unknown harness {harness_raw:?} (claude or codex)"
+                "{what}: unknown harness {harness_raw:?} (claude, codex or dsh)"
             ))
         })?;
         let pm = match s

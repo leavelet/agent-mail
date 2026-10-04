@@ -4,6 +4,7 @@
 
 pub mod adapter;
 pub mod codex_rpc;
+pub mod dsh_host;
 pub mod hook_client;
 pub mod inject;
 pub mod mux;

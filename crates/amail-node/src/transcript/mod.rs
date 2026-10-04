@@ -13,6 +13,7 @@
 
 pub mod claude;
 pub mod codex;
+pub mod dsh;
 pub mod tail;
 
 use crate::adapter::Harness;
@@ -47,6 +48,7 @@ pub fn parser_for(h: Harness) -> Box<dyn Parser> {
     match h {
         Harness::Claude => Box::new(claude::ClaudeParser::default()),
         Harness::Codex => Box::new(codex::CodexParser::default()),
+        Harness::Dsh => Box::new(dsh::DshParser::default()),
     }
 }
 

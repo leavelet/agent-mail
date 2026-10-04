@@ -50,6 +50,8 @@ pub struct Config {
     pub amail_exe: PathBuf,
     pub claude_bin: String,
     pub codex_bin: String,
+    /// The `dsh` launcher (DeepSeek Harness).
+    pub dsh_bin: String,
     pub codex_auth: PathBuf,
     /// Coalescing window for wake-ups caused by normal `to` mail.
     pub wake_window: Duration,
@@ -122,6 +124,7 @@ impl Config {
             amail_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("amail")),
             claude_bin: "claude".into(),
             codex_bin: "codex".into(),
+            dsh_bin: "dsh".into(),
             codex_auth: crate::paths::home().join(".codex").join("auth.json"),
             wake_window: Duration::from_secs(3),
             wake_confirm: Duration::from_secs(10),
@@ -486,6 +489,7 @@ pub struct Node {
     save_lock: Mutex<()>,
     claude: Arc<dyn Adapter>,
     codex: Arc<dyn Adapter>,
+    dsh: Arc<dyn Adapter>,
     prepared: HashMap<Harness, Arc<OnceCell<Result<(), String>>>>,
     st: Mutex<State>,
     state_file: PathBuf,
@@ -569,10 +573,12 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
         server_url: cfg.url.clone(),
         claude_bin: cfg.claude_bin.clone(),
         codex_bin: cfg.codex_bin.clone(),
+        dsh_bin: cfg.dsh_bin.clone(),
         codex_auth: cfg.codex_auth.clone(),
     };
     let claude: Arc<dyn Adapter> = Arc::new(crate::adapter::claude::Claude::new(env.clone()));
-    let codex: Arc<dyn Adapter> = Arc::new(crate::adapter::codex::Codex::new(env));
+    let codex: Arc<dyn Adapter> = Arc::new(crate::adapter::codex::Codex::new(env.clone()));
+    let dsh: Arc<dyn Adapter> = Arc::new(crate::adapter::dsh::Dsh::new(env));
     let state_file = cfg.state_dir.join("node-state.json");
     let mut st = State {
         saved: persist::load(&state_file),
@@ -585,6 +591,7 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
         let adapter = match Harness::parse(&l.harness) {
             Some(Harness::Claude) => &claude,
             Some(Harness::Codex) => &codex,
+            Some(Harness::Dsh) => &dsh,
             None => continue,
         };
         let ok = alive(l.pid, l.pid_start)
@@ -615,13 +622,15 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
     supervise::restore(&mut st, |h| match Harness::parse(h) {
         Some(Harness::Claude) => Some(claude.harness()),
         Some(Harness::Codex) => Some(codex.harness()),
+        Some(Harness::Dsh) => Some(dsh.harness()),
         None => None,
     });
     let node = Arc::new(Node {
         server: ServerClient::new(&cfg.url, &cfg.token, cfg.hook_server_timeout)?,
         claude,
         codex,
-        prepared: [Harness::Claude, Harness::Codex]
+        dsh,
+        prepared: [Harness::Claude, Harness::Codex, Harness::Dsh]
             .into_iter()
             .map(|h| (h, Arc::new(OnceCell::new())))
             .collect(),
@@ -639,7 +648,7 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
     });
 
     let mut tasks = Vec::new();
-    for h in [Harness::Claude, Harness::Codex] {
+    for h in [Harness::Claude, Harness::Codex, Harness::Dsh] {
         let n = node.clone();
         tasks.push(tokio::spawn(async move {
             n.ensure_prepared(h).await.ok();
@@ -675,6 +684,7 @@ impl Node {
         match h {
             Harness::Claude => &self.claude,
             Harness::Codex => &self.codex,
+            Harness::Dsh => &self.dsh,
         }
     }
 
@@ -896,6 +906,9 @@ impl Node {
         let Some(hook) = adapter.parse(&v) else {
             return HookOutcome::default();
         };
+        if !adapter.accepts(env, &hook) {
+            return HookOutcome::default();
+        }
         let Some((seat, registered)) = self.identify(&*adapter, env, &hook) else {
             return HookOutcome::default();
         };

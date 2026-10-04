@@ -1,0 +1,9 @@
+{
+ "session_id": "session-00000000-0000-4000-8000-00000000d5d5",
+ "transcript_path": null,
+ "cwd": "/tmp/amail-fixture/work",
+ "model": "dsh",
+ "permission_mode": "default",
+ "hook_event_name": "SessionStart",
+ "source": "startup"
+}

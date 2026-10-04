@@ -138,14 +138,29 @@ enum Cmd {
     Org(OrgCmd),
     /// Run the per-host node daemon (or manage it, see `amail node --help`).
     Node(NodeCli),
-    /// Hook entry point for a harness (`claude` or `codex`). Reads the hook
+    /// Hook entry point for a harness (`claude`, `codex` or `dsh`). Reads the hook
     /// input on stdin; never fails and never blocks for long.
     #[command(hide = true)]
     Hook { harness: String },
+    /// Run a seat's DeepSeek Harness web host (started by `amail run`).
+    #[command(hide = true)]
+    DshHost {
+        #[arg(long)]
+        seat: String,
+        #[arg(long)]
+        endpoint: PathBuf,
+        #[arg(long)]
+        resume: Option<String>,
+        #[arg(long)]
+        prompt: Option<String>,
+        /// The host command, after `--`.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
     /// Start a harness session for a seat in this terminal (through the node).
     Run {
         seat: String,
-        /// Override the seat's harness (`claude` or `codex`).
+        /// Override the seat's harness (`claude`, `codex` or `dsh`).
         #[arg(long)]
         harness: Option<String>,
         /// The node socket (default: AMAIL_NODE_SOCK, then the standard path).
@@ -247,6 +262,9 @@ struct NodeArgs {
     claude_bin: String,
     #[arg(long, env = "AMAIL_CODEX_BIN", default_value = "codex")]
     codex_bin: String,
+    /// The DeepSeek Harness launcher.
+    #[arg(long, env = "AMAIL_DSH_BIN", default_value = "dsh")]
+    dsh_bin: String,
     #[arg(long, env = "AMAIL_ZELLIJ_BIN", default_value = "zellij")]
     zellij_bin: String,
     /// Most supervised sessions starting at once.
@@ -483,6 +501,31 @@ fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
+    if let Cmd::DshHost {
+        seat,
+        endpoint,
+        resume,
+        prompt,
+        command,
+    } = &cli.cmd
+    {
+        let args = amail_node::dsh_host::HostArgs {
+            seat: seat.clone(),
+            endpoint: endpoint.clone(),
+            resume: resume.clone(),
+            prompt: prompt.clone(),
+            command: command.clone(),
+        };
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        let code = rt.block_on(amail_node::dsh_host::run(args));
+        return ExitCode::from(code.clamp(0, 255) as u8);
+    }
     if let Cmd::Run {
         seat,
         harness,
@@ -612,6 +655,7 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Serve { .. }
         | Cmd::Admin(_)
         | Cmd::Hook { .. }
+        | Cmd::DshHost { .. }
         | Cmd::Run { .. }
         | Cmd::Down { .. }
         | Cmd::Ps
@@ -1304,6 +1348,7 @@ async fn node_daemon(a: NodeArgs) -> Result<()> {
     cfg.label = a.label.or(file.label).or_else(hostname);
     cfg.claude_bin = a.claude_bin;
     cfg.codex_bin = a.codex_bin;
+    cfg.dsh_bin = a.dsh_bin;
     cfg.zellij_bin = a.zellij_bin;
     cfg.start_limit = a.start_limit;
     if let Some(p) = a.codex_auth {
