@@ -175,8 +175,8 @@ impl Adapter for Claude {
     }
 
     fn claim_limit(&self) -> u32 {
-        // A shown entry is at most about 1,100 characters (an 800-character
-        // body and its header): 8 stay below Claude Code's 10,000.
+        // Claimed mail is packed into `inject_budget` by its rendered size;
+        // what does not fit waits for the next hook.
         8
     }
 

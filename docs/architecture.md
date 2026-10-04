@@ -98,7 +98,9 @@ resumes them when mail arrives. See [team files](teams.md).
 
    One header line per message; every body line behind `  > `; a body over
    800 characters is replaced by `body not shown (N lines): run amail read
-   <id>`. Subjects and `meta` are single-line, so mail content cannot pass
+   <id>`. One answer holds as many whole messages as fit in the harness's
+   limit for hook context (counted as rendered, prefixes and escapes
+   included); the node keeps the others and shows them with the next hook. Subjects and `meta` are single-line, so mail content cannot pass
    itself off as a header or as a line from the mail system.
 8. **Reading and answering.** The agent runs `amail read`, `amail reply`
    or `amail ack` like any shell command; those calls mark the delivery

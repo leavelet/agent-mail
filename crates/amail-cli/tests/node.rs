@@ -42,6 +42,7 @@ node_tests!(
     lost_answer_is_kept,
     restart_restores_idle_seat,
     inlined_mail_is_read,
+    injection_fits_harness_limit,
     transcript_mirror_follows_file,
     focus_holds_mail,
     digest_at_natural_points,
@@ -1013,6 +1014,53 @@ async fn inlined_mail_is_read(b: Backend) {
     };
     assert_eq!(state(short).await, "read");
     assert_eq!(state(long).await, "notified");
+}
+
+/// Bodies that render much longer than they are (here: all line breaks)
+/// do not push a hook's answer over the harness's limit: what does not fit
+/// is kept and shown, whole, by the next hook; every message once.
+async fn injection_fits_harness_limit(b: Backend) {
+    let Some(h) = setup(b, "injection_fits_harness_limit", Opts::default()).await else {
+        return;
+    };
+    h.seat("w1", "claude").await;
+    let env = claude_env("w1", &h.dir.path().join("cc.sock"));
+    h.hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    let mut sent = Vec::new();
+    for i in 0..4 {
+        let body = format!("m{i}{}", "\n".repeat(790));
+        let v = h
+            .api
+            .post(
+                "/messages",
+                json!({"to": ["w1"], "subject": format!("s{i}"), "body": body}),
+            )
+            .await;
+        sent.push(v["id"].as_i64().unwrap());
+    }
+    h.wait_pending("w1", 4, 0, 0).await;
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        let v = h.hook("claude", env.clone(), claude("PostToolUse")).await;
+        let Some(t) = hook_text(&v) else { break };
+        // Claude Code cuts hook context above 10,000 characters.
+        assert!(t.chars().count() <= 9000, "{}", t.chars().count());
+        let ids = injected_ids(&t);
+        assert!(!ids.is_empty() && ids.len() < 4, "{t}");
+        for id in &ids {
+            assert!(t.contains(&format!(
+                "  > m{}",
+                sent.iter().position(|s| s == id).unwrap()
+            )));
+        }
+        seen.extend(ids);
+        if seen.len() == 4 {
+            break;
+        }
+        assert!(t.contains("More mail is waiting"), "{t}");
+    }
+    assert_eq!(seen, sent);
 }
 
 /// Server-sent events of a response, as `(event, data)`.

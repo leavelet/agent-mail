@@ -755,6 +755,21 @@ impl Node {
         self.wake_kick.notify_one();
     }
 
+    /// Keep claimed mail that did not fit in a hook's answer for the next
+    /// hook of the seat.
+    fn keep(&self, seat: &str, entries: Vec<InboxEntry>) {
+        let mut st = self.lock();
+        let s = st.seat(seat);
+        let mut all = entries;
+        all.append(&mut s.stash);
+        all.sort_by_key(|e| e.delivery.seq);
+        all.dedup_by_key(|e| e.message.id);
+        s.stash = all;
+        st.record_stash(seat);
+        drop(st);
+        self.wake_kick.notify_one();
+    }
+
     // --- socket ---------------------------------------------------------------
 
     async fn accept_loop(self: Arc<Self>, listener: tokio::net::UnixListener) {
@@ -1120,9 +1135,11 @@ impl Node {
         }
 
         // 2. Server calls, without the lock, all within `deadline`.
-        let limit = adapter.claim_limit();
-        let via = format!("hook:{}", hook.name);
         let stashed = plan.stash.len();
+        // Kept mail counts against the claim limit: what one hook shows is
+        // bounded, and kept mail goes first.
+        let limit = adapter.claim_limit().saturating_sub(stashed as u32);
+        let via = format!("hook:{}", hook.name);
         let mut claimed: Vec<InboxEntry> = plan.stash;
         let mut digest: Vec<InboxEntry> = Vec::new();
         let mut failed = false;
@@ -1136,7 +1153,9 @@ impl Node {
             limit: if digest { DIGEST_LIMIT } else { limit },
         };
         let mut calls: Vec<ClaimSpec> = Vec::new();
-        if plan.claim_all {
+        if limit == 0 {
+            more = plan.claim_all || plan.claim_urgent_all || plan.claim_to || plan.claim_urgent;
+        } else if plan.claim_all {
             calls.push(spec(&[To, Cc, List], false, false));
         } else if plan.claim_urgent_all {
             calls.push(spec(&[To, Cc, List], true, false));
@@ -1232,9 +1251,19 @@ impl Node {
             }
         }
 
+        // Claimed mail is shown whole, as much as fits in the harness's limit
+        // (leaving room for the digest and the summary); the rest is kept and
+        // shown by the next hook. An entry is never cut, since mail with an
+        // inlined body is marked read by the claim.
         let mut text = String::new();
+        let mut kept = Vec::new();
         if !claimed.is_empty() {
-            text = crate::inject::new_mail(seat, &claimed, more);
+            let reserve =
+                if digest.is_empty() { 0 } else { 1000 } + if summary.is_empty() { 0 } else { 500 };
+            let budget = adapter.inject_budget().saturating_sub(reserve);
+            let (t, shown) = crate::inject::new_mail(seat, &claimed, more, budget);
+            text = t;
+            kept = claimed.split_off(shown);
         }
         if !digest.is_empty() {
             let rest = adapter.inject_budget().saturating_sub(text.len()).max(1000);
@@ -1257,6 +1286,9 @@ impl Node {
         } else {
             Output::Context(text)
         };
+        if !kept.is_empty() {
+            self.keep(seat, kept);
+        }
         claimed.extend(digest);
         (out, claimed)
     }
