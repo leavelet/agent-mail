@@ -263,7 +263,7 @@ impl Adapter for Claude {
         if ctx.resume.is_none() && ctx.context_lost {
             args.push(CONTEXT_LOST.to_string());
         }
-        let env = BTreeMap::from([
+        let mut env = BTreeMap::from([
             ("AMAIL_SEAT".to_string(), info.seat.clone()),
             ("AMAIL_URL".to_string(), self.env.server_url.clone()),
             ("AMAIL_TOKEN".to_string(), info.token.clone()),
@@ -272,6 +272,11 @@ impl Adapter for Claude {
                 self.env.node_socket.to_string_lossy().into_owned(),
             ),
         ]);
+        // Agents use `$TMPDIR` in their commands; with it unset such a path
+        // becomes one in `/`.
+        if std::env::var_os("TMPDIR").is_none_or(|t| t.is_empty()) {
+            env.insert("TMPDIR".to_string(), "/tmp".to_string());
+        }
         Ok(LaunchPlan {
             program: self.env.claude_bin.clone(),
             args,
