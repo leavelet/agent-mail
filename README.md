@@ -11,7 +11,7 @@ budgets so that a team of agents cannot drown itself (or its human) in mail.
 
 One binary, `amail`, is the server, the admin tool and the command-line client
 that agents and people use. Storage is SQLite (default, zero setup) or
-Postgres.
+Postgres; with Postgres, several server instances can share one database.
 
 **Status: early.** The server, storage and CLI, plus a per-host **node** that
 pushes mail into running Claude Code and Codex sessions: mid-turn through
@@ -128,6 +128,38 @@ extension, which the migration creates (it is a trusted extension: the
 database owner may create it). SQLite suits a single host and small to medium
 teams; Postgres is for larger deployments and standard backup/replication.
 
+A SQLite database serves one `amail serve` process: a second one on the same
+file stops with an error (it holds a lock on `<db>.serve.lock`).
+
+### Running several instances
+
+Any number of `amail serve` processes may share one Postgres database; put
+any HTTP load balancer in front of them (no stickiness needed). Event streams
+(`/events`, conversation mirrors) reconnect to any instance on their own.
+
+```sh
+amail serve --db postgres://... --listen 10.0.0.5:8025 --advertise-url http://10.0.0.5:8025
+amail serve --db postgres://... --listen 10.0.0.6:8025 --advertise-url http://10.0.0.6:8025
+```
+
+The database stays the only source of truth. What a single process used to
+keep to itself is handled like this:
+
+| state | with several instances |
+|---|---|
+| mailbox events (`/events`) and their replay buffer | every instance sends each event (org, seat, counter) to the others with Postgres `NOTIFY` on one channel, after the change is committed, batched; each instance feeds them into its own buffer. Event ids are per instance: a client that reconnects to another instance gets a snapshot of the counters instead of a replay. An instance that loses its listening connection (or hears nothing, not even its own ping, for 35 s) reconnects and ends all its event streams, so clients resynchronize |
+| presence | in the `presence` table (one instance keeps it in memory); the instance that gets a report tells the others which seats changed, and they read the rows |
+| send budget | one token bucket per seat in the `send_budget` table, updated in one statement on the database's clock: exact, whatever instance a send hits (one instance on SQLite keeps it in memory) |
+| node commands (sleep, wake, mirror leases) | sent to all instances with `NOTIFY` (a few short fields); each instance hands them to the node streams it holds. Each instance records its node streams per org (`node_streams`, heartbeat every 10 s), so `node_connected` and `node_offline` have one answer; a killed instance's streams still count for up to 30 s |
+| conversation mirrors | too much data for `NOTIFY`, and never stored: the instance whose browsers watch a seat records the watch (`mirror_watch`, renewed with the lease); the instance that receives the node's posts forwards them over HTTP to the watching instances (`--advertise-url`), with the node's own token |
+| browser sessions, idempotent claim keys, escalation steps | in the database already; an escalation step is taken by one instance only (a conditional update) |
+
+What can still go missing is bounded: a `NOTIFY` lost because an instance died
+between its commit and its batch (a few milliseconds) or because the
+database dropped it. Nodes therefore refresh all pending counts every 30 s,
+so such mail is shown at most 30 s late; browsers catch up with their next
+event or reconnect.
+
 ## Concepts
 
 - **Org**: the isolation boundary. Exactly one **user** (a person, fully
@@ -158,7 +190,10 @@ teams; Postgres is for larger deployments and standard backup/replication.
   server-sent events use `mod_seq` as the cursor.
 - **Source**: computed for the reader: `user` (your org's user — instructions),
   `agent` (a seat in your org), `external` (anything from another org, even
-  its user — never instructions).
+  its user — never instructions), `system` (the mail server itself, e.g. an
+  acknowledgement that did not come; sent from the org's hidden `amail`
+  system seat, which has no tokens and cannot be addressed, so no client can
+  send it).
 - **Links**: orgs are isolated until one user requests a link and the other
   accepts. Either side can revoke it. Without a link, mail to `name@org` is
   rejected.
@@ -171,6 +206,28 @@ teams; Postgres is for larger deployments and standard backup/replication.
   per minute with a burst of 30; the user seat is exempt), a cap on recipients
   per message (default 200), list post policies, and a reply-depth limit
   (default 50). Defaults are per-org settings (`amail org set`).
+- **Acknowledgement deadlines**: mail sent with `--ack` must be acknowledged
+  within `--ack-timeout` (default: the org's `ack_timeout_min`, 15). Then the
+  sender gets a `system` mail naming who has not; if they still have not
+  after the same time again, a second one goes to the sender with those
+  seats' leads (parents in the sender's org) in Cc, once. System mail asks for
+  no acknowledgement and costs no budget.
+- **Focus**: `amail focus on [--for 30m]` holds all but urgent mail for the
+  seat (at most the org's `focus_max_min`, 240; without `--for`, that long);
+  `amail focus off` ends it. Held mail neither wakes nor is injected; it
+  comes when the focus ends. `amail who` and the web interface show who is
+  focused.
+- **Digests**: a list member with mode `digest` is not notified of each
+  message. At the seat's next natural claim point (`UserPromptSubmit`, or
+  `Stop`, which then continues the turn) the node injects one digest: a line
+  per thread with subject, senders, count and the first line of the latest
+  message; those deliveries become notified (not read). Digest mail never
+  wakes a seat by itself, except that a seat that stays idle (or asleep) is
+  woken once its oldest digest mail has waited the org's
+  `digest_interval_min` (30), at most once per interval.
+- **Send receipts** name recipients of your org that will not see the mail at
+  once: asleep (and whether this mail starts them), offline, focused (until
+  when), or not answering wake-ups.
 
 ## Tokens
 
@@ -190,9 +247,10 @@ org cannot be revoked.
 
 | command | |
 |---|---|
-| `amail serve --db <url> --listen <addr>` | run the server |
+| `amail serve --db <url> --listen <addr> [--advertise-url <url>]` | run the server (`--advertise-url`: see "Running several instances") |
 | `amail admin create-org <org> [--user-name owner] --db <url>` | create an org directly in the database; prints the user token |
-| `amail send --to a,b [--cc c] -s <subject> [-m <body>] [--urgent] [--ack] [--meta k=v]...` | body from stdin when `-m` is omitted |
+| `amail send --to a,b [--cc c] -s <subject> [-m <body>] [--urgent] [--ack [--ack-timeout 30m]] [--meta k=v]...` | body from stdin when `-m` is omitted |
+| `amail focus on [--for 30m] [--seat s]` / `amail focus off` | hold all but urgent mail for a while (user tokens: any seat) |
 | `amail inbox [--all] [--seat s]` | unread messages (all with `--all`) |
 | `amail read <id> [--peek]` | show a message; marks it read unless `--peek` |
 | `amail reply <id> [--all] [-m <body>]` | subject and thread are inherited |
@@ -210,7 +268,7 @@ org cannot be revoked.
 | `amail up [-f amail.toml] [--only g,s] [--no-start] [--prune]` | bring a team up from a team file (see "Teams") |
 | `amail down [--only g,s]` / `amail ps` | stop the team's sessions / one line per seat |
 | `amail attach <group or seat>` / `amail sleep <seat>` / `amail wake <seat>` | attach to a group's zellij session / put a seat to sleep / start it now |
-| `amail org show/set` | org settings (budgets and limits, `--webhook-url`, `--no-webhook`) |
+| `amail org show/set` | org settings (budgets and limits, `--ack-timeout-min`, `--focus-max-min`, `--digest-interval-min`, `--webhook-url`, `--no-webhook`) |
 
 ## HTTP API
 
@@ -221,13 +279,14 @@ header `X-Amail-Csrf: 1`, and an `Origin` header must name the server.
 
 | | |
 |---|---|
-| `POST /messages` | send `{to, cc, subject, body, in_reply_to?, priority?, ack_required?}` |
+| `POST /messages` | send `{to, cc, subject, body, in_reply_to?, priority?, ack_required?, ack_timeout_s?, meta?}`; the answer lists each address with its seat count (and for a list in `To`, `wakes`: its members notified at once) and `notes` on recipients that will not see it at once |
 | `GET /inbox` | `seat`, `unread`, `after_seq`, `before_seq`, `limit`; headers only |
 | `GET /messages/{id}` | full message; marks the caller's delivery read unless `peek=1` |
 | `POST /messages/{id}/ack` | acknowledge |
 | `GET /messages/{id}/status` | per-recipient state (sender and the sender org's user only) |
 | `GET /threads/{id}` | messages of a thread the caller may see |
-| `POST /claim` | `{classes, min_priority?, via, limit?, inline_body_max?, include_digest?, mark_inlined_read?}`: atomically mark pending deliveries notified and return them; concurrent claims never return the same delivery. With `mark_inlined_read`, deliveries whose body is returned inline are marked read too |
+| `POST /claim` | `{classes, min_priority?, via, limit?, inline_body_max?, include_digest?, digest_only?, mark_inlined_read?, key?, preview_chars?}`: atomically mark pending deliveries notified and return them; concurrent claims never return the same delivery. With `mark_inlined_read`, deliveries whose body is returned inline are marked read too. `key` (chosen by the caller) makes the claim idempotent: a claim with a key the seat used in the last ten minutes takes nothing new and returns what the first one took, also when both run at once |
+| `PUT /focus`, `DELETE /focus` | `seat=` (user tokens; seat tokens: their own): focus `{for_s?, until?}` (default and maximum: the org's `focus_max_min`), or end it |
 | `GET /changes` | `since` (seq): deliveries created or changed since |
 | `GET /events` | server-sent events: `mailbox` `{"seat","seq"}` per mailbox change (supports `Last-Event-ID`), `presence`, and for node tokens `command` (`{op: "transcript"\|"sleep"\|"wake", seat, lease_ms?, backfill?, node?}`; nodes ignore unknown events, ops and seats they do not host) |
 | `GET, POST /seats`; `GET, PATCH, DELETE /seats/{name}`; `POST /seats/{name}/tokens` | seats |
@@ -235,8 +294,8 @@ header `X-Amail-Csrf: 1`, and an `Origin` header must name the server.
 | `GET, POST /links`; `POST /links/{org}/accept`; `DELETE /links/{org}` | links |
 | `GET /archive/messages` | `since`, `until`, `from`, `to` (a recipient seat), `thread`, `before_id`, `limit` (user tokens) |
 | `GET, PATCH /org`; `GET, POST /tokens`; `DELETE /tokens/{id}`; `GET /whoami` | org settings (including `webhook_url`; `null` clears it), tokens, caller identity |
-| `GET /pending` | node and user tokens: per seat, pending (unnotified, immediate) deliveries by class, urgent count, and the seat's counter |
-| `POST /presence` | node tokens: `{node?, seats: [{seat, state, wake_failed?, harness?, since?, attention?, attention_hint?, terminal_url?}]}`; states `offline`, `busy`, `idle`, `awaiting`, `dormant`; `attention` tags a seat that needs a person (`trust-prompt`, `login`, `permission`, `failed`, `wake-failed`). Kept in memory for 90 s (an expired entry produces no event: treat `updated_at` older than 90 s as offline); shown as `presence` on seats (with `node_connected`) and as `presence` events on `/events` |
+| `GET /pending` | node and user tokens: per seat, pending (unnotified, immediate) deliveries by class, urgent count, pending digest deliveries (`digest`, `digest_since`), `focus_until`, and the seat's counter; `digest_interval_ms` of the org |
+| `POST /presence` | node tokens: `{node?, seats: [{seat, state, wake_failed?, harness?, since?, attention?, attention_hint?, terminal_url?}]}`; states `offline`, `busy`, `idle`, `awaiting`, `dormant`; `attention` tags a seat that needs a person (`trust-prompt`, `login`, `permission`, `failed`, `wake-failed`). Valid for 90 s (an expired entry produces no event: treat `updated_at` older than 90 s as offline); kept in memory by a single server and in the database by several; shown as `presence` on seats (with `node_connected`) and as `presence` events on `/events` |
 | `GET /seats/{name}/launch` | node and user tokens: harness, model, role, parent, permission mode and a new seat token, for starting a session; the token of the seat's previous launch is revoked |
 | `POST /session`; `DELETE /session` | sign a browser in with `{token}` (user tokens only; needs `X-Amail-Csrf: 1`) / out |
 | `GET /overview` | user tokens: agent seats per state, seats needing a person, messages in the last hour and day, the user's unread count, the size of the attention queue |
@@ -283,7 +342,7 @@ Every delivery moves through `queued` → `notified` → `read` → `acked`:
   and its body when that is short), or the recipient claimed it with
   `amail claim`.
 - **read**: the whole message reached the recipient: through `amail read`, or
-  because the body was short enough (400 characters) to be injected in full.
+  because the body was short enough (800 characters) to be injected in full.
 - **acked**: the recipient confirmed it with `amail ack`.
 
 There is one way mail gets into a running agent: a harness hook asks the node,
@@ -316,7 +375,7 @@ runs one `amail node`, which connects those sessions to the server:
   2 ms end to end, p99, with 1,000 seats). The hook client never fails: if the
   node is down or slow (300 ms, `AMAIL_HOOK_TIMEOUT_MS`), it prints nothing.
   One hook claims at most a few messages (8 for Claude Code, 5 for Codex) and
-  shows each one's header, with the body when it has at most 400 characters;
+  shows each one's header, with the body when it has at most 800 characters;
   a longer message is marked `body not shown (N lines): run amail read <id>`
   and stays unread until the agent reads it. The rest follows with the next
   hook.
@@ -334,6 +393,17 @@ runs one `amail node`, which connects those sessions to the server:
   An unanswered wake-up is retried once after 10 s, then the seat is reported
   as `wake_failed` and tried again after 1 minute, doubling up to 10 minutes,
   or at once when new mail arrives for it.
+- **Terminal paste (last resort, off by default).** A supervised seat with
+  `paste_fallback = true` in the team file (per seat, or in `[defaults]`)
+  whose two native wake-ups went unanswered gets the nudge typed into its
+  zellij pane, then Enter, and the turn's `UserPromptSubmit` must confirm it
+  as usual. Typing into a terminal is risky (an open dialog drops the text
+  and takes Enter as its default answer; a half-written draft would be sent
+  with the nudge), so the node first reads the pane: it types only if the
+  seat is idle, the bottom of the screen shows no dialog, menu or busy
+  marker, and the input box is empty; and it presses Enter only if the box
+  then holds exactly the nudge. Otherwise nothing is typed and the seat is
+  marked `wake_failed`.
 - **State**: the node tracks each seat as `offline`, `busy`, `idle` or
   `awaiting` (a permission prompt) from hooks and process liveness, and
   reports it to the server.
@@ -396,6 +466,7 @@ restart = "on-failure"           # or "never"
 harness = "claude"
 model = "sonnet"
 permission_mode = "unattended"
+# paste_fallback = true          # see "Terminal paste"; off by default
 
 [[seat]]
 name = "root"
@@ -505,13 +576,21 @@ checks trust only at start, so after answering once, run `amail wake <seat>`
 
 - **Lost answers.** If a hook's answer cannot be delivered (the hook client
   timed out or went away), the node keeps the claimed mail and shows it with
-  the seat's next injecting hook, or wakes the idle seat for it. One window
-  remains: the server executed a claim but the node never got the response (it
-  timed out after 150 ms). Such mail is marked notified without having been
-  shown; it stays unread, so it appears in the next session's unread summary
-  and in `amail inbox`.
+  the seat's next injecting hook, or wakes the idle seat for it. A claim whose
+  own answer from the server is lost (a timeout, a dropped connection) is
+  retried in the background with the same idempotency key, so the node gets
+  exactly the mail the first attempt took and keeps it the same way. One
+  window remains: the node process dies after the server answered a claim
+  and before the mail reached the hook. Such mail is marked notified without
+  having been shown; it stays unread, so it appears in the next session's
+  unread summary and in `amail inbox`.
 - Timeouts nest: the node's server calls for one hook (150 ms in total) <
   the hook client's wait (300 ms) < the harness's hook timeout (3-5 s).
+- With several server instances: mailbox events that one instance had
+  committed but not yet sent to the others when it died reach nodes on other
+  instances with the next 30 s resync; a killed instance's node streams count
+  as connected for up to 30 s; conversation mirrors across instances need
+  `--advertise-url`.
 - One session per seat: if two sessions use the same seat, the most recent
   hook wins.
 - After a node restart, sessions whose process and wake target still exist
@@ -571,6 +650,11 @@ The team tests (`crates/amail-cli/tests/team.rs`) run the real `amail up`,
 `down`, `ps`, `sleep` and `wake` against a node whose "panes" are plain
 processes running a fake harness (`tests/common/fake_harness.sh`) that speaks
 the hook protocol; they need neither zellij nor a harness (only `git`).
+`tests/cluster.rs` runs two real `amail serve` processes on one Postgres
+database (and checks that SQLite refuses a second one); `tests/faults.rs`
+kills the server, the node or one of two instances, cuts the node off, or
+makes the database unavailable while mail is on its way, and checks that
+every message is injected exactly once once the fault is over.
 
 Crates:
 
@@ -581,7 +665,7 @@ Crates:
 | `amail-server` | the axum HTTP API, server-sent events, policy and rate limits |
 | `amail-node` | the node daemon, the hook client, the Claude Code and Codex adapters |
 | `amail-cli` | the `amail` binary |
-| `amail-bench` | load generator: `amail-bench --url http://127.0.0.1:8025 --db <same db> --rates 170,500` |
+| `amail-bench` | load generator: `amail-bench --url http://127.0.0.1:8025 --db <same db> --rates 170,500`; `--mode e2e` adds one real node per org with simulated sessions (`--url a,b` for several instances) |
 
 ## License
 

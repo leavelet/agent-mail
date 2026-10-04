@@ -175,7 +175,8 @@ impl Adapter for Claude {
     }
 
     fn claim_limit(&self) -> u32 {
-        // A shown entry is at most about 1,000 characters.
+        // A shown entry is at most about 1,100 characters (an 800-character
+        // body and its header): 8 stay below Claude Code's 10,000.
         8
     }
 

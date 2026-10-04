@@ -177,6 +177,10 @@ pub async fn counts(
                 unread: r.unread,
                 pending: r.pending,
                 seq: r.last_seq,
+                focus_until: r
+                    .focus_until
+                    .filter(|t| *t > amail_store::now_ms())
+                    .map(render::ts),
             })
             .collect(),
     }))

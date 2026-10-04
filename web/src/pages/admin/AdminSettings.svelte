@@ -8,6 +8,9 @@
   let burst = $state(0);
   let maxRecipients = $state(0);
   let depth = $state(0);
+  let ackTimeout = $state(15);
+  let focusMax = $state(240);
+  let digestInterval = $state(30);
   let webhook = $state('');
   let msg = $state<string | null>(null);
   let error = $state<string | null>(null);
@@ -18,6 +21,9 @@
     burst = o.send_burst;
     maxRecipients = o.max_recipients;
     depth = o.max_thread_depth;
+    ackTimeout = o.ack_timeout_min;
+    focusMax = o.focus_max_min;
+    digestInterval = o.digest_interval_min;
     webhook = o.webhook_url ?? '';
   }
 
@@ -38,6 +44,9 @@
           send_burst: burst,
           max_recipients: maxRecipients,
           max_thread_depth: depth,
+          ack_timeout_min: ackTimeout,
+          focus_max_min: focusMax,
+          digest_interval_min: digestInterval,
           webhook_url: webhook.trim() || null,
         }),
       );
@@ -56,6 +65,9 @@
       <label><span>{t('admin.org.burst')}</span><input type="number" min="1" bind:value={burst} /></label>
       <label><span>{t('admin.org.maxRecipients')}</span><input type="number" min="1" bind:value={maxRecipients} /></label>
       <label><span>{t('admin.org.depth')}</span><input type="number" min="1" bind:value={depth} /></label>
+      <label><span>{t('admin.org.ackTimeout')}</span><input type="number" min="1" bind:value={ackTimeout} /></label>
+      <label><span>{t('admin.org.focusMax')}</span><input type="number" min="1" bind:value={focusMax} /></label>
+      <label><span>{t('admin.org.digestInterval')}</span><input type="number" min="1" bind:value={digestInterval} /></label>
       <label><span>{t('admin.org.webhook')}</span><input type="url" placeholder="https://…" bind:value={webhook} /></label>
       <p class="faint hint">{t('admin.org.webhookHint')}</p>
       <div class="row"><button class="primary" type="submit">{t('admin.save')}</button>{#if msg}<span class="ok">{msg}</span>{/if}</div>

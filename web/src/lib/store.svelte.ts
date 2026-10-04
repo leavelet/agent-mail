@@ -203,6 +203,11 @@ class Store {
     const next = seat ? new Map(this.counts) : new Map<string, SeatCounts>();
     for (const c of r.seats) next.set(c.seat, c);
     this.counts = next;
+    // Focus changes come as mailbox events: take them from the counts.
+    const focus = new Map(r.seats.map((c) => [c.seat, c.focus_until]));
+    if (this.seats.some((s) => focus.has(s.name) && focus.get(s.name) !== s.focus_until)) {
+      this.seats = this.seats.map((s) => (focus.has(s.name) ? { ...s, focus_until: focus.get(s.name) } : s));
+    }
   }
 
   async refreshAttention(): Promise<void> {

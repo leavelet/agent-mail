@@ -5,7 +5,9 @@
 #
 # Files in $D (the directory of this script):
 #   <seat>.launches  one line per start: "<unix ms> <pid> <args...>"
-#   <seat>.mode      optional behaviour: trust | exit3 | badresume | slow | noturn
+#   <seat>.mode      optional behaviour: trust | exit3 | badresume | slow | noturn |
+#                    deaf (ignores native wake-ups; its screen shows an empty
+#                    input box) | deafdialog (the same, with a dialog open)
 #   <seat>.busy      while it exists, a turn keeps making tool calls
 #   <seat>.prompt    created by the test: start a turn (like a person typing)
 #   <seat>.answer    answers the trust prompt (mode trust)
@@ -132,10 +134,30 @@ else
     fi
 fi
 
+# A screen like a harness's idle TUI, for the paste fallback.
+screen() {
+    printf '\033[2J'
+    echo "● Done."
+    case "$mode" in
+    deafdialog)
+        echo "Do you want to proceed?"
+        echo "❯ 1. Yes"
+        echo "  2. No"
+        ;;
+    *)
+        echo "────────────────────"
+        echo "> "
+        echo "────────────────────"
+        ;;
+    esac
+}
+screen
+
 trap 'exit 143' TERM
 while :; do
     if [ -f "$D/$seat.wake" ]; then
         rm -f "$D/$seat.wake"
+        case "$mode" in deaf*) continue ;; esac
         if [ "$kind" = codex ] && [ -n "$resumed" ]; then
             hook "{\"hook_event_name\":\"SessionStart\",\"session_id\":\"$sid\",\"source\":\"resume\"}" > /dev/null
             resumed=""
@@ -145,6 +167,7 @@ while :; do
     if [ -f "$D/$seat.prompt" ]; then
         rm -f "$D/$seat.prompt"
         turn "\"a prompt\""
+        screen
     fi
     if [ -f "$D/$seat.ask" ]; then
         rm -f "$D/$seat.ask"

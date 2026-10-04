@@ -157,6 +157,7 @@ impl Env {
                     cwd: cwd.to_string_lossy().into_owned(),
                     mux_session: "amail-acme-main".into(),
                     tab: s.to_string(),
+                    paste_fallback: false,
                 }
             })
             .collect();

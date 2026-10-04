@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { scrollToRow, virtualWindow } from '../../src/lib/virtual';
-import { effectiveState, freshPresence, needsPerson, nodeOpBlock, stateAge } from '../../src/lib/presence';
+import { effectiveState, focusUntil, freshPresence, needsPerson, nodeOpBlock, stateAge } from '../../src/lib/presence';
 import { Coalescer } from '../../src/lib/coalesce';
 import { attentionKey, seatsWaitingForUser, sortAttention } from '../../src/lib/attention';
 import { deliveryState, deliveryStep, viaLabel } from '../../src/lib/delivery';
@@ -52,6 +52,13 @@ describe('presence', () => {
     expect(nodeOpBlock(seat({ node_connected: false }), now)).toBe('noNode');
     expect(nodeOpBlock(seat(), now)).toBe('noPresence');
     expect(nodeOpBlock(seat({}, 'user'), now)).toBe('user');
+  });
+  it('shows focus only while it lasts', () => {
+    const later = new Date(now + 600_000).toISOString();
+    const earlier = new Date(now - 1).toISOString();
+    expect(focusUntil({ ...seat({}), focus_until: later }, now)).toBe(later);
+    expect(focusUntil({ ...seat({}), focus_until: earlier }, now)).toBeUndefined();
+    expect(focusUntil(seat({}), now)).toBeUndefined();
   });
 });
 

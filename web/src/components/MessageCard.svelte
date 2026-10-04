@@ -117,6 +117,10 @@
   .src-agent {
     color: var(--src-agent);
   }
+  .src-system {
+    color: var(--src-system);
+    background: color-mix(in srgb, var(--src-system) 12%, transparent);
+  }
   .src-external {
     color: var(--src-external);
     background: color-mix(in srgb, var(--src-external) 12%, transparent);

@@ -8,6 +8,7 @@ pub mod hook_client;
 pub mod inject;
 pub mod mux;
 pub mod node;
+pub mod paste;
 pub mod paths;
 pub mod persist;
 pub mod server;

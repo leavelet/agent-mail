@@ -130,6 +130,10 @@
   .src-user {
     color: var(--src-user);
   }
+  .src-system {
+    color: var(--src-system);
+    background: color-mix(in srgb, var(--src-system) 12%, transparent);
+  }
   .src-external {
     color: var(--src-external);
   }

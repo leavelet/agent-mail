@@ -358,4 +358,5 @@ pub struct CountRec {
     pub last_seq: i64,
     pub unread: i64,
     pub pending: i64,
+    pub focus_until: Option<i64>,
 }

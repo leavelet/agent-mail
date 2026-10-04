@@ -87,6 +87,10 @@ pub struct SeatPlacement {
     /// The zellij session, `amail-<org>-<group>`.
     pub mux_session: String,
     pub tab: String,
+    /// When native wake-ups fail, type the nudge into the seat's pane, if
+    /// that is safe (see the node).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub paste_fallback: bool,
 }
 
 /// A row of `amail ps`.

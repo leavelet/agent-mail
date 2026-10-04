@@ -1669,7 +1669,7 @@ impl Node {
     /// is sent once more; if that is not confirmed either, the seat is marked
     /// `wake_failed` and tried again on a backoff, or at once when new mail
     /// arrives for it.
-    fn wake_scan(&self) -> Option<Instant> {
+    fn wake_scan(self: &Arc<Self>) -> Option<Instant> {
         let now = Instant::now();
         let mut next: Option<Instant> = None;
         let mut soonest = |t: Instant| next = Some(next.map_or(t, |n: Instant| n.min(t)));
@@ -1682,6 +1682,15 @@ impl Node {
         let mut changed = Vec::new();
         let (confirm, window) = (self.cfg.wake_confirm, self.cfg.wake_window);
         let (backoff0, backoff_max) = (self.cfg.wake_backoff, self.cfg.wake_backoff_max);
+        // Seats that may be woken by typing into their pane.
+        let paste_ok: HashMap<String, (String, u32)> = st
+            .saved
+            .managed
+            .iter()
+            .filter(|(_, m)| m.paste_fallback)
+            .filter_map(|(n, m)| Some((n.clone(), (m.mux_session.clone(), m.pane?))))
+            .collect();
+        let mut pastes: Vec<(String, String, u32, u64)> = Vec::new();
         for (name, s) in st.seats.iter_mut() {
             let target = s.session.as_ref().and_then(|x| x.target.clone());
             // Mail held by focus is due when the focus ends; digest mail
@@ -1719,6 +1728,16 @@ impl Node {
                     counter += 1;
                     fire.push((h, name.clone(), target, counter));
                     s.wake_out = Some((now, attempt + 1));
+                    s.wakes += 1;
+                    soonest(now + confirm);
+                } else if attempt == 2
+                    && let Some((session, pane)) = paste_ok.get(name)
+                {
+                    // Native wake-ups failed: try typing the nudge (it is
+                    // checked against the screen first).
+                    counter += 1;
+                    pastes.push((name.clone(), session.clone(), *pane, counter));
+                    s.wake_out = Some((now, 3));
                     s.wakes += 1;
                     soonest(now + confirm);
                 } else {
@@ -1789,6 +1808,10 @@ impl Node {
             st.saved.wakes.insert(name.clone(), n);
         }
         drop(st);
+        for (seat, session, pane, n) in pastes {
+            let me = self.clone();
+            tokio::spawn(async move { me.paste_wake(&seat, &session, pane, n).await });
+        }
         for (h, seat, target, n) in fire {
             let adapter = self.adapter(h).clone();
             tracing::info!("waking seat {seat} (#{n})");
@@ -1799,6 +1822,54 @@ impl Node {
             });
         }
         next
+    }
+
+    /// Type the wake-up into the seat's pane, if the screen shows an idle
+    /// harness at an empty input box (see [`crate::paste`]); otherwise, or
+    /// if anything is off, the seat is marked `wake_failed` at once.
+    async fn paste_wake(self: Arc<Self>, seat: &str, session: &str, pane: u32, n: u64) {
+        let text = crate::inject::wake_text(n);
+        let r = async {
+            let idle = self.lock().seats.get(seat).is_some_and(|s| {
+                s.state == SeatState::Idle && s.wake_out.is_some_and(|w| w.1 == 3)
+            });
+            if !idle {
+                bail!("the seat is no longer idle");
+            }
+            let screen = self.mux.screen(session, pane).await?;
+            crate::paste::check(&screen).map_err(anyhow::Error::msg)?;
+            self.mux.paste(session, pane, &text).await?;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let screen = self.mux.screen(session, pane).await?;
+            crate::paste::check_typed(&screen, &text).map_err(anyhow::Error::msg)?;
+            self.mux.enter(session, pane).await
+        }
+        .await;
+        match r {
+            Ok(()) => tracing::info!("seat {seat}: typed the wake-up (#{n}) into its pane"),
+            Err(e) => {
+                tracing::warn!("seat {seat}: not typing a wake-up into its pane: {e:#}");
+                let mut st = self.lock();
+                let (b0, bmax) = (self.cfg.wake_backoff, self.cfg.wake_backoff_max);
+                let s = st.seat(seat);
+                if s.wake_out.is_some_and(|w| w.1 == 3) {
+                    s.wake_out = None;
+                    s.wake_backoff = if s.wake_backoff.is_zero() {
+                        b0
+                    } else {
+                        (s.wake_backoff * 2).min(bmax)
+                    };
+                    s.wake_retry_at = Some(Instant::now() + s.wake_backoff);
+                    if !s.wake_failed {
+                        s.wake_failed = true;
+                        st.dirty_presence.insert(seat.to_string());
+                    }
+                }
+                drop(st);
+                self.presence_kick.notify_one();
+                self.wake_kick.notify_one();
+            }
+        }
     }
 
     // --- presence and liveness -------------------------------------------------

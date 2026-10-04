@@ -856,6 +856,10 @@ pub struct SeatCounts {
     pub pending: i64,
     /// The seat's sequence counter.
     pub seq: i64,
+    /// The seat is in focus until then (changing it moves the counter, so
+    /// a client that follows `mailbox` events sees it here).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus_until: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

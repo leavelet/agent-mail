@@ -5,8 +5,8 @@
   import { t, ui } from '../lib/ui.svelte';
   import { href, go } from '../lib/router.svelte';
   import { get, qs, ApiError } from '../lib/api';
-  import { effectiveState, freshPresence, stateAge, nodeOpBlock } from '../lib/presence';
-  import { duration } from '../lib/time';
+  import { effectiveState, focusUntil, freshPresence, stateAge, nodeOpBlock } from '../lib/presence';
+  import { duration, shortTime } from '../lib/time';
   import { fromEntry, fromHeader, newestFirst, type MailRow } from '../lib/mailrows';
   import type { ArchiveResponse, InboxResponse } from '../lib/types';
   import StateBadge from './StateBadge.svelte';
@@ -28,6 +28,7 @@
   const p = $derived(seat ? freshPresence(seat.presence, now) : undefined);
   const seatState = $derived(seat ? effectiveState(seat, now) : 'offline');
   const age = $derived(seat ? stateAge(seat, now) : undefined);
+  const focus = $derived(seat ? focusUntil(seat, now) : undefined);
   const children = $derived(store.seats.filter((s) => s.parent === name).map((s) => s.name));
   const block = $derived(seat ? nodeOpBlock(seat, now) : 'noPresence');
   const seq = $derived(store.counts.get(name)?.seq ?? 0);
@@ -93,6 +94,7 @@
         <h1 class="mono">{seat.name}</h1>
         {#if seat.display_name}<span class="muted">{seat.display_name}</span>{/if}
         {#if seat.kind === 'agent'}<StateBadge state={seatState} {age} />{:else}<span class="chip neutral">{t('org.you')}</span>{/if}
+        {#if focus}<span class="chip focus" title={t('flag.focus.long')}>◐ {t('flag.focus', { time: shortTime(focus, now, ui.lang) })}</span>{/if}
       </div>
       <div class="actions row wrap">
         {#if seat.kind === 'agent'}

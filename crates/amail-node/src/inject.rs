@@ -3,8 +3,10 @@
 
 use amail_proto::{DeliveryClass, InboxEntry, LaunchInfo, Priority, Source};
 
-/// Bodies up to this many characters are shown inline.
-pub const INLINE_BODY_MAX: u32 = 400;
+/// Bodies up to this many characters are shown inline. (400 until M5: merge
+/// requests of 400-520 characters then arrived header-only and were acted
+/// on unread.)
+pub const INLINE_BODY_MAX: u32 = 800;
 
 /// Length of the first-line preview of a message in a digest.
 pub const PREVIEW_CHARS: u32 = 120;

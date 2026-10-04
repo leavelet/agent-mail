@@ -3,7 +3,7 @@
 export type SeatState = 'offline' | 'busy' | 'idle' | 'awaiting' | 'dormant';
 export const SEAT_STATES: SeatState[] = ['busy', 'awaiting', 'idle', 'dormant', 'offline'];
 
-export type Source = 'user' | 'agent' | 'external';
+export type Source = 'user' | 'agent' | 'external' | 'system';
 export type DeliveryClass = 'to' | 'cc' | 'list';
 export type DeliveryMode = 'immediate' | 'digest' | 'archive';
 export type Priority = 'normal' | 'urgent';
@@ -44,6 +44,8 @@ export interface Seat {
   group?: string;
   created_at: string;
   presence?: Presence;
+  /** In focus mode (only urgent mail reaches it) until then. */
+  focus_until?: string;
 }
 
 export interface PresenceEvent extends Presence {
@@ -168,6 +170,7 @@ export interface SeatCounts {
   unread: number;
   pending: number;
   seq: number;
+  focus_until?: string;
 }
 
 export interface CountsResponse {
@@ -208,6 +211,9 @@ export interface OrgInfo {
   send_burst: number;
   max_recipients: number;
   max_thread_depth: number;
+  ack_timeout_min: number;
+  focus_max_min: number;
+  digest_interval_min: number;
   webhook_url?: string;
 }
 

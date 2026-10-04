@@ -2,8 +2,9 @@
   import type { Row } from '../lib/tree';
   import type { Seat, SeatCounts, SeatState } from '../lib/types';
   import { SEAT_STATES } from '../lib/types';
-  import { effectiveState, freshPresence, stateAge } from '../lib/presence';
-  import { t } from '../lib/ui.svelte';
+  import { effectiveState, focusUntil, freshPresence, stateAge } from '../lib/presence';
+  import { shortTime } from '../lib/time';
+  import { t, ui } from '../lib/ui.svelte';
   import StateBadge from './StateBadge.svelte';
 
   let {
@@ -34,6 +35,7 @@
   const p = $derived(freshPresence(seat.presence, now));
   const age = $derived(stateAge(seat, now));
   const isUser = $derived(seat.kind === 'user');
+  const focus = $derived(focusUntil(seat, now));
   const hm = $derived([seat.harness ?? p?.harness, seat.model].filter(Boolean).join(' · '));
   const attnLabel = $derived.by(() => {
     const a = p?.attention;
@@ -91,6 +93,7 @@
   <div class="flags">
     {#if attnLabel}<span class="chip attn" title={p?.attention_hint ?? t('flag.attention')}>⚠ {attnLabel}</span>{/if}
     {#if p?.wake_failed && p?.attention !== 'wake-failed'}<span class="chip attn" title={t('flag.wakeFailed.long')}>{t('flag.wakeFailed')}</span>{/if}
+    {#if focus}<span class="chip focus" title={t('flag.focus.long')}>◐ {t('flag.focus', { time: shortTime(focus, now, ui.lang) })}</span>{/if}
     {#if waiting}<span class="chip you" title={t('flag.waitingYou.long')}>✉ {t('flag.waitingYou')}</span>{/if}
   </div>
   <div class="mail">

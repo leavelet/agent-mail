@@ -904,6 +904,7 @@ impl Node {
                 pid_start: None,
                 last_exit: None,
                 order: 0,
+                paste_fallback: false,
             });
             m.order = order as u32;
             if m.harness != p.harness {
@@ -916,6 +917,7 @@ impl Node {
                 m.pane = None;
             }
             m.group = p.group.clone();
+            m.paste_fallback = p.paste_fallback;
             m.harness = p.harness.clone();
             m.cwd = p.cwd.clone();
             m.mux_session = p.mux_session.clone();

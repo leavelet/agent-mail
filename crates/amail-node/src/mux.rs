@@ -78,6 +78,13 @@ pub trait Mux: Send + Sync + 'static {
     /// The visible text of a pane.
     async fn screen(&self, session: &str, pane: u32) -> Result<String>;
 
+    /// Paste `text` into a pane (as a terminal paste: bracketed if the
+    /// program asked for it). No Enter.
+    async fn paste(&self, session: &str, pane: u32, text: &str) -> Result<()>;
+
+    /// Press Enter in a pane.
+    async fn enter(&self, session: &str, pane: u32) -> Result<()>;
+
     /// End a session and everything in it.
     async fn kill_session(&self, session: &str) -> Result<()>;
 
@@ -541,6 +548,36 @@ impl Mux for Zellij {
         .await
     }
 
+    async fn paste(&self, session: &str, pane: u32, text: &str) -> Result<()> {
+        let id = format!("terminal_{pane}");
+        self.run(&[
+            "--session",
+            session,
+            "action",
+            "paste",
+            "--pane-id",
+            &id,
+            text,
+        ])
+        .await
+        .map(drop)
+    }
+
+    async fn enter(&self, session: &str, pane: u32) -> Result<()> {
+        let id = format!("terminal_{pane}");
+        self.run(&[
+            "--session",
+            session,
+            "action",
+            "send-keys",
+            "--pane-id",
+            &id,
+            "Enter",
+        ])
+        .await
+        .map(drop)
+    }
+
     async fn kill_session(&self, session: &str) -> Result<()> {
         let _g = self.op.lock().await;
         if let Some(mut h) = self
@@ -609,6 +646,8 @@ pub struct ProcessMux {
     env: Vec<(String, String)>,
     next: Mutex<u32>,
     sessions: Mutex<HashMap<String, std::collections::BTreeMap<u32, FakePane>>>,
+    /// What was typed into panes: `(session, pane, text)`, Enter as `"\n"`.
+    pub typed: Mutex<Vec<(String, u32, String)>>,
 }
 
 impl ProcessMux {
@@ -618,6 +657,7 @@ impl ProcessMux {
             env,
             next: Mutex::new(0),
             sessions: Mutex::new(HashMap::new()),
+            typed: Mutex::new(Vec::new()),
         }
     }
 
@@ -668,6 +708,23 @@ impl ProcessMux {
             *status.lock().unwrap() = Some(s);
         });
         Ok(())
+    }
+
+    fn edit_prompt(&self, session: &str, pane: u32, f: impl FnOnce(&mut String)) {
+        let sessions = self.sessions.lock().unwrap();
+        let Some(p) = sessions.get(session).and_then(|m| m.get(&pane)) else {
+            return;
+        };
+        let mut out = p.output.lock().unwrap();
+        let text = String::from_utf8_lossy(&out).into_owned();
+        let Some(start) = text.rfind("\n> ").map(|i| i + 1) else {
+            return;
+        };
+        let end = text[start..].find('\n').map_or(text.len(), |i| start + i);
+        let mut line = text[start..end].to_string();
+        f(&mut line);
+        let new = format!("{}{line}{}", &text[..start], &text[end..]);
+        *out = new.into_bytes();
     }
 
     /// The pids of all live panes (for tests).
@@ -772,6 +829,26 @@ impl Mux for ProcessMux {
             Some(i) => text[i + 4..].to_string(),
             None => text,
         })
+    }
+
+    /// Recorded; like a TUI's input box, the last line that starts with
+    /// `> ` shows what was typed (until Enter).
+    async fn paste(&self, session: &str, pane: u32, text: &str) -> Result<()> {
+        self.typed
+            .lock()
+            .unwrap()
+            .push((session.to_string(), pane, text.to_string()));
+        self.edit_prompt(session, pane, |line| line.push_str(text));
+        Ok(())
+    }
+
+    async fn enter(&self, session: &str, pane: u32) -> Result<()> {
+        self.typed
+            .lock()
+            .unwrap()
+            .push((session.to_string(), pane, "\n".to_string()));
+        self.edit_prompt(session, pane, |line| line.truncate(2));
+        Ok(())
     }
 
     async fn kill_session(&self, session: &str) -> Result<()> {

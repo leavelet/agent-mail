@@ -11,6 +11,12 @@ export function parseTime(s: string | undefined | null): number {
 }
 
 /** Presence that is still valid at `now`, else undefined. */
+/** The end of the seat's focus, if it is in focus at `now`. */
+export function focusUntil(seat: Seat, now: number): string | undefined {
+  const t = parseTime(seat.focus_until);
+  return t > now ? seat.focus_until : undefined;
+}
+
 export function freshPresence(p: Presence | undefined, now: number): Presence | undefined {
   if (!p) return undefined;
   const updated = parseTime(p.updated_at);

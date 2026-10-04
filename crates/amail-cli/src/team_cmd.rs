@@ -367,6 +367,7 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
                 cwd: t.workdir(&s).to_string_lossy().into_owned(),
                 mux_session: format!("amail-{}-{g}", me.org),
                 tab,
+                paste_fallback: plan.paste_fallback,
             }
         })
         .collect();

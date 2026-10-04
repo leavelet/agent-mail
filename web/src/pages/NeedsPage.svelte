@@ -104,7 +104,7 @@
                   <span class="chip attn">⚠ {it.attention ? attnLabel(it.attention) : t('flag.wakeFailed')}</span>
                 {:else if it.message}
                   {#if it.message.priority === 'urgent'}<span class="chip urgent">{t('mail.urgent')}</span>{/if}
-                  {#if it.message.source === 'external'}<span class="chip neutral">{t('mail.source.external')}</span>{/if}
+                  {#if it.message.source === 'external' || it.message.source === 'system'}<span class="chip neutral" title={t(`mail.source.${it.message.source}.long`)}>{t(`mail.source.${it.message.source}`)}</span>{/if}
                   <span class="subj">{it.message.subject || t('mail.noSubject')}</span>
                 {/if}
               </div>

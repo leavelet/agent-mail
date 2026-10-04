@@ -25,6 +25,10 @@ test('smoke: org, compose, reply, thread, delivery, search, mirror, needs-you', 
   await expect(page.locator('.trow[data-seat="be-lead"] [data-state="idle"]')).toBeVisible();
   await expect(page.locator('.trow[data-seat="fe-lead"]')).toContainText('permission prompt');
   await expect(page.locator('.trow[data-seat="be-lead"]')).toContainText('waiting for you');
+  // A seat in focus says so, live.
+  await api(s.userToken, 'PUT', '/focus?seat=be-1', { for_s: 1800 });
+  await expect(page.locator('.trow[data-seat="be-1"]')).toContainText('focus until');
+  await api(s.userToken, 'DELETE', '/focus?seat=be-1');
 
   // Compose to be-lead.
   await page.goto(`${s.base}/#/compose?to=be-lead`);

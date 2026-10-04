@@ -878,12 +878,12 @@ macro_rules! impl_store_common {
             }
 
             pub async fn counts(c: &mut Conn, org_id: i64, seat_id: Option<i64>) -> Result<Vec<CountRec>> {
-                let rows: Vec<(i64, String, i64, i64, i64)> = sqlx::query_as(
+                let rows: Vec<(i64, String, i64, i64, i64, Option<i64>)> = sqlx::query_as(
                     "SELECT s.id, s.name, s.last_seq, \
                      (SELECT COUNT(*) FROM deliveries d WHERE d.seat_id = s.id AND d.read_at IS NULL \
                        AND d.mode <> 'archive') AS unread, \
                      (SELECT COUNT(*) FROM deliveries d WHERE d.seat_id = s.id AND d.notified_at IS NULL \
-                       AND d.mode = 'immediate') AS pending \
+                       AND d.mode = 'immediate') AS pending, s.focus_until \
                      FROM seats s WHERE s.org_id = $1 AND s.deleted_at IS NULL AND ($2 IS NULL OR s.id = $2) \
                      ORDER BY s.name",
                 )
@@ -893,7 +893,9 @@ macro_rules! impl_store_common {
                 .await?;
                 Ok(rows
                     .into_iter()
-                    .map(|(seat_id, seat_name, last_seq, unread, pending)| CountRec { seat_id, seat_name, last_seq, unread, pending })
+                    .map(|(seat_id, seat_name, last_seq, unread, pending, focus_until)| {
+                        CountRec { seat_id, seat_name, last_seq, unread, pending, focus_until }
+                    })
                     .collect())
             }
 

@@ -976,7 +976,7 @@ async fn inlined_mail_is_read(b: Backend) {
         .api
         .post(
             "/messages",
-            json!({"to": ["w1"], "subject": "long", "body": "x".repeat(500)}),
+            json!({"to": ["w1"], "subject": "long", "body": "x".repeat(1000)}),
         )
         .await["id"]
         .as_i64()

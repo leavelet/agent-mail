@@ -425,6 +425,15 @@ pub async fn run_step(
     let start = Instant::now() + Duration::from_millis(200);
     let measure_from = start + Duration::from_secs(o.warmup);
     let end = measure_from + Duration::from_secs(o.duration);
+    let wall0 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+        + 200;
+    let window_unix_ms = [
+        wall0 + o.warmup * 1000,
+        wall0 + (o.warmup + o.duration) * 1000,
+    ];
     let sem = Arc::new(tokio::sync::Semaphore::new(o.max_inflight));
     let send_us = Arc::new(Mutex::new(Vec::<u64>::new()));
     let errors = Arc::new(AtomicU64::new(0));
@@ -491,6 +500,7 @@ pub async fn run_step(
     };
     let mut rng = rand::rngs::StdRng::from_rng(&mut rand::rng());
     let mut i: u64 = 0;
+    let mut overloaded = false;
     loop {
         let at = start + Duration::from_secs_f64(i as f64 / rate);
         if at >= end {
@@ -499,6 +509,11 @@ pub async fn run_step(
         i += 1;
         tokio::time::sleep_until(at).await;
         let permit = sem.clone().acquire_owned().await.unwrap();
+        // Far behind schedule: the server cannot keep up; end the step.
+        if Instant::now() > at + Duration::from_secs(30) {
+            overloaded = true;
+            break;
+        }
         let (si, msg) = message_for(o, &w, &mut rng);
         let url = format!("{}/v1/messages", sim.base[i as usize % sim.base.len()]);
         let (http, w, send_us, errors, first_error, sent, sent_at) = (
@@ -534,7 +549,16 @@ pub async fn run_step(
             }
         });
     }
-    let _ = sem.acquire_many(o.max_inflight as u32).await;
+    // Wait for sends in flight, at most a minute.
+    let unfinished = match tokio::time::timeout(
+        Duration::from_secs(60),
+        sem.acquire_many(o.max_inflight as u32),
+    )
+    .await
+    {
+        Ok(_) => 0,
+        Err(_) => o.max_inflight - sem.available_permits(),
+    };
     // Let deliveries sent near the end of the window arrive.
     tokio::time::sleep(Duration::from_secs(o.drain)).await;
     measuring.await.ok();
@@ -552,10 +576,14 @@ pub async fn run_step(
     json!({
         "mode": "e2e",
         "target_rate": rate,
+        "window_unix_ms": window_unix_ms,
         "duration_s": o.duration,
         "sent_per_s": sent.load(Ordering::Relaxed) as f64 / window,
         "send_ms": stats(&mut s),
         "errors": errors.load(Ordering::Relaxed),
+        "overloaded": overloaded,
+        "unfinished_sends": unfinished,
+        "scheduled_sends": i,
         "first_error": first_error.lock().unwrap().clone(),
         "to_busy_ms": stats(&mut busy),
         "to_wake_ms": stats(&mut wake),

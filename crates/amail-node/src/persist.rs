@@ -103,6 +103,9 @@ pub struct Managed {
     /// How the last run ended, for `amail ps`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_exit: Option<String>,
+    /// Type the wake-up into the pane when native wake-ups fail (guarded).
+    #[serde(default)]
+    pub paste_fallback: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

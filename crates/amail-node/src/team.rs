@@ -69,6 +69,8 @@ struct SeatOpts {
     harness: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
+    /// Allow the guarded terminal-paste wake-up (see the node).
+    paste_fallback: Option<bool>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -83,6 +85,7 @@ struct SeatRaw {
     role_file: Option<PathBuf>,
     cwd: Option<PathBuf>,
     display_name: Option<String>,
+    paste_fallback: Option<bool>,
     /// `[[seat]]` only: join this group (as a worker of its lead, unless
     /// `parent` says otherwise).
     group: Option<String>,
@@ -184,6 +187,8 @@ pub struct SeatPlan {
     /// Explicit working directory (absolute).
     pub cwd: Option<PathBuf>,
     pub display_name: Option<String>,
+    /// When native wake-ups fail, type the nudge into the terminal (guarded).
+    pub paste_fallback: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -426,6 +431,11 @@ pub fn parse(text: &str, base: &Path) -> Result<Team, TeamError> {
             role,
             cwd: s.cwd.as_deref().map(|p| abs(base, p)),
             display_name: s.display_name.clone(),
+            paste_fallback: s
+                .paste_fallback
+                .or(inherit.paste_fallback)
+                .or(defaults.paste_fallback)
+                .unwrap_or(false),
         });
         Ok(())
     };
@@ -501,6 +511,7 @@ pub fn parse(text: &str, base: &Path) -> Result<Team, TeamError> {
                     harness: w.harness.clone(),
                     model: w.model.clone(),
                     permission_mode: w.permission_mode.clone(),
+                    paste_fallback: None,
                 };
                 for n in 1..=w.count {
                     let s = SeatRaw {

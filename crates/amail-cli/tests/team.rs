@@ -48,6 +48,7 @@ team_tests!(
     session_without_a_turn_starts_fresh,
     list_mail_wakes_and_cold_starts,
     staged_merge_worktrees_and_validation,
+    paste_fallback_types_only_when_safe,
 );
 
 async fn setup(
@@ -1127,4 +1128,108 @@ workers = [{ name = "a" }, { name = "b", harness = "codex" }]
         "{out}"
     );
     cli(&h, &["down"]).await;
+}
+
+/// When native wake-ups fail, a seat with `paste_fallback` gets the nudge
+/// typed into its pane, but only if its screen shows an empty input box;
+/// with a dialog open, or without the option, it is marked wake_failed.
+async fn paste_fallback_types_only_when_safe(b: Backend) {
+    let Some(h) = setup(
+        b,
+        "paste_fallback_types_only_when_safe",
+        Some(|c| {
+            c.wake_confirm = Duration::from_millis(700);
+            c.wake_window = Duration::from_millis(100);
+        }),
+    )
+    .await
+    else {
+        return;
+    };
+    let _i: Vec<FakeInbox> = ["p", "q", "r"].iter().map(|s| inbox(&h, s)).collect();
+    set_mode(&h, "p", "deaf");
+    set_mode(&h, "q", "deafdialog");
+    set_mode(&h, "r", "deaf");
+    write_team(
+        &h,
+        r#"
+[team]
+workroot = "@DIR@/work"
+[defaults]
+harness = "claude"
+paste_fallback = true
+[[seat]]
+name = "p"
+[[seat]]
+name = "q"
+[[seat]]
+name = "r"
+paste_fallback = false
+"#,
+    );
+    up(&h, &[]).await;
+    for s in ["p", "q", "r"] {
+        wait_state(&h, s, "idle").await;
+    }
+    let pane = |seat: &str| {
+        let h = &h;
+        let seat = seat.to_string();
+        async move { row(h, &seat).await.pane.unwrap() }
+    };
+    let (pp, pq, pr) = (pane("p").await, pane("q").await, pane("r").await);
+    let typed = |pane: u32| -> Vec<String> {
+        h.mux
+            .as_ref()
+            .unwrap()
+            .typed
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, p, _)| *p == pane)
+            .map(|(_, _, t)| t.clone())
+            .collect()
+    };
+    let ids: Vec<i64> = {
+        let mut v = Vec::new();
+        for s in ["p", "q", "r"] {
+            v.push(h.api.send(&[s], &[], &format!("for {s}"), false).await);
+        }
+        v
+    };
+    // p: two native wake-ups go unanswered, then the nudge is typed and
+    // Enter pressed (the "TUI" submits it as a prompt).
+    let t0 = Instant::now();
+    while typed(pp).len() < 2 {
+        if t0.elapsed() > Duration::from_secs(20) {
+            let m = h.mux.as_ref().unwrap();
+            let r = row(&h, "p").await;
+            let screen = amail_node::mux::Mux::screen(&**m, &r.mux_session, pp).await;
+            panic!(
+                "nothing typed into p: {r:?}\nscreen: {screen:?}\ntyped: {:?}",
+                typed(pp)
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let t = typed(pp);
+    assert!(
+        t[0].starts_with("[amail] You have new mail (wake #"),
+        "{t:?}"
+    );
+    assert_eq!(t[1], "\n");
+    std::fs::write(h.fake.join("p.prompt"), "").unwrap();
+    wait_injected(&h, "p", ids[0]).await;
+    wait_state(&h, "p", "idle").await;
+    assert_eq!(row(&h, "p").await.attention, None);
+    // q (a dialog on screen) and r (no fallback): nothing typed, flagged.
+    for s in ["q", "r"] {
+        let t0 = Instant::now();
+        while row(&h, s).await.attention.as_deref() != Some("wake-failed") {
+            assert!(t0.elapsed() < Duration::from_secs(20), "{s} not flagged");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    assert!(typed(pq).is_empty() && typed(pr).is_empty());
+    let st = h.api.get(&format!("/messages/{}/status", ids[1])).await;
+    assert_eq!(st["recipients"][0]["state"], "queued");
 }

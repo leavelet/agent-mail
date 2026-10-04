@@ -35,6 +35,7 @@
   --src-user: #2f5bd3;
   --src-agent: #4b5560;
   --src-external: #b0461a;
+  --src-system: #6b3fa0;
 
   --row-h: 30px;
   --radius: 6px;
@@ -79,6 +80,8 @@
     --src-user: #7ea4ff;
     --src-agent: #a8b1bb;
     --src-external: #f08a5c;
+  --src-system: #c39bf0;
+    --src-system: #c39bf0;
     color-scheme: dark;
   }
 }
@@ -118,6 +121,7 @@
   --src-user: #7ea4ff;
   --src-agent: #a8b1bb;
   --src-external: #f08a5c;
+  --src-system: #c39bf0;
   color-scheme: dark;
 }
 
@@ -348,6 +352,10 @@ td {
 .chip.ok {
   color: var(--ok);
   background: var(--ok-weak);
+}
+.chip.focus {
+  color: var(--src-system);
+  background: color-mix(in srgb, var(--src-system) 12%, transparent);
 }
 .count {
   display: inline-block;
