@@ -245,11 +245,15 @@ process without any sandbox. So for a seat with `permission_mode =
 unattended`) amail runs the whole host under bubblewrap (`bwrap`), unless
 the jail is turned off for the seat (see below):
 
-- the system is mounted read-only, and the jail has its own process
-  namespace (other processes and their environments are not visible);
-- the home directory, `/tmp` and `$XDG_RUNTIME_DIR` are empty;
-- the Docker, Podman and containerd sockets are covered by `/dev/null`
-  (a Unix socket can be used through a read-only mount);
+- `/` (the whole system) is mounted read-only; `/dev` is a new minimal
+  device directory and `/proc` belongs to the jail's own process namespace
+  (other processes and their environments are not visible);
+- empty `tmpfs` mounts cover the home directory, `/tmp` and
+  `$XDG_RUNTIME_DIR`;
+- the Docker, Podman and containerd sockets (`/run/docker.sock`,
+  `/var/run/docker.sock`, `/run/podman/podman.sock`,
+  `/run/containerd/containerd.sock`, those that exist) are covered by
+  `/dev/null` (a Unix socket can be used through a read-only mount);
 - mounted back writable: the seat's working directory and its own dsh
   home;
 - git follows the seat's `git_access` (in the team file or `amail run
@@ -268,14 +272,34 @@ the jail is turned off for the seat (see below):
   `gitdir` and `config.worktree`. `off` makes git read-only. The working
   directory's `.git` stays read-only unless `full` makes it writable.
   Read-only entries that do not exist are covered by an empty read-only
-  placeholder, which leaves an empty file or directory of that name in the
-  git directory. A seat does not start while a repository's git directory
-  contains a `commondir` file or a symbolic link where git never creates
-  one;
-- mounted back read-only: the `amail` and `dsh` installations, the Node.js
-  runtime, `~/.gitconfig`, the repository's git directories (except what
-  the rules above make writable), the seat's profile and patch, its own
-  endpoint directory and the node socket's directory;
+  placeholder (an empty `tmpfs` mounted read-only for `hooks/`, `modules/`,
+  `worktrees/` and `info/`, an empty file otherwise), which leaves an empty
+  file or directory of that name in the git directory. A seat does not
+  start while a repository's git directory contains a `commondir` file or
+  a symbolic link where git never creates one;
+- mounted back read-only: the directory that holds the `amail` binary, the
+  `dsh` installation (the directory above its `node_modules`), the Node.js
+  installation (two levels above the real path of the `node` found in
+  `PATH`), the repository's git directories (except what the rules above
+  make writable), the seat's profile and patch, its own endpoint directory
+  and the node socket's directory;
+- mounted back read-only, each file on its own: git's configuration files
+  `~/.gitconfig` and, in git's configuration directory
+  (`$XDG_CONFIG_HOME/git`, by default `~/.config/git`), `config`, `ignore`
+  and `attributes`, those that exist. The directory itself is not mounted,
+  so git's credential stores (`~/.config/git/credentials`,
+  `~/.git-credentials`) stay hidden. If one of these files is a symbolic
+  link, only the regular file it points to is mounted, at the link's path,
+  and a link to a file named `credentials` or `.git-credentials` is not
+  mounted. Files that other configuration names (`include.path`,
+  `core.excludesFile` under the home directory) are not mounted;
+- paths in these lists that do not exist are skipped (except the
+  placeholders above); a deeper path is mounted after the one that
+  contains it;
+- the host runs in a new session without a controlling terminal, and its
+  standard input is `/dev/null`, so it cannot read from or type into the
+  terminal the seat was started in (dsh's web host does not read its
+  input; its output still goes to the seat's pane);
 - the network is shared (the model API and the amail server).
 
 Inside the jail dsh runs with `DSH_PERMISSION_MODE=danger-full-access`;

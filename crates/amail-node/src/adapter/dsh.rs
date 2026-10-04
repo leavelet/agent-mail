@@ -990,6 +990,7 @@ mod tests {
             "",
             &j.rw,
             &j.ro,
+            &[],
             &j.empty_dirs,
             &j.empty_files,
             &empty.path().to_string_lossy(),

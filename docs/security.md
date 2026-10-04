@@ -168,6 +168,17 @@ seat with its jail on, the default: amail runs its host in a bwrap jail
 that hides the home directory, the runtime directory and other processes,
 so the points below that need those do not apply to it; it can still read
 the rest of the file system. With `dsh_jail = false` all the points apply.
+The jail mounts `/` read-only, a new `/dev` and `/proc`, and empty `tmpfs`
+mounts over the home directory, `/tmp` and `$XDG_RUNTIME_DIR`; it covers
+the Docker, Podman and containerd sockets with `/dev/null`; it mounts back
+writable the seat's working directory, its dsh home and the git paths its
+`git_access` allows; and it mounts back read-only the `amail`, `dsh` and
+Node.js installations, the repository's other git paths, the seat's
+profile, patch and endpoint directory, the node socket's directory, and
+git's configuration files `~/.gitconfig` and `config`, `ignore` and
+`attributes` in `~/.config/git` (or `$XDG_CONFIG_HOME/git`), each file on its own, never git's
+credential stores. The host has no controlling terminal and reads
+`/dev/null`. The full list is in the harness documentation.
 See [harness support](harnesses.md#deepseek-harness-dsh).) An agent that can run shell commands (Claude Code
 with `--dangerously-skip-permissions`, a Codex seat whose sandbox lets it
 read your home directory, or any agent whose commands you approve without
