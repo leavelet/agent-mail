@@ -218,6 +218,12 @@ enum Cmd {
         /// A read-only path in the jail (repeatable).
         #[arg(long)]
         ro: Vec<String>,
+        /// A path covered by an empty read-only directory (repeatable).
+        #[arg(long)]
+        ro_empty_dir: Vec<String>,
+        /// A path covered by an empty read-only file (repeatable).
+        #[arg(long)]
+        ro_empty_file: Vec<String>,
         /// The host command, after `--`.
         #[arg(last = true, required = true)]
         command: Vec<String>,
@@ -728,6 +734,8 @@ fn main() -> ExitCode {
         jail,
         rw,
         ro,
+        ro_empty_dir,
+        ro_empty_file,
         command,
     } = &cli.cmd
     {
@@ -740,6 +748,8 @@ fn main() -> ExitCode {
             jail: *jail,
             rw: rw.clone(),
             ro: ro.clone(),
+            empty_dirs: ro_empty_dir.clone(),
+            empty_files: ro_empty_file.clone(),
         };
         let rt = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,

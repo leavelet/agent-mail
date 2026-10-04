@@ -364,8 +364,9 @@ Description=amail node (delivers mail to this host's agent sessions)
 ExecStart=%h/.local/bin/amail node
 Restart=on-failure
 RestartSec=2
-# The node starts claude, codex and zellij: make sure they are on this PATH
-# (or pass --claude-bin, --codex-bin, --zellij-bin).
+# The node starts claude, codex, dsh and zellij: make sure they are on this
+# PATH (or pass --claude-bin, --codex-bin, --dsh-bin, --zellij-bin). For dsh
+# seats, pass the model provider's key with --dsh-env-file <file>.
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]

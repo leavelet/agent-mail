@@ -312,10 +312,12 @@ impl Report {
 
 /// Harness versions amail has been tested with: the adapters use
 /// interfaces the harnesses do not document (Claude Code's session inbox
-/// socket, Codex's app-server and hook trust), which may change.
+/// socket, Codex's app-server and hook trust, dsh's web host API), which
+/// may change.
 const VERIFIED: &[(&str, &str, &str)] = &[
     ("claude", "2.1.", "Claude Code 2.1.x"),
     ("codex", "0.160.", "codex-cli 0.160.x"),
+    ("dsh", "0.2.", "DeepSeek Harness 0.2.x"),
     ("zellij", "0.45.", "zellij 0.45.x"),
 ];
 
@@ -482,7 +484,15 @@ pub async fn doctor(profile: Option<&Path>, team_file: &Path, out: &Out) -> Resu
 
     // Harnesses and zellij.
     for (bin, prefix, label) in VERIFIED {
-        match version_of(bin) {
+        // The node finds dsh as AMAIL_DSH_BIN (or `amail node --dsh-bin`).
+        let path = match *bin {
+            "dsh" => std::env::var("AMAIL_DSH_BIN")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "dsh".into()),
+            _ => bin.to_string(),
+        };
+        match version_of(&path) {
             None => r.add(
                 Level::Info,
                 bin,
@@ -554,9 +564,10 @@ pub async fn doctor(profile: Option<&Path>, team_file: &Path, out: &Out) -> Resu
                     max.as_deref().unwrap_or("-")
                 ),
                 Some(
-                    "Codex's sandbox needs them: every sandboxed command fails. Allow them \
-                     (sysctl kernel.apparmor_restrict_unprivileged_userns=0) or run Codex seats \
-                     without the sandbox"
+                    "Codex's sandbox and the jail of unattended dsh seats need them: every \
+                     sandboxed Codex command fails and unattended dsh seats do not start. Allow \
+                     them (sysctl kernel.apparmor_restrict_unprivileged_userns=0) or run Codex \
+                     seats without the sandbox"
                         .into(),
                 ),
             );
@@ -564,9 +575,45 @@ pub async fn doctor(profile: Option<&Path>, team_file: &Path, out: &Out) -> Resu
             r.add(
                 Level::Ok,
                 "user namespaces",
-                "allowed (Codex's sandbox can start)",
+                "allowed (Codex's sandbox and dsh's jail can start)",
                 None,
             );
+        }
+        // Unattended dsh seats run their host under bubblewrap.
+        let bwrap = std::process::Command::new("bwrap")
+            .args([
+                "--ro-bind",
+                "/",
+                "/",
+                "--unshare-pid",
+                "--proc",
+                "/proc",
+                "--",
+                "true",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        match bwrap {
+            Ok(st) if st.success() => r.add(
+                Level::Ok,
+                "bwrap",
+                "works (jail of unattended dsh seats)",
+                None,
+            ),
+            Ok(_) => r.add(
+                Level::Warn,
+                "bwrap",
+                "installed but cannot create a sandbox",
+                Some("unattended dsh seats do not start; allow user namespaces".into()),
+            ),
+            Err(_) => r.add(
+                Level::Info,
+                "bwrap",
+                "not found",
+                Some("needed for unattended dsh seats: install bubblewrap".into()),
+            ),
         }
     }
 

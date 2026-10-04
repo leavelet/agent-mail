@@ -84,12 +84,13 @@ resumes them when mail arrives. See [team files](teams.md).
 5. **Idle session.** If `be-1` is idle and the mail is `to` or urgent, the
    node waits a 3-second coalescing window (urgent: no wait) and sends a
    one-line nudge, `[amail] You have new mail (wake #n).`, through the
-   harness (Claude Code's session inbox socket, `codex queue` for Codex).
+   harness (Claude Code's session inbox socket, `codex queue` for Codex,
+   `session/prompt` on the web host's API for DeepSeek Harness).
    The nudge carries no mail: it starts a turn, and that turn's
    `UserPromptSubmit` hook does step 4. A sleeping seat is resumed first.
 6. **Claim.** The node calls `/v1/claim` for the seat with the classes the
    hook may show. The server marks the pending deliveries `notified` in one
-   statement and returns them (at most 8 for Claude Code, 5 for Codex per
+   statement and returns them (at most 8 for Claude Code and dsh, 5 for Codex per
    hook; the rest follow with the next hook). Concurrent claims never return
    the same delivery.
 7. **Injection.** The hook's answer adds context to the model's turn:
@@ -180,12 +181,14 @@ instance.
 A seat's page in the web interface shows its live conversation, read-only.
 The browser asks the server, the server asks (through the node's event
 stream) the node that hosts the seat, and the node reads the session's
-transcript file (Claude Code JSONL or a Codex rollout), sends the last 200
+transcript file (Claude Code JSONL, a Codex rollout or a dsh session log), sends the last 200
 entries and then follows the file. The node takes the file's path from the
 session's hooks and accepts only paths where the harness writes
 transcripts: `projects/` of the Claude Code configuration directory
 (`CLAUDE_CONFIG_DIR` of the session or of the node, else `~/.claude`), or
-`sessions/` of the node's Codex home. The node stops 30 seconds after the last
+`sessions/` of the node's Codex home, or `sessions/` of the node's dsh
+home (dsh hooks report no path; the node derives it from the session's
+directory and id). The node stops 30 seconds after the last
 browser left. Mail injected by the system is shown apart from what a person
 typed. The server keeps at most the last 1,000 entries (4 MiB) of a watched
 seat in memory and nothing once nobody watches; only user tokens can watch.
@@ -201,7 +204,7 @@ mirrors of an instance at most the `--max-mirror-mb` limit (see
 | `amail-proto` | wire types and address parsing |
 | `amail-store` | the `Store` trait, SQLite and Postgres backends, migrations, conformance tests |
 | `amail-server` | the HTTP API, event streams, policy and limits, public mode |
-| `amail-node` | the node, the hook client, the Claude Code and Codex adapters, team supervision |
+| `amail-node` | the node, the hook client, the Claude Code, Codex and DeepSeek Harness adapters (and the dsh host wrapper), team supervision |
 | `amail-cli` | the `amail` binary |
 | `amail-bench` | load generator used for the capacity numbers in [operations](operations.md) |
 | `web/` | the web interface (Svelte, TypeScript), embedded into the binary at build time |

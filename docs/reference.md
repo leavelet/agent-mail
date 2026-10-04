@@ -30,7 +30,7 @@ exit code.
 | `amail register <url> --invite <code> --org <name> [--user-name owner] [--name n]` | register an org on a public server; saves the login and prints the user token once |
 | `amail profile ls` / `use <name>` / `rm <name>` | saved logins |
 | `amail init [-f amail.toml] [--force]` | write a commented sample team file |
-| `amail doctor [-f amail.toml]` | check the platform, server, token, node, harness and zellij versions, Codex socket path and sandbox, Claude Code trust of this directory, and the team file; exits non-zero on a failure |
+| `amail doctor [-f amail.toml]` | check the platform, server, token, node, harness and zellij versions, Codex socket path and sandbox, `bwrap` (for unattended dsh seats), Claude Code trust of this directory, and the team file; exits non-zero on a failure |
 
 ### Mail
 
@@ -51,7 +51,7 @@ exit code.
 
 | command | |
 |---|---|
-| `amail seat add <name> [--parent p] [--role r] [--harness claude\|codex] [--model m] [--display-name d] [--permission-mode default\|unattended]` | create a seat (the permission mode is stored for display; launches take it from the team file or `amail run --permission-mode`) |
+| `amail seat add <name> [--parent p] [--role r] [--harness claude\|codex\|dsh] [--model m] [--display-name d] [--permission-mode default\|unattended]` | create a seat (the permission mode is stored for display; launches take it from the team file or `amail run --permission-mode`) |
 | `amail seat set/ls/rm/token` | change, list, delete a seat; issue a seat token |
 | `amail list create <name> [--policy anyone\|members\|user_only] [--description d]` | create a list |
 | `amail list ls [name]` / `rm` / `add <list> <members...> [--mode immediate\|digest\|archive]` / `remove` | lists and members |
@@ -70,7 +70,7 @@ exit code.
 | `amail node token [--save]` | issue a node token (user token needed); `--save` writes it with the URL to `<state dir>/node.toml` |
 | `amail node status` | the node's view of its seats |
 | `amail node web-token` | a login token for the node's browser terminal |
-| `amail run <seat> [--harness claude\|codex] [--permission-mode default\|unattended] [-- args]` | start the seat's harness session in this terminal. `--permission-mode unattended` runs it without permission prompts; without the flag a seat placed by `amail up` uses its team file's `permission_mode` and any other seat keeps the prompts. The server's seat setting is not used |
+| `amail run <seat> [--harness claude\|codex\|dsh] [--permission-mode default\|unattended] [-- args]` | start the seat's harness session in this terminal. `--permission-mode unattended` runs it without permission prompts; without the flag a seat placed by `amail up` uses its team file's `permission_mode` and any other seat keeps the prompts. The server's seat setting is not used |
 | `amail up [-f amail.toml] [--only g,s] [--no-start] [--prune]` | bring a team up from a team file ([team files](teams.md)) |
 | `amail down [--only g,s]` / `amail ps` | stop the team's sessions / one line per seat |
 | `amail attach <group or seat>` / `amail sleep <seat>` / `amail wake <seat>` | attach to a group's zellij session / put a seat to sleep / start it now |
@@ -79,7 +79,10 @@ Node options: `--url`, `--token` (`AMAIL_NODE_TOKEN`), `--state-dir`
 (`AMAIL_STATE_DIR`, default `~/.local/share/amail`), `--socket`
 (`AMAIL_NODE_SOCK`, default `$XDG_RUNTIME_DIR/amail/node.sock`, or
 `<state dir>/run/node.sock` without `XDG_RUNTIME_DIR`), `--label`,
-`--claude-bin`, `--codex-bin`, `--zellij-bin`, `--start-limit` (4),
+`--claude-bin`, `--codex-bin`, `--dsh-bin` (`AMAIL_DSH_BIN`),
+`--dsh-env-file` (`AMAIL_DSH_ENV_FILE`: `NAME=value` lines given only to
+DeepSeek Harness hosts, for the model provider's key), `--zellij-bin`,
+`--start-limit` (4),
 `--codex-auth`, `--wake-window-ms` (3000), `--wake-confirm-ms` (10000),
 `--web-terminal-port`, `--web-terminal-url`. Without `--url`/`--token` the
 node uses `AMAIL_URL`, then `node.toml`, then the current saved login's URL.

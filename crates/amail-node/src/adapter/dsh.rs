@@ -295,6 +295,17 @@ impl Api {
     }
 }
 
+/// The paths of a seat's jail (see [`Dsh::jail_paths`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Jail {
+    pub rw: Vec<String>,
+    pub ro: Vec<String>,
+    /// Paths that do not exist and must stay so: an empty read-only
+    /// directory or file is mounted there.
+    pub empty_dirs: Vec<String>,
+    pub empty_files: Vec<String>,
+}
+
 pub struct Dsh {
     env: AdapterEnv,
 }
@@ -334,30 +345,61 @@ impl Dsh {
             .join(format!("{seat}.toml"))
     }
 
-    /// What an unattended seat's jail exposes: `(writable, read-only)`.
+    /// What an unattended seat's jail exposes.
+    ///
     /// Writable: the working directory, its git directories (a worktree's
-    /// git directory and the repository's common one lie outside it) and
-    /// the dsh home (session logs). Read-only: the `amail` and `dsh`
-    /// installations, the seat's profile and patch, the endpoint files, and the
-    /// node socket's directory. Everything else under the home directory is
-    /// hidden; the rest of the system is read-only.
-    pub fn jail_paths(&self, cwd: &str, seat: &str) -> (Vec<String>, Vec<String>) {
+    /// git directory and the repository's common one lie outside it; the
+    /// same rules as for Codex seats keep `hooks/`, `config` and the other
+    /// entries git takes commands from read-only, and those that do not
+    /// exist are covered by empty read-only placeholders so they cannot be
+    /// created) and the dsh home (session logs). Read-only: the `amail` and
+    /// `dsh` installations, the seat's profile and patch, the endpoint
+    /// files, and the node socket's directory. Everything else under the
+    /// home directory is hidden; the rest of the system is read-only.
+    pub fn jail_paths(&self, cwd: &str, seat: &str) -> Result<Jail> {
         let s = |p: PathBuf| p.to_string_lossy().into_owned();
-        let mut rw = vec![cwd.to_string()];
-        rw.extend(super::codex::git_dirs(cwd));
-        rw.push(s(self.home()));
-        let mut ro = Vec::new();
-        ro.extend(self.env.amail_dir());
-        ro.extend(dsh_install_root(&self.env.dsh_bin).map(s));
-        ro.push(s(self.seat_profile_path(seat)));
-        ro.push(s(self.seat_patch_path(seat)));
-        ro.push(s(self.run_dir()));
-        ro.extend(self.env.node_socket.parent().map(|p| s(p.to_path_buf())));
-        rw.sort();
-        rw.dedup();
-        ro.sort();
-        ro.dedup();
-        (rw, ro)
+        let mut j = Jail {
+            rw: vec![cwd.to_string(), s(self.home())],
+            ..Jail::default()
+        };
+        for d in super::codex::git_dirs(cwd) {
+            let dir = Path::new(&d);
+            if super::codex::git_dir_kind(dir) == Some(super::codex::GitDir::Redirected) {
+                bail!(
+                    "{d} contains a commondir file, which git does not create in a \
+                     repository's git directory; git run in that repository would take \
+                     its config and hooks from the directory it names. Check it and \
+                     remove it before starting dsh seats"
+                );
+            }
+            for (path, mode) in super::codex::git_dir_rules(dir) {
+                let p = Path::new(&path);
+                match mode {
+                    "write" => j.rw.push(path),
+                    _ if p.exists() => j.ro.push(path),
+                    // Entries git reads as directories, and files.
+                    _ if matches!(
+                        p.file_name().and_then(|n| n.to_str()),
+                        Some("hooks" | "modules" | "worktrees")
+                    ) =>
+                    {
+                        j.empty_dirs.push(path)
+                    }
+                    _ => j.empty_files.push(path),
+                }
+            }
+        }
+        j.ro.extend(self.env.amail_dir());
+        j.ro.extend(dsh_install_root(&self.env.dsh_bin).map(s));
+        j.ro.push(s(self.seat_profile_path(seat)));
+        j.ro.push(s(self.seat_patch_path(seat)));
+        j.ro.push(s(self.run_dir()));
+        j.ro.extend(self.env.node_socket.parent().map(|p| s(p.to_path_buf())));
+        for v in [&mut j.rw, &mut j.ro, &mut j.empty_dirs, &mut j.empty_files] {
+            v.sort();
+            v.dedup();
+        }
+        Ok(j)
     }
 
     fn hooks_path(&self) -> PathBuf {
@@ -604,11 +646,16 @@ impl Adapter for Dsh {
             // own sandbox limits writes only, and its file tools run inside
             // the host without any sandbox.
             args.push("--jail".into());
-            for p in self.jail_paths(ctx.cwd, &info.seat).0 {
-                args.extend(["--rw".into(), p]);
-            }
-            for p in self.jail_paths(ctx.cwd, &info.seat).1 {
-                args.extend(["--ro".into(), p]);
+            let j = self.jail_paths(ctx.cwd, &info.seat)?;
+            for (flag, list) in [
+                ("--rw", j.rw),
+                ("--ro", j.ro),
+                ("--ro-empty-dir", j.empty_dirs),
+                ("--ro-empty-file", j.empty_files),
+            ] {
+                for p in list {
+                    args.extend([flag.to_string(), p]);
+                }
             }
         }
         match ctx.resume {
@@ -829,6 +876,120 @@ mod tests {
         assert_eq!(m["C"], "q");
         std::fs::write(&p, "not a pair\n").unwrap();
         assert!(read_env_file(&p).is_err());
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    /// A seat in a worktree: its git directories are writable except the
+    /// entries git takes commands from; under bwrap, writes there fail and
+    /// git's own state files can be written.
+    #[test]
+    fn jail_git_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "i",
+            ],
+        );
+        let wt = root.join("wt");
+        git(
+            &repo,
+            &["worktree", "add", "-q", "-b", "w", wt.to_str().unwrap()],
+        );
+        let d = dsh(&root.join("state"));
+        let j = d.jail_paths(wt.to_str().unwrap(), "w").unwrap();
+        let common = repo.join(".git");
+        let linked = common.join("worktrees").join("wt");
+        let p = |x: &Path| x.to_string_lossy().into_owned();
+        assert!(
+            j.rw.contains(&p(&common)) && j.rw.contains(&p(&linked)),
+            "{j:?}"
+        );
+        assert!(j.ro.contains(&p(&common.join("config"))), "{j:?}");
+        assert!(j.ro.contains(&p(&common.join("hooks"))), "{j:?}");
+        assert!(j.ro.contains(&p(&common.join("worktrees"))), "{j:?}");
+        assert!(j.ro.contains(&p(&linked.join("commondir"))), "{j:?}");
+        assert!(j.empty_dirs.contains(&p(&common.join("modules"))), "{j:?}");
+        assert!(
+            j.empty_files.contains(&p(&common.join("config.worktree"))),
+            "{j:?}"
+        );
+
+        let bwrap_ok = std::process::Command::new("bwrap")
+            .args(["--ro-bind", "/", "/", "--", "true"])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !bwrap_ok {
+            eprintln!("bwrap cannot run here: jail check skipped");
+            return;
+        }
+        let args = crate::dsh_host::jail_args("", "", &j.rw, &j.ro, &j.empty_dirs, &j.empty_files);
+        let script = format!(
+            "cd {wt}; \
+             (echo x >> {c}/config) 2>/dev/null && echo config-writable; \
+             (touch {c}/hooks/pre-commit) 2>/dev/null && echo hooks-writable; \
+             (mkdir {c}/modules/x) 2>/dev/null && echo modules-writable; \
+             (echo x > {l}/commondir) 2>/dev/null && echo commondir-writable; \
+             touch {c}/amail-test.lock && echo lock-ok; \
+             git -c user.name=t -c user.email=t@t commit -q --allow-empty -m j && echo commit-ok",
+            wt = wt.display(),
+            c = common.display(),
+            l = linked.display(),
+        );
+        let out = std::process::Command::new("bwrap")
+            .args(&args)
+            .args(["--", "sh", "-c", &script])
+            .output()
+            .unwrap();
+        let out = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.trim(), "lock-ok\ncommit-ok", "{out}");
+        // The placeholders left nothing behind that git would read.
+        assert!(
+            !common.join("config.worktree").exists()
+                || std::fs::read(common.join("config.worktree"))
+                    .unwrap()
+                    .is_empty()
+        );
+    }
+
+    #[test]
+    fn redirected_git_dir_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        std::fs::write(repo.join(".git").join("commondir"), ".\n").unwrap();
+        let d = dsh(&root.join("state"));
+        let e = d.jail_paths(repo.to_str().unwrap(), "w").unwrap_err();
+        assert!(e.to_string().contains("commondir"), "{e}");
     }
 
     #[test]

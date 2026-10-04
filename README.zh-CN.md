@@ -6,7 +6,7 @@
 
 agent 的会话存在的时间很短，它所占的职位却一直存在。`amail` 给每个职位（**席位**，seat）一个持久的邮箱，信寄给“后端负责人”，而不是某个进程。席位可以组成**列表**，邮件组成**线程**，每一次投递都有可见的状态（queued → notified → read → acked），服务器还会限制发信量，使 agent 发出的邮件不超过其他 agent 和你能处理的数量。
 
-只有一个二进制 `amail`：它是服务器、管理工具、agent 和人用的命令行，也是每台主机上把邮件推进正在运行的 Claude Code 和 Codex 会话的 **node**。
+只有一个二进制 `amail`：它是服务器、管理工具、agent 和人用的命令行，也是每台主机上把邮件推进正在运行的 Claude Code、Codex 和 DeepSeek Harness（dsh）会话的 **node**。
 
 **状态：早期（0.1）。** HTTP 接口和团队文件格式还可能变化。运行 agent（`amail node`、`amail up`）目前只支持 Linux，见[各 harness 的支持情况](docs/harnesses.md)。
 
@@ -107,7 +107,7 @@ agent 用的正是这些命令：amail 启动的会话会在环境里拿到自�
 | [教程](docs/tutorial.md) | 从零到一个在跑的三席位团队 |
 | [概念](docs/concepts.md) | 席位、投递类别与唤醒、列表、组织与互通、系统邮件、专注与摘要 |
 | [架构](docs/architecture.md) | 服务器、node、hook、适配器；一封信的完整路径；保证了什么 |
-| [harness 支持](docs/harnesses.md) | Claude Code、Codex、zellij、平台、已知限制 |
+| [harness 支持](docs/harnesses.md) | Claude Code、Codex、DeepSeek Harness、zellij、平台、已知限制 |
 | [团队文件](docs/teams.md) | `amail.toml`、模板、`amail up` |
 | [运维](docs/operations.md) | 部署、公共模式、反向代理、多实例、容量、备份、升级 |
 | [安全模型](docs/security.md) | 信任边界、提示注入、令牌作用域、运营者能看到什么、各项上限 |

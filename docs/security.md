@@ -44,9 +44,9 @@ user's machine beyond what such mail and role text can talk an agent into:
   `unattended` and the local side did not choose that, the node logs a
   notice and `amail run` prints it;
 - it cannot choose which program runs. The harness binaries come from the
-  node's configuration (`claude` and `codex` on `PATH`, or the node's
-  `--claude-bin` and `--codex-bin`); the server's `harness` setting only
-  picks one of the two for a seat that is not in a team file and is
+  node's configuration (`claude`, `codex` and `dsh` on `PATH`, or the node's
+  `--claude-bin`, `--codex-bin` and `--dsh-bin`); the server's `harness`
+  setting only picks one of them for a seat that is not in a team file and is
   started without `--harness`. A model name from the server that could be
   read as a command-line option is ignored;
 - it cannot add launch arguments: the extra arguments of `amail run` come
@@ -75,6 +75,15 @@ from the kernel (`SO_PEERCRED`) and follows that process's parents in
   nothing. All Codex sessions of a node hold the same pass, so a Codex
   session that knows another Codex seat's thread id can get that seat's
   credentials and mail.
+- A DeepSeek Harness (dsh) seat runs its hooks under its own web host,
+  which runs below the process the node launched for the seat. For an
+  unattended seat the host runs in a bwrap jail with its own process
+  namespace; the kernel reports the hook's process id in the node's
+  namespace, so the chain of parents still reaches that process. The node
+  answers a dsh hook only when it comes from below the session of the seat
+  it names. The host's launch token, which gives full control of the
+  host's sessions, is kept in a file in the node's state directory
+  (mode 0600) and is visible inside the jail.
 - Requests meant for the person (`amail run`, `up`, `down`, `ps`,
   `attach`, `sleep`, `wake`, `amail node status`) are refused to processes
   that run below a session the node launched or with the node's Codex
@@ -86,7 +95,12 @@ from the kernel (`SO_PEERCRED`) and follows that process's parents in
 **On the host, agents and the person are not separated from each other.**
 All sessions run as the same operating-system user as the person who
 started the node, so file permissions do not separate the agents from each
-other or from the person. An agent that can run shell commands (Claude Code
+other or from the person. (The exception is an unattended DeepSeek Harness
+seat: amail runs its host in a bwrap jail that hides the home directory,
+the runtime directory and other processes, so the points below that need
+those do not apply to it; it can still read the rest of the file system and
+the dsh home it shares with the node's other dsh seats. See
+[harness support](harnesses.md#deepseek-harness-dsh).) An agent that can run shell commands (Claude Code
 with `--dangerously-skip-permissions`, a Codex seat whose sandbox lets it
 read your home directory, or any agent whose commands you approve without
 reading them) can:
@@ -177,8 +191,9 @@ of every message unambiguous and keeps mail out of the permission system:
   `amail run --permission-mode`), never by mail or by the server (see
   [trust boundaries](#trust-boundaries)). Seats with `permission_mode =
   "unattended"` have no prompts at all: there, what an agent may do is
-  limited only by the harness's sandbox (Codex) or not at all (Claude Code
-  with `--dangerously-skip-permissions`). Run unattended seats only on
+  limited only by the harness's sandbox (Codex), by amail's bwrap jail
+  (DeepSeek Harness; see [harness support](harnesses.md#deepseek-harness-dsh)),
+  or not at all (Claude Code with `--dangerously-skip-permissions`). Run unattended seats only on
   repositories and hosts you can afford to lose, and be most careful when
   your org is linked to others.
 

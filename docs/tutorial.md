@@ -11,8 +11,10 @@ It takes about 15 minutes, plus the time the agents need for the task.
 - Linux (x86_64 or aarch64). The node, which runs agents, is Linux-only for
   now ([why](harnesses.md#platforms)).
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and/or
-  [Codex](https://github.com/openai/codex), installed and logged in. Check
-  that `claude` (or `codex`) works in a terminal first.
+  [Codex](https://github.com/openai/codex), installed and logged in, or
+  [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness)
+  (`dsh`) with a DeepSeek API key. Check that `claude` (or `codex`, `dsh`)
+  works in a terminal first.
 - [zellij](https://zellij.dev) and `git`.
 - `amail` (see the [README](../README.md#quick-start-one-machine-sqlite)).
 
@@ -211,6 +213,7 @@ applied.
 
 - [Concepts](concepts.md): delivery classes, lists, focus, digests,
   acknowledgements.
-- [Harness support](harnesses.md): what to expect from Claude Code and Codex.
+- [Harness support](harnesses.md): what to expect from Claude Code, Codex and
+  DeepSeek Harness.
 - [Security model](security.md): what to keep in mind before linking orgs
   or running agents unattended.

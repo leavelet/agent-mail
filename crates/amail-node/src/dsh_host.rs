@@ -38,6 +38,9 @@ pub struct HostArgs {
     pub rw: Vec<String>,
     /// Read-only paths inside the jail (besides the system).
     pub ro: Vec<String>,
+    /// Paths covered by an empty read-only directory or file.
+    pub empty_dirs: Vec<String>,
+    pub empty_files: Vec<String>,
 }
 
 /// The `bwrap` arguments of a seat's jail, before `--` and the command.
@@ -50,7 +53,14 @@ pub struct HostArgs {
 /// would give root). The listed paths are mounted back, read-only or
 /// writable; paths that do not exist are skipped. The network is shared
 /// (the model API, the amail server).
-pub fn jail_args(home: &str, runtime_dir: &str, rw: &[String], ro: &[String]) -> Vec<String> {
+pub fn jail_args(
+    home: &str,
+    runtime_dir: &str,
+    rw: &[String],
+    ro: &[String],
+    empty_dirs: &[String],
+    empty_files: &[String],
+) -> Vec<String> {
     let mut args: Vec<String> = [
         "--ro-bind",
         "/",
@@ -86,16 +96,38 @@ pub fn jail_args(home: &str, runtime_dir: &str, rw: &[String], ro: &[String]) ->
             masked.push(real);
         }
     }
-    let mut mounts: Vec<(&str, &String)> = ro
+    #[derive(Clone, Copy)]
+    enum M {
+        Ro,
+        Rw,
+        EmptyDir,
+        EmptyFile,
+    }
+    let mut mounts: Vec<(M, &String)> = ro
         .iter()
-        .map(|p| ("--ro-bind", p))
-        .chain(rw.iter().map(|p| ("--bind", p)))
+        .map(|p| (M::Ro, p))
+        .chain(rw.iter().map(|p| (M::Rw, p)))
         .filter(|(_, p)| std::path::Path::new(p.as_str()).exists())
+        .chain(empty_dirs.iter().map(|p| (M::EmptyDir, p)))
+        .chain(empty_files.iter().map(|p| (M::EmptyFile, p)))
         .collect();
     // Parents before children, so a deeper mount is not hidden.
     mounts.sort_by_key(|(_, p)| (p.matches('/').count(), (*p).clone()));
-    for (flag, p) in mounts {
-        args.extend([flag.to_string(), p.clone(), p.clone()]);
+    for (m, p) in mounts {
+        let p = p.clone();
+        match m {
+            M::Ro => args.extend(["--ro-bind".into(), p.clone(), p]),
+            M::Rw => args.extend(["--bind".into(), p.clone(), p]),
+            M::EmptyDir => args.extend([
+                "--perms".into(),
+                "0555".into(),
+                "--tmpfs".into(),
+                p.clone(),
+                "--remount-ro".into(),
+                p,
+            ]),
+            M::EmptyFile => args.extend(["--ro-bind".into(), "/dev/null".into(), p]),
+        }
     }
     args
 }
@@ -179,10 +211,17 @@ async fn run_inner(a: HostArgs) -> Result<i32> {
         ro.extend(runtime_paths(&home));
         let mut c = tokio::process::Command::new("bwrap");
         let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_default();
-        c.args(jail_args(&home, &runtime, &a.rw, &ro))
-            .arg("--")
-            .arg(program)
-            .args(args);
+        c.args(jail_args(
+            &home,
+            &runtime,
+            &a.rw,
+            &ro,
+            &a.empty_dirs,
+            &a.empty_files,
+        ))
+        .arg("--")
+        .arg(program)
+        .args(args);
         c
     } else {
         let mut c = tokio::process::Command::new(program);
@@ -437,6 +476,8 @@ mod tests {
             "/nonexistent-runtime-dir",
             &[deep.clone(), work.clone(), format!("{d}/missing")],
             std::slice::from_ref(&d),
+            &[format!("{deep}/hooks")],
+            &[format!("{deep}/config")],
         );
         let s = args.join(" ");
         assert!(s.starts_with("--ro-bind / / --dev /dev --unshare-pid --proc /proc --tmpfs /tmp"));
@@ -449,6 +490,9 @@ mod tests {
         assert!(pos(&format!("--ro-bind {d} {d}")) < pos(&format!("--bind {work} {work}")));
         assert!(pos(&format!("--bind {work} {work}")) < pos(&format!("--bind {deep} {deep}")));
         assert!(!s.contains("missing"));
+        assert!(s.contains(&format!("--tmpfs {deep}/hooks --remount-ro {deep}/hooks")));
+        assert!(s.contains(&format!("--ro-bind /dev/null {deep}/config")));
+        assert!(pos(&format!("--bind {deep} {deep}")) < pos(&format!("{deep}/hooks")));
     }
 
     #[test]

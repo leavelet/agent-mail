@@ -13,6 +13,7 @@ verified range.
 |---|---|---|---|---|---|
 | Claude Code | 2.1.x | hooks: `UserPromptSubmit`, `PostToolUse`, `Stop` | the session's inbox socket | `claude --resume` | JSONL transcript |
 | Codex (codex-cli) | 0.160.x | the same hooks | `codex queue` (the shared app-server) | `codex resume` | rollout file |
+| DeepSeek Harness (dsh) | 0.2.x | the same hooks, through dsh's Codex hook bridge | the web host's API (`session/prompt`) | the host loads the session again | JSONL session log |
 | zellij | 0.45.x | | | sessions and panes for `amail up` | |
 
 Other harnesses are not supported yet.
@@ -142,6 +143,110 @@ directory. When its path is longer than a Unix socket path may be (107
 bytes), the node reaches it through `/proc/self/fd` (Linux). A shorter
 `AMAIL_STATE_DIR` avoids this; `amail doctor` shows the length.
 
+## DeepSeek Harness (dsh)
+
+dsh has no terminal interface. A person uses a dsh session in a browser,
+through the GUI of a `dsh web` host, and amail reaches the session through
+the same host's HTTP API.
+
+**Launch.** Each dsh seat runs its own host. `amail run <seat>` starts
+`amail dsh-host`, which starts `dsh web --port 0` and reads the line the
+host prints at start-up (`dsh web: <url>/?token=<token>`). The wrapper
+writes the address and the one-time launch token to a private file in the
+node's state directory, creates the seat's session through the API (or
+loads its earlier session), and sends the first prompt. The same line
+appears in the seat's pane: open that URL in a browser to use the
+session. The pane shows the host's log, not the conversation.
+
+All dsh seats of a host share one dsh home (`<state dir>/dsh-home`), which
+amail sets up to write uncompressed JSONL session logs; your own `~/.dsh`
+is not used. A per-seat `--patch` overlay sets the system prompt (the mail
+instructions and the seat's role) and the model (for example
+`deepseek-flash`, or `<provider>/<model>`). The node finds the launcher as
+`dsh` on `PATH`, or as `amail node --dsh-bin` (`AMAIL_DSH_BIN`).
+
+**The model provider's key.** Give it with `amail node --dsh-env-file
+<file>` (`AMAIL_DSH_ENV_FILE`): a file of `NAME=value` lines, for example
+`DEEPSEEK_API_KEY=...`. The node reads the file when it starts and passes
+these variables only to dsh hosts. A key in the node's own environment
+would reach every process the node starts, including Claude Code and
+Codex sessions. dsh removes variables with credential-shaped names
+(`*KEY*`, `*TOKEN*`, `*SECRET*`, `*PASSWORD*`) from the environment of the
+agent's shell commands. For the same reason the seat's `amail` command
+finds its token through a profile file (`AMAIL_PROFILE`), not
+`AMAIL_TOKEN`.
+
+**Hooks.** dsh's Codex hook bridge runs `amail hook dsh` for
+`SessionStart`, `UserPromptSubmit`, `PostToolUse` and `Stop`. Hooks run as
+children of the host and see the seat's `AMAIL_SEAT`; the node answers
+them only from below the process it launched for that seat. The bridge has
+no `SessionEnd`, permission or interrupt event. When a turn is cancelled in
+the GUI or fails, dsh runs no hook, so the wrapper follows the session log
+and reports a `turn/end` that did not complete as the end of the turn.
+Only the session amail created for the seat is connected to mail; other
+sessions a person opens in the same host's GUI are ignored.
+
+**Wake-up.** The node logs in to the host with its launch token and queues
+the nudge with `session/prompt` (mode `queue`). On an idle session this
+starts a turn; on a busy one it runs as the next turn; a session that is
+not loaded is loaded first. A sleeping seat is started again, its host
+loads the saved session, and the nudge follows.
+
+**Unattended seats run in a jail.** dsh's own sandbox modes (`read-only`,
+`workspace-write`, `danger-full-access`) limit writes only, and its file
+tools (`read`, `grep`, `glob`) read files inside the host process without
+any sandbox. So for a seat with `permission_mode = "unattended"` (in the
+team file or with `amail run --permission-mode unattended`) amail runs the
+whole host under bubblewrap (`bwrap`):
+
+- the system is mounted read-only, and the jail has its own process
+  namespace (other processes and their environments are not visible);
+- the home directory, `/tmp` and `$XDG_RUNTIME_DIR` are empty;
+- the Docker, Podman and containerd sockets are covered by `/dev/null`
+  (a Unix socket can be used through a read-only mount);
+- mounted back writable: the seat's working directory, its git directory
+  and the repository's common git directory, and the dsh home;
+- in the git directories, the same entries as for Codex seats stay
+  read-only (`hooks/`, `config`, `config.worktree`, `modules/`,
+  `worktrees/`, and `commondir` and `config.worktree` of linked worktrees);
+  those that do not exist are covered by an empty read-only placeholder,
+  which leaves an empty file or directory of that name in the git
+  directory. A seat does not start while a repository's git directory
+  contains a `commondir` file;
+- mounted back read-only: the `amail` and `dsh` installations, the Node.js
+  runtime, `~/.gitconfig`, the seat's profile and patch, the endpoint
+  files and the node socket's directory;
+- the network is shared (the model API and the amail server).
+
+Inside the jail dsh runs with `DSH_PERMISSION_MODE=danger-full-access`;
+the jail is the limit. If `bwrap` cannot run (not installed, or user
+namespaces not allowed), the seat does not start; it never runs without
+the jail. `amail doctor` checks `bwrap`. A seat that is not `unattended`
+has no jail: dsh asks for approvals in the browser, and its file tools can
+read any file the user can read.
+
+**What a jailed seat can still read or reach:**
+
+- every file outside the home directory and the runtime directory, read
+  only;
+- the dsh home, which all dsh seats of the host share: the other dsh
+  seats' session logs, and the home's credential store
+  (`.credentials.yaml`, with the GUI's cookie secret and any key saved
+  through the GUI);
+- its own host's environment, which holds the model provider's key (dsh's
+  in-process tools run in the host process);
+- the network.
+
+**Other notes.**
+
+- The bridge reports no permission requests, so a seat that is not
+  `unattended` waiting for an approval in the browser shows `busy`, not
+  `awaiting`. Its `Stop` input has no `stop_hook_active`; the node's limit
+  of three blocks in a row prevents loops.
+- A turn cut off by a crash of the host is not continued after the
+  restart; mail it had already read is not delivered again.
+- Each seat runs a host process (about 200 MB when idle).
+
 ## zellij
 
 `amail up` runs one zellij session per group (`amail-<org>-<group>`, seats
@@ -159,13 +264,13 @@ all your zellij sessions and can attach to those that allow web sharing.
 the node's (the node restarts its own). Put it behind an HTTPS proxy and pass
 `--web-terminal-url` to reach it from another host.
 
-## Limitations common to both harnesses
+## Limitations common to all harnesses
 
 - **Mail cannot interrupt.** A busy agent sees mail only between tool calls
   (`to` and urgent) or at the end of its turn; a long tool call or a long
   generation delays it, and `urgent` does not interrupt either.
-- **Long bodies are not inlined.** One hook shows at most 8 (Claude Code) or
-  5 (Codex) messages, each with its body only up to 800 characters; longer
+- **Long bodies are not inlined.** One hook shows at most 8 (Claude Code,
+  dsh) or 5 (Codex) messages, each with its body only up to 800 characters; longer
   mail says `body not shown (N lines): run amail read <id>` and stays
   unread until the agent reads it. Agents do not always read it before
   acting.

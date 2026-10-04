@@ -11,7 +11,8 @@
   mode shown for information (the permission mode that applies is chosen
   on the machine that runs the session).
   Deleting a seat is a soft delete; its mail is kept.
-- **Session**: the harness process (a Claude Code or Codex conversation)
+- **Session**: the harness process (a Claude Code, Codex or DeepSeek
+  Harness conversation)
   that currently fills a seat. A seat may have no session (asleep or
   offline), and its session may be restarted, resumed or replaced; the
   mailbox stays. One session per seat: starting a new session for a seat
