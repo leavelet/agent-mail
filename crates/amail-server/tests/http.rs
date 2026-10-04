@@ -1078,15 +1078,18 @@ async fn sse_collect(resp: reqwest::Response, n: usize) -> Vec<(String, Value)> 
         buf.push_str(&String::from_utf8_lossy(&chunk.unwrap().unwrap()));
         while let Some(i) = buf.find("\n\n") {
             let block: String = buf.drain(..i + 2).collect();
-            let (mut id, mut data) = (String::new(), None);
+            let (mut id, mut data, mut event) = (String::new(), None, String::new());
             for line in block.lines() {
                 if let Some(v) = line.strip_prefix("id:") {
                     id = v.trim().to_string();
+                } else if let Some(v) = line.strip_prefix("event:") {
+                    event = v.trim().to_string();
                 } else if let Some(v) = line.strip_prefix("data:") {
                     data = Some(serde_json::from_str(v.trim()).unwrap());
                 }
             }
-            if let Some(d) = data {
+            // User streams also carry `nodes` and `directory` events.
+            if let (Some(d), "mailbox") = (data, event.as_str()) {
                 out.push((id, d));
             }
         }

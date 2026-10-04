@@ -1,6 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { scrollToRow, virtualWindow } from '../../src/lib/virtual';
-import { effectiveState, focusUntil, freshPresence, needsPerson, nodeOpBlock, stateAge, terminalHref } from '../../src/lib/presence';
+import {
+  attentionTag,
+  effectiveState,
+  focusUntil,
+  freshPresence,
+  needsPerson,
+  nodeOpBlock,
+  startingAtPrompt,
+  stateAge,
+  terminalHref,
+} from '../../src/lib/presence';
+import { noteKey } from '../../src/lib/receipt';
 import { Coalescer } from '../../src/lib/coalesce';
 import { attentionKey, seatsWaitingForUser, sortAttention } from '../../src/lib/attention';
 import { deliveryState, deliveryStep, viaLabel } from '../../src/lib/delivery';
@@ -165,5 +176,35 @@ describe('terminal links', () => {
     expect(terminalHref('data:text/html,x')).toBeUndefined();
     expect(terminalHref('not a url')).toBeUndefined();
     expect(terminalHref(undefined)).toBeUndefined();
+  });
+});
+
+describe('turn failures and prompts', () => {
+  const now = Date.parse('2026-10-04T12:00:00Z');
+  const tf = { reason: 'boom', at: '2026-10-04T11:59:00Z', count: 1, retrying: true };
+  const base = { state: 'idle' as const, since: '2026-10-04T11:00:00Z', updated_at: '2026-10-04T11:59:30Z' };
+  it('counts a failing seat as needing a person', () => {
+    const seat: Seat = { name: 'a', kind: 'agent', created_at: 'x', presence: { ...base, turn_failed: tf } };
+    expect(needsPerson(seat, now)).toBe(true);
+    expect(attentionTag(seat.presence)).toBe('turn-failed');
+    expect(attentionTag({ ...base, attention: 'login', turn_failed: tf })).toBe('login');
+    expect(attentionTag({ ...base, wake_failed: true })).toBe('wake-failed');
+    expect(attentionTag(base)).toBeUndefined();
+  });
+  it('calls an offline seat at a prompt starting', () => {
+    expect(startingAtPrompt({ ...base, state: 'offline', attention: 'trust-prompt' })).toBe(true);
+    expect(startingAtPrompt({ ...base, state: 'idle', attention: 'trust-prompt' })).toBe(false);
+    expect(startingAtPrompt({ ...base, state: 'offline', attention: 'failed' })).toBe(false);
+    expect(startingAtPrompt(undefined)).toBe(false);
+  });
+});
+
+describe('send receipt notes', () => {
+  it('match the meaning of the CLI', () => {
+    expect(noteKey({ seat: 'a', state: 'dormant', wakes: true }).key).toBe('compose.note.dormantWakes');
+    expect(noteKey({ seat: 'a', state: 'dormant', wakes: false }).key).toBe('compose.note.dormant');
+    expect(noteKey({ seat: 'a', state: 'focus', wakes: false, until: 'T' })).toEqual({ key: 'compose.note.focus', params: { until: 'T' } });
+    expect(noteKey({ seat: 'a', state: 'turn_failed', wakes: true }).key).toBe('compose.note.turnFailed');
+    expect(noteKey({ seat: 'a', state: 'new_state', wakes: false })).toEqual({ key: 'compose.note.other', params: { state: 'new_state' } });
   });
 });

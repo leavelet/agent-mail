@@ -11,9 +11,11 @@ import { t } from './ui.svelte';
 import type {
   AttentionItem,
   CountsResponse,
+  DirectoryEvent,
   Link,
   ListInfo,
   MailboxEvent,
+  NodesEvent,
   Overview,
   PresenceEvent,
   Seat,
@@ -39,6 +41,8 @@ class Store {
   links = $state.raw<Link[]>([]);
   /** The event stream is open. */
   live = $state(false);
+  /** Node event streams open for the org (null: not known yet). */
+  nodesConnected = $state<number | null>(null);
   /** What the server says about itself (public mode, retention). */
   info = $state.raw<ServerInfo | null>(null);
   loadError = $state<string | null>(null);
@@ -174,6 +178,25 @@ class Store {
         // Ignore malformed events.
       }
     });
+    // A seat or list was created, changed or deleted: reload the directory
+    // (merged with the other updates of the same second).
+    es.addEventListener('directory', (e) => {
+      try {
+        const d = JSON.parse((e as MessageEvent).data) as DirectoryEvent;
+        this.coalescer.add(d.kind === 'list' ? 'd:lists' : 'd:seats');
+      } catch {
+        // Ignore malformed events.
+      }
+    });
+    // A node connected or went away: sleep and wake work only with one.
+    es.addEventListener('nodes', (e) => {
+      try {
+        const n = JSON.parse((e as MessageEvent).data) as NodesEvent;
+        this.setNodesConnected(n.connected);
+      } catch {
+        // Ignore malformed events.
+      }
+    });
     es.onerror = () => {
       this.live = false;
       if (es.readyState === EventSource.CLOSED && this.es === es) {
@@ -196,13 +219,29 @@ class Store {
     await Promise.all([this.refreshSeats(), this.refreshCounts(), this.refreshAttention(), this.refreshOverview()]).catch(() => undefined);
   }
 
+  /** Apply the number of connected nodes to every seat's presence. */
+  setNodesConnected(n: number) {
+    this.nodesConnected = n;
+    const connected = n > 0;
+    if (this.seats.some((s) => s.presence && s.presence.node_connected !== connected)) {
+      this.seats = this.seats.map((s) => (s.presence && s.presence.node_connected !== connected ? { ...s, presence: { ...s.presence, node_connected: connected } } : s));
+    }
+  }
+
   private async flush(keys: Set<string>) {
     const mail = new Set<string>();
     let presenceChanged = false;
+    const jobs: Promise<unknown>[] = [];
     for (const k of keys) {
       if (k.startsWith('m:')) mail.add(k.slice(2));
       else if (k.startsWith('p:')) presenceChanged = true;
     }
+    if (keys.has('d:seats')) {
+      // The new list replaces the seats; presence updates of this round are
+      // in it already or follow.
+      jobs.push(this.refreshSeats().then(() => this.refreshCounts()));
+    }
+    if (keys.has('d:lists')) jobs.push(this.refreshDirectory());
     if (presenceChanged && this.presence.size) {
       const updates = this.presence;
       this.presence = new Map();
@@ -213,7 +252,6 @@ class Store {
         return { ...s, presence };
       });
     }
-    const jobs: Promise<unknown>[] = [];
     if (mail.size) {
       if (mail.size > ALL_COUNTS_OVER) jobs.push(this.refreshCounts());
       else jobs.push(...[...mail].map((s) => this.refreshCounts(s)));
@@ -234,7 +272,14 @@ class Store {
   }
 
   async refreshSeats(): Promise<void> {
-    this.seats = await get<Seat[]>('/v1/seats');
+    const seats = await get<Seat[]>('/v1/seats');
+    // The node count from the event stream is newer than a list fetched
+    // while a node (dis)connected.
+    const n = this.nodesConnected;
+    this.seats =
+      n === null
+        ? seats
+        : seats.map((s) => (s.presence && s.presence.node_connected !== n > 0 ? { ...s, presence: { ...s.presence, node_connected: n > 0 } } : s));
   }
 
   async refreshCounts(seat?: string): Promise<void> {

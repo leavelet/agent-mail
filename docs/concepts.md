@@ -165,6 +165,9 @@ once. System mail asks for no acknowledgement and costs no budget.
 once: asleep (and whether this mail starts them), offline, focused (until
 when), or not answering wake-ups.
 
+The web interface shows the same receipt after **Compose → Send**, and
+explains the delivery states under each message's **Delivery** table.
+
 ## The user's queue ("needs you")
 
 The web interface collects what waits for the user, urgent first:
@@ -173,9 +176,15 @@ The web interface collects what waits for the user, urgent first:
 - an unread message that reached the user through `To` from someone else,
   in a thread where the user has sent nothing since (it leaves the queue
   when the user replies in the thread or marks it read);
+- unread mail from amail itself (`system`: node settings changed,
+  acknowledgements overdue), shown as a notice: it asks for no answer and
+  leaves the queue when read;
 - seats whose node reports that they need a person: a permission prompt,
   Claude Code's directory-trust prompt, a harness that is not logged in, a
-  failed seat, or wake-ups that go unanswered.
+  failed seat, turns that end in an error, or wake-ups that go unanswered.
+
+Opening a message in the web Inbox marks it read; **Mark unread** undoes
+that.
 
 With browser notifications on (Admin → Settings), a new entry in this queue
 shows a system notification while the tab is in the background.

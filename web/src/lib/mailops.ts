@@ -10,6 +10,13 @@ export async function markRead(id: number): Promise<Delivery> {
   return r.delivery;
 }
 
+/** Mark the user's delivery not read again (acknowledged mail stays read). */
+export async function markUnread(id: number): Promise<Delivery> {
+  const r = await post<{ delivery: Delivery }>(`/v1/messages/${enc(String(id))}/unread`);
+  void store.mailChanged();
+  return r.delivery;
+}
+
 export async function ack(id: number): Promise<Delivery> {
   const r = await post<{ delivery: Delivery }>(`/v1/messages/${enc(String(id))}/ack`);
   void store.mailChanged();

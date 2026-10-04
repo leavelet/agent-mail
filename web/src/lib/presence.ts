@@ -38,7 +38,26 @@ export function stateAge(seat: Seat, now: number): number | undefined {
 
 export function needsPerson(seat: Seat, now: number): boolean {
   const p = freshPresence(seat.presence, now);
-  return !!p && (!!p.attention || !!p.wake_failed);
+  return !!p && (!!p.attention || !!p.wake_failed || !!p.turn_failed);
+}
+
+/** Attention tags the interface has words for. */
+export const KNOWN_ATTENTION = ['trust-prompt', 'login', 'permission', 'failed', 'wake-failed', 'no-activity', 'turn-failed'];
+
+/** The seat's attention tag: the node's, else `turn-failed` or
+ * `wake-failed` (as the server's "needs you" queue names them). */
+export function attentionTag(p: Presence | undefined): string | undefined {
+  if (!p) return undefined;
+  return p.attention || (p.turn_failed ? 'turn-failed' : p.wake_failed ? 'wake-failed' : undefined);
+}
+
+/** Prompts a session shows before it starts working. */
+const START_PROMPTS = ['trust-prompt', 'login', 'permission'];
+
+/** The node reports the seat offline while its session waits at a prompt
+ * for a person (it has not started yet): the interface says "starting". */
+export function startingAtPrompt(p: Presence | undefined): boolean {
+  return !!p && p.state === 'offline' && !!p.attention && START_PROMPTS.includes(p.attention);
 }
 
 /** Why node operations (sleep, wake) are unavailable, or null if they are. */

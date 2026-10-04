@@ -1107,7 +1107,7 @@ macro_rules! impl_store_common {
             /// are looked at; each is checked with index lookups.
             pub async fn attention(c: &mut Conn, user_seat_id: i64, limit: i64) -> Result<Vec<Entry>> {
                 let rows: Vec<EntryRow> = sqlx::query_as(concat!(
-                    "SELECT ", deliv_cols!(), ", ", msg_cols!(), ", '' AS body FROM \
+                    "SELECT ", deliv_cols!(), ", ", msg_cols!(), ", substr(m.body, 1, 400) AS body FROM \
                      (SELECT * FROM deliveries WHERE seat_id = $1 ORDER BY seq DESC LIMIT $3) d",
                     deliv_joins!(),
                     " JOIN messages m ON m.id = d.message_id",
@@ -1808,6 +1808,18 @@ macro_rules! impl_store_common {
                     c,
                     "UPDATE deliveries SET read_at = $1 WHERE message_id = $2 AND seat_id = $3 \
                      AND read_at IS NULL RETURNING id",
+                    message_id,
+                    seat_id,
+                )
+                .await
+            }
+
+            pub async fn mark_unread(c: &mut Conn, message_id: i64, seat_id: i64) -> Result<Option<(DeliveryRec, Option<SeqBump>)>> {
+                // `$1` (the time `touch` binds) is not needed here.
+                touch(
+                    c,
+                    "UPDATE deliveries SET read_at = NULL WHERE $1 > 0 AND message_id = $2 \
+                     AND seat_id = $3 AND read_at IS NOT NULL AND acked_at IS NULL RETURNING id",
                     message_id,
                     seat_id,
                 )
@@ -3288,6 +3300,10 @@ macro_rules! impl_store_common {
                     Some(_) => {}
                 }
                 run!(self.write, |c| q::mark_read(c, message_id, seat_id).await)
+            }
+
+            async fn mark_unread(&self, message_id: i64, seat_id: i64) -> $crate::Result<Option<($crate::DeliveryRec, Option<$crate::SeqBump>)>> {
+                run!(self.write, |c| q::mark_unread(c, message_id, seat_id).await)
             }
 
             async fn ack(&self, message_id: i64, seat_id: i64) -> $crate::Result<Option<($crate::DeliveryRec, Option<$crate::SeqBump>)>> {

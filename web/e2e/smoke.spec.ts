@@ -36,6 +36,8 @@ test('smoke: org, compose, reply, thread, delivery, search, mirror, needs-you', 
   await page.locator('#c-subj').fill('Use a bounded scan');
   await page.locator('#c-body').fill('Scan the most recent 2,000 messages and say so in the response.');
   await page.getByRole('button', { name: /^Send/ }).click();
+  await expect(page.getByTestId('send-receipt')).toContainText('be-lead: 1 seat');
+  await page.getByRole('link', { name: 'Open the thread' }).click();
   await expect(page).toHaveURL(/#\/thread\/\d+/);
   const sentId = Number(new URL(page.url()).hash.match(/m=(\d+)/)?.[1]);
   expect(sentId).toBeGreaterThan(0);

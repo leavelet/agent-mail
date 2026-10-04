@@ -13,7 +13,8 @@
 //! - `tool/call`: `data.name`, `data.arguments` (a JSON string);
 //! - `tool/result`: `data.message.content[].text`, `data.message.isError`;
 //! - `turn/end`: `data.reason.kind` (`completed`; `aborted` or
-//!   `interrupted` when cancelled or cut off; `error`).
+//!   `interrupted` when cancelled or cut off; `error`, shown as an error
+//!   event with `data.reason.error.message`).
 //!
 //! Streaming, accounting and hook bookkeeping records are skipped.
 
@@ -137,13 +138,17 @@ impl Parser for DshParser {
                             .get("error")
                             .and_then(|e| str_at(e, "message"))
                             .unwrap_or(k);
-                        vec![event(
+                        // The turn failed: an error, not a note of the
+                        // mail system.
+                        let mut e = event(
                             ts,
                             R::System,
                             K::Notice,
                             &format!("turn ended: {msg}"),
                             None,
-                        )]
+                        );
+                        e.error = true;
+                        vec![e]
                     }
                 })
             }
@@ -210,6 +215,7 @@ not json
             ]
         );
         assert!(ev[6].error && !ev[4].error);
+        assert!(ev[8].error && !ev[7].error && !ev[1].error);
         assert_eq!(ev[0].ts.as_deref(), Some("2023-11-14T22:13:20.2Z"));
         let s = p.stats();
         assert_eq!(s.skipped, 1);

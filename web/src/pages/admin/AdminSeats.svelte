@@ -104,7 +104,7 @@
     <label>{t('admin.name')}<input class="mono" required bind:value={form.name} size="14" /></label>
     <label>{t('admin.parent')}<input class="mono" list="seat-names" bind:value={form.parent} size="12" /></label>
     <label>{t('admin.harness')}
-      <select bind:value={form.harness}><option value="">—</option><option>claude</option><option>codex</option></select></label>
+      <select bind:value={form.harness}><option value="">—</option><option>claude</option><option>codex</option><option>dsh</option></select></label>
     <label>{t('admin.model')}<input bind:value={form.model} size="12" /></label>
     <label>{t('admin.permission')}
       <select bind:value={form.permission_mode}><option value="">—</option><option>default</option><option>unattended</option></select></label>
@@ -128,7 +128,7 @@
               <form class="create inline" onsubmit={save}>
                 <strong class="mono">{s.name}</strong>
                 <label>{t('admin.parent')}<input class="mono" list="seat-names" bind:value={edit.parent} size="12" /></label>
-                <label>{t('admin.harness')}<select bind:value={edit.harness}><option value="">—</option><option>claude</option><option>codex</option></select></label>
+                <label>{t('admin.harness')}<select bind:value={edit.harness}><option value="">—</option><option>claude</option><option>codex</option><option>dsh</option></select></label>
                 <label>{t('admin.model')}<input bind:value={edit.model} size="12" /></label>
                 <label>{t('admin.permission')}<select bind:value={edit.permission_mode}><option value="">—</option><option>default</option><option>unattended</option></select></label>
                 <label>{t('admin.group')}<input class="mono" bind:value={edit.group} size="10" /></label>

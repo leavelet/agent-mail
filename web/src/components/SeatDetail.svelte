@@ -6,7 +6,17 @@
   import { t, ui } from '../lib/ui.svelte';
   import { href, go } from '../lib/router.svelte';
   import { get, qs, ApiError } from '../lib/api';
-  import { effectiveState, focusUntil, freshPresence, stateAge, nodeOpBlock, terminalHref } from '../lib/presence';
+  import {
+    KNOWN_ATTENTION,
+    attentionTag,
+    effectiveState,
+    focusUntil,
+    freshPresence,
+    startingAtPrompt,
+    stateAge,
+    nodeOpBlock,
+    terminalHref,
+  } from '../lib/presence';
   import { duration, shortTime } from '../lib/time';
   import { fromEntry, fromHeader, newestFirst, type MailRow } from '../lib/mailrows';
   import type { ArchiveResponse, InboxResponse } from '../lib/types';
@@ -78,12 +88,14 @@
   }
 
   const blockReason = $derived(block ? t(`seat.disabled.${block}`) : '');
+  const tag = $derived(attentionTag(p));
   const attnText = $derived.by(() => {
-    const a = p?.attention;
-    if (!a) return null;
-    const k = `attn.${a}`;
-    return ['attn.trust-prompt', 'attn.login', 'attn.permission', 'attn.failed', 'attn.wake-failed', 'attn.no-activity'].includes(k) ? t(k as 'attn.login') : a;
+    if (!tag) return null;
+    return KNOWN_ATTENTION.includes(tag) ? t(`attn.${tag}` as 'attn.login') : tag;
   });
+  const starting = $derived(startingAtPrompt(p));
+  const tf = $derived(p?.turn_failed);
+  const terminal = $derived(terminalHref(p?.terminal_url));
 </script>
 
 {#if !seat}
@@ -94,7 +106,7 @@
       <div class="title">
         <h1 class="mono">{seat.name}</h1>
         {#if seat.display_name}<span class="muted"><Vis text={seat.display_name} /></span>{/if}
-        {#if seat.kind === 'agent'}<StateBadge state={seatState} {age} />{:else}<span class="chip neutral">{t('org.you')}</span>{/if}
+        {#if seat.kind === 'agent'}<StateBadge state={seatState} {age} {starting} failing={!!tf} long />{:else}<span class="chip neutral">{t('org.you')}</span>{/if}
         {#if focus}<span class="chip focus" title={t('flag.focus.long')}>◐ {t('flag.focus', { time: shortTime(focus, now, ui.lang) })}</span>{/if}
       </div>
       <div class="actions row wrap">
@@ -109,10 +121,26 @@
     {#if block && seat.kind === 'agent'}<p class="faint reason">{blockReason}</p>{/if}
     {#if opMsg}<p class="opmsg" role="status">{opMsg}</p>{/if}
 
-    {#if attnText || p?.wake_failed}
+    {#if p?.attention && p.attention !== 'turn-failed'}
+      <div class="alert" role="alert" data-testid="seat-attention">
+        <strong>⚠ {t('seat.attention')}: {attnText}</strong>
+        {#if p.attention === 'trust-prompt'}
+          <span data-testid="trust-help">{terminal ? t('seat.trust.web') : t('seat.trust.cli', { cmd: attachCmd })}</span>
+        {:else if p.attention_hint}<span><Vis text={p.attention_hint} /></span>{/if}
+      </div>
+    {:else if p?.wake_failed && !tf}
       <div class="alert" role="alert">
-        <strong>⚠ {t('seat.attention')}{attnText ? `: ${attnText}` : ''}</strong>
-        {#if p?.attention_hint}<span><Vis text={p.attention_hint} /></span>{:else if p?.wake_failed}<span>{t('seat.wakeFailed')}</span>{/if}
+        <strong>⚠ {t('seat.attention')}: {t('attn.wake-failed')}</strong>
+        <span>{t('seat.wakeFailed')}</span>
+      </div>
+    {/if}
+    {#if tf}
+      <div class="alert" role="alert" data-testid="turn-failed">
+        <strong>⚠ {t('seat.turnFailed.title')}</strong>
+        <span>{t('seat.turnFailed.reason')} <code class="reason-text"><Vis text={tf.reason} /></code></span>
+        <span>{t('seat.turnFailed.count', { n: tf.count, time: shortTime(tf.at, now, ui.lang) })}</span>
+        <span>{tf.retrying ? t('seat.turnFailed.retrying') : t('seat.turnFailed.stopped')}</span>
+        <span>{t('seat.turnFailed.todo')}</span>
       </div>
     {/if}
 
@@ -127,7 +155,7 @@
       </dd>
       {#if seat.kind === 'agent'}
         <dt>{t('seat.state')}</dt>
-        <dd>{t(`state.${seatState}.long`)}{#if age !== undefined} · {t('seat.for', { d: duration(age, ui.lang) })}{/if}</dd>
+        <dd>{starting ? t('state.starting.long') : t(`state.${seatState}.long`)}{#if age !== undefined} · {t('seat.for', { d: duration(age, ui.lang) })}{/if}</dd>
         <dt>{t('seat.harness')}</dt>
         <dd><Vis text={[seat.harness ?? p?.harness, seat.model].filter(Boolean).join(' · ') || '—'} />{#if seat.permission_mode} · <span class="faint">{seat.permission_mode}</span>{/if}</dd>
         <dt>{t('seat.node')}</dt>
@@ -135,8 +163,8 @@
         {#if seat.group}<dt>{t('seat.group')}</dt><dd class="mono"><Vis text={seat.group} /></dd>{/if}
         <dt>{t('seat.terminal')}</dt>
         <dd>
-          {#if terminalHref(p?.terminal_url)}
-            <a href={terminalHref(p?.terminal_url)} target="_blank" rel="noopener noreferrer">{t('seat.openTerminal')} ↗</a>
+          {#if terminal}
+            <a href={terminal} target="_blank" rel="noopener noreferrer">{t('seat.openTerminal')} ↗</a>
           {:else}
             <span class="faint">{t('seat.attachCmd')}</span>
             <code class="cmd">{attachCmd}</code>
@@ -240,6 +268,10 @@
   }
   .alert span {
     color: var(--text);
+  }
+  .reason-text {
+    white-space: pre-wrap;
+    word-break: break-word;
   }
   .facts {
     display: grid;

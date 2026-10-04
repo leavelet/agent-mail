@@ -62,6 +62,21 @@ pub fn preview(body: &str, max: usize) -> String {
     out
 }
 
+/// The beginning of `body` with its lines joined by spaces, cut to `max`
+/// characters (a preview of the first lines).
+pub fn lead(body: &str, max: usize) -> String {
+    let text = body
+        .split_whitespace()
+        .map(|w| w.chars().filter(|c| !c.is_control()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut out: String = text.chars().take(max).collect();
+    if text.chars().count() > max {
+        out.push('…');
+    }
+    out
+}
+
 pub fn header(m: &MessageRec, viewer: &Org) -> p::MessageHeader {
     p::MessageHeader {
         id: m.id,

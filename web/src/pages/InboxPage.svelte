@@ -21,6 +21,13 @@
   let error = $state<string | null>(null);
   let selected = $state<number | undefined>(undefined);
   let pane: MessagePane | undefined = $state();
+  /** The selection was made by the person (not the automatic first row):
+   * opening it marks it read. */
+  let picked = $state(false);
+  $effect(() => {
+    void tab;
+    picked = false;
+  });
 
   const me = $derived(store.me?.seat);
   const seq = $derived(me ? (store.counts.get(me)?.seq ?? 0) : 0);
@@ -83,6 +90,7 @@
     const next = moveIndex(e.key, index, rows.length);
     if (next !== null) {
       selected = rows[next].id;
+      picked = true;
       document.querySelector(`[data-msg="${selected}"]`)?.scrollIntoView({ block: 'nearest' });
       e.preventDefault();
       return;
@@ -97,6 +105,9 @@
       e.preventDefault();
     } else if (e.key === 'e') {
       pane?.doMarkRead();
+      e.preventDefault();
+    } else if (e.key === 'u') {
+      pane?.doMarkUnread();
       e.preventDefault();
     } else if (e.key === 'a') {
       pane?.doAck();
@@ -126,7 +137,10 @@
           {selected}
           showTo={tab === 'sent'}
           label={tab === 'sent' ? t('mail.sent') : t('mail.inbox')}
-          onselect={(r) => (selected = r.id)}
+          onselect={(r) => {
+            selected = r.id;
+            picked = true;
+          }}
           onopen={(r) => go(['thread', r.thread_id], { m: r.id })}
         />
         {#if (tab === 'inbox' && more) || (tab === 'sent' && sentNext)}
@@ -138,7 +152,7 @@
   <section class="reader">
     {#if selected !== undefined}
       {#key selected}
-        <MessagePane bind:this={pane} id={selected} onchange={changed} />
+        <MessagePane bind:this={pane} id={selected} onchange={changed} markOnOpen={picked && tab === 'inbox'} />
       {/key}
     {:else}
       <div class="empty">{t('mail.select')}</div>

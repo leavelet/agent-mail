@@ -19,6 +19,19 @@ export interface WhoAmI {
   seat?: string;
 }
 
+/** The seat's last turn failed (model or API error, or the session ended
+ * during the turn). */
+export interface TurnFailure {
+  reason: string;
+  /** When the last failed turn ended. */
+  at: string;
+  /** Failed turns in a row. */
+  count: number;
+  /** The node shows the mail of the failed turns to the seat again; false
+   * once it stopped (after three failures in a row): a person must look. */
+  retrying: boolean;
+}
+
 export interface Presence {
   state: SeatState;
   wake_failed?: boolean;
@@ -29,6 +42,7 @@ export interface Presence {
   attention?: string;
   attention_hint?: string;
   terminal_url?: string;
+  turn_failed?: TurnFailure;
   node_connected?: boolean;
 }
 
@@ -52,6 +66,18 @@ export interface Seat {
 
 export interface PresenceEvent extends Presence {
   seat: string;
+}
+
+/** A seat or list was created, changed or deleted (user streams). */
+export interface DirectoryEvent {
+  kind: 'seat' | 'list';
+  name: string;
+  change: 'created' | 'updated' | 'deleted';
+}
+
+/** Node event streams open for the org (user streams; sent at once and on change). */
+export interface NodesEvent {
+  connected: number;
 }
 
 export interface MailboxEvent {
@@ -158,12 +184,25 @@ export interface SendRequest {
   meta?: Meta;
 }
 
+/** Why a recipient will not see a message at once. */
+export interface RecipientNote {
+  seat: string;
+  /** `dormant`, `offline`, `focus`, `wake_failed`, `turn_failed` (others may follow). */
+  state: string;
+  /** Mail of this class and priority starts or wakes the seat now. */
+  wakes: boolean;
+  /** `focus`: when it ends. */
+  until?: string;
+}
+
 export interface SendResponse {
   id: number;
   thread_id: number;
-  recipients: { address: string; seats: number }[];
+  /** `wakes`: for a list in To, how many members are notified at once (which wakes idle ones). */
+  recipients: { address: string; seats: number; wakes?: number }[];
   rejected: { address: string; reason: string }[];
   deliveries: number;
+  notes?: RecipientNote[];
 }
 
 export interface Overview {
@@ -171,6 +210,8 @@ export interface Overview {
   states: Partial<Record<SeatState, number>>;
   needs_person: number;
   wake_failed: number;
+  /** Seats whose last turn failed (older servers: absent). */
+  turn_failed?: number;
   mail_last_hour: number;
   mail_last_day: number;
   user_unread: number;
@@ -189,7 +230,7 @@ export interface CountsResponse {
   seats: SeatCounts[];
 }
 
-export type AttentionKind = 'ack' | 'reply' | 'seat';
+export type AttentionKind = 'ack' | 'reply' | 'seat' | 'notice';
 
 export interface AttentionItem {
   kind: AttentionKind;
@@ -201,6 +242,9 @@ export interface AttentionItem {
   attention?: string;
   hint?: string;
   wake_failed?: boolean;
+  turn_failed?: TurnFailure;
+  /** The start of the message, its lines joined. */
+  preview?: string;
 }
 
 export interface ListInfo {

@@ -3,7 +3,14 @@
   import { t } from '../lib/ui.svelte';
   import { href, router } from '../lib/router.svelte';
 
-  const section = $derived(router.route.parts[0] ?? 'org');
+  const route = $derived(router.route.parts[0] ?? 'org');
+  // A thread belongs to no section of its own: it stays under the list it
+  // was opened from (none when it was opened directly or after sending).
+  let from = $state<string | null>(null);
+  $effect(() => {
+    if (route !== 'thread') from = route;
+  });
+  const section = $derived(route === 'thread' ? (from === 'compose' ? null : from) : route);
   const sub = $derived(router.route.parts[1] ?? 'seats');
   const unread = $derived(store.me?.seat ? (store.counts.get(store.me.seat)?.unread ?? 0) : 0);
   const admin = ['seats', 'lists', 'links', 'tokens', 'settings'] as const;
@@ -15,7 +22,7 @@
     {#if store.attention.length}<span class="count alert">{store.attention.length}</span>{/if}
   </a>
   <a href={href(['org'])} class:active={section === 'org' || section === 'seat'}><span>{t('nav.org')}</span></a>
-  <a href={href(['inbox'])} class:active={section === 'inbox' || section === 'thread'}>
+  <a href={href(['inbox'])} class:active={section === 'inbox'}>
     <span>{t('nav.inbox')}</span>
     {#if unread}<span class="count hot">{unread}</span>{/if}
   </a>

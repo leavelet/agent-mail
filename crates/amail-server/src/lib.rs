@@ -7,6 +7,7 @@ pub mod cluster;
 pub mod commands;
 pub mod config;
 mod directory;
+pub mod dirwatch;
 pub mod error;
 pub mod events;
 pub mod limits;
@@ -58,6 +59,8 @@ pub struct AppState {
     pub revocations: Arc<revoke::Revocations>,
     /// Recent mail per org, for the overview.
     pub activity: Arc<activity::Activity>,
+    /// Seat and list changes, for `directory` events.
+    pub directory: Arc<dirwatch::DirectoryHub>,
 }
 
 impl AppState {
@@ -78,6 +81,7 @@ impl AppState {
             limiters: Arc::new(limits::Limiters::new(&config::Limits::default())),
             revocations: Arc::new(revoke::Revocations::default()),
             activity: Arc::new(activity::Activity::default()),
+            directory: Arc::new(dirwatch::DirectoryHub::default()),
         }
     }
 
@@ -126,6 +130,16 @@ impl AppState {
                 k: tokens,
                 s: sessions,
             });
+        }
+    }
+
+    /// A seat or list changed: tell this instance's event streams and the
+    /// other instances.
+    pub(crate) fn directory_changed(&self, org_id: i64, kind: &str, name: &str, change: &str) {
+        let ev = dirwatch::event(kind, name, change);
+        self.directory.deliver(org_id, ev.clone());
+        if let Some(c) = &self.cluster {
+            c.notify(cluster::Wire::Directory { o: org_id, d: ev });
         }
     }
 
@@ -182,6 +196,7 @@ pub fn router(state: AppState) -> Router {
         .route("/messages/{id}/ack", post(mail::ack))
         .route("/messages/{id}/status", get(mail::status))
         .route("/messages/{id}/read", post(ui::mark_read))
+        .route("/messages/{id}/unread", post(ui::mark_unread))
         .route("/session", post(web::login).delete(web::logout))
         .route("/overview", get(ui::overview))
         .route("/counts", get(ui::counts))
