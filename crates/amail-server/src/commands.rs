@@ -10,7 +10,7 @@
 use amail_proto::NodeCommand;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::{Notify, broadcast, watch};
 
 const CHANNEL: usize = 256;
 
@@ -25,6 +25,9 @@ pub struct NodeHub {
     pub changed: Notify,
     /// Sends a command to the other instances.
     forward: OnceLock<Forward>,
+    /// Open node streams per org (here and elsewhere), for event streams
+    /// that follow it.
+    watchers: Mutex<HashMap<i64, watch::Sender<usize>>>,
 }
 
 struct OrgNodes {
@@ -56,6 +59,7 @@ impl Drop for NodeConn {
         }
         drop(orgs);
         self.hub.changed.notify_one();
+        self.hub.refresh(self.org_id);
     }
 }
 
@@ -72,6 +76,7 @@ impl NodeHub {
         let rx = o.tx.subscribe();
         drop(orgs);
         self.changed.notify_one();
+        self.refresh(org_id);
         (
             rx,
             NodeConn {
@@ -85,6 +90,7 @@ impl NodeHub {
     pub fn close_org(&self, org_id: i64) {
         self.orgs.lock().unwrap().remove(&org_id);
         self.changed.notify_one();
+        self.watchers.lock().unwrap().remove(&org_id);
     }
 
     /// Forward commands to other instances with `f` (set once, by the
@@ -148,6 +154,33 @@ impl NodeHub {
     /// Replace what is known about the other instances' node streams.
     pub fn set_remote(&self, counts: HashMap<i64, i64>) {
         *self.remote.lock().unwrap() = counts;
+        let orgs: Vec<i64> = self.watchers.lock().unwrap().keys().copied().collect();
+        for o in orgs {
+            self.refresh(o);
+        }
+    }
+
+    /// Follow the number of open node streams of an org (the receiver
+    /// starts with the current number).
+    pub fn watch(&self, org_id: i64) -> watch::Receiver<usize> {
+        let n = self.connected(org_id);
+        let mut w = self.watchers.lock().unwrap();
+        let tx = w.entry(org_id).or_insert_with(|| watch::channel(n).0);
+        tx.send_if_modified(|v| std::mem::replace(v, n) != n);
+        tx.subscribe()
+    }
+
+    /// Tell the watchers of an org its current number of node streams.
+    fn refresh(&self, org_id: i64) {
+        let n = self.connected(org_id);
+        let mut w = self.watchers.lock().unwrap();
+        if let Some(tx) = w.get(&org_id) {
+            if tx.receiver_count() == 0 {
+                w.remove(&org_id);
+            } else {
+                tx.send_if_modified(|v| std::mem::replace(v, n) != n);
+            }
+        }
     }
 }
 
@@ -185,5 +218,24 @@ mod tests {
         assert_eq!(hub.send(1, cmd.clone()), 2);
         assert_eq!(hub.send(2, cmd.clone()), 0);
         assert_eq!(sent.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn watch_follows_node_streams() {
+        let hub = Arc::new(NodeHub::new());
+        let mut w = hub.watch(1);
+        assert_eq!(*w.borrow_and_update(), 0);
+        let (_rx, conn) = hub.connect(1);
+        assert!(w.has_changed().unwrap());
+        assert_eq!(*w.borrow_and_update(), 1);
+        // Another org does not count.
+        let (_rx2, _conn2) = hub.connect(2);
+        assert!(!w.has_changed().unwrap());
+        drop(conn);
+        assert_eq!(*w.borrow_and_update(), 0);
+        hub.set_remote(HashMap::from([(1, 3)]));
+        assert_eq!(*w.borrow_and_update(), 3);
+        hub.close_org(1);
+        assert!(w.has_changed().is_err());
     }
 }

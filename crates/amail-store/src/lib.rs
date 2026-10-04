@@ -206,6 +206,13 @@ pub trait Store: Send + Sync + 'static {
         message_id: i64,
         seat_id: i64,
     ) -> Result<Option<(DeliveryRec, Option<SeqBump>)>>;
+    /// Mark the seat's delivery not read again (an acknowledged delivery
+    /// stays read). `None` if the seat has no delivery.
+    async fn mark_unread(
+        &self,
+        message_id: i64,
+        seat_id: i64,
+    ) -> Result<Option<(DeliveryRec, Option<SeqBump>)>>;
     /// Mark the seat's delivery acknowledged (and read).
     async fn ack(
         &self,
@@ -266,7 +273,8 @@ pub trait Store: Send + Sync + 'static {
     async fn counts(&self, org_id: i64, seat_id: Option<i64>) -> Result<Vec<CountRec>>;
     /// Deliveries to the user seat that wait for the user (see the server's
     /// `/v1/attention`), oldest first, among the seat's newest
-    /// [`amail_proto::limits::MAX_ATTENTION_SCAN`] deliveries.
+    /// [`amail_proto::limits::MAX_ATTENTION_SCAN`] deliveries. Bodies hold
+    /// only their first 400 characters (for a preview).
     async fn attention(&self, user_seat_id: i64, limit: i64) -> Result<Vec<Entry>>;
     /// Messages the org sent or received from minute `since_minute` (minutes
     /// since the Unix epoch) on, as added with [`Store::add_activity`].

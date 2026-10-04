@@ -18,6 +18,8 @@ use std::collections::HashMap;
 
 const MAX_TERMS: usize = 10;
 const ATTENTION_LIMIT: i64 = 500;
+/// Characters of a message shown in the "needs you" queue.
+const PREVIEW_CHARS: usize = 200;
 
 /// Presence of every seat of the org that a node reports, with
 /// `node_connected` filled in.
@@ -58,6 +60,7 @@ fn seat_items(presence: &HashMap<String, Presence>) -> Vec<AttentionItem> {
                 .or_else(|| p.turn_failed.as_ref().map(|t| t.reason.clone())),
             wake_failed: p.wake_failed,
             turn_failed: p.turn_failed.clone(),
+            preview: None,
         })
         .collect()
 }
@@ -68,12 +71,16 @@ async fn attention_items(st: &AppState, auth: &Auth) -> ApiResult<Vec<AttentionI
     let mut urgent = Vec::new();
     let mut normal = Vec::new();
     for e in &entries {
+        let header = render::header(&e.message, &auth.org);
+        // Mail from the server itself (settings changed, acknowledgements
+        // overdue) asks for no answer: a notice, until it is read.
         let kind = if e.message.ack_required && e.delivery.acked_at.is_none() {
             AttentionKind::Ack
+        } else if header.source == p::Source::System {
+            AttentionKind::Notice
         } else {
             AttentionKind::Reply
         };
-        let header = render::header(&e.message, &auth.org);
         let item = AttentionItem {
             kind,
             since: header.created_at.clone(),
@@ -85,6 +92,7 @@ async fn attention_items(st: &AppState, auth: &Auth) -> ApiResult<Vec<AttentionI
             hint: None,
             wake_failed: false,
             turn_failed: None,
+            preview: Some(render::lead(&e.message.body, PREVIEW_CHARS)),
         };
         if e.message.priority == Priority::Urgent {
             urgent.push(item);
@@ -346,6 +354,35 @@ pub async fn mark_read(
         return Err(ApiError::not_found(format!("no message {id}")));
     }
     let (d, bump) = st.store.mark_read(id, seat.id).await?.ok_or_else(|| {
+        ApiError::not_found(format!("message {id} was not delivered to {}", seat.name))
+    })?;
+    if let Some(b) = bump {
+        st.bus.publish(b.org_id, &[(seat.name.clone(), b.seq)]);
+    }
+    Ok(Json(p::AckResponse {
+        delivery: render::delivery(&d, &auth.org),
+    }))
+}
+
+/// `POST /v1/messages/{id}/unread` (user tokens): mark the user's delivery
+/// not read again, as a person does in a mail program. An acknowledged
+/// delivery stays read.
+pub async fn mark_unread(
+    State(st): State<AppState>,
+    auth: Auth,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<p::AckResponse>> {
+    auth.require_user()?;
+    let seat = auth.mail_seat()?.clone();
+    let m = st
+        .store
+        .message(id)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("no message {id}")))?;
+    if !crate::mail::can_read(&st, &auth, &m).await? {
+        return Err(ApiError::not_found(format!("no message {id}")));
+    }
+    let (d, bump) = st.store.mark_unread(id, seat.id).await?.ok_or_else(|| {
         ApiError::not_found(format!("message {id} was not delivered to {}", seat.name))
     })?;
     if let Some(b) = bump {

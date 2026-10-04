@@ -44,6 +44,8 @@ web_tests!(
     sent_and_mark_read,
     archive_by_recipient,
     seat_commands_reach_nodes,
+    live_directory_and_node_events,
+    mark_unread_and_notices,
     transcript_relay,
     embedded_app_and_headers,
 );
@@ -964,6 +966,158 @@ async fn seat_commands_reach_nodes(srv: Server) {
     );
     let seat = user.ok(Method::GET, "/seats/a", None).await;
     assert_eq!(seat["presence"]["node_connected"], false);
+}
+
+/// User event streams follow seat and list changes (`directory`) and the
+/// number of connected nodes (`nodes`); presence events say whether a node
+/// is connected, like `GET /v1/seats`.
+async fn live_directory_and_node_events(srv: Server) {
+    let user = srv.org("acme").await;
+    let _a = user.seat("a").await;
+    let seat_events = user.seat("s").await.stream("/events").await;
+    let mut ue = Sse::new(user.stream("/events").await);
+    // The current number first.
+    let (_, n) = ue.next_of(&["nodes"], 5).await.unwrap();
+    assert_eq!(n, json!({ "connected": 0 }));
+
+    user.ok(Method::POST, "/seats", Some(json!({ "name": "c" })))
+        .await;
+    let (_, d) = ue.next_of(&["directory"], 5).await.unwrap();
+    assert_eq!(
+        d,
+        json!({ "kind": "seat", "name": "c", "change": "created" })
+    );
+    user.ok(
+        Method::PATCH,
+        "/seats/c",
+        Some(json!({ "display_name": "C" })),
+    )
+    .await;
+    let (_, d) = ue.next_of(&["directory"], 5).await.unwrap();
+    assert_eq!(d["change"], "updated");
+    user.ok(Method::DELETE, "/seats/c", None).await;
+    let (_, d) = ue.next_of(&["directory"], 5).await.unwrap();
+    assert_eq!(
+        d,
+        json!({ "kind": "seat", "name": "c", "change": "deleted" })
+    );
+    user.ok(Method::POST, "/lists", Some(json!({ "name": "team" })))
+        .await;
+    let (_, d) = ue.next_of(&["directory"], 5).await.unwrap();
+    assert_eq!(
+        d,
+        json!({ "kind": "list", "name": "team", "change": "created" })
+    );
+    user.ok(Method::PUT, "/lists/team/members/a", None).await;
+    let (_, d) = ue.next_of(&["directory"], 5).await.unwrap();
+    assert_eq!(d["change"], "updated");
+
+    // A node connects, reports, and goes away.
+    let node = user.node().await;
+    let events = node.stream("/events").await;
+    let (_, n) = ue.next_of(&["nodes"], 5).await.unwrap();
+    assert_eq!(n, json!({ "connected": 1 }));
+    node.ok(
+        Method::POST,
+        "/presence",
+        Some(json!({ "node": "h1", "seats": [{"seat": "a", "state": "dormant"}] })),
+    )
+    .await;
+    let (_, p) = ue.next_of(&["presence"], 5).await.unwrap();
+    assert_eq!(p["seat"], "a");
+    assert_eq!(p["node_connected"], true);
+    drop(events);
+    let (_, n) = ue.next_of(&["nodes"], 5).await.unwrap();
+    assert_eq!(n, json!({ "connected": 0 }));
+
+    // Seat tokens get neither.
+    let mut se = Sse::new(seat_events);
+    user.ok(Method::POST, "/seats", Some(json!({ "name": "d" })))
+        .await;
+    assert!(se.next_of(&["directory", "nodes"], 1).await.is_none());
+}
+
+/// The user marks mail unread again; mail from the server is a notice in
+/// the queue, and queue entries carry the start of the message.
+async fn mark_unread_and_notices(srv: Server) {
+    let user = srv.org("acme").await;
+    let a = user.seat("a").await;
+    let id = a
+        .send(json!({ "to": ["owner"], "subject": "report", "body": "Done.\nAll tests pass.\n\nDetails follow." }))
+        .await;
+    let queue = user.ok(Method::GET, "/attention", None).await;
+    let item = &queue["items"][0];
+    assert_eq!(item["kind"], "reply");
+    assert_eq!(item["preview"], "Done. All tests pass. Details follow.");
+
+    user.ok(Method::POST, &format!("/messages/{id}/read"), None)
+        .await;
+    assert_eq!(
+        user.ok(Method::GET, "/attention", None).await["items"],
+        json!([])
+    );
+    let d = user
+        .ok(Method::POST, &format!("/messages/{id}/unread"), None)
+        .await;
+    assert!(d["delivery"]["read_at"].is_null(), "{d}");
+    assert_eq!(
+        user.ok(Method::GET, "/attention", None).await["items"][0]["kind"],
+        "reply"
+    );
+    // Only user tokens; only the user's own deliveries.
+    assert_eq!(
+        a.call(Method::POST, &format!("/messages/{id}/unread"), None)
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    let own = user
+        .send(json!({ "to": ["a"], "subject": "x", "body": "y" }))
+        .await;
+    assert_eq!(
+        user.call(Method::POST, &format!("/messages/{own}/unread"), None)
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    // Acknowledged mail stays read.
+    let ackd = a
+        .send(json!({ "to": ["owner"], "subject": "ack me", "body": "b", "ack_required": true }))
+        .await;
+    user.ok(Method::POST, &format!("/messages/{ackd}/ack"), None)
+        .await;
+    let d = user
+        .ok(Method::POST, &format!("/messages/{ackd}/unread"), None)
+        .await;
+    assert!(d["delivery"]["read_at"].is_string(), "{d}");
+
+    // A node's notice is system mail: a notice, not mail to answer.
+    let node = user.node().await;
+    node.ok(
+        Method::POST,
+        "/node/notices",
+        Some(json!({
+            "node": "box",
+            "notices": [{
+                "kind": "settings",
+                "changes": [{"setting": "local_policy", "old": "restricted", "new": "open"}],
+            }],
+        })),
+    )
+    .await;
+    let queue = user.ok(Method::GET, "/attention", None).await;
+    let kinds: Vec<(&str, &str)> = queue["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| {
+            (
+                i["kind"].as_str().unwrap(),
+                i["message"]["source"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(kinds, vec![("reply", "agent"), ("notice", "system")]);
 }
 
 fn ev(role: &str, kind: &str, text: &str) -> Value {

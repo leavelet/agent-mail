@@ -1114,6 +1114,27 @@ pub struct PresenceEvent {
     pub presence: Presence,
 }
 
+/// Payload of a server-sent `directory` event (user tokens): a seat or list
+/// of the org was created, changed or deleted. Clients reload what they show
+/// of the directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryEvent {
+    /// `seat` or `list`.
+    pub kind: String,
+    pub name: String,
+    /// `created`, `updated` or `deleted`.
+    pub change: String,
+}
+
+/// Payload of a server-sent `nodes` event (user tokens): the number of node
+/// event streams open for the org changed. Sent once when the stream opens
+/// and then on every change; `connected > 0` is what
+/// [`Presence::node_connected`] says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodesEvent {
+    pub connected: u32,
+}
+
 /// Response of `GET /v1/seats/{name}/launch` (node tokens): what a node needs
 /// to start a harness session for the seat, including a fresh seat token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1204,8 +1225,10 @@ pub struct CountsResponse {
 }
 
 string_enum!(
-    /// Why an entry is in the user's "needs you" queue.
-    AttentionKind { Ack => "ack", Reply => "reply", Seat => "seat" }
+    /// Why an entry is in the user's "needs you" queue: an acknowledgement
+    /// asked, mail to answer, a seat that needs a person, or a notice from
+    /// the server (read it; it asks for nothing).
+    AttentionKind { Ack => "ack", Reply => "reply", Seat => "seat", Notice => "notice" }
 );
 
 /// One entry of `GET /v1/attention`.
@@ -1234,6 +1257,9 @@ pub struct AttentionItem {
     /// The seat's last turn failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_failed: Option<TurnFailure>,
+    /// The beginning of `message`'s body, its lines joined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

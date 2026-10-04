@@ -158,6 +158,7 @@ pub async fn create_seat(
         }
     }
     let s = st.store.create_seat(auth.org.id, &seat).await?;
+    st.directory_changed(auth.org.id, "seat", &s.name, "created");
     Ok((StatusCode::CREATED, Json(seat_out(&st, &auth, &s).await?)))
 }
 
@@ -192,6 +193,7 @@ pub async fn patch_seat(
         check_name(g)?;
     }
     let s = st.store.update_seat(auth.org.id, &name, &patch).await?;
+    st.directory_changed(auth.org.id, "seat", &s.name, "updated");
     Ok(Json(seat_out(&st, &auth, &s).await?))
 }
 
@@ -202,6 +204,7 @@ pub async fn delete_seat(
 ) -> ApiResult<StatusCode> {
     auth.require_user()?;
     st.store.delete_seat(auth.org.id, &name).await?;
+    st.directory_changed(auth.org.id, "seat", &name, "deleted");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -393,6 +396,7 @@ pub async fn create_list(
         ));
     }
     let l = st.store.create_list(auth.org.id, &list).await?;
+    st.directory_changed(auth.org.id, "list", &l.name, "created");
     Ok((
         StatusCode::CREATED,
         Json(render::list(&l, Some(Vec::new()))),
@@ -432,6 +436,7 @@ pub async fn delete_list(
 ) -> ApiResult<StatusCode> {
     auth.require_user()?;
     st.store.delete_list(auth.org.id, &name).await?;
+    st.directory_changed(auth.org.id, "list", &name, "deleted");
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -516,6 +521,7 @@ pub async fn put_member(
         ));
     }
     st.store.put_member(auth.org.id, l.id, &member).await?;
+    st.directory_changed(auth.org.id, "list", &l.name, "updated");
     Ok(Json(p::ListMember {
         address: member.address,
         mode,
@@ -535,6 +541,7 @@ pub async fn delete_member(
         .ok_or_else(|| ApiError::not_found(format!("no list {list:?}")))?;
     let a = member_address(&auth, &address)?;
     if st.store.remove_member(l.id, &a.to_string()).await? {
+        st.directory_changed(auth.org.id, "list", &l.name, "updated");
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found(format!(
