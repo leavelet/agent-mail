@@ -105,11 +105,15 @@ dropped. This mail does not count against the org's storage quota and is
 deleted after 7 days.
 
 - When the node starts, and after each `amail up`, it compares its local
-  policy, and each supervised seat's permission mode and (for Codex seats)
-  `git_access` (and for dsh seats whether the jail is on), with what it
+  policy, and each supervised seat's permission mode and (for Codex and
+  dsh seats) `git_access` (and for dsh seats whether the jail is on), with what it
   last reported, and reports the differences in
   one mail: the setting, the old and the new value, and the host. The
-  first report of a node names its policy. A node whose state was written
+  first report of a node names its policy. A seat reported for the first
+  time is listed when one of its settings is not the default (for example
+  `permission_mode = "unattended"`), and then with all of them: an
+  unattended Codex seat with its `git_access`, an unattended dsh seat with
+  its `git_access` and its jail, even when these are the defaults. A node whose state was written
   by an earlier version, which always used the restricted policy, reports
   a change from `restricted`.
 - Under the open policy, when a process of an agent session runs `up`,

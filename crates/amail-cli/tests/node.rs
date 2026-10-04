@@ -1801,6 +1801,13 @@ env -u AMAIL_TOKEN CODEX_THREAD_ID={tid} AMAIL_CODEX_PASS={pass} timeout 10 "$B"
     )
     .await;
     assert!(plan["env"]["AMAIL_TOKEN"].is_string(), "{plan}");
+    // Agents use `$TMPDIR`: a session gets one when the node has none.
+    let tmp = std::env::var("TMPDIR").ok().filter(|t| !t.is_empty());
+    assert_eq!(
+        plan["env"]["TMPDIR"].as_str(),
+        if tmp.is_some() { None } else { Some("/tmp") },
+        "{plan}"
+    );
     h.wait("the launch is saved", || async {
         let saved: Value = serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
         saved["roots"]["w2"]["pid"] == std::process::id()

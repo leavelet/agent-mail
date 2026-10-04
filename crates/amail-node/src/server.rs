@@ -183,6 +183,29 @@ impl ServerClient {
         .await
     }
 
+    /// Return the deliveries of `messages` that the claim with `key` took
+    /// to "not notified, not read" (the turn that showed them failed).
+    pub async fn release(
+        &self,
+        seat: &str,
+        key: &str,
+        messages: &[i64],
+    ) -> Result<amail_proto::ReleaseResponse> {
+        let body = amail_proto::ReleaseRequest {
+            key: key.to_string(),
+            messages: messages.to_vec(),
+        };
+        Self::json(
+            self.req(
+                reqwest::Method::POST,
+                &format!("/claim/release?seat={}", enc(seat)),
+            )
+            .timeout(Duration::from_secs(10))
+            .json(&body),
+        )
+        .await
+    }
+
     pub async fn unread(&self, seat: &str, limit: u32) -> Result<InboxResponse> {
         Self::json(
             self.req(

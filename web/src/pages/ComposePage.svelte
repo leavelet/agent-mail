@@ -8,6 +8,7 @@
   import type { MessageResponse, SendResponse, Message, Delivery } from '../lib/types';
   import AddressInput from '../components/AddressInput.svelte';
   import MessageCard from '../components/MessageCard.svelte';
+  import SendReceipt from '../components/SendReceipt.svelte';
 
   let { query }: { query: URLSearchParams } = $props();
 
@@ -23,12 +24,15 @@
   let busy = $state(false);
   let error = $state<string | null>(null);
   let bodyEl: HTMLTextAreaElement | undefined = $state();
+  /** The answer to the last send: shown instead of the form. */
+  let receipt = $state.raw<SendResponse | null>(null);
 
   $effect(() => {
     const reply = query.get('reply');
     const all = query.get('all') === '1';
     to = query.get('to') ?? '';
     cc = '';
+    receipt = null;
     subject = query.get('subject') ?? '';
     replyTo = null;
     if (!reply) return;
@@ -65,6 +69,20 @@
     }
   }
 
+  /** Start a new message after a receipt. */
+  function again() {
+    receipt = null;
+    to = '';
+    cc = '';
+    subject = '';
+    body = '';
+    urgent = false;
+    ackReq = false;
+    meta = [];
+    replyTo = null;
+    if (query.get('reply') || query.get('to') || query.get('subject')) go(['compose']);
+  }
+
   async function send(e?: SubmitEvent) {
     e?.preventDefault();
     error = null;
@@ -81,12 +99,7 @@
         else if (!replyDelivery.read_at) await markRead(replyTo.id).catch(() => undefined);
       }
       void store.mailChanged();
-      if (r.rejected.length) {
-        error = t('compose.rejected', { list: r.rejected.map((x) => `${x.address} (${x.reason})`).join(', ') });
-        busy = false;
-        return;
-      }
-      go(['thread', r.thread_id], { m: r.id });
+      receipt = r;
     } catch (err) {
       if (err instanceof ApiError && err.rejected.length) {
         error = t('compose.rejected', { list: err.rejected.map((x) => `${x.address} (${x.reason})`).join(', ') });
@@ -99,6 +112,9 @@
 
 <div class="page compose">
   <div class="page-head"><h1>{replyTo ? t('compose.replyTitle') : t('compose.title')}</h1></div>
+  {#if receipt}
+    <SendReceipt r={receipt} onagain={again} />
+  {:else}
   <form class="card form" onsubmit={send}>
     <div class="field"><label for="c-to">{t('compose.to')}</label><AddressInput id="c-to" label={t('compose.to')} bind:value={to} /></div>
     <div class="field"><label for="c-cc">{t('compose.cc')}</label><AddressInput id="c-cc" label={t('compose.cc')} bind:value={cc} /></div>
@@ -144,6 +160,7 @@
       <button class="primary" type="submit" disabled={busy}>{busy ? t('compose.sending') : t('compose.send')} <kbd>Ctrl ↵</kbd></button>
     </div>
   </form>
+  {/if}
   {#if replyTo}
     <div class="quoted">
       <MessageCard message={replyTo} />

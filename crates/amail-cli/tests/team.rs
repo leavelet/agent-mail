@@ -774,6 +774,41 @@ async fn crash_restart_backoff_and_resume_fallback(b: Backend) {
     assert!(ok, "{out}");
     wait_state(&h, "s", "idle").await;
     assert_eq!(row(&h, "s").await.attention, None);
+    assert!(h.seat_status("s").await["turn_failed"].is_null());
+
+    // Killed during a turn that showed mail: a failed turn. The mail is
+    // marked not read again and shown by a turn of the restarted session.
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+    std::fs::write(h.fake.join("s.busy"), "").unwrap();
+    std::fs::write(h.fake.join("s.prompt"), "").unwrap();
+    wait_state(&h, "s", "busy").await;
+    let m = h.api.send(&["s"], &[], "during the turn", false).await;
+    wait_injected(&h, "s", m).await;
+    std::fs::remove_file(h.fake.join("s.busy")).unwrap();
+    let before = injected(&h, "s").matches(&format!("#{m} from")).count();
+    kill9(row(&h, "s").await.pid.unwrap());
+    h.wait("turn failure", || async {
+        h.seat_status("s").await["turn_failed"]["count"] == 1
+    })
+    .await;
+    let f = h.seat_status("s").await["turn_failed"].clone();
+    assert!(
+        f["reason"]
+            .as_str()
+            .unwrap()
+            .contains("was killed or vanished during the turn"),
+        "{f}"
+    );
+    assert_eq!(row(&h, "s").await.attention.as_deref(), Some("turn-failed"));
+    wait_for("shown again", || {
+        injected(&h, "s").matches(&format!("#{m} from")).count() == before + 1
+    })
+    .await;
+    wait_state(&h, "s", "idle").await;
+    h.wait("cleared by a normal turn", || async {
+        h.seat_status("s").await["turn_failed"].is_null()
+    })
+    .await;
     cli(&h, &["down"]).await;
 }
 

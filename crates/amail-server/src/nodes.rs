@@ -102,6 +102,10 @@ pub async fn presence(
                 MAX_HINT_CHARS,
             )?;
             check_text("terminal_url", u.terminal_url.as_deref(), MAX_URL_CHARS)?;
+            if let Some(t) = &u.turn_failed {
+                check_text("turn_failed.reason", Some(&t.reason), MAX_HINT_CHARS)?;
+                check_text("turn_failed.at", Some(&t.at), 64)?;
+            }
         }
     }
     let live: HashSet<String> = st

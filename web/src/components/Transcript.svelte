@@ -94,6 +94,14 @@
     return t(`tr.${s}`);
   });
 
+  /** How an event is labelled: mail the mail system put into the session,
+   * an error that ended a turn, or another note of the harness. */
+  function noticeKind(ev: TranscriptEvent): 'mail' | 'error' | 'system' {
+    // Older nodes did not flag a failed dsh turn as an error.
+    if (ev.error || (ev.role === 'system' && ev.text.startsWith('turn ended:'))) return 'error';
+    return ev.text.trimStart().startsWith('[amail') ? 'mail' : 'system';
+  }
+
   function firstLine(s: string): string {
     const line = s.split('\n', 1)[0];
     return line.length > 160 ? `${line.slice(0, 160)}…` : line;
@@ -127,10 +135,11 @@
     {:else}
       {#if explain}<div class="inline-status">{explain}</div>{/if}
       {#each events as ev, i (i)}
-        <div class="ev {ev.role} k-{ev.kind}" class:err={ev.error}>
+        {@const nk = ev.kind === 'notice' ? noticeKind(ev) : null}
+        <div class="ev {ev.role} k-{ev.kind}" class:err={ev.error} class:failed={nk === 'error'} data-notice={nk}>
           <div class="gutter">
             <span class="who">
-              {#if ev.kind === 'notice'}{t('tr.notice')}{:else}{t(`tr.role.${ev.role}`)}{/if}
+              {#if nk === 'mail'}{t('tr.notice')}{:else if nk === 'error'}{t('tr.error')}{:else if nk === 'system'}{t('tr.role.system')}{:else}{t(`tr.role.${ev.role}`)}{/if}
             </span>
             {#if ev.ts}<span class="ts faint">{shortTime(ev.ts, ui.now, ui.lang)}</span>{/if}
           </div>
@@ -290,6 +299,15 @@
     border: 1px dashed var(--notice);
     border-radius: 5px;
     padding: 4px 8px;
+  }
+  .failed .who {
+    color: var(--danger);
+    font-weight: 700;
+  }
+  .k-notice.failed .body {
+    background: var(--danger-weak);
+    border: 1px solid var(--danger);
+    color: var(--danger);
   }
   .k-notice .body pre {
     font-family: var(--mono);

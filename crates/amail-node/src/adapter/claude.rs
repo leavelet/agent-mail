@@ -22,6 +22,7 @@ const EVENTS: &[&str] = &[
     "UserPromptSubmit",
     "PostToolUse",
     "Stop",
+    "StopFailure",
     "Notification",
     "PermissionRequest",
     "SessionEnd",
@@ -100,6 +101,23 @@ impl Claude {
     }
 }
 
+/// The error of a `StopFailure` hook: its type and message. Claude Code
+/// 2.1.289 sends `error` (the type, e.g. `authentication_failed`) and
+/// `last_assistant_message` (the text shown); its documentation names
+/// `error_type` and `error_message`. All are read.
+pub fn stop_failure_reason(input: &Value) -> String {
+    let kind = str_field(input, "error_type").or_else(|| str_field(input, "error"));
+    let msg = str_field(input, "error_message")
+        .or_else(|| str_field(input, "last_assistant_message"))
+        .or_else(|| str_field(input, "error_details"));
+    match (kind, msg) {
+        (Some(k), Some(m)) => format!("{k}: {m}"),
+        (Some(k), None) => k.to_string(),
+        (None, Some(m)) => m.to_string(),
+        (None, None) => "the turn ended with an error".to_string(),
+    }
+}
+
 #[async_trait::async_trait]
 impl Adapter for Claude {
     fn harness(&self) -> Harness {
@@ -120,6 +138,10 @@ impl Adapter for Claude {
             },
             "PostToolUse" => Event::PostToolUse,
             "Stop" => Event::Stop,
+            // A turn that ended in an API error (instead of `Stop`).
+            "StopFailure" => Event::TurnFailed {
+                reason: stop_failure_reason(input),
+            },
             "PermissionRequest" => Event::Awaiting,
             "Notification" => match str_field(input, "notification_type") {
                 Some("permission_prompt") => Event::Awaiting,
@@ -241,7 +263,7 @@ impl Adapter for Claude {
         if ctx.resume.is_none() && ctx.context_lost {
             args.push(CONTEXT_LOST.to_string());
         }
-        let env = BTreeMap::from([
+        let mut env = BTreeMap::from([
             ("AMAIL_SEAT".to_string(), info.seat.clone()),
             ("AMAIL_URL".to_string(), self.env.server_url.clone()),
             ("AMAIL_TOKEN".to_string(), info.token.clone()),
@@ -250,6 +272,11 @@ impl Adapter for Claude {
                 self.env.node_socket.to_string_lossy().into_owned(),
             ),
         ]);
+        // Agents use `$TMPDIR` in their commands; with it unset such a path
+        // becomes one in `/`.
+        if std::env::var_os("TMPDIR").is_none_or(|t| t.is_empty()) {
+            env.insert("TMPDIR".to_string(), "/tmp".to_string());
+        }
         Ok(LaunchPlan {
             program: self.env.claude_bin.clone(),
             args,

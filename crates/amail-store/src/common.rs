@@ -769,6 +769,8 @@ pub(crate) struct PresenceRow {
     attention: Option<String>,
     attention_hint: Option<String>,
     terminal_url: Option<String>,
+    /// [`amail_proto::TurnFailure`] as JSON.
+    turn_failed: Option<String>,
 }
 
 impl PresenceRow {
@@ -784,6 +786,11 @@ impl PresenceRow {
             attention: self.attention,
             attention_hint: self.attention_hint,
             terminal_url: self.terminal_url,
+            // Unreadable (written by another version): left out.
+            turn_failed: self
+                .turn_failed
+                .as_deref()
+                .and_then(|t| serde_json::from_str(t).ok()),
         })
     }
 }
@@ -1102,7 +1109,7 @@ macro_rules! impl_store_common {
             /// are looked at; each is checked with index lookups.
             pub async fn attention(c: &mut Conn, user_seat_id: i64, limit: i64) -> Result<Vec<Entry>> {
                 let rows: Vec<EntryRow> = sqlx::query_as(concat!(
-                    "SELECT ", deliv_cols!(), ", ", msg_cols!(), ", '' AS body FROM \
+                    "SELECT ", deliv_cols!(), ", ", msg_cols!(), ", substr(m.body, 1, 400) AS body FROM \
                      (SELECT * FROM deliveries WHERE seat_id = $1 ORDER BY seq DESC LIMIT $3) d",
                     deliv_joins!(),
                     " JOIN messages m ON m.id = d.message_id",
@@ -1798,11 +1805,70 @@ macro_rules! impl_store_common {
                 }))
             }
 
+            /// Return deliveries a keyed claim took to "not notified, not
+            /// read": those of `message_ids` among the claim's, unless
+            /// acknowledged meanwhile. Returns the released `(delivery id,
+            /// message id)` pairs and the seat's new seq.
+            pub async fn release_claim(c: &mut Conn, seat_id: i64, key: &str, message_ids: &[i64]) -> Result<(Vec<i64>, Option<SeqBump>)> {
+                let Some(ids) = claimed_with_key(c, seat_id, key).await? else {
+                    return Ok((Vec::new(), None));
+                };
+                let ids: Vec<i64> = ids.into_iter().take(1000).collect();
+                if ids.is_empty() || message_ids.is_empty() {
+                    return Ok((Vec::new(), None));
+                }
+                let msgs: Vec<i64> = message_ids.iter().copied().take(1000).collect();
+                let sql = format!(
+                    "UPDATE deliveries SET notified_at = NULL, notified_via = NULL, read_at = NULL \
+                     WHERE seat_id = $1 AND acked_at IS NULL AND notified_at IS NOT NULL \
+                     AND id IN ({}) AND message_id IN ({}) RETURNING id, message_id, org_id",
+                    placeholders(2, ids.len()),
+                    placeholders(2 + ids.len(), msgs.len()),
+                );
+                let mut q = sqlx::query_as::<_, (i64, i64, i64)>(&sql).bind(seat_id);
+                for id in &ids {
+                    q = q.bind(*id);
+                }
+                for id in &msgs {
+                    q = q.bind(*id);
+                }
+                let mut rows = q.fetch_all(&mut *c).await?;
+                if rows.is_empty() {
+                    return Ok((Vec::new(), None));
+                }
+                rows.sort_unstable();
+                let n = rows.len() as i64;
+                let last = bump_seq(c, seat_id, n).await?;
+                for (i, (id, _, _)) in rows.iter().enumerate() {
+                    sqlx::query("UPDATE deliveries SET mod_seq = $1 WHERE id = $2")
+                        .bind(last - n + 1 + i as i64)
+                        .bind(*id)
+                        .execute(&mut *c)
+                        .await?;
+                }
+                let org_id = rows[0].2;
+                let mut released: Vec<i64> = rows.into_iter().map(|r| r.1).collect();
+                released.sort_unstable();
+                Ok((released, Some(SeqBump { org_id, seat_id, seq: last })))
+            }
+
             pub async fn mark_read(c: &mut Conn, message_id: i64, seat_id: i64) -> Result<Option<(DeliveryRec, Option<SeqBump>)>> {
                 touch(
                     c,
                     "UPDATE deliveries SET read_at = $1 WHERE message_id = $2 AND seat_id = $3 \
                      AND read_at IS NULL RETURNING id",
+                    message_id,
+                    seat_id,
+                )
+                .await
+            }
+
+            pub async fn mark_unread(c: &mut Conn, message_id: i64, seat_id: i64) -> Result<Option<(DeliveryRec, Option<SeqBump>)>> {
+                // `$1` (the time `touch` binds) is not needed here.
+                touch(
+                    c,
+                    "UPDATE deliveries SET read_at = NULL WHERE $1 > 0 AND message_id = $2 \
+                     AND seat_id = $3 AND read_at IS NOT NULL AND acked_at IS NULL RETURNING id",
                     message_id,
                     seat_id,
                 )
@@ -2136,7 +2202,7 @@ macro_rules! impl_store_common {
             pub async fn presence(c: &mut Conn, org_id: i64, seat: Option<&str>) -> Result<Vec<PresenceRec>> {
                 let rows: Vec<PresenceRow> = sqlx::query_as(
                     "SELECT s.name AS seat, p.state, p.wake_failed, p.harness, p.node, p.since, p.updated_at, \
-                     p.attention, p.attention_hint, p.terminal_url \
+                     p.attention, p.attention_hint, p.terminal_url, p.turn_failed \
                      FROM presence p JOIN seats s ON s.id = p.seat_id \
                      WHERE p.org_id = $1 AND s.deleted_at IS NULL AND ($2 IS NULL OR s.name = $2) ORDER BY s.name",
                 )
@@ -2184,14 +2250,15 @@ macro_rules! impl_store_common {
                     stored.push((seat_id, rec));
                 }
                 for chunk in stored.chunks(500) {
-                    let rows: Vec<String> = (0..chunk.len()).map(|i| format!("({})", placeholders(i * 11 + 1, 11))).collect();
+                    let rows: Vec<String> = (0..chunk.len()).map(|i| format!("({})", placeholders(i * 12 + 1, 12))).collect();
                     let sql = format!(
                         "INSERT INTO presence (seat_id, org_id, state, wake_failed, harness, node, since, updated_at, \
-                         attention, attention_hint, terminal_url) VALUES {} \
+                         attention, attention_hint, terminal_url, turn_failed) VALUES {} \
                          ON CONFLICT (seat_id) DO UPDATE SET state = excluded.state, wake_failed = excluded.wake_failed, \
                          harness = excluded.harness, node = excluded.node, since = excluded.since, \
                          updated_at = excluded.updated_at, attention = excluded.attention, \
-                         attention_hint = excluded.attention_hint, terminal_url = excluded.terminal_url",
+                         attention_hint = excluded.attention_hint, terminal_url = excluded.terminal_url, \
+                         turn_failed = excluded.turn_failed",
                         rows.join(", ")
                     );
                     let mut q = sqlx::query(&sql);
@@ -2207,7 +2274,8 @@ macro_rules! impl_store_common {
                             .bind(r.updated_at)
                             .bind(r.attention.clone())
                             .bind(r.attention_hint.clone())
-                            .bind(r.terminal_url.clone());
+                            .bind(r.terminal_url.clone())
+                            .bind(r.turn_failed.as_ref().and_then(|t| serde_json::to_string(t).ok()));
                     }
                     q.execute(&mut *c).await?;
                 }
@@ -2312,7 +2380,7 @@ macro_rules! impl_store_common {
                 .execute(&mut *c)
                 .await?;
                 sqlx::query("DELETE FROM tokens WHERE revoked_at IS NOT NULL").execute(&mut *c).await?;
-                sqlx::query("DELETE FROM claim_keys WHERE created_at < $1").bind(now - 600_000).execute(&mut *c).await?;
+                sqlx::query("DELETE FROM claim_keys WHERE created_at < $1").bind(now - $crate::CLAIM_KEY_TTL_MS).execute(&mut *c).await?;
                 sqlx::query("DELETE FROM mirror_watch WHERE expires_at < $1").bind(now).execute(&mut *c).await?;
                 sqlx::query(
                     "DELETE FROM node_streams WHERE instance_id IN \
@@ -3684,6 +3752,10 @@ macro_rules! impl_store_common {
                 run!(self.write, |c| q::mark_read(c, message_id, seat_id).await)
             }
 
+            async fn mark_unread(&self, message_id: i64, seat_id: i64) -> $crate::Result<Option<($crate::DeliveryRec, Option<$crate::SeqBump>)>> {
+                run!(self.write, |c| q::mark_unread(c, message_id, seat_id).await)
+            }
+
             async fn ack(&self, message_id: i64, seat_id: i64) -> $crate::Result<Option<($crate::DeliveryRec, Option<$crate::SeqBump>)>> {
                 run!(self.write, |c| q::ack(c, message_id, seat_id).await)
             }
@@ -3709,6 +3781,11 @@ macro_rules! impl_store_common {
                     return Ok((Vec::new(), None));
                 }
                 self.claim_impl(seat_id, f).await
+            }
+
+            async fn release_claim(&self, seat_id: i64, key: &str, message_ids: &[i64]) -> $crate::Result<(Vec<i64>, Option<$crate::SeqBump>)> {
+                let (key, ids) = (key.to_string(), message_ids.to_vec());
+                run!(self.write, |c| q::release_claim(c, seat_id, &key, &ids).await)
             }
 
             async fn changes(&self, seat_id: i64, since: i64, limit: i64) -> $crate::Result<Vec<$crate::Entry>> {

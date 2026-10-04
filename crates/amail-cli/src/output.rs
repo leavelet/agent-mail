@@ -119,6 +119,11 @@ pub fn message(m: &Message) -> String {
     out
 }
 
+/// What the delivery states mean, printed under `amail status`.
+pub const STATE_LEGEND: &str = "(notified: the header was shown to the agent; read: the whole body was \
+put into the agent's context, inline or by amail read, which does not mean it was acted on; \
+acked: the recipient acknowledged it)";
+
 /// `a read [to] notified 10:00 via hook, read 10:01`
 pub fn status_line(r: &p::RecipientStatus) -> String {
     let d: &Delivery = &r.delivery;
@@ -196,6 +201,10 @@ pub fn seat_line(s: &p::Seat) -> String {
         out.push_str(&format!(" state={}", l(&p.state.to_string())));
         if p.wake_failed {
             out.push_str(" wake_failed");
+        }
+        if let Some(t) = &p.turn_failed {
+            out.push_str(&format!(" turn_failed={}", t.count));
+            out.push_str(&quoted("turn_error", &Some(t.reason.clone())));
         }
     }
     if let Some(t) = &s.focus_until {
@@ -275,6 +284,11 @@ fn note(n: &p::RecipientNote) -> String {
             }
         }
         "wake_failed" => "does not answer wake-ups; a person may need to look".to_string(),
+        "turn_failed" => {
+            "its last turn failed (a harness or model error); it gets the mail when a turn \
+             works again, and a person may need to look"
+                .to_string()
+        }
         other => l(other).into_owned(),
     };
     format!("{} {what}", l(&n.seat))

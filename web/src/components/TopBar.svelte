@@ -20,6 +20,11 @@
           <span class="lbl">{t(`state.${s}`)}</span>
         </a>
       {/each}
+      {#if ov.turn_failed}
+        <a class="stat failing" href={href(['org'], { state: 'needs' })} title={t('top.turnFailed.long')} data-testid="top-turn-failed">
+          <span class="num">⚠ {ov.turn_failed}</span><span class="lbl">{t('top.turnFailed')}</span>
+        </a>
+      {/if}
       <span class="sep" aria-hidden="true"></span>
       <a class="stat" href={href(['archive'])} title={t('archive.timeline')}>
         <span class="num">{t('top.lastHour', { n: ov.mail_last_hour })}</span>
@@ -99,6 +104,13 @@
   }
   .stat .num {
     font-weight: 600;
+  }
+  .stat.failing {
+    background: var(--danger-weak);
+  }
+  .stat.failing,
+  .stat.failing .lbl {
+    color: var(--danger);
   }
   .dot {
     width: 8px;

@@ -163,6 +163,7 @@ async fn dsh_hooks_and_wake(b: Backend) {
     let opts = Opts {
         tweak: Some(|c| {
             c.dsh_env = [("DEEPSEEK_API_KEY".to_string(), "test-key".to_string())].into();
+            c.turn_retry_backoff = Duration::from_millis(300);
         }),
         ..Opts::default()
     };
@@ -354,6 +355,44 @@ async fn dsh_hooks_and_wake(b: Backend) {
                            "cwd": cwd.to_string_lossy()});
     assert_eq!(h.hook("dsh", env.clone(), interrupt).await, Value::Null);
     assert_eq!(h.state("ds").await, "idle");
+    assert_eq!(h.seat_status("ds").await["turn_failed"], Value::Null);
+
+    // A turn that showed mail fails (the wrapper reports `TurnFailed`): the
+    // mail is not read any more, and is shown again by the next turn,
+    // which the node starts with a wake-up after the backoff.
+    let prompts = host.calls("session/prompt").len();
+    let m4 = h.api.send(&["ds"], &[], "fourth", false).await;
+    h.wait("wake-up prompt", || async {
+        host.calls("session/prompt").len() == prompts + 1
+    })
+    .await;
+    let out = h
+        .hook("dsh", env.clone(), dsh("UserPromptSubmit", sid))
+        .await;
+    assert_eq!(injected_ids(&hook_text(&out).unwrap()), vec![m4]);
+    let failed = json!({"hook_event_name": "TurnFailed", "session_id": sid,
+                        "cwd": cwd.to_string_lossy(), "reason": "no API key"});
+    assert_eq!(h.hook("dsh", env.clone(), failed).await, Value::Null);
+    assert_eq!(h.state("ds").await, "idle");
+    assert_eq!(h.seat_status("ds").await["turn_failed"]["count"], 1);
+    h.wait("released on the server", || async {
+        let s = h.api.get(&format!("/messages/{m4}/status")).await;
+        s["recipients"][0]["notified_at"].is_null() && s["recipients"][0]["read_at"].is_null()
+    })
+    .await;
+    h.wait("woken again", || async {
+        host.calls("session/prompt").len() == prompts + 2
+    })
+    .await;
+    let out = h
+        .hook("dsh", env.clone(), dsh("UserPromptSubmit", sid))
+        .await;
+    assert_eq!(injected_ids(&hook_text(&out).unwrap()), vec![m4]);
+    assert_eq!(
+        h.hook("dsh", env.clone(), dsh("Stop", sid)).await,
+        Value::Null
+    );
+    assert_eq!(h.seat_status("ds").await["turn_failed"], Value::Null);
 }
 
 /// `amail dsh-host` with a fake `dsh`: publishes the endpoint, creates the
@@ -460,6 +499,29 @@ async fn dsh_host_wrapper(b: Backend) {
         h.state("dw").await == "idle"
     })
     .await;
+    // A cancelled turn is not a failure.
+    assert_eq!(h.seat_status("dw").await["turn_failed"], Value::Null);
+    // A turn that failed (a model provider error): reported as such, with
+    // dsh's message.
+    h.hook("dsh", env.clone(), dsh("UserPromptSubmit", "session-new"))
+        .await;
+    assert_eq!(h.state("dw").await, "busy");
+    append(
+        &log,
+        "{\"type\":\"turn/start\",\"seq\":3,\"time\":3,\"data\":{\"turn\":2}}\n\
+         {\"type\":\"turn/end\",\"seq\":4,\"time\":4,\"data\":{\"turn\":2,\"reason\":{\"kind\":\"error\",\
+         \"error\":{\"message\":\"llm-deepseek: no API key for provider route\",\"code\":\"UNKNOWN\"}}}}\n",
+    );
+    h.wait("turn failure reported", || async {
+        h.seat_status("dw").await["turn_failed"]["count"] == 1
+    })
+    .await;
+    let f = h.seat_status("dw").await["turn_failed"].clone();
+    assert_eq!(
+        f["reason"], "llm-deepseek: no API key for provider route",
+        "{f}"
+    );
+    assert_eq!(h.state("dw").await, "idle");
 
     // Stopping the wrapper stops the host and removes the endpoint.
     // SAFETY: signalling our child.
@@ -561,4 +623,14 @@ async fn dsh_host_wrapper(b: Backend) {
     })
     .await;
     child.kill().await.unwrap();
+}
+
+fn append(path: &Path, text: &str) {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .unwrap();
+    f.write_all(text.as_bytes()).unwrap();
 }

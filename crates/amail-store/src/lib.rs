@@ -17,6 +17,12 @@ mod sqlite;
 pub mod testutil;
 
 pub use model::*;
+
+/// How long a claim's idempotency key is kept: a retried claim with the
+/// key returns what the first one took, and the claim can be released
+/// (see [`Store::release_claim`]) for this long. It covers the longest
+/// harness turn a released claim is expected to span.
+pub const CLAIM_KEY_TTL_MS: i64 = 6 * 3_600_000;
 pub use postgres::PgStore;
 pub use sqlite::SqliteStore;
 
@@ -200,6 +206,13 @@ pub trait Store: Send + Sync + 'static {
         message_id: i64,
         seat_id: i64,
     ) -> Result<Option<(DeliveryRec, Option<SeqBump>)>>;
+    /// Mark the seat's delivery not read again (an acknowledged delivery
+    /// stays read). `None` if the seat has no delivery.
+    async fn mark_unread(
+        &self,
+        message_id: i64,
+        seat_id: i64,
+    ) -> Result<Option<(DeliveryRec, Option<SeqBump>)>>;
     /// Mark the seat's delivery acknowledged (and read).
     async fn ack(
         &self,
@@ -215,6 +228,17 @@ pub trait Store: Send + Sync + 'static {
     /// the two claims run concurrently. A retry after a lost response thus
     /// gets the same batch.
     async fn claim(&self, seat_id: i64, f: &ClaimFilter) -> Result<(Vec<Entry>, Option<SeqBump>)>;
+    /// Undo part of a keyed claim (the claim's key is kept for
+    /// [`CLAIM_KEY_TTL_MS`]): the seat's deliveries of `message_ids` that
+    /// the claim with `key` took become "not notified, not read" again,
+    /// unless acknowledged meanwhile. Returns the message ids released.
+    /// Used when the harness turn that showed them failed.
+    async fn release_claim(
+        &self,
+        seat_id: i64,
+        key: &str,
+        message_ids: &[i64],
+    ) -> Result<(Vec<i64>, Option<SeqBump>)>;
     /// Deliveries created or changed after `since` (by `mod_seq`), ascending.
     async fn changes(&self, seat_id: i64, since: i64, limit: i64) -> Result<Vec<Entry>>;
     /// All deliveries of a message, across orgs.
@@ -249,7 +273,8 @@ pub trait Store: Send + Sync + 'static {
     async fn counts(&self, org_id: i64, seat_id: Option<i64>) -> Result<Vec<CountRec>>;
     /// Deliveries to the user seat that wait for the user (see the server's
     /// `/v1/attention`), oldest first, among the seat's newest
-    /// [`amail_proto::limits::MAX_ATTENTION_SCAN`] deliveries.
+    /// [`amail_proto::limits::MAX_ATTENTION_SCAN`] deliveries. Bodies hold
+    /// only their first 400 characters (for a preview).
     async fn attention(&self, user_seat_id: i64, limit: i64) -> Result<Vec<Entry>>;
     /// Messages the org sent or received from minute `since_minute` (minutes
     /// since the Unix epoch) on, as added with [`Store::add_activity`].

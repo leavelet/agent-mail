@@ -267,6 +267,7 @@ pub async fn delete_org(st: &AppState, org: &amail_store::Org) -> ApiResult<()> 
 pub fn close_org(st: &AppState, org_id: i64) {
     st.bus.close_org(org_id);
     st.presence.close_org(org_id);
+    st.directory.close_org(org_id);
     st.nodes.close_org(org_id);
     st.mirror.close_org(org_id);
 }

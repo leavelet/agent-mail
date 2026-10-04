@@ -7,6 +7,7 @@
     [['Enter', 'o'], 'keys.open'],
     [['r'], 'keys.reply'],
     [['e'], 'keys.markRead'],
+    [['u'], 'keys.markUnread'],
     [['a'], 'keys.ack'],
     [['c'], 'keys.compose'],
     [['/'], 'keys.search'],

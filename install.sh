@@ -3,6 +3,11 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/OWNER/agent-mail/main/install.sh | sh
 #
+# OWNER is a placeholder: the repository's owner is not decided yet, so
+# this URL and the default AMAIL_REPO below do not work until OWNER is
+# replaced by the real GitHub owner. Until then, build from source (see
+# README.md) or set AMAIL_REPO to the repository you install from.
+#
 # Environment:
 #   AMAIL_VERSION      version to install, e.g. 0.1.0 (default: the latest release)
 #   AMAIL_INSTALL_DIR  where to put the binary (default: ~/.local/bin)
@@ -29,7 +34,15 @@ say() { printf '%s\n' "$*" >&2; }
 die() { say "error: $*"; exit 1; }
 
 case "$AMAIL_REPO" in
-    OWNER/*) [ -n "${AMAIL_DOWNLOAD_BASE:-}" ] || die "set AMAIL_REPO to the GitHub repository (owner/agent-mail)" ;;
+    OWNER/*)
+        if [ -z "${AMAIL_DOWNLOAD_BASE:-}" ]; then
+            say "error: this script still names the placeholder repository $AMAIL_REPO."
+            say "The repository's owner is not filled in yet. Either build amail from"
+            say "source (see README.md, \"Build from source\"), or run the script with"
+            say "AMAIL_REPO=<owner>/agent-mail set to the repository you install from."
+            exit 1
+        fi
+        ;;
 esac
 
 need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required"; }

@@ -924,6 +924,30 @@ pub fn parse_marker(prompt: &str) -> Option<(String, String)> {
     (ok(seat) && ok(nonce)).then(|| (seat.to_string(), nonce.to_string()))
 }
 
+/// The turns of a `thread/turns/list` answer, newest first as listed.
+/// Unknown statuses count as in progress.
+pub fn parse_turns(v: &Value) -> Vec<TurnInfo> {
+    v["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|t| TurnInfo {
+            status: match t["status"].as_str() {
+                Some("completed") => TurnStatus::Completed,
+                Some("interrupted") => TurnStatus::Interrupted,
+                Some("failed") => TurnStatus::Failed(
+                    t["error"]["message"]
+                        .as_str()
+                        .unwrap_or("the turn failed")
+                        .to_string(),
+                ),
+                _ => TurnStatus::InProgress,
+            },
+            started_at: t["startedAt"].as_i64(),
+        })
+        .collect()
+}
+
 #[async_trait::async_trait]
 impl Adapter for Codex {
     fn harness(&self) -> Harness {
@@ -988,6 +1012,25 @@ impl Adapter for Codex {
 
     fn claim_limit(&self) -> u32 {
         5
+    }
+
+    /// Codex hooks have no event for a failed turn (0.160: `Stop` and
+    /// `Interrupt` only), so the node asks the shared app-server.
+    fn checks_turns(&self) -> bool {
+        true
+    }
+
+    async fn last_turns(&self, target: &str) -> Result<Vec<TurnInfo>> {
+        let r = crate::codex_rpc::socket_calls(
+            &self.control_socket(),
+            &[(
+                "thread/turns/list",
+                json!({"threadId": target, "limit": 3, "sortDirection": "desc",
+                       "itemsView": "notLoaded"}),
+            )],
+        )
+        .await?;
+        Ok(parse_turns(r.first().unwrap_or(&Value::Null)))
     }
 
     async fn wake(&self, target: &str, text: &str) -> Result<()> {

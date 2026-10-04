@@ -45,6 +45,12 @@ The first public version.
   the root.
 - `amail ps`, `attach`, `sleep`, `wake`, `down`; a guarded terminal-paste
   wake-up as a last resort (off by default).
+- Failed turns: mail shown in a harness turn that failed (Claude Code
+  `StopFailure`, a dsh turn that ended with an error, a Codex turn the
+  app-server reports as failed, or a session process that ended during the
+  turn) goes back to "not read" and is delivered again, up to three failed
+  turns in a row; the seat is flagged as `turn failed` in `amail ps`, the
+  web interface and the user's queue, and the user gets one system mail.
 
 #### Web interface
 

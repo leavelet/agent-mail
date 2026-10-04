@@ -61,6 +61,12 @@ pub enum Wire {
     /// their streams.
     #[serde(rename = "r")]
     Ended { k: Vec<i64>, s: Vec<String> },
+    /// A seat or list of the org changed.
+    #[serde(rename = "d")]
+    Directory {
+        o: i64,
+        d: amail_proto::DirectoryEvent,
+    },
     /// The sender's own liveness ping (others ignore it).
     #[serde(rename = "h")]
     Ping,
@@ -283,6 +289,7 @@ impl Cluster {
                     .map(crate::revoke::Cred::Token)
                     .chain(s.into_iter().map(crate::revoke::Cred::Session)),
             ),
+            Wire::Directory { o, d } => st.directory.deliver(o, d),
             Wire::Ping => {}
         }
     }

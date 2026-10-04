@@ -158,6 +158,28 @@ pub async fn connect_unix(path: &std::path::Path) -> std::io::Result<tokio::net:
     r
 }
 
+/// Where a program runs from: `bin` itself when it contains a slash, else
+/// the first executable file of that name on `PATH`.
+pub fn find_program(bin: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let exec = |p: &Path| {
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    };
+    if bin.is_empty() {
+        return None;
+    }
+    if bin.contains('/') {
+        let p = PathBuf::from(bin);
+        return exec(&p).then_some(p);
+    }
+    std::env::var_os("PATH")?
+        .to_string_lossy()
+        .split(':')
+        .filter(|d| !d.is_empty())
+        .map(|d| Path::new(d).join(bin))
+        .find(|p| exec(p))
+}
+
 #[cfg(test)]
 mod tests {
     #[tokio::test]

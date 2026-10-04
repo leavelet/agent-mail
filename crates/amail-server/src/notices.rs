@@ -237,6 +237,57 @@ fn render(n: &NodeNotice, host: &str, seats: &HashSet<String>) -> Section {
                     .to_string(),
             }
         }
+        NodeNotice::TurnFailures {
+            seat,
+            count,
+            harness,
+            error,
+        } => {
+            let who = if seats.contains(seat) {
+                format!("seat {seat}")
+            } else {
+                "a seat that is not in this org".to_string()
+            };
+            let harness = harness
+                .as_deref()
+                .filter(|h| matches!(*h, "claude" | "codex" | "dsh"))
+                .map(|h| format!(" ({h})"))
+                .unwrap_or_default();
+            let error: String = amail_proto::text::line(error)
+                .chars()
+                .take(amail_proto::limits::MAX_HINT_CHARS)
+                .collect();
+            // Seat names that are not of this org are not shown.
+            let named = seats.contains(seat);
+            let subject = if named {
+                format!("Turns of seat {seat} are failing on host {host}")
+            } else {
+                format!("Turns of a seat are failing on host {host}")
+            };
+            let (attach, wake) = if named {
+                (
+                    format!("amail attach {seat}"),
+                    format!("amail wake {seat}"),
+                )
+            } else {
+                ("amail attach".to_string(), "amail wake".to_string())
+            };
+            Section {
+                subject,
+                intro: format!(
+                    "The last {count} turns of {who}{harness} on host {host} failed. The node \
+                     has stopped showing the mail of those turns to the seat again; the mail \
+                     is marked not read, and the seat gets it with its next turn. The \
+                     harness's last error (as it reported it):"
+                ),
+                items: vec![format!("    {error}")],
+                outro: format!(
+                    "Look at the seat's session ({attach}, or the seat's conversation in the \
+                     web interface). When the cause is fixed, wake the seat ({wake}); a turn \
+                     that ends normally clears the failure.\n"
+                ),
+            }
+        }
     }
 }
 
@@ -338,6 +389,19 @@ fn check(report: &NodeNotices) -> ApiResult<()> {
                         )));
                     }
                 }
+            }
+            NodeNotice::TurnFailures {
+                seat,
+                harness,
+                error,
+                ..
+            } => {
+                if !amail_proto::valid_name(seat) {
+                    return Err(ApiError::bad_request("not a seat name"));
+                }
+                crate::directory::check_text("harness", harness.as_deref(), 32)?;
+                // Cut when shown; refuse only what is far too long.
+                crate::directory::check_text("error", Some(error), 4000)?;
             }
         }
     }

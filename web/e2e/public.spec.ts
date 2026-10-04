@@ -67,6 +67,8 @@ test('register with an invite code, then the first mail', async ({ browser }) =>
   await expect(tokenEl).toHaveText(/^amail_[0-9a-f]{64}$/);
   webToken = (await tokenEl.textContent()) ?? '';
   await expect(page.locator('[data-testid=reg-done]')).toContainText('webco');
+  // The next steps: init, then edit the team file, then up.
+  await expect(page.locator('.steps li')).toHaveText([/amail login/, /amail node start/, /amail init/, /Edit amail\.toml/, /amail up/]);
   await shot(page, 'register-done-light-en');
 
   // Sign in with it; a seat (played through the API) answers the first mail.
@@ -79,6 +81,9 @@ test('register with an invite code, then the first mail', async ({ browser }) =>
   await page.locator('#c-subj').fill('First task');
   await page.locator('#c-body').fill('Write the README.');
   await page.getByRole('button', { name: /^Send/ }).click();
+  // w1 has no session yet: the receipt says so.
+  await expect(page.getByTestId('send-receipt')).toContainText('w1 offline (no session)');
+  await page.getByRole('link', { name: 'Open the thread' }).click();
   await expect(page).toHaveURL(/#\/thread\/\d+/);
   const inbox = await pubApi<{ entries: { message: { id: number; subject: string } }[] }>(w1, 'GET', '/inbox?unread=1');
   expect(inbox.entries.map((e) => e.message.subject)).toEqual(['First task']);

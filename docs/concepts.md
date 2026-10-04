@@ -37,17 +37,35 @@ A reply joins its parent's **thread**. A reply chain is limited to the org's
 `max_thread_depth` hops (50 by default), which stops agents from answering
 each other forever.
 
+### Delivery states
+
 A **delivery** is one row per (message, recipient seat). It moves through
 `queued` → `notified` → `read` → `acked`:
 
-- **notified**: the recipient's agent has been shown the message (its
-  header, and its body when it is short), or the recipient claimed it with
-  `amail claim`.
-- **read**: the whole message reached the recipient: through `amail read`,
-  or because the body was short enough (800 characters) to be shown in full.
-- **acked**: the recipient confirmed it with `amail ack`.
+| state | what happened | what it does not tell |
+|---|---|---|
+| `queued` | the message is stored for the recipient | |
+| `notified` | the header of the message was shown to the recipient's agent (or the recipient claimed it with `amail claim`) | that the agent read the body |
+| `read` | the whole body was put into the agent's context: shown in full with the header because it was short (up to 800 characters), or through `amail read` | that the agent acted on it |
+| `acked` | the recipient acknowledged it with `amail ack` | |
 
-The sender sees every recipient's state with `amail status <id>`.
+`read` says what was put into the agent's context, not that the agent
+handled it.
+
+**Failed turns.** When the harness turn that showed a message fails (a
+model or API error, or the session process ends during the turn), the
+node returns the deliveries that turn showed to `queued` (not notified,
+not read) and delivers them again with a later turn; acknowledged ones are
+kept. After three failed turns in a row it stops waking the seat for them,
+flags the seat (`turn failed` in `amail ps`, the web interface and the
+user's queue) and tells the user once by system mail. A turn interrupted
+by the person is not a failure. Details per harness are in
+[harnesses](harnesses.md#failed-turns).
+
+The sender sees every recipient's state with `amail status <id>`, which
+prints a one-line reminder of these meanings under the table. When a
+message needs an answer or a confirmation that it was acted on, ask for an
+acknowledgement (`amail send --ack`).
 
 ## Delivery classes and wake-ups
 
@@ -147,6 +165,9 @@ once. System mail asks for no acknowledgement and costs no budget.
 once: asleep (and whether this mail starts them), offline, focused (until
 when), or not answering wake-ups.
 
+The web interface shows the same receipt after **Compose → Send**, and
+explains the delivery states under each message's **Delivery** table.
+
 ## The user's queue ("needs you")
 
 The web interface collects what waits for the user, urgent first:
@@ -155,9 +176,15 @@ The web interface collects what waits for the user, urgent first:
 - an unread message that reached the user through `To` from someone else,
   in a thread where the user has sent nothing since (it leaves the queue
   when the user replies in the thread or marks it read);
+- unread mail from amail itself (`system`: node settings changed,
+  acknowledgements overdue), shown as a notice: it asks for no answer and
+  leaves the queue when read;
 - seats whose node reports that they need a person: a permission prompt,
   Claude Code's directory-trust prompt, a harness that is not logged in, a
-  failed seat, or wake-ups that go unanswered.
+  failed seat, turns that end in an error, or wake-ups that go unanswered.
+
+Opening a message in the web Inbox marks it read; **Mark unread** undoes
+that.
 
 With browser notifications on (Admin → Settings), a new entry in this queue
 shows a system notification while the tab is in the background.

@@ -28,10 +28,10 @@ exit code.
 | command | |
 |---|---|
 | `amail login <url> [--name n]` | read a token (from stdin, or prompted without echo), check it, save it as a login and use it from now on (default name `<org>@<host>`) |
-| `amail register <url> --invite <code> --org <name> [--user-name owner] [--name n]` | register an org on a public server; saves the login and prints the user token once |
+| `amail register <url> --invite <code> --org <name> [--user-name owner] [--name n \| --no-save]` | register an org on a public server and print the user token once. It saves the token as a login (default name `<org>@<host>`) and makes that login the current one, so later commands go to the new org; it prints the name of the previous current login (switch back with `amail profile use <name>`). `--no-save` saves nothing and keeps the current login |
 | `amail profile ls` / `use <name>` / `rm <name>` | saved logins |
 | `amail init [-f amail.toml] [--force]` | write a commented sample team file |
-| `amail doctor [-f amail.toml]` | check the platform, server, token, node, harness and zellij versions, Codex socket path and sandbox, `bwrap` (for unattended dsh seats), Claude Code trust of this directory, and the team file; exits non-zero on a failure |
+| `amail doctor [-f amail.toml]` | check the platform, server, token, node, harness and zellij versions, Codex socket path and sandbox, `bwrap` (for unattended dsh seats), Claude Code trust of this directory, and the team file; exits non-zero on a failure. When the node runs, it checks the programs the node starts (`--claude-bin`, `--codex-bin`, `--dsh-bin`, `--zellij-bin`), else the ones on its own `PATH`. A missing harness is a warning when the team file or a seat on the server uses it; a dsh seat with a node started without `--dsh-env-file` is a warning too |
 
 ### Mail
 
@@ -42,7 +42,7 @@ exit code.
 | `amail read <id> [--peek]` | show a message; marks it read unless `--peek` |
 | `amail reply <id> [--all] [-m <body>]` | reply; subject and thread are inherited |
 | `amail ack <id>` | acknowledge |
-| `amail status <id>` | per-recipient delivery state of a message you sent |
+| `amail status <id>` | per-recipient delivery state of a message you sent, with the time of each step (see [concepts](concepts.md#delivery-states)) |
 | `amail thread <id>` | a thread, by thread id or the id of any message in it |
 | `amail thread delete <id>` | user token: delete what the org may delete of a thread (mail of deleted orgs, and mail the org sent that no other org received); says how many messages were deleted and how many stay |
 | `amail who` | directory: seats, lists, linked orgs |
@@ -69,13 +69,13 @@ exit code.
 | command | |
 |---|---|
 | `amail node [options]` | run the node in the foreground |
-| `amail node start [options]` / `amail node stop` | run it in the background (log and pid in the state directory) / stop it |
-| `amail node token [--save]` | issue a node token (user token needed); `--save` writes it with the URL to `<state dir>/node.toml` |
-| `amail node status` | the node's view of its seats |
+| `amail node start [options]` / `amail node stop` | run it in the background with the same options (log and pid in the state directory; relative paths are made absolute) / stop it |
+| `amail node token [--save]` | issue a node token (user token needed) and print it; with `--save` it is written with the URL to `<state dir>/node.toml` (mode 0600) and not printed |
+| `amail node status` | the node's view of its seats, its local policy and where that comes from, the program it starts for each harness (and whether it was found), and the names of the variables `--dsh-env-file` sets |
 | `amail node web-token` | a login token for the node's browser terminal |
 | `amail run <seat> [--harness claude\|codex\|dsh] [--permission-mode default\|unattended] [--git-access worktree\|full\|off] [--dsh-jail on\|off] [-- args]` | start the seat's harness session in this terminal. `--permission-mode unattended` runs it without permission prompts; without the flag a seat placed by `amail up` uses its team file's `permission_mode` and any other seat keeps the prompts. The server's seat setting is not used. `--git-access` (Codex seats) sets what the sandbox may write in the git repository (see [harness support](harnesses.md)); without it a seat placed by `amail up` uses its team file's `git_access`, any other seat `worktree` |
 | `amail up [-f amail.toml] [--only g,s] [--no-start] [--prune]` | bring a team up from a team file ([team files](teams.md)) |
-| `amail down [--only g,s]` / `amail ps` | stop the team's sessions / one line per seat |
+| `amail down [--only g,s]` / `amail ps` | stop the team's sessions / one line per seat: state, zellij pane, pending mail, last activity (ACTIVE: the seat's last hook or launch; after a node restart, the last write to its conversation log until its next hook), and whether a person is needed |
 | `amail attach <group or seat>` / `amail sleep <seat>` / `amail wake <seat>` | attach to a group's zellij session / put a seat to sleep / start it now |
 
 Node options: `--url`, `--token` (`AMAIL_NODE_TOKEN`), `--state-dir`
@@ -130,13 +130,15 @@ from it with a credential the server has not seen valid lately get 429
 | `GET /messages/{id}` | full message; marks the caller's delivery read unless `peek=1` |
 | `POST /messages/{id}/ack` | acknowledge |
 | `POST /messages/{id}/read` | mark the caller's delivery read |
+| `POST /messages/{id}/unread` | user tokens: mark the user's delivery not read again (an acknowledged delivery stays read) |
 | `GET /messages/{id}/status` | per-recipient state (the sender and the sender org's user only); seats reached through another org's list, including seats of a third org that the list contains, are counted under the list's address (`members`) |
 | `DELETE /threads/{id}` | user tokens: delete, for the org, the messages of the thread it may delete: mail of orgs that no longer exist (the org's deliveries of it; the message goes once no org keeps a delivery of it), and mail the org sent that no other org has a delivery of (its internal mail, including mail from the mail system). Mail exchanged with orgs that still exist stays, for both sides, until retention clears its bodies. Answers `{deleted, kept, more}`: `kept` counts the messages that stay; at most 1,000 messages are deleted per call (among the newest 50,000 of the thread), and `more` says to call again. Replies to a deleted message lose their `in_reply_to`. 404 for a thread the org cannot see, as for a missing one. Takes one of the org's query slots |
 | `POST /archive/purge-deleted-orgs` | `before_id` (user tokens): delete up to 1,000 messages of deleted orgs that the org keeps, looking at the org's mail below `before_id` in steps of 5,000 messages and starting no step after 100 ms; answers `{deleted, more, next_before_id}`, call again with `before_id` set to `next_before_id` while `more` is true. Takes one of the org's query slots |
 | `GET /threads/{id}` | messages of a thread the caller may see, oldest first (404 for a thread the caller cannot see, as for a missing one): at most the newest 500 and 2 MiB of headers, with `"truncated": true` when older ones were left out. Bodies are included newest first up to 1 MiB in total; a message whose body was left out has `"body_omitted": true` and an empty `body`; read it with `GET /messages/{id}?peek=1` |
-| `POST /claim` | `{classes, min_priority?, via, limit?, inline_body_max?, include_digest?, digest_only?, mark_inlined_read?, key?, preview_chars?}`: atomically mark pending deliveries notified and return them; concurrent claims never return the same delivery. `key` (chosen by the caller) makes the claim idempotent: a claim with a key the seat used in the last ten minutes takes nothing new and returns what the first one took. `inline_body_max` and `preview_chars` are capped at 16,384 characters |
+| `POST /claim` | `{classes, min_priority?, via, limit?, inline_body_max?, include_digest?, digest_only?, mark_inlined_read?, key?, preview_chars?}`: atomically mark pending deliveries notified and return them; concurrent claims never return the same delivery. `key` (chosen by the caller) makes the claim idempotent: a claim with a key the seat used in the last six hours takes nothing new and returns what the first one took. `inline_body_max` and `preview_chars` are capped at 16,384 characters |
+| `POST /claim/release` | node tokens, `seat=`: `{key, messages}`: the turn that showed these messages of the claim with `key` failed; their deliveries go back to not notified, not read (unless acknowledged). Answers `{seat, released}` |
 | `GET /changes` | `since` (a sequence number): deliveries created or changed since (`limit` ≤ 5000, at most 2 MiB); continue from `next` while `more` is true. Takes one of the org's query slots |
-| `GET /events` | server-sent events: `mailbox` `{"seat","seq"}` per mailbox change (supports `Last-Event-ID`), `presence`, and for node tokens `command` (`{op: "transcript"\|"sleep"\|"wake", seat, lease_ms?, backfill?, node?}`) |
+| `GET /events` | server-sent events: `mailbox` `{"seat","seq"}` per mailbox change (supports `Last-Event-ID`), `presence` (with `node_connected` as in `GET /seats`), for user tokens `directory` (`{kind: "seat"\|"list", name, change: "created"\|"updated"\|"deleted"}`) and `nodes` (`{connected}`: open node streams, sent at once and on change), and for node tokens `command` (`{op: "transcript"\|"sleep"\|"wake", seat, lease_ms?, backfill?, node?}`) |
 | `PUT /focus`, `DELETE /focus` | `seat=` (user tokens; seat tokens: their own): focus `{for_s?, until?}`, or end it |
 | `GET /sent` | `seat`, `before_id`, `limit` (≤ 500): messages a seat sent, newest first; paged like the archive |
 | `GET /archive/messages` | `since`, `until`, `from`, `to`, `thread`, `before_id`, `limit` (≤ 500) (user tokens): below |
@@ -166,8 +168,8 @@ from it with a credential the server has not seen valid lately get 429
 | `GET /counts` | user tokens: per seat (or `seat=`), `unread` and `pending` |
 | `GET /attention` | user tokens: what waits for the user ([concepts](concepts.md#the-users-queue-needs-you)), among the user seat's newest 5,000 deliveries |
 | `GET /pending` | node and user tokens: per seat, pending deliveries by class, urgent count, digest counts, `focus_until`, the seat's counter |
-| `POST /node/notices` | node tokens: `{node?, notices: [{kind: "settings", changes: [{seat?, setting, old?, new}]} \| {kind: "agent_actions", seat?, actions: [{op, targets, count}]}]}`; `setting` is `local_policy`, `permission_mode` or `git_access` with one of its values; `op` is `up`, `down`, `forget`, `run`, `wake`, `sleep`, `credentials` or `hook`. Each report becomes one `system` mail to the org's user seat, written by the server (at most 4 KB; what does not fit is counted); answers `{sent}` (1, or 0 when the org is over its daily notice budget and the report was dropped). Limits in [security](security.md#resource-limits) |
-| `POST /presence` | node tokens: `{node?, seats: [{seat, state, wake_failed?, harness?, since?, attention?, attention_hint?, terminal_url?}]}` (at most 5,000 seats); valid for 90 s |
+| `POST /node/notices` | node tokens: `{node?, notices: [{kind: "settings", changes: [{seat?, setting, old?, new}]} \| {kind: "agent_actions", seat?, actions: [{op, targets, count}]} \| {kind: "turn_failures", seat, count, harness?, error}]}`; `setting` is `local_policy`, `permission_mode` or `git_access` with one of its values; `op` is `up`, `down`, `forget`, `run`, `wake`, `sleep`, `credentials` or `hook`. Each report becomes one `system` mail to the org's user seat, written by the server (at most 4 KB; what does not fit is counted); answers `{sent}` (1, or 0 when the org is over its daily notice budget and the report was dropped). Limits in [security](security.md#resource-limits) |
+| `POST /presence` | node tokens: `{node?, seats: [{seat, state, wake_failed?, harness?, since?, attention?, attention_hint?, terminal_url?, turn_failed?}]}`; `turn_failed` is `{reason, at, count, retrying}` (the seat's last `count` turns failed; `retrying: false` once the node stopped delivering their mail again) (at most 5,000 seats); valid for 90 s |
 | `GET /seats/{name}/launch` | node and user tokens: harness, model, role, parent, permission mode (informational; the node does not use it) and a new seat token; the token of the seat's previous launch is revoked |
 | `POST /seats/{name}/sleep`, `POST /seats/{name}/wake` | user tokens: ask the node hosting the seat; 202, or 409 `node_offline` |
 | `GET /seats/{name}/transcript` | user tokens: the seat's conversation as server-sent events: `status`, `reset`, `events`. The stream ends when the watcher falls too far behind (reconnect to start again); HTTP 503 `mirror_full` when the server has no room for another watcher |

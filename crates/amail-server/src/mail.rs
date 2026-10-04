@@ -415,6 +415,34 @@ pub async fn claim(
     }))
 }
 
+/// `POST /v1/claim/release` (node tokens): see [`p::ReleaseRequest`].
+pub async fn release(
+    State(st): State<AppState>,
+    auth: Auth,
+    Query(q): Query<SeatParam>,
+    Json(req): Json<p::ReleaseRequest>,
+) -> ApiResult<Json<p::ReleaseResponse>> {
+    if auth.scope != p::TokenScope::Node {
+        return Err(ApiError::forbidden("requires a node token"));
+    }
+    let seat = auth.mailbox(&st, q.seat.as_deref()).await?;
+    if req.key.is_empty() || req.key.len() > 100 {
+        return Err(ApiError::bad_request("key must be 1..=100 characters"));
+    }
+    if req.messages.len() > 500 {
+        return Err(ApiError::bad_request("at most 500 messages"));
+    }
+    let (released, bump) = st
+        .store
+        .release_claim(seat.id, &req.key, &req.messages)
+        .await?;
+    publish(&st, &seat.name, bump);
+    Ok(Json(p::ReleaseResponse {
+        seat: seat.name,
+        released,
+    }))
+}
+
 #[derive(Deserialize)]
 pub struct ChangesParams {
     seat: Option<String>,
@@ -532,18 +560,46 @@ pub async fn events(
             std::future::ready(out)
         });
     // Presence events have no id and are not replayed; a lagging presence
-    // receiver just skips what it missed.
+    // receiver just skips what it missed. `node_connected` is filled in as
+    // in `GET /v1/seats`.
+    let (nodes, org_id) = (st.nodes.clone(), auth.org.id);
     let presence = BroadcastStream::new(presence_rx).filter_map(move |r| {
         let out = match r {
-            Ok(e) if only2.as_deref().is_none_or(|o| o == e.seat) => Some(
-                Event::default()
-                    .event("presence")
-                    .data(serde_json::to_string(&e).unwrap_or_default()),
-            ),
+            Ok(mut e) if only2.as_deref().is_none_or(|o| o == e.seat) => {
+                e.presence.node_connected = nodes.connected(org_id) > 0;
+                Some(
+                    Event::default()
+                        .event("presence")
+                        .data(serde_json::to_string(&e).unwrap_or_default()),
+                )
+            }
             _ => None,
         };
         std::future::ready(out)
     });
+    // User tokens also get `directory` events (seats and lists changed) and
+    // `nodes` events (the number of connected nodes, now and on change).
+    let user_events = if auth.scope == TokenScope::User {
+        let dir = BroadcastStream::new(st.directory.subscribe(auth.org.id)).filter_map(|r| {
+            std::future::ready(r.ok().map(|d| {
+                Event::default()
+                    .event("directory")
+                    .data(serde_json::to_string(&d).unwrap_or_default())
+            }))
+        });
+        let nodes =
+            tokio_stream::wrappers::WatchStream::new(st.nodes.watch(auth.org.id)).map(|n| {
+                Event::default().event("nodes").data(
+                    serde_json::to_string(&p::NodesEvent {
+                        connected: n as u32,
+                    })
+                    .unwrap_or_default(),
+                )
+            });
+        stream::select(dir, nodes).boxed()
+    } else {
+        stream::empty().boxed()
+    };
     // Node tokens also get `command` events (sleep, wake, transcript leases);
     // while the stream is open the node counts as connected.
     let commands = if auth.scope == TokenScope::Node {
@@ -567,7 +623,7 @@ pub async fn events(
         .chain(live)
         .map(Some)
         .chain(stream::once(std::future::ready(None)));
-    let others = stream::select(presence, commands).map(Some);
+    let others = stream::select(stream::select(presence, commands), user_events).map(Some);
     let stream = stream::select(mailbox, others)
         .take_while(|e| std::future::ready(e.is_some()))
         .filter_map(std::future::ready)

@@ -55,10 +55,58 @@ pub struct Saved {
     /// [`crate::wire::CODEX_PASS_ENV`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_pass: Option<String>,
+    /// Seat -> what the node tracks of its turns (see [`TurnTrack`]).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub turns: BTreeMap<String, TurnTrack>,
+    /// Claims to release on the server (their turn failed), in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub releases: Vec<Release>,
     /// The settings the server last accepted a report of (see
     /// [`crate::node`]'s settings notices).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reported: Option<Reported>,
+}
+
+/// The mail a seat's current turn showed, and its failed turns.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnTrack {
+    /// Message id -> the key of the claim that took it, for mail claimed
+    /// for the seat and not yet settled (kept for a later hook, or shown
+    /// in the current turn).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub keys: BTreeMap<i64, String>,
+    /// Message ids shown in the current turn.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shown: Vec<i64>,
+    /// Failed turns in a row.
+    #[serde(default)]
+    pub failures: u32,
+    /// The last failure's reason and time (Unix ms).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_at: Option<i64>,
+    /// The person was told about this run of failures.
+    #[serde(default)]
+    pub noticed: bool,
+    /// After too many failures, the person woke the seat: its mail is
+    /// delivered again until the next failure.
+    #[serde(default)]
+    pub manual_retry: bool,
+}
+
+impl TurnTrack {
+    pub fn is_empty(&self) -> bool {
+        *self == TurnTrack::default()
+    }
+}
+
+/// Deliveries of one claim to release (see [`Saved::releases`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Release {
+    pub seat: String,
+    pub key: String,
+    pub messages: Vec<i64>,
 }
 
 /// Settings of a node as reported to the server.

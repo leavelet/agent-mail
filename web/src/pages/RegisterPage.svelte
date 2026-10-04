@@ -64,10 +64,14 @@
         <button class="primary" onclick={signIn}>{t('reg.signin')}</button>
       </div>
       <p class="muted">{t('reg.next')}</p>
-      <pre class="cmds">amail login {origin}          # paste the token
-amail seat add worker-1 --harness claude --model sonnet
-amail node token --save && amail node start
-amail init && amail up                  # or: amail run worker-1</pre>
+      <ol class="steps">
+        <li>{t('reg.step.login')}<pre class="cmds">amail login {origin}</pre></li>
+        <li>{t('reg.step.node')}<pre class="cmds">amail node token --save
+amail node start</pre></li>
+        <li>{t('reg.step.init')}<pre class="cmds">amail init</pre></li>
+        <li>{t('reg.step.edit')}</li>
+        <li>{t('reg.step.up')}<pre class="cmds">amail up</pre></li>
+      </ol>
     {:else if closed}
       <p class="error" role="alert">{t('reg.closed')}</p>
     {:else}
@@ -152,6 +156,16 @@ amail init && amail up                  # or: amail run worker-1</pre>
   }
   .warn {
     font-size: 13px;
+  }
+  .steps {
+    margin: 0;
+    padding-left: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .steps .cmds {
+    margin-top: 3px;
   }
   .cmds {
     margin: 0;

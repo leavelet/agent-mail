@@ -48,10 +48,13 @@ export async function requestPermission(): Promise<boolean> {
 }
 
 /** Title and body of the notification for an item. */
-export function describe(i: AttentionItem, t: (k: 'notify.ack' | 'notify.reply' | 'notify.seat', p?: Record<string, string>) => string): { title: string; body: string } {
+export function describe(
+  i: AttentionItem,
+  t: (k: 'notify.ack' | 'notify.reply' | 'notify.seat' | 'notify.notice', p?: Record<string, string>) => string,
+): { title: string; body: string } {
   if (i.kind === 'seat') return { title: t('notify.seat', { seat: i.seat ?? '' }), body: i.hint ?? i.attention ?? '' };
   const m = i.message;
-  const title = t(i.kind === 'ack' ? 'notify.ack' : 'notify.reply', { from: m?.from ?? '' });
+  const title = t(i.kind === 'ack' ? 'notify.ack' : i.kind === 'notice' ? 'notify.notice' : 'notify.reply', { from: m?.from ?? '' });
   return { title, body: m?.subject ?? '' };
 }
 
