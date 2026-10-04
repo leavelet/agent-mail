@@ -337,6 +337,8 @@ SELECT $1, $8, COALESCE((SELECT group_concat(id) FROM temp.claim_ids), ''), $9
 );
 
 const WRITER_CHECKPOINT_EVERY: Duration = Duration::from_secs(1);
+/// How long the writer's RESTART checkpoint waits for readers.
+const RESTART_WAIT: Duration = Duration::from_millis(100);
 
 /// Run a passive checkpoint four times a second while the store is alive.
 async fn checkpoint_loop(pool: SqlitePool, alive: mpsc::WeakSender<Job>) {
@@ -362,10 +364,17 @@ async fn writer_loop(mut conn: SqliteConnection, mut rx: mpsc::Receiver<Job>) {
         run_batch(&mut conn, &mut batch).await;
         if last_checkpoint.elapsed() >= WRITER_CHECKPOINT_EVERY {
             // RESTART waits for in-flight readers, then lets the next write
-            // start the WAL from the beginning.
+            // start the WAL from the beginning. It waits at most
+            // `RESTART_WAIT`, so that long reads following each other (one
+            // org's searches, say) do not hold up every write; the WAL is
+            // then reset at a later pass.
+            let _ = conn
+                .execute(format!("PRAGMA busy_timeout = {}", RESTART_WAIT.as_millis()).as_str())
+                .await;
             if let Err(e) = conn.execute("PRAGMA wal_checkpoint(RESTART)").await {
                 tracing::warn!("sqlite checkpoint failed: {e}");
             }
+            let _ = conn.execute("PRAGMA busy_timeout = 10000").await;
             last_checkpoint = std::time::Instant::now();
         }
     }
