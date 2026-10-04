@@ -92,7 +92,7 @@ The server stores only their SHA-256 hashes. Each token is shown once.
 |---|---|---|
 | `user` | `amail admin create-org`, registration, `amail token user`, rotation, `amail admin token reset` | everything in its org: seats, lists, tokens, links, settings, the whole archive, conversations; send and receive as the user seat |
 | `seat` | `amail seat token`, and the node when it starts a session | send and receive as its seat; read its mailbox and the threads it takes part in; read the org's directory |
-| `node` | `amail node token` (`amail token node`) | for any seat of its org: list and claim pending mail, read changes and events, report presence, fetch launch information (which issues a new seat token and revokes the seat's previous launch token), post conversation entries. It cannot send mail or read message bodies through `/v1/messages` |
+| `node` | `amail node token` (`amail token node`) | for any agent seat of its org (never the user seat): list and claim pending mail, read changes and events, report presence, fetch launch information (which issues a new seat token and revokes the seat's previous launch token), post conversation entries. It cannot send mail or read message bodies through `/v1/messages` |
 | `operator` | `amail admin operator-token create`, on the database only | the operator endpoints: statistics, suspend, resume and delete orgs. No mailbox, no mail, no conversations |
 
 - `amail token ls` lists an org's live tokens (never the secrets);

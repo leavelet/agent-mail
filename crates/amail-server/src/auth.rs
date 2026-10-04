@@ -16,7 +16,7 @@
 use crate::AppState;
 use crate::error::{ApiError, ApiResult};
 use crate::peer::Peer;
-use amail_proto::TokenScope;
+use amail_proto::{SeatKind, TokenScope};
 use amail_store::{Org, Seat};
 use axum::extract::FromRequestParts;
 use axum::http::header;
@@ -221,11 +221,21 @@ impl Auth {
             }
             TokenScope::Operator => Err(ApiError::forbidden("operator tokens have no mailbox")),
             TokenScope::User | TokenScope::Node => match seat {
-                Some(name) => state
-                    .store
-                    .seat_by_name(self.org.id, name)
-                    .await?
-                    .ok_or_else(|| ApiError::not_found(format!("no seat {name:?}"))),
+                Some(name) => {
+                    let seat = state
+                        .store
+                        .seat_by_name(self.org.id, name)
+                        .await?
+                        .ok_or_else(|| ApiError::not_found(format!("no seat {name:?}")))?;
+                    // Nodes host agent sessions only. The user's mail is read
+                    // by the user (CLI or web), never claimed by a node.
+                    if self.scope == TokenScope::Node && seat.kind != SeatKind::Agent {
+                        return Err(ApiError::forbidden(
+                            "node tokens can only access agent seats' mailboxes",
+                        ));
+                    }
+                    Ok(seat)
+                }
                 None if self.is_user() => Ok(self.mail_seat()?.clone()),
                 None => Err(ApiError::bad_request("node tokens must pass seat=<name>")),
             },

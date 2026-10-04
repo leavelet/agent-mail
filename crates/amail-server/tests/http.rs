@@ -63,6 +63,7 @@ http_tests!(
     sender_notes,
     digest_claims,
     claim_keys_http,
+    node_tokens_cannot_use_user_mailbox,
 );
 
 struct Server {
@@ -1464,8 +1465,10 @@ async fn pending_counts_http(srv: Server) {
         ])
     );
     // The user seat has no session: nodes do not see it; users do.
-    let v = node.ok(Method::GET, "/pending?seat=owner", None).await;
-    assert_eq!(v["seats"], json!([]));
+    assert_eq!(
+        node.get("/pending?seat=owner").await.0,
+        StatusCode::FORBIDDEN
+    );
     let v = user.ok(Method::GET, "/pending", None).await;
     assert_eq!(v["seats"].as_array().unwrap().len(), 3);
     // One seat; user tokens may ask too.
@@ -1835,13 +1838,12 @@ async fn message_meta(srv: Server) {
     assert_eq!(v["message"]["meta"], meta);
     let inbox = user.inbox("unread=1").await;
     assert_eq!(inbox[0]["message"]["meta"], meta);
+    let _b = user.seat("b").await;
+    a.send(json!({ "to": ["b"], "subject": "merge", "body": "please", "meta": meta }))
+        .await;
     let node = node_token(&user).await;
     let c = node
-        .ok(
-            Method::POST,
-            "/claim?seat=owner",
-            Some(json!({ "via": "t" })),
-        )
+        .ok(Method::POST, "/claim?seat=b", Some(json!({ "via": "t" })))
         .await;
     assert_eq!(c["entries"][0]["message"]["meta"], meta);
     // No meta: the field is omitted.
@@ -2392,4 +2394,40 @@ async fn claim_keys_http(srv: Server) {
         .0,
         StatusCode::BAD_REQUEST
     );
+}
+
+/// Node tokens act for agent seats only: they cannot read, claim or follow
+/// the user seat's mailbox.
+async fn node_tokens_cannot_use_user_mailbox(srv: Server) {
+    let user = srv.org("acme").await;
+    let _a = user.seat("a").await;
+    let node = node_token(&user).await;
+    let other = srv.org("bravo").await;
+    other.link(&user, "acme", "bravo").await;
+    other
+        .send(json!({ "to": ["owner@acme"], "subject": "for the user", "body": "SECRET-BODY" }))
+        .await;
+    for (method, path, body) in [
+        (
+            Method::POST,
+            "/claim?seat=owner",
+            Some(json!({ "via": "x", "inline_body_max": 100000 })),
+        ),
+        (Method::GET, "/inbox?seat=owner", None),
+        (Method::GET, "/changes?seat=owner", None),
+        (Method::GET, "/pending?seat=owner", None),
+        (Method::GET, "/events?seat=owner", None),
+        (Method::GET, "/attention?seat=owner", None),
+    ] {
+        let (s, v) = node.call(method.clone(), path, body).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{method} {path}: {v}");
+        assert!(!v.to_string().contains("SECRET-BODY"));
+    }
+    // The mail is still unread and unnotified for the user.
+    let e = user.inbox("").await;
+    assert_eq!(subjects(&e), ["for the user"]);
+    assert!(e[0]["delivery"]["notified_at"].is_null(), "{e:?}");
+    // Agent seats still work for nodes.
+    node.ok(Method::POST, "/claim?seat=a", Some(json!({ "via": "x" })))
+        .await;
 }
