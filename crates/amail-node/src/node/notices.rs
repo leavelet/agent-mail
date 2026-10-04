@@ -225,6 +225,10 @@ impl Node {
     /// Send what is due; keep it for the next try if the server does not
     /// take it.
     pub(super) async fn send_notices(&self) {
+        if !self.lock().connected {
+            // Kept until the server is reachable again.
+            return;
+        }
         let now = Instant::now();
         let (notices, settings, sessions) = {
             let mut st = self.lock();
