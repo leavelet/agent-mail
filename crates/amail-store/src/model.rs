@@ -500,6 +500,8 @@ pub struct MailDeleted {
     pub kept: i64,
     /// More could be deleted with another call.
     pub more: bool,
+    /// Purge: the `before` of the next call.
+    pub next_before_id: Option<i64>,
 }
 
 /// What [`crate::Store::operator_stats`] reports.

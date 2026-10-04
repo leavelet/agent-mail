@@ -3088,26 +3088,71 @@ macro_rules! impl_store_common {
                     if *kind == 1 { own.push(*id) } else { theirs.push(*id) }
                 }
                 let deleted = delete_mail(c, Some(org_id), &own, &theirs).await?;
-                Ok(Some(MailDeleted { deleted, kept, more }))
+                Ok(Some(MailDeleted { deleted, kept, more, next_before_id: None }))
             }
 
             /// Delete, for org `org_id`, up to `limit` messages of deleted
-            /// orgs that it keeps (see `delete_mail`).
-            pub async fn purge_deleted_org_mail(c: &mut Conn, org_id: i64, limit: i64) -> Result<MailDeleted> {
-                let ids: Vec<i64> = sqlx::query_scalar(
-                    "SELECT DISTINCT d.message_id FROM deliveries d \
-                     WHERE d.org_id = $1 AND d.message_id IN (SELECT m.id FROM messages m \
-                     WHERE m.org_id IN (SELECT id FROM orgs WHERE deleted_at IS NOT NULL)) \
-                     ORDER BY d.message_id LIMIT $2",
-                )
-                .bind(org_id)
-                .bind(limit.max(0) + 1)
-                .fetch_all(&mut *c)
-                .await?;
-                let more = ids.len() as i64 > limit;
-                let ids = &ids[..ids.len().min(limit.max(0) as usize)];
-                let deleted = delete_mail(c, Some(org_id), &[], ids).await?;
-                Ok(MailDeleted { deleted, kept: 0, more })
+            /// orgs that it keeps (see `delete_mail`), looking at the org's
+            /// deliveries below message id `before`, newest first, in steps
+            /// of [`STEP_MESSAGES`] messages, and starting no step after
+            /// `time_limit`. `next_before_id` is where to go on.
+            pub async fn purge_deleted_org_mail(
+                c: &mut Conn,
+                org_id: i64,
+                limit: i64,
+                before: Option<i64>,
+                time_limit: Option<std::time::Duration>,
+            ) -> Result<MailDeleted> {
+                let started = std::time::Instant::now();
+                let limit = limit.max(1);
+                let mut before = before.unwrap_or(i64::MAX);
+                let mut ids: Vec<i64> = Vec::new();
+                let mut next = None;
+                let mut first = true;
+                loop {
+                    if !first && time_limit.is_some_and(|t| started.elapsed() >= t) {
+                        next = Some(before);
+                        break;
+                    }
+                    first = false;
+                    let step: Vec<i64> = sqlx::query_scalar(
+                        "SELECT DISTINCT message_id FROM deliveries WHERE org_id = $1 AND message_id < $2 \
+                         ORDER BY message_id DESC LIMIT $3",
+                    )
+                    .bind(org_id)
+                    .bind(before)
+                    .bind(STEP_MESSAGES)
+                    .fetch_all(&mut *c)
+                    .await?;
+                    let Some(lowest) = step.last().copied() else { break };
+                    let sql = format!(
+                        "SELECT m.id FROM messages m JOIN orgs o ON o.id = m.org_id \
+                         WHERE o.deleted_at IS NOT NULL AND m.id IN ({}) ORDER BY m.id DESC",
+                        placeholders(1, step.len())
+                    );
+                    let mut q = sqlx::query_scalar::<_, i64>(&sql);
+                    for id in &step {
+                        q = q.bind(*id);
+                    }
+                    let found = q.fetch_all(&mut *c).await?;
+                    let room = (limit - ids.len() as i64) as usize;
+                    if found.len() > room {
+                        ids.extend(&found[..room]);
+                        next = ids.last().copied();
+                        break;
+                    }
+                    ids.extend(found);
+                    if (step.len() as i64) < STEP_MESSAGES {
+                        break;
+                    }
+                    before = lowest;
+                    if ids.len() as i64 == limit {
+                        next = Some(before);
+                        break;
+                    }
+                }
+                let deleted = delete_mail(c, Some(org_id), &[], &ids).await?;
+                Ok(MailDeleted { deleted, kept: 0, more: next.is_some(), next_before_id: next })
             }
 
             /// Retention: delete up to `limit` messages of deleted orgs
@@ -3919,8 +3964,14 @@ macro_rules! impl_store_common {
                 run!(self.write, |c| q::delete_thread(c, org_id, thread_id, limit).await)
             }
 
-            async fn purge_deleted_org_mail(&self, org_id: i64, limit: i64) -> $crate::Result<$crate::MailDeleted> {
-                run!(self.write, |c| q::purge_deleted_org_mail(c, org_id, limit).await)
+            async fn purge_deleted_org_mail(
+                &self,
+                org_id: i64,
+                limit: i64,
+                before: Option<i64>,
+                time_limit: Option<std::time::Duration>,
+            ) -> $crate::Result<$crate::MailDeleted> {
+                run!(self.write, |c| q::purge_deleted_org_mail(c, org_id, limit, before, time_limit).await)
             }
 
             async fn expire_deleted_org_mail(&self, cutoff: i64, limit: i64) -> $crate::Result<u64> {

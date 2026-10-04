@@ -405,8 +405,16 @@ pub trait Store: Send + Sync + 'static {
         thread_id: i64,
         limit: i64,
     ) -> Result<Option<MailDeleted>>;
-    /// Delete, for the org, up to `limit` messages of deleted orgs it keeps.
-    async fn purge_deleted_org_mail(&self, org_id: i64, limit: i64) -> Result<MailDeleted>;
+    /// Delete, for the org, up to `limit` messages of deleted orgs it keeps,
+    /// looking below message id `before` and starting no step of the walk
+    /// after `time_limit` (`MailDeleted::next_before_id` continues).
+    async fn purge_deleted_org_mail(
+        &self,
+        org_id: i64,
+        limit: i64,
+        before: Option<i64>,
+        time_limit: Option<std::time::Duration>,
+    ) -> Result<MailDeleted>;
     /// Retention: delete up to `limit` messages of deleted orgs created
     /// before `cutoff`, with all their deliveries; returns how many.
     async fn expire_deleted_org_mail(&self, cutoff: i64, limit: i64) -> Result<u64>;

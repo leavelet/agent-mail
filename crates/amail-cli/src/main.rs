@@ -1493,15 +1493,17 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Org(OrgCmd::PurgeDeletedOrgs) => {
             let mut deleted = 0;
+            let mut path = "/archive/purge-deleted-orgs".to_string();
             loop {
-                let r: p::DeleteMailResponse = parse(
-                    &c.raw(Method::POST, "/archive/purge-deleted-orgs", None)
-                        .await?,
-                )?;
+                let r: p::DeleteMailResponse = parse(&c.raw(Method::POST, &path, None).await?)?;
                 deleted += r.deleted;
                 if !r.more {
                     break;
                 }
+                path = match r.next_before_id {
+                    Some(id) => format!("/archive/purge-deleted-orgs?before_id={id}"),
+                    None => "/archive/purge-deleted-orgs".to_string(),
+                };
             }
             out.show(&json!({ "deleted": deleted }), || {
                 Ok(format!("deleted {deleted} messages of deleted orgs"))

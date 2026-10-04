@@ -594,6 +594,9 @@ pub struct DeleteMailResponse {
     /// More can be deleted: call again.
     #[serde(default)]
     pub more: bool,
+    /// Purge: pass as `before_id` to the next call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_before_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -4,7 +4,7 @@
 
 use crate::AppState;
 use crate::auth::Auth;
-use crate::error::{ApiError, ApiResult, Json, Path};
+use crate::error::{ApiError, ApiResult, Json, Path, Query};
 use crate::limits::Pool;
 use crate::mail::limited;
 use amail_proto::limits::MAX_DELETE_MESSAGES;
@@ -16,6 +16,7 @@ fn response(d: amail_store::MailDeleted) -> p::DeleteMailResponse {
         deleted: d.deleted,
         kept: d.kept,
         more: d.more,
+        next_before_id: d.next_before_id,
     }
 }
 
@@ -49,18 +50,31 @@ pub async fn delete_thread(
     Ok(Json(response(done)))
 }
 
+#[derive(serde::Deserialize)]
+pub struct PurgeParams {
+    before_id: Option<i64>,
+}
+
 /// `POST /v1/archive/purge-deleted-orgs` (user tokens): delete up to
-/// `MAX_DELETE_MESSAGES` messages of deleted orgs that the org keeps.
+/// `MAX_DELETE_MESSAGES` messages of deleted orgs that the org keeps,
+/// looking at its mail below `before_id` for a bounded time (as a search
+/// does); `next_before_id` continues.
 pub async fn purge_deleted_orgs(
     State(st): State<AppState>,
     auth: Auth,
+    Query(q): Query<PurgeParams>,
 ) -> ApiResult<Json<p::DeleteMailResponse>> {
     auth.require_user()?;
     let store = st.store.clone();
     let org_id = auth.org.id;
     let done = limited(&st, &auth, Pool::Other, async move {
         Ok(store
-            .purge_deleted_org_mail(org_id, MAX_DELETE_MESSAGES)
+            .purge_deleted_org_mail(
+                org_id,
+                MAX_DELETE_MESSAGES,
+                q.before_id,
+                Some(crate::mail::SCAN_TIME_LIMIT),
+            )
             .await?)
     })
     .await?;

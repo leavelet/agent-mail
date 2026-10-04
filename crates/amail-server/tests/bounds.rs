@@ -50,6 +50,7 @@ bound_tests!(
     deleted_org_mail_is_charged_to_receivers,
     claim_loads_bounded_bodies,
     deleted_org_mail_does_not_block_sending,
+    purge_walk_is_bounded,
     user_deletes_threads,
     user_purges_deleted_org_mail,
     retention_deletes_deleted_org_mail,
@@ -1616,11 +1617,17 @@ async fn user_purges_deleted_org_mail(b: Backend, t: &str) {
 
     // One at a time from the store; the rest through the API.
     let id = srv.db.store.org_by_name("acme").await.unwrap().unwrap().id;
-    let d = srv.db.store.purge_deleted_org_mail(id, 1).await.unwrap();
-    assert_eq!((d.deleted, d.more), (1, true));
+    let d = srv
+        .db
+        .store
+        .purge_deleted_org_mail(id, 1, None, None)
+        .await
+        .unwrap();
+    assert_eq!((d.deleted, d.more, d.next_before_id), (1, true, Some(m2)));
+    // Newest first: the second message went.
     assert_eq!(
         bytes(&acme).await,
-        (stored, charge("two", 2, "", &["owner@acme"], &[], 1))
+        (stored, charge("one", 1, "", &to1, &[], 1))
     );
     counts_consistent(&srv, "one purged").await;
     let v = acme
@@ -1731,7 +1738,19 @@ async fn deletion_alongside_sends(b: Backend, t: &str) {
     let store = srv.db.store.clone();
     let purge = |org: i64| {
         let store = store.clone();
-        async move { while store.purge_deleted_org_mail(org, 3).await.unwrap().more {} }
+        async move {
+            let mut before = None;
+            loop {
+                let d = store
+                    .purge_deleted_org_mail(org, 3, before, None)
+                    .await
+                    .unwrap();
+                if !d.more {
+                    break;
+                }
+                before = d.next_before_id;
+            }
+        }
     };
     let sends = |from: Client, to: &'static str| async move {
         for i in 0..20 {
@@ -1870,4 +1889,51 @@ async fn failed_authentication_is_limited_per_address(b: Backend, t: &str) {
         from(&new_token(), "2001:db8:1:3::1").await,
         StatusCode::UNAUTHORIZED
     );
+}
+
+/// A purge looks at the org's deliveries in steps and starts no step after
+/// its time limit (as a search does), so that one request holds its query
+/// slot for a bounded time: with a limit of zero, each call looks at one
+/// step of 5,000 delivered messages and answers with a cursor.
+async fn purge_walk_is_bounded(b: Backend, t: &str) {
+    let srv = start!(b, t, public());
+    let vic = srv.org("vic").await;
+    let att = srv.org("att").await;
+    att.link(&vic, "vic", "att").await;
+    att.send(json!({ "to": ["owner@vic"], "subject": "old", "body": "x" }))
+        .await;
+    att.ok(Method::DELETE, "/org", Some(json!({ "confirm": "att" })))
+        .await;
+    // 12,000 newer messages delivered to vic's user.
+    let o = srv.db.store.org_by_name("vic").await.unwrap().unwrap();
+    let user = srv.db.store.user_seat(o.id).await.unwrap().unwrap();
+    srv.db.fill_messages(o.id, user.id, 12_000, "filler").await;
+    srv.db
+        .exec(&[format!(
+            "INSERT INTO deliveries (org_id, message_id, seat_id, class, mode, seq, mod_seq, read_at, notified_at) \
+             SELECT {org}, m.id, {seat}, 'to', 'immediate', 1000 + m.id, 1000 + m.id, 1, 1 \
+             FROM messages m WHERE m.org_id = {org} AND m.subject LIKE 'filler %'",
+            org = o.id,
+            seat = user.id
+        )])
+        .await;
+    let mut before = None;
+    let mut calls = 0;
+    let mut deleted = 0;
+    loop {
+        let d = srv
+            .db
+            .store
+            .purge_deleted_org_mail(o.id, 1000, before, Some(Duration::ZERO))
+            .await
+            .unwrap();
+        calls += 1;
+        deleted += d.deleted;
+        if !d.more {
+            break;
+        }
+        before = d.next_before_id;
+    }
+    assert_eq!((calls, deleted), (3, 1));
+    assert_eq!(vic.get("/org").await.1["kept_bytes"], 0);
 }
