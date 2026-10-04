@@ -236,8 +236,17 @@ impl Node {
                     Some(w) => {
                         let harness = Harness::parse(&w.harness).unwrap_or(Harness::Claude);
                         let path = w.path.clone();
+                        let base = w.base.clone().unwrap_or_default();
                         let opened = tokio::task::spawn_blocking(move || {
-                            Tail::open(std::path::Path::new(&path), harness, backfill)
+                            let p = std::path::Path::new(&path);
+                            // Checked again: links may have changed.
+                            if !crate::transcript::path_under(p, std::path::Path::new(&base)) {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::PermissionDenied,
+                                    "outside the harness's transcript directory",
+                                ));
+                            }
+                            Tail::open(p, harness, backfill)
                         })
                         .await;
                         match opened {

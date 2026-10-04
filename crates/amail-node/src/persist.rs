@@ -83,6 +83,10 @@ pub struct TranscriptRef {
     pub path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// The harness's transcript directory the path was accepted under
+    /// (checked again when the file is opened).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
 }
 
 /// A supervised seat: where it runs and what the supervisor knows about it.

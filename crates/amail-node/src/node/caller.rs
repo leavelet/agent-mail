@@ -83,6 +83,15 @@ fn environ_has(pid: u32, entry: &[u8]) -> bool {
         .unwrap_or(false)
 }
 
+/// The value of `name` in the environment `pid` started with.
+pub fn environ_var(pid: u32, name: &str) -> Option<String> {
+    let env = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let key = format!("{name}=");
+    env.split(|b| *b == 0)
+        .find_map(|kv| kv.strip_prefix(key.as_bytes()))
+        .map(|v| String::from_utf8_lossy(v).into_owned())
+}
+
 /// Compare two secrets in time that depends only on their lengths.
 pub fn same_secret(a: &str, b: &str) -> bool {
     a.len() == b.len()

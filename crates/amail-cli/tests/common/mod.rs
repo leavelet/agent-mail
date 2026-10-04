@@ -285,6 +285,8 @@ impl Harness {
         cfg.restart_backoff = Duration::from_millis(200);
         cfg.resume_grace = Duration::from_secs(3);
         cfg.check_callers = opts.check_callers.unwrap_or(opts.supervise);
+        // Claude Code transcripts are followed only under `projects` here.
+        cfg.claude_config_dir = dir.path().join("claude");
         let fake_dir = dir.path().join("fake");
         let mut mux = None;
         if opts.supervise {

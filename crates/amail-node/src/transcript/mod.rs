@@ -24,6 +24,47 @@ pub const MAX_TOOL_CHARS: usize = 4000;
 /// Longest `text` / `notice` text kept, in characters.
 pub const MAX_TEXT_CHARS: usize = 16000;
 
+/// `path` with symbolic links resolved: its nearest existing parent,
+/// resolved, with the components that do not exist yet appended.
+fn resolve(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut rest = Vec::new();
+    let mut p = path;
+    loop {
+        match p.canonicalize() {
+            Ok(mut c) => {
+                c.extend(rest.iter().rev());
+                return Some(c);
+            }
+            Err(_) => {
+                rest.push(p.file_name()?);
+                p = p.parent()?;
+            }
+        }
+    }
+}
+
+/// Whether `path` names a `.jsonl` file below the directory `base`: an
+/// absolute path without `.` or `..` components that lies under `base`
+/// once symbolic links are resolved in both (a file or directory that does
+/// not exist yet counts by its name). The node follows only transcripts in
+/// the directories where the harnesses write them.
+pub fn path_under(path: &std::path::Path, base: &std::path::Path) -> bool {
+    use std::path::Component;
+    let plain = |p: &std::path::Path| {
+        p.is_absolute()
+            && !p
+                .components()
+                .any(|c| matches!(c, Component::CurDir | Component::ParentDir))
+    };
+    if !plain(path) || !plain(base) || path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+        return false;
+    }
+    match (resolve(path), resolve(base)) {
+        (Some(p), Some(b)) => p.starts_with(&b) && p != b,
+        _ => false,
+    }
+}
+
 /// Counters of one parser.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ParseStats {
@@ -152,6 +193,35 @@ impl ToolNames {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn transcript_paths() {
+        let d = tempfile::tempdir().unwrap();
+        let base = d.path().join("projects");
+        std::fs::create_dir_all(base.join("p")).unwrap();
+        std::fs::write(base.join("p/s.jsonl"), "").unwrap();
+        std::fs::write(d.path().join("outside.jsonl"), "").unwrap();
+        std::os::unix::fs::symlink(d.path().join("outside.jsonl"), base.join("p/link.jsonl"))
+            .unwrap();
+        std::os::unix::fs::symlink(d.path(), base.join("up")).unwrap();
+        let ok = |p: std::path::PathBuf| super::path_under(&p, &base);
+        assert!(ok(base.join("p/s.jsonl")));
+        // Not written yet, also in a directory not made yet.
+        assert!(ok(base.join("p/new.jsonl")));
+        assert!(ok(base.join("q/r/new.jsonl")));
+        assert!(!ok(d.path().join("outside.jsonl")));
+        assert!(!ok(base.join("p/link.jsonl")));
+        assert!(!ok(base.join("up/outside.jsonl")));
+        assert!(!ok(base.join("up/x/new.jsonl")));
+        assert!(!ok(base.join("p/../../outside.jsonl")));
+        assert!(!ok(base.join("p/s.txt")));
+        assert!(!ok(std::path::PathBuf::from("projects/p/s.jsonl")));
+        assert!(!ok(std::path::PathBuf::from("/etc/passwd")));
+        // A transcript directory that does not exist yet.
+        let missing = d.path().join("missing");
+        assert!(super::path_under(&missing.join("a/s.jsonl"), &missing));
+        assert!(!super::path_under(&base.join("p/s.jsonl"), &missing));
+    }
+
     use super::*;
 
     #[test]

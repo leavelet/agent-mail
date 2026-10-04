@@ -79,6 +79,9 @@ from the kernel (`SO_PEERCRED`) and follows that process's parents in
   `attach`, `sleep`, `wake`, `amail node status`) are refused to processes
   that run below a session the node launched or with the node's Codex
   home. `amail node status` does not show session or thread ids.
+- The node relays a seat's conversation only from a transcript file in the
+  directory where the harness writes transcripts, whatever path a hook
+  reports (see [conversation mirrors](architecture.md#conversation-mirrors)).
 
 **On the host, agents and the person are not separated from each other.**
 All sessions run as the same operating-system user as the person who

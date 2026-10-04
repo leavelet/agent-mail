@@ -48,6 +48,7 @@ node_tests!(
     digest_at_natural_points,
     lost_claim_answer_is_recovered,
     socket_checks_callers,
+    transcript_paths_are_checked,
 );
 
 use amail_store::testutil::Backend;
@@ -1247,7 +1248,9 @@ async fn transcript_mirror_follows_file(b: Backend) {
     h.seat("w1", "claude").await;
     let inbox = FakeInbox::start(h.dir.path().join("cc.sock"), None);
     let env = claude_env("w1", &inbox.path);
-    let file = h.dir.path().join("session-1.jsonl");
+    let projects = h.dir.path().join("claude/projects/p");
+    std::fs::create_dir_all(&projects).unwrap();
+    let file = projects.join("session-1.jsonl");
     let user = |t: &str| {
         claude_line(json!({"type": "user", "timestamp": "2026-10-04T10:00:00Z",
         "message": {"role": "user", "content": t}}))
@@ -1305,7 +1308,7 @@ async fn transcript_mirror_follows_file(b: Backend) {
     assert_eq!(st["mirrors"], json!(["w1"]));
 
     // A new session (another transcript file): reset, then its backfill.
-    let file2 = h.dir.path().join("session-2.jsonl");
+    let file2 = projects.join("session-2.jsonl");
     append(&file2, &user("Second session."));
     h.hook(
         "claude",
@@ -1611,6 +1614,8 @@ async fn socket_checks_callers(b: Backend) {
         .current_dir(&work)
         .env("FAKE_AMAIL", BIN)
         .env("AMAIL_HOOK_TIMEOUT_MS", "5000")
+        // Its own Claude Code configuration directory (not the node's).
+        .env("CLAUDE_CONFIG_DIR", h.dir.path().join("cc2"))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -1678,6 +1683,9 @@ async fn socket_checks_callers(b: Backend) {
 
     // Inside w1's session, as an agent's tool command would.
     std::fs::write(h.dir.path().join("up.json"), up.to_string()).unwrap();
+    let own = h.dir.path().join("cc2/projects/p/s.jsonl");
+    let with_transcript = with(up.clone(), &[("transcript_path", json!(own))]);
+    std::fs::write(h.dir.path().join("upt.json"), with_transcript.to_string()).unwrap();
     let script = format!(
         r#"B="$FAKE_AMAIL"
 cd '{dir}'
@@ -1688,6 +1696,7 @@ timeout 10 "$B" node status; echo "status-exit=$?"
 timeout 10 "$B" ps; echo "ps-exit=$?"
 AMAIL_SEAT=w2 "$B" hook claude < up.json > w2.out; echo "w2-hook-bytes=$(wc -c < w2.out)"
 "$B" hook claude < up.json > w1.out; echo "w1-hook-bytes=$(wc -c < w1.out)"
+"$B" hook claude < upt.json > /dev/null
 env -u AMAIL_TOKEN CODEX_THREAD_ID={tid} AMAIL_CODEX_PASS={pass} timeout 10 "$B" inbox; echo "codex-cred-exit=$?"
 "#,
         dir = h.dir.path().display(),
@@ -1718,6 +1727,15 @@ env -u AMAIL_TOKEN CODEX_THREAD_ID={tid} AMAIL_CODEX_PASS={pass} timeout 10 "$B"
         serde_json::from_str(&std::fs::read_to_string(h.dir.path().join("w1.out")).unwrap())
             .unwrap();
     assert_eq!(injected_ids(&hook_text(&w1_out).unwrap()), vec![m1]);
+
+    // The session's transcript lies under its own Claude Code configuration
+    // directory, which the node read from the session's environment.
+    let state = h.dir.path().join("state/node-state.json");
+    h.wait("w1's transcript is saved", || async {
+        let saved: Value = serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+        saved["transcripts"]["w1"]["path"] == json!(own)
+    })
+    .await;
 
     // Outside the sessions: Codex credentials need the pass.
     let req = |pass: Option<String>| amail_node::wire::Request::Credentials {
@@ -1767,7 +1785,6 @@ env -u AMAIL_TOKEN CODEX_THREAD_ID={tid} AMAIL_CODEX_PASS={pass} timeout 10 "$B"
     )
     .await;
     assert!(plan["env"]["AMAIL_TOKEN"].is_string(), "{plan}");
-    let state = h.dir.path().join("state/node-state.json");
     h.wait("the launch is saved", || async {
         let saved: Value = serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
         saved["roots"]["w2"]["pid"] == std::process::id()
@@ -1788,4 +1805,96 @@ env -u AMAIL_TOKEN CODEX_THREAD_ID={tid} AMAIL_CODEX_PASS={pass} timeout 10 "$B"
     session.wait().ok();
     stand_in.kill().ok();
     stand_in.wait().ok();
+}
+
+/// The node follows a transcript only where the harness writes them: for
+/// Claude Code under `projects` of its configuration directory, for Codex
+/// under the dedicated home's `sessions`. Other paths in hooks are ignored.
+async fn transcript_paths_are_checked(b: Backend) {
+    let Some(h) = setup(b, "transcript_paths_are_checked", Opts::default()).await else {
+        return;
+    };
+    h.seat("w1", "claude").await;
+    h.seat("w2", "claude").await;
+    h.seat("cx", "codex").await;
+    let d = h.dir.path();
+    let projects = d.join("claude/projects");
+    std::fs::create_dir_all(projects.join("p")).unwrap();
+    let outside = d.join("outside.jsonl");
+    std::fs::write(&outside, "{}\n").unwrap();
+    std::os::unix::fs::symlink(&outside, projects.join("p/link.jsonl")).unwrap();
+    let claude_hook = |seat: &str, path: &std::path::Path| {
+        let env = vec![("AMAIL_SEAT".to_string(), seat.to_string())];
+        let input = with(
+            claude("UserPromptSubmit"),
+            &[("transcript_path", json!(path))],
+        );
+        h.hook("claude", env, input)
+    };
+    for bad in [
+        outside.clone(),
+        projects.join("p/link.jsonl"),
+        projects.join("p/../../outside.jsonl"),
+        std::path::PathBuf::from("/etc/passwd"),
+    ] {
+        claude_hook("w1", &bad).await;
+    }
+    let good = projects.join("p/s.jsonl");
+    claude_hook("w2", &good).await;
+
+    // A Codex session (registered by its marker) reports its rollout file.
+    let stand_in = d.join("work");
+    std::fs::create_dir_all(&stand_in).unwrap();
+    let plan = h
+        .node
+        .as_ref()
+        .unwrap()
+        .node
+        .handle(amail_node::wire::Request::Launch {
+            seat: "cx".into(),
+            cwd: stand_in.to_string_lossy().into(),
+            pid: std::process::id(),
+            harness: None,
+            extra: vec![],
+            pane: None,
+            mux_session: None,
+        })
+        .await;
+    let prompt = plan["args"].as_array().unwrap().last().unwrap().clone();
+    let tid = "00000000-0000-7000-8000-0000000000c2";
+    let rollout = d.join("state/codex-home/sessions/2026/10/04/rollout-x.jsonl");
+    let first = with(
+        codex("UserPromptSubmit"),
+        &[
+            ("session_id", json!(tid)),
+            ("prompt", prompt),
+            ("transcript_path", json!(rollout)),
+        ],
+    );
+    h.hook("codex", vec![], first).await;
+    // A Codex hook naming a Claude Code transcript is ignored.
+    let other = with(
+        codex("PostToolUse"),
+        &[("session_id", json!(tid)), ("transcript_path", json!(good))],
+    );
+    h.hook("codex", vec![], other).await;
+
+    let state = d.join("state/node-state.json");
+    h.wait("the transcripts are saved", || async {
+        let saved: Value =
+            serde_json::from_str(&std::fs::read_to_string(&state).unwrap_or_default())
+                .unwrap_or(Value::Null);
+        saved["transcripts"]["w2"]["path"] == json!(good)
+            && saved["transcripts"]["cx"]["path"] == json!(rollout)
+    })
+    .await;
+    // Give a late write the chance to show up, then look again.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let saved: Value = serde_json::from_str(&std::fs::read_to_string(&state).unwrap()).unwrap();
+    assert!(
+        saved["transcripts"]["w1"].is_null(),
+        "{}",
+        saved["transcripts"]
+    );
+    assert_eq!(saved["transcripts"]["cx"]["path"], json!(rollout));
 }

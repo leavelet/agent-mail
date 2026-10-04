@@ -181,7 +181,11 @@ A seat's page in the web interface shows its live conversation, read-only.
 The browser asks the server, the server asks (through the node's event
 stream) the node that hosts the seat, and the node reads the session's
 transcript file (Claude Code JSONL or a Codex rollout), sends the last 200
-entries and then follows the file. The node stops 30 seconds after the last
+entries and then follows the file. The node takes the file's path from the
+session's hooks and accepts only paths where the harness writes
+transcripts: `projects/` of the Claude Code configuration directory
+(`CLAUDE_CONFIG_DIR` of the session or of the node, else `~/.claude`), or
+`sessions/` of the node's Codex home. The node stops 30 seconds after the last
 browser left. Mail injected by the system is shown apart from what a person
 typed. The server keeps at most the last 1,000 entries (4 MiB) of a watched
 seat in memory and nothing once nobody watches; only user tokens can watch.

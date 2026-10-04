@@ -108,6 +108,11 @@ pub struct Config {
     /// that drive the socket from processes the node did not launch turn
     /// this off.
     pub check_callers: bool,
+    /// Claude Code's configuration directory as the node sees it
+    /// (`$CLAUDE_CONFIG_DIR`, else `~/.claude`). Claude Code transcripts are
+    /// followed only under its `projects` directory, or under that of the
+    /// directory the session was started with.
+    pub claude_config_dir: PathBuf,
 }
 
 /// The node's browser terminal: a `zellij web` server of its own (on its
@@ -157,6 +162,10 @@ impl Config {
             web_terminal: None,
             digest_every: None,
             check_callers: true,
+            claude_config_dir: std::env::var_os("CLAUDE_CONFIG_DIR")
+                .filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| crate::paths::home().join(".claude")),
         }
     }
 }
@@ -598,6 +607,23 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
             p
         }
     };
+    // Transcripts recorded before paths were checked: keep those in the
+    // default transcript directories.
+    let defaults = [
+        cfg.claude_config_dir.join("projects"),
+        crate::adapter::codex::home_in(&cfg.state_dir).join("sessions"),
+    ];
+    st.saved.transcripts.retain(|_, t| {
+        if t.base.is_some() {
+            return true;
+        }
+        t.base = defaults
+            .iter()
+            .find(|b| crate::transcript::path_under(std::path::Path::new(&t.path), b))
+            .map(|b| b.to_string_lossy().into_owned());
+        st.save_dirty = true;
+        t.base.is_some()
+    });
     // Sessions that ended while the node was down.
     let before = st.saved.roots.len();
     st.saved.roots.retain(|_, r| alive(r.pid, r.pid_start));
@@ -1101,6 +1127,66 @@ impl Node {
         Some((seat, true))
     }
 
+    /// Directories where the harness writes `seat`'s transcripts: for
+    /// Codex the dedicated home's `sessions`; for Claude Code `projects` of
+    /// the configuration directory the seat's session was started with
+    /// (from its environment) and of the node's.
+    fn transcript_bases(&self, h: Harness, seat: &str) -> Vec<PathBuf> {
+        match h {
+            Harness::Codex => {
+                vec![crate::adapter::codex::home_in(&self.cfg.state_dir).join("sessions")]
+            }
+            Harness::Claude => {
+                let mut v = vec![self.cfg.claude_config_dir.join("projects")];
+                let root = self.lock().saved.roots.get(seat).cloned();
+                if let Some(r) = root.filter(|r| alive(r.pid, r.pid_start)) {
+                    let dir = caller::environ_var(r.pid, "CLAUDE_CONFIG_DIR")
+                        .filter(|d| !d.is_empty())
+                        .map(PathBuf::from)
+                        .or_else(|| {
+                            caller::environ_var(r.pid, "HOME")
+                                .map(|h| PathBuf::from(h).join(".claude"))
+                        });
+                    if let Some(d) = dir {
+                        v.push(d.join("projects"));
+                    }
+                }
+                v
+            }
+        }
+    }
+
+    /// `(path, base)` if a hook's transcript path lies in a directory where
+    /// the harness writes `seat`'s transcripts.
+    fn accept_transcript(&self, h: Harness, seat: &str, path: &str) -> Option<(String, String)> {
+        let known = self
+            .lock()
+            .saved
+            .transcripts
+            .get(seat)
+            .filter(|t| t.path == path && t.harness == h.as_str())
+            .and_then(|t| t.base.clone());
+        if let Some(base) = known {
+            return Some((path.to_string(), base));
+        }
+        let p = std::path::Path::new(path);
+        match self
+            .transcript_bases(h, seat)
+            .into_iter()
+            .find(|b| crate::transcript::path_under(p, b))
+        {
+            Some(b) => Some((path.to_string(), b.to_string_lossy().into_owned())),
+            None => {
+                tracing::warn!(
+                    "seat {seat}: ignoring transcript path {path:?}, which is outside the \
+                     directories where {} writes transcripts",
+                    h.as_str()
+                );
+                None
+            }
+        }
+    }
+
     /// Run the state machine for one hook; returns the answer and the
     /// claimed mail it shows.
     async fn run_hook(
@@ -1114,6 +1200,10 @@ impl Node {
     ) -> (Output, Vec<InboxEntry>) {
         let hint = adapter.session_hint(env, hook);
         let cap = self.cfg.stop_block_cap;
+        let transcript = hook
+            .transcript_path
+            .as_deref()
+            .and_then(|p| self.accept_transcript(adapter.harness(), seat, p));
         // 1. State transition and plan, under the lock.
         let plan = {
             let mut st = self.lock();
@@ -1162,11 +1252,12 @@ impl Node {
                     sess.target = hint.wake_target.clone();
                 }
             }
-            if let Some(path) = &hook.transcript_path {
+            if let Some((path, base)) = transcript {
                 let r = crate::persist::TranscriptRef {
                     harness: adapter.harness().as_str().to_string(),
-                    path: path.clone(),
+                    path,
                     session_id: hook.session_id.clone(),
+                    base: Some(base),
                 };
                 if st.saved.transcripts.get(seat) != Some(&r) {
                     st.saved.transcripts.insert(seat.to_string(), r);
