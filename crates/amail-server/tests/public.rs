@@ -716,6 +716,23 @@ async fn stream_request_and_link_limits(b: Backend, t: &str) {
     assert_eq!(s3, StatusCode::TOO_MANY_REQUESTS);
     // Other orgs are not affected.
     assert_eq!(beta.stream("/events").await.0, StatusCode::OK);
+    // A client that goes away gives its place back: beta's second stream
+    // is closed by the client, and a new one opens.
+    let open = || {
+        common::open_stream(
+            common::stream_client()
+                .get(format!("{}/v1/events", srv.base))
+                .bearer_auth(&beta.token),
+        )
+    };
+    let second = open().await;
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(open().await.status(), StatusCode::TOO_MANY_REQUESTS);
+    drop(second);
+    eventually("a closed stream gives its place back", async || {
+        open().await.status() == StatusCode::OK
+    })
+    .await;
 
     // Requests per token: the burst, then 429. (The bucket refills at 5 a
     // second while the requests run, so under load more than ten may pass
