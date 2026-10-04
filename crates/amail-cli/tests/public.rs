@@ -604,11 +604,21 @@ fn node_start_and_stop() {
         None,
     );
     assert!(out.contains("node started"), "{out}");
-    let status = env.ok(&["node", "status"], &[], None);
-    assert!(
-        status.contains(&format!("node connected to server {url}")),
-        "{status}"
-    );
+    // The node answers on its socket before its first connection to the
+    // server is made.
+    let want = format!("node connected to server {url}");
+    let t0 = std::time::Instant::now();
+    loop {
+        let status = env.ok(&["node", "status"], &[], None);
+        if status.contains(&want) {
+            break;
+        }
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(10),
+            "{status}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     let err = env.fails(&["node", "start"], &[]);
     assert!(err.contains("already running"), "{err}");
     let out = env.ok(&["node", "stop"], &[], None);
