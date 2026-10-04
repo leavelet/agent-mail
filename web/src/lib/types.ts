@@ -38,6 +38,8 @@ export interface Seat {
   parent?: string;
   display_name?: string;
   role?: string;
+  /** In `GET /v1/seats`: `role` holds only its beginning; `GET /v1/seats/{name}` has all of it. */
+  role_truncated?: boolean;
   harness?: string;
   model?: string;
   permission_mode?: PermissionMode;
@@ -77,6 +79,8 @@ export interface MessageHeader {
 
 export interface Message extends MessageHeader {
   body: string;
+  /** In a thread: the body was left out to keep the answer small; fetch it with `GET /v1/messages/{id}`. */
+  body_omitted?: boolean;
 }
 
 export interface Delivery {
@@ -99,6 +103,8 @@ export interface InboxEntry {
 export interface InboxResponse {
   seat: string;
   entries: InboxEntry[];
+  /** The page was cut by size: more entries follow. */
+  truncated?: boolean;
 }
 
 export interface MessageResponse {
@@ -121,6 +127,8 @@ export interface StatusResponse {
 export interface ThreadResponse {
   thread_id: number;
   messages: Message[];
+  /** Older messages were left out. */
+  truncated?: boolean;
 }
 
 export interface ArchiveResponse {

@@ -85,7 +85,44 @@ pub fn message(m: &MessageRec, viewer: &Org) -> p::Message {
     p::Message {
         header: header(m, viewer),
         body: m.body.clone(),
+        body_omitted: false,
     }
+}
+
+/// Size of `v` as JSON.
+pub fn json_len<T: serde::Serialize>(v: &T) -> usize {
+    serde_json::to_vec(v).map(|b| b.len()).unwrap_or(usize::MAX)
+}
+
+/// Cuts `items` so that their JSON stays within `max` bytes, keeping at
+/// least one item: from the start of the list (`keep_last` false) or from
+/// its end. Returns whether items were dropped.
+pub fn fit<T: serde::Serialize>(items: &mut Vec<T>, max: usize, keep_last: bool) -> bool {
+    let mut total = 0usize;
+    let mut keep = 0;
+    let n = items.len();
+    for i in 0..n {
+        let item = if keep_last {
+            &items[n - 1 - i]
+        } else {
+            &items[i]
+        };
+        // One more byte for the separating comma.
+        total = total.saturating_add(json_len(item) + 1);
+        if total > max && keep > 0 {
+            break;
+        }
+        keep += 1;
+    }
+    if keep == n {
+        return false;
+    }
+    if keep_last {
+        items.drain(..n - keep);
+    } else {
+        items.truncate(keep);
+    }
+    true
 }
 
 pub fn delivery(d: &DeliveryRec, viewer: &Org) -> p::Delivery {
@@ -118,6 +155,7 @@ pub fn seat(s: &Seat, presence: Option<p::Presence>) -> p::Seat {
         parent: s.parent_name.clone(),
         display_name: s.display_name.clone(),
         role: s.role.clone(),
+        role_truncated: false,
         harness: s.harness.clone(),
         model: s.model.clone(),
         permission_mode: s.permission_mode,
@@ -126,6 +164,19 @@ pub fn seat(s: &Seat, presence: Option<p::Presence>) -> p::Seat {
         presence,
         focus_until: s.focus_until.filter(|t| *t > amail_store::now_ms()).map(ts),
     }
+}
+
+/// A seat as listed by `GET /seats`: its role cut to
+/// [`p::limits::LIST_ROLE_CHARS`] characters.
+pub fn seat_in_list(s: &Seat, presence: Option<p::Presence>) -> p::Seat {
+    let mut out = seat(s, presence);
+    if let Some(r) = &mut out.role
+        && let Some((i, _)) = r.char_indices().nth(p::limits::LIST_ROLE_CHARS)
+    {
+        r.truncate(i);
+        out.role_truncated = true;
+    }
+    out
 }
 
 pub fn list(l: &List, members: Option<Vec<p::ListMember>>) -> p::List {
@@ -157,5 +208,31 @@ pub fn org(o: &Org, storage_quota: Option<i64>) -> p::OrgInfo {
         webhook_url: o.webhook_url.clone(),
         stored_bytes: o.stored_bytes,
         storage_quota_bytes: storage_quota,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fit;
+
+    #[test]
+    fn fit_cuts_by_json_size() {
+        // Each item is 12 bytes as JSON ("aaaaaaaaaa") plus a comma.
+        let items = || vec!["a".repeat(10); 5];
+        let mut v = items();
+        assert!(!fit(&mut v, 100, false));
+        assert_eq!(v.len(), 5);
+        let mut v: Vec<String> = (0..5).map(|i| format!("{i}{}", "a".repeat(9))).collect();
+        assert!(fit(&mut v, 30, false));
+        assert_eq!(v, vec!["0aaaaaaaaa", "1aaaaaaaaa"]);
+        let mut v: Vec<String> = (0..5).map(|i| format!("{i}{}", "a".repeat(9))).collect();
+        assert!(fit(&mut v, 30, true));
+        assert_eq!(v, vec!["3aaaaaaaaa", "4aaaaaaaaa"]);
+        // At least one item, however large.
+        let mut v = items();
+        assert!(fit(&mut v, 1, false));
+        assert_eq!(v.len(), 1);
+        let mut v: Vec<String> = Vec::new();
+        assert!(!fit(&mut v, 1, false));
     }
 }

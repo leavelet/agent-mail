@@ -126,7 +126,11 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
         }
         _ => "main".to_string(),
     };
-    let server_seats: Vec<p::Seat> = c.get("/seats").await?;
+    let mut server_seats: Vec<p::Seat> = c.get("/seats").await?;
+    // The list cuts long roles; compare with the whole one.
+    for s in server_seats.iter_mut().filter(|s| s.role_truncated) {
+        *s = c.get(&format!("/seats/{}", s.name)).await?;
+    }
     let by_name: BTreeMap<&str, &p::Seat> =
         server_seats.iter().map(|s| (s.name.as_str(), s)).collect();
     for s in &t.seats {

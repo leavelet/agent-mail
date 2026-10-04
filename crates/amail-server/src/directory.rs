@@ -121,7 +121,7 @@ pub async fn list_seats(State(st): State<AppState>, auth: Auth) -> ApiResult<Jso
             .seats(auth.org.id)
             .await?
             .iter()
-            .map(|s| render::seat(s, presence.remove(&s.name)))
+            .map(|s| render::seat_in_list(s, presence.remove(&s.name)))
             .collect(),
     ))
 }
@@ -493,6 +493,20 @@ pub async fn put_member(
         seat_id,
         mode,
     };
+    let max = amail_proto::limits::MAX_LIST_MEMBERS;
+    if l.member_count >= max
+        && !st
+            .store
+            .list_members(l.id)
+            .await?
+            .iter()
+            .any(|m| m.address == member.address)
+    {
+        return Err(ApiError::unprocessable(
+            "too_many_members",
+            format!("a list has at most {max} members"),
+        ));
+    }
     st.store.put_member(auth.org.id, l.id, &member).await?;
     Ok(Json(p::ListMember {
         address: member.address,

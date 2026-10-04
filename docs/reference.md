@@ -113,26 +113,26 @@ session cookie; with the cookie, everything but `GET` needs the header
 | | |
 |---|---|
 | `POST /messages` | send `{to, cc, subject, body, in_reply_to?, priority?, ack_required?, ack_timeout_s?, meta?}`; the answer lists each address with its seat count (and for a list in `To`, `wakes`: its members notified at once) and `notes` on recipients that will not see it at once. 507 `storage_quota` when the message does not fit in the org's storage quota |
-| `GET /inbox` | `seat`, `unread`, `after_seq`, `before_seq`, `limit` (≤ 1000); headers only |
+| `GET /inbox` | `seat`, `unread`, `after_seq`, `before_seq`, `limit` (≤ 1000); headers only. A page is at most 2 MiB: when it was cut, `"truncated": true`, and the next page starts after the last entry (with `before_seq`: before the first) |
 | `GET /messages/{id}` | full message; marks the caller's delivery read unless `peek=1` |
 | `POST /messages/{id}/ack` | acknowledge |
 | `POST /messages/{id}/read` | mark the caller's delivery read |
 | `GET /messages/{id}/status` | per-recipient state (the sender and the sender org's user only); seats reached through another org's list are counted under the list's address (`members`) |
-| `GET /threads/{id}` | messages of a thread the caller may see; at most the newest 500, with `"truncated": true` when older ones were left out |
+| `GET /threads/{id}` | messages of a thread the caller may see, oldest first: at most the newest 500 and 2 MiB of headers, with `"truncated": true` when older ones were left out. Bodies are included newest first up to 1 MiB in total; a message whose body was left out has `"body_omitted": true` and an empty `body`; read it with `GET /messages/{id}?peek=1` |
 | `POST /claim` | `{classes, min_priority?, via, limit?, inline_body_max?, include_digest?, digest_only?, mark_inlined_read?, key?, preview_chars?}`: atomically mark pending deliveries notified and return them; concurrent claims never return the same delivery. `key` (chosen by the caller) makes the claim idempotent: a claim with a key the seat used in the last ten minutes takes nothing new and returns what the first one took |
-| `GET /changes` | `since` (a sequence number): deliveries created or changed since (`limit` ≤ 5000) |
+| `GET /changes` | `since` (a sequence number): deliveries created or changed since (`limit` ≤ 5000, at most 2 MiB); continue from `next` while `more` is true |
 | `GET /events` | server-sent events: `mailbox` `{"seat","seq"}` per mailbox change (supports `Last-Event-ID`), `presence`, and for node tokens `command` (`{op: "transcript"\|"sleep"\|"wake", seat, lease_ms?, backfill?, node?}`) |
 | `PUT /focus`, `DELETE /focus` | `seat=` (user tokens; seat tokens: their own): focus `{for_s?, until?}`, or end it |
-| `GET /sent` | `seat`, `before_id`, `limit` (≤ 500): messages a seat sent, newest first |
-| `GET /archive/messages` | `since`, `until`, `from`, `to` (a recipient seat), `thread`, `before_id`, `limit` (≤ 500) (user tokens) |
+| `GET /sent` | `seat`, `before_id`, `limit` (≤ 500): messages a seat sent, newest first; paged like the archive |
+| `GET /archive/messages` | `since`, `until`, `from`, `to`, `thread`, `before_id`, `limit` (≤ 500) (user tokens): below |
 | `GET /archive/search` | `q`, `before_id`, `limit` (≤ 200) (user tokens): full-text search, below |
 
 ### Directory and settings
 
 | | |
 |---|---|
-| `GET, POST /seats`; `GET, PATCH, DELETE /seats/{name}`; `POST /seats/{name}/tokens` | seats |
-| `GET, POST /lists`; `GET, DELETE /lists/{name}`; `PUT, DELETE /lists/{name}/members/{address}` | lists |
+| `GET, POST /seats`; `GET, PATCH, DELETE /seats/{name}`; `POST /seats/{name}/tokens` | seats; `GET /seats` cuts each role to its first 1,000 characters and sets `role_truncated`, `GET /seats/{name}` has all of it |
+| `GET, POST /lists`; `GET, DELETE /lists/{name}`; `PUT, DELETE /lists/{name}/members/{address}` | lists (at most 1,000 members each) |
 | `GET, POST /links`; `POST /links/{org}/accept`; `DELETE /links/{org}` | links |
 | `GET, PATCH /org` | org settings (including `webhook_url`; `null` clears it), and `stored_bytes` (the mail the org sent, as counted for the storage quota) with `storage_quota_bytes` when the server has a quota |
 | `DELETE /org` | user tokens, `{"confirm": "<org name>"}`: delete the org and all its data; mail other orgs received from it stays with them, from `name@org (deleted org)` |
@@ -147,7 +147,7 @@ session cookie; with the cookie, everything but `GET` needs the header
 | | |
 |---|---|
 | `POST /session`; `DELETE /session` | sign a browser in with `{token}` (user or operator tokens; needs `X-Amail-Csrf: 1`) / out |
-| `GET /overview` | user tokens: agent seats per state, seats needing a person, messages in the last hour and day, the user's unread count, the size of the attention queue |
+| `GET /overview` | user tokens: agent seats per state, seats needing a person, messages in the last hour and day (counted up to 50,000), the user's unread count, the size of the attention queue |
 | `GET /counts` | user tokens: per seat (or `seat=`), `unread` and `pending` |
 | `GET /attention` | user tokens: what waits for the user ([concepts](concepts.md#the-users-queue-needs-you)) |
 | `GET /pending` | node and user tokens: per seat, pending deliveries by class, urgent count, digest counts, `focus_until`, the seat's counter |
@@ -165,17 +165,35 @@ session cookie; with the cookie, everything but `GET` needs the header
 | `POST /operator/orgs/{name}/suspend`, `/resume` | suspend (tokens and sessions stop working, open streams end, data is kept) / resume |
 | `DELETE /operator/orgs/{name}` | `{"confirm": "<name>"}`: delete the org with all its data |
 
+### Archive and search pages
+
+Both answer the messages the org can see (its own and those delivered to
+it), newest first, without bodies, in pages of at most 2 MiB. Pass
+`next_before_id` as `before_id` to continue; when it is absent, nothing
+older matches. A page can be short, or even empty, and still have
+`next_before_id`: each request looks at no more than 50,000 of the org's
+messages, starting below `before_id`, and then stops.
+
+Archive filters: `from` and `to` take a seat (`name`) or another org's
+address (`name@org`). For a seat of the org, `from` is its sent mail and
+`to` its mailbox (also what reached it through lists); these read that
+seat's mail directly. For another org's address, `to` matches the messages
+that name that address in To or Cc, not those that reached its seats
+through that org's lists. `thread` looks at the thread's newest 50,000
+messages. `since` and `until` are RFC 3339 times.
+
 ### Search
 
 `q` is split on whitespace and every term must occur in the subject or the
 body, as a case-insensitive substring, in any script (Chinese included), at
-most 10 terms. Terms of three characters or more use the index (SQLite:
-FTS5 with the trigram tokenizer; Postgres: a `pg_trgm` GIN index). If any
-term is shorter, the search scans only the 2,000 most recent messages
-before `before_id` and says so (`"mode": "scan"`, `scan_limit`);
-`next_before_id` continues with older mail. Results are the messages the
-org can see (its own and those delivered to it), newest first, with a
-snippet.
+most 10 terms. On SQLite only ASCII letters are compared without case. A
+request looks at the 50,000 most recent messages before `before_id` (2,000
+when a term is shorter than three characters; `scan_limit` says which), so
+a search that finds few matches continues with `next_before_id`. Each hit
+has a snippet of the body around the first match. `mode` is always
+`"scan"`. At most 4 searches and archive requests of one org run at a time
+on a public server (further ones get 429 `too_many_queries`), and a query
+that runs longer than 10 seconds is cancelled (503 `query_timeout`).
 
 ### Webhook
 

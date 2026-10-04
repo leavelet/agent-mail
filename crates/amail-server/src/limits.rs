@@ -119,6 +119,8 @@ pub struct Limiters {
     pub streams: Arc<StreamCount>,
     /// Webhook notices in flight per org.
     pub webhooks: Arc<StreamCount>,
+    /// Search and archive requests in flight per org.
+    pub queries: Arc<StreamCount>,
 }
 
 impl Limiters {
@@ -135,6 +137,7 @@ impl Limiters {
                 .map(|n| Buckets::per_hour(n, (n / 2.0).max(1.0))),
             streams: Arc::new(StreamCount::new(l.org_streams)),
             webhooks: Arc::new(StreamCount::new(l.org_webhooks_in_flight)),
+            queries: Arc::new(StreamCount::new(l.org_queries)),
         }
     }
 

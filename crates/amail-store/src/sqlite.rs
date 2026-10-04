@@ -7,7 +7,7 @@
 //! others) and commits once. Concurrent sends are thereby merged into one
 //! commit, and per-seat sequence numbers are trivially serialized.
 
-use crate::common::{join_addrs, like_pattern, line_count, meta_to_db};
+use crate::common::{join_addrs, line_count, meta_to_db};
 use crate::model::*;
 use crate::{OpenOptions, Result, StoreError, now_ms};
 use futures::future::BoxFuture;
@@ -112,6 +112,24 @@ impl SqliteStore {
         f(&mut c).await
     }
 
+    /// A read whose cost depends on the data (search, archive, threads):
+    /// interrupted after [`amail_proto::limits::QUERY_TIMEOUT_MS`].
+    async fn read_query<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: for<'c> FnOnce(&'c mut SqliteConnection) -> BoxFuture<'c, Result<T>> + Send + 'static,
+    {
+        let mut c = self.read.acquire().await?;
+        let deadline = std::time::Instant::now()
+            + Duration::from_millis(amail_proto::limits::QUERY_TIMEOUT_MS);
+        c.lock_handle()
+            .await?
+            .set_progress_handler(10_000, move || std::time::Instant::now() < deadline);
+        let out = f(&mut c).await;
+        c.lock_handle().await?.remove_progress_handler();
+        out
+    }
+
     async fn write<T, F>(&self, f: F) -> Result<T>
     where
         T: Send + 'static,
@@ -206,60 +224,6 @@ impl SqliteStore {
             created_at: now,
             seqs,
         })
-    }
-
-    /// Index mode: FTS5 trigram `MATCH` with one quoted phrase per term (a
-    /// phrase of three or more characters matches any substring). Scan mode:
-    /// `LIKE` over the window (case-insensitive for ASCII).
-    async fn search_impl(
-        &self,
-        org_id: i64,
-        q: &SearchQuery,
-        lower: Option<i64>,
-    ) -> Result<Vec<MessageRec>> {
-        let fts = q.scan.is_none();
-        let conds: Vec<String> = if !fts {
-            (0..q.terms.len())
-                .map(|i| {
-                    format!(
-                        "(m.subject LIKE ${n} ESCAPE '\\' OR m.body LIKE ${n} ESCAPE '\\')",
-                        n = i + 5
-                    )
-                })
-                .collect()
-        } else {
-            vec!["f.messages_fts MATCH $5".into()]
-        };
-        let sql =
-            crate::common::search_sql_sqlite(&conds, q.before_id.is_some(), lower.is_some(), fts);
-        let binds: Vec<String> = if q.scan.is_some() {
-            q.terms.iter().map(|t| like_pattern(t)).collect()
-        } else {
-            vec![
-                q.terms
-                    .iter()
-                    .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
-                    .collect::<Vec<_>>()
-                    .join(" AND "),
-            ]
-        };
-        let (before, limit) = (q.before_id, q.limit);
-        let rows: Vec<crate::common::MsgRow> = self
-            .read(move |c| {
-                Box::pin(async move {
-                    let mut query = sqlx::query_as(&sql)
-                        .bind(org_id)
-                        .bind(before)
-                        .bind(lower)
-                        .bind(limit);
-                    for b in &binds {
-                        query = query.bind(b);
-                    }
-                    Ok(query.fetch_all(&mut *c).await?)
-                })
-            })
-            .await?;
-        crate::common::collect(rows, crate::common::MsgRow::into_message)
     }
 
     async fn claim_impl(
@@ -461,4 +425,4 @@ impl SqliteStore {
     }
 }
 
-impl_store_common!(SqliteStore, sqlx::Sqlite);
+impl_store_common!(SqliteStore, sqlx::Sqlite, Dialect::Sqlite);

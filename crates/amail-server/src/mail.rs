@@ -5,6 +5,7 @@ use crate::AppState;
 use crate::auth::Auth;
 use crate::error::{ApiError, ApiResult, Json, Path, Query};
 use crate::render;
+use amail_proto::limits::{MAX_PAGE_BYTES, MAX_THREAD_BODY_BYTES, MAX_THREAD_MESSAGES};
 use amail_proto::{self as p, Address, Priority, TokenScope};
 use amail_store::{ArchiveQuery, ClaimFilter, InboxQuery, MessageRec, SeqBump};
 use axum::extract::State;
@@ -82,12 +83,16 @@ pub async fn inbox(
         limit: q.limit.unwrap_or(50).clamp(1, 1000),
     };
     let entries = st.store.inbox(seat.id, &query).await?;
+    let mut entries: Vec<p::InboxEntry> = entries
+        .iter()
+        .map(|e| render::entry(e, &auth.org))
+        .collect();
+    // Paging backwards, the entries next to `before_seq` (the end) stay.
+    let truncated = render::fit(&mut entries, MAX_PAGE_BYTES, query.before_seq.is_some());
     Ok(Json(p::InboxResponse {
         seat: seat.name,
-        entries: entries
-            .iter()
-            .map(|e| render::entry(e, &auth.org))
-            .collect(),
+        entries,
+        truncated,
     }))
 }
 
@@ -245,9 +250,6 @@ pub(crate) fn external_group(
     (!lists.is_empty()).then(|| lists.join(", "))
 }
 
-/// The most messages `GET /v1/threads/{id}` answers (the newest ones).
-pub const MAX_THREAD_MESSAGES: i64 = 500;
-
 pub async fn thread(
     State(st): State<AppState>,
     auth: Auth,
@@ -257,24 +259,57 @@ pub async fn thread(
     if auth.scope == TokenScope::Seat && !st.store.seat_in_thread(seat.id, id).await? {
         return Err(ApiError::not_found(format!("no thread {id}")));
     }
-    let mut messages = st
+    let mut found = st
         .store
-        .thread(id, auth.org.id, MAX_THREAD_MESSAGES + 1)
+        .thread(
+            id,
+            auth.org.id,
+            MAX_THREAD_MESSAGES + 1,
+            MAX_THREAD_BODY_BYTES,
+        )
         .await?;
-    if messages.is_empty() {
+    if found.is_empty() {
         return Err(ApiError::not_found(format!("no thread {id}")));
     }
-    let truncated = messages.len() as i64 > MAX_THREAD_MESSAGES;
+    let mut truncated = found.len() as i64 > MAX_THREAD_MESSAGES;
     if truncated {
-        messages.remove(0);
+        found.remove(0);
+    }
+    let mut messages: Vec<p::Message> = found
+        .into_iter()
+        .map(|t| {
+            let mut m = render::message(&t.message, &auth.org);
+            m.body_omitted = t.body_omitted;
+            m
+        })
+        .collect();
+    // Bodies, newest first, within MAX_THREAD_BODY_BYTES as JSON (the
+    // store kept their raw size within it); headers, newest first, within
+    // MAX_PAGE_BYTES.
+    let (mut bodies, mut headers) = (0usize, 0usize);
+    let mut keep = 0;
+    for m in messages.iter_mut().rev() {
+        if !m.body.is_empty() {
+            bodies += render::json_len(&m.body);
+            if bodies > MAX_THREAD_BODY_BYTES {
+                m.body = String::new();
+                m.body_omitted = true;
+            }
+        }
+        headers += render::json_len(&m.header) + 1;
+        if headers > MAX_PAGE_BYTES && keep > 0 {
+            break;
+        }
+        keep += 1;
+    }
+    if keep < messages.len() {
+        messages.drain(..messages.len() - keep);
+        truncated = true;
     }
     Ok(Json(p::ThreadResponse {
         thread_id: id,
         truncated,
-        messages: messages
-            .iter()
-            .map(|m| render::message(m, &auth.org))
-            .collect(),
+        messages,
     }))
 }
 
@@ -351,15 +386,18 @@ pub async fn changes(
     let since = q.since.unwrap_or(0);
     let limit = q.limit.unwrap_or(500).clamp(1, 5000);
     let entries = st.store.changes(seat.id, since, limit).await?;
+    let full = entries.len() as i64 == limit;
+    let mut entries: Vec<p::InboxEntry> = entries
+        .iter()
+        .map(|e| render::entry(e, &auth.org))
+        .collect();
+    let cut = render::fit(&mut entries, MAX_PAGE_BYTES, false);
     let next = entries.last().map(|e| e.delivery.mod_seq).unwrap_or(since);
     Ok(Json(p::ChangesResponse {
         seat: seat.name,
-        more: entries.len() as i64 == limit,
+        more: full || cut,
         next,
-        entries: entries
-            .iter()
-            .map(|e| render::entry(e, &auth.org))
-            .collect(),
+        entries,
     }))
 }
 
@@ -551,14 +589,41 @@ pub async fn archive(
         before_id: q.before_id,
         limit,
     };
-    let msgs = st.store.archive(auth.org.id, &query).await?;
-    let next_before_id = if msgs.len() as i64 == limit {
-        msgs.last().map(|m| m.id)
+    let _slot = query_slot(&st, &auth)?;
+    let page = st.store.archive(auth.org.id, &query).await?;
+    Ok(Json(archive_response(page, &auth.org)))
+}
+
+/// An archive page as sent: within [`MAX_PAGE_BYTES`], continuing after
+/// the last message kept when it was cut.
+pub fn archive_response(
+    page: amail_store::ArchivePage,
+    org: &amail_store::Org,
+) -> p::ArchiveResponse {
+    let mut messages: Vec<p::MessageHeader> = page
+        .messages
+        .iter()
+        .map(|m| render::header(m, org))
+        .collect();
+    let next_before_id = if render::fit(&mut messages, MAX_PAGE_BYTES, false) {
+        messages.last().map(|m| m.id)
     } else {
-        None
+        page.next_before_id
     };
-    Ok(Json(p::ArchiveResponse {
-        messages: msgs.iter().map(|m| render::header(m, &auth.org)).collect(),
+    p::ArchiveResponse {
+        messages,
         next_before_id,
-    }))
+    }
+}
+
+/// One of the org's search or archive requests in flight; 429 when the org
+/// has as many as its limit.
+pub fn query_slot(st: &AppState, auth: &Auth) -> ApiResult<crate::limits::StreamGuard> {
+    st.limiters.queries.open(auth.org.id).ok_or_else(|| {
+        ApiError::too_many(
+            "too_many_queries",
+            "this org has too many search and archive requests in progress",
+            1000,
+        )
+    })
 }

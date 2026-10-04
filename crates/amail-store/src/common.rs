@@ -133,13 +133,6 @@ macro_rules! auth_select {
     };
 }
 
-/// Visibility of message `m` to org `$1`: sent by it or delivered to it.
-macro_rules! visible_to_org {
-    () => {
-        "(m.org_id = $1 OR EXISTS (SELECT 1 FROM deliveries vd WHERE vd.message_id = m.id AND vd.org_id = $1))"
-    };
-}
-
 /// Runs a query body in an owned, boxed closure via `read` or `write`.
 macro_rules! run {
     ($self:ident . $how:ident, |$c:ident| $body:expr) => {
@@ -181,66 +174,167 @@ pub(crate) fn like_pattern(term: &str) -> String {
     p
 }
 
-/// The query part shared by both backends' search: visibility, the page
-/// (`before_id`) and, in scan mode, the window's lower bound. Binds `$1` org,
-/// `$2` before_id, `$3` lower bound, `$4` limit; terms start at `$5`.
-pub(crate) fn search_sql(term_conds: &[String]) -> String {
-    let mut sql = String::from(concat!(
-        "SELECT ",
-        msg_cols!(),
-        ", m.body FROM messages m",
-        msg_joins!(),
-        " WHERE ",
-        visible_to_org!(),
-        " AND ($2 IS NULL OR m.id < $2) AND ($3 IS NULL OR m.id >= $3)"
-    ));
-    for c in term_conds {
-        sql.push_str(" AND ");
-        sql.push_str(c);
+/// What differs between the two backends' SQL in search.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Dialect {
+    Sqlite,
+    Postgres,
+}
+
+impl Dialect {
+    /// Case-insensitive `LIKE` (SQLite's `LIKE` folds ASCII letters).
+    fn ilike(self) -> &'static str {
+        match self {
+            Dialect::Sqlite => "LIKE",
+            Dialect::Postgres => "ILIKE",
+        }
+    }
+    /// Character position of a substring, 0 when absent.
+    fn strpos(self, hay: &str, needle: &str) -> String {
+        match self {
+            Dialect::Sqlite => format!("instr({hay}, {needle})"),
+            Dialect::Postgres => format!("strpos({hay}, {needle})"),
+        }
+    }
+    fn greatest(self) -> &'static str {
+        match self {
+            Dialect::Sqlite => "max",
+            Dialect::Postgres => "GREATEST",
+        }
+    }
+}
+
+/// Ids of the messages visible to org `$1` in `[$3, $2)`: the org's own
+/// and those delivered to it, each from its index.
+pub(crate) const WINDOW_IDS: &str = "SELECT id FROM messages WHERE org_id = $1 AND id >= $3 AND id < $2 \
+     UNION SELECT message_id FROM deliveries WHERE org_id = $1 AND message_id >= $3 AND message_id < $2";
+
+/// One search step over the window `[$3, $2)` of org `$1`, at most `$4`
+/// hits. Term `i` binds its `LIKE` pattern at `$(5+2i)` and its text at
+/// `$(6+2i)`. The body itself is not returned: only an excerpt of
+/// [`SNIPPET_CHARS`] characters starting 40 characters before the first
+/// match in the body (`ex_start`, 1-based) and the body's length.
+pub(crate) fn search_sql(d: Dialect, nterms: usize) -> String {
+    let lb = "lower(m.body)";
+    let positions: Vec<String> = (0..nterms)
+        .map(|i| {
+            format!(
+                "NULLIF({}, 0)",
+                d.strpos(lb, &format!("lower(${})", 6 + 2 * i))
+            )
+        })
+        .collect();
+    // The first match in the body, NULL when only the subject matched.
+    let at = match d {
+        Dialect::Postgres => format!("LEAST({})", positions.join(", ")),
+        Dialect::Sqlite => {
+            let big = "1000000000";
+            let args: Vec<String> = positions
+                .iter()
+                .map(|p| format!("COALESCE({p}, {big})"))
+                .chain([big.to_string()])
+                .collect();
+            format!("NULLIF(min({}), {big})", args.join(", "))
+        }
+    };
+    let start = format!("{}(1, COALESCE({at}, 1) - 40)", d.greatest());
+    let len = match d {
+        Dialect::Sqlite => "length(m.body)",
+        Dialect::Postgres => "CAST(char_length(m.body) AS BIGINT)",
+    };
+    let mut sql = format!(
+        "SELECT {cols}, substr(m.body, {start}, {n}) AS body, CAST({start} AS BIGINT) AS ex_start, {len} AS body_chars \
+         FROM messages m{joins} WHERE m.id IN ({WINDOW_IDS})",
+        cols = msg_cols!(),
+        joins = msg_joins!(),
+        n = SNIPPET_CHARS,
+    );
+    for i in 0..nterms {
+        let n = 5 + 2 * i;
+        sql.push_str(&format!(
+            " AND (m.subject {op} ${n} ESCAPE '\\' OR m.body {op} ${n} ESCAPE '\\')",
+            op = d.ilike()
+        ));
     }
     sql.push_str(" ORDER BY m.id DESC LIMIT $4");
     sql
 }
 
-/// SQLite's search: the same binds as [`search_sql`], but the page bounds
-/// only when given (SQLite does not see through `$n IS NULL OR ...`), and
-/// with `fts` the full-text index drives the query newest first.
-pub(crate) fn search_sql_sqlite(
-    term_conds: &[String],
-    before: bool,
-    lower: bool,
-    fts: bool,
-) -> String {
-    let mut sql = String::from(concat!("SELECT ", msg_cols!(), ", m.body FROM "));
-    if fts {
-        sql.push_str("messages_fts f JOIN messages m ON m.id = f.rowid");
-    } else {
-        sql.push_str("messages m");
+/// A row of [`search_sql`].
+#[derive(sqlx::FromRow)]
+pub(crate) struct HitRow {
+    #[sqlx(flatten)]
+    msg: MsgRow,
+    ex_start: i64,
+    body_chars: i64,
+}
+
+impl HitRow {
+    pub(crate) fn into_hit(self) -> Result<SearchHit> {
+        let (start, total) = (self.ex_start, self.body_chars);
+        let mut message = self.msg.into_message()?;
+        let excerpt = std::mem::take(&mut message.body);
+        let shown = excerpt.chars().count() as i64;
+        Ok(SearchHit {
+            message,
+            excerpt,
+            cut_before: start > 1,
+            cut_after: start - 1 + shown < total,
+        })
     }
-    sql.push_str(msg_joins!());
-    sql.push_str(" WHERE ");
-    if lower {
-        // A bounded window: the visible ids from the two indexes.
-        sql.push_str(
-            "m.id IN (SELECT id FROM messages WHERE org_id = $1 AND id >= $3 \
-             UNION SELECT message_id FROM deliveries WHERE org_id = $1 AND message_id >= $3)",
-        );
-    } else {
-        sql.push_str(visible_to_org!());
+}
+
+/// The lower end of a window of at most `n` messages below some id, from
+/// the counts and lowest ids of the index ranges it was built from (each
+/// read at most `n` rows): `a` the org's own messages, `b` its deliveries,
+/// `v` their union cut to `n`.
+pub(crate) fn window_bounds(
+    n: i64,
+    a: (i64, Option<i64>),
+    b: (i64, Option<i64>),
+    v: (i64, Option<i64>),
+) -> Window {
+    let Some(mut lo) = v.1 else {
+        return Window {
+            lo: None,
+            count: 0,
+            exhausted: true,
+        };
+    };
+    // A range that stopped at `n` rows may have more ids below its lowest
+    // one; the window cannot reach below that.
+    for (count, min) in [a, b] {
+        if count >= n {
+            lo = lo.max(min.unwrap_or(lo));
+        }
     }
-    let id = if fts { "f.rowid" } else { "m.id" };
-    if before {
-        sql.push_str(&format!(" AND {id} < $2"));
+    Window {
+        lo: Some(lo),
+        count: v.0,
+        exhausted: a.0 < n && b.0 < n && v.0 < n,
     }
-    if lower {
-        sql.push_str(&format!(" AND {id} >= $3"));
-    }
-    for c in term_conds {
-        sql.push_str(" AND ");
-        sql.push_str(c);
-    }
-    sql.push_str(&format!(" ORDER BY {id} DESC LIMIT $4"));
-    sql
+}
+
+/// Visible ids `[lo, before)` that one step of a search or an archive
+/// query looks at.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Window {
+    /// `None`: nothing visible below `before`.
+    pub lo: Option<i64>,
+    /// Ids counted in the window (at most `n`).
+    pub count: i64,
+    /// Nothing visible lies below `lo`.
+    pub exhausted: bool,
+}
+
+/// Messages one step of a search or an archive query looks at.
+pub(crate) const STEP_MESSAGES: i64 = 5_000;
+
+/// A `LIKE` pattern matching `addr` as one element of a comma-separated
+/// address list wrapped in commas.
+pub(crate) fn addr_pattern(addr: &str) -> String {
+    let inner = like_pattern(addr);
+    format!("%,{},%", &inner[1..inner.len() - 1])
 }
 
 pub(crate) fn line_count(body: &str) -> i64 {
@@ -516,6 +610,14 @@ impl MsgRow {
     }
 }
 
+/// A message header with the size of its body in bytes.
+#[derive(sqlx::FromRow)]
+pub(crate) struct SizedRow {
+    #[sqlx(flatten)]
+    pub(crate) msg: MsgRow,
+    pub(crate) body_bytes: Option<i64>,
+}
+
 #[derive(sqlx::FromRow)]
 pub(crate) struct DelivRow {
     d_id: i64,
@@ -689,16 +791,18 @@ pub(crate) fn collect<R, T>(rows: Vec<R>, f: impl Fn(R) -> Result<T>) -> Result<
 /// Generates `mod q` (the portable queries, for one sqlx database type) and
 /// `impl Store for $store`.
 macro_rules! impl_store_common {
-    ($store:ty, $db:ty) => {
+    ($store:ty, $db:ty, $dialect:expr) => {
         #[allow(dead_code)]
         pub(crate) mod q {
             use $crate::common::*;
             use $crate::model::*;
             use $crate::{now_ms, Result, StoreError};
+            use amail_proto::limits::MAX_SCAN_MESSAGES;
             use amail_proto::{LinkState, SeatKind, TokenScope};
 
             pub(crate) type Conn = <$db as sqlx::Database>::Connection;
             pub(crate) type Db = $db;
+            const DIALECT: Dialect = $dialect;
 
             pub async fn org_by_id(c: &mut Conn, id: i64) -> Result<Option<Org>> {
                 let r: Option<OrgRow> = sqlx::query_as("SELECT * FROM orgs WHERE id = $1 AND deleted_at IS NULL")
@@ -986,33 +1090,112 @@ macro_rules! impl_store_common {
                 collect(rows, EntryRow::into_entry)
             }
 
+            /// The first message id created at or after `t` (ids follow
+            /// creation times up to [`ID_TIME_MARGIN_MS`]), from the time index.
+            async fn id_at(c: &mut Conn, t: i64) -> Result<Option<i64>> {
+                Ok(sqlx::query_scalar::<_, i64>(
+                    "SELECT id FROM messages WHERE created_at >= $1 ORDER BY created_at, id LIMIT 1",
+                )
+                .bind(t)
+                .fetch_optional(&mut *c)
+                .await?)
+            }
+
             pub async fn message_count(c: &mut Conn, org_id: i64, since: i64) -> Result<i64> {
-                Ok(sqlx::query_scalar(concat!(
-                    "SELECT COUNT(*) FROM messages m WHERE m.created_at >= $2 AND ",
-                    visible_to_org!()
-                ))
+                // The org's ids from the window start on (each from its
+                // index), counted up to the scan bound.
+                let Some(lo) = id_at(c, since - ID_TIME_MARGIN_MS).await? else {
+                    return Ok(0);
+                };
+                Ok(sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM (SELECT v.id FROM (SELECT id FROM messages WHERE org_id = $1 AND id >= $2 \
+                     UNION SELECT message_id FROM deliveries WHERE org_id = $1 AND message_id >= $2) v \
+                     LIMIT $4) w JOIN messages m ON m.id = w.id WHERE m.created_at >= $3",
+                )
                 .bind(org_id)
+                .bind(lo)
                 .bind(since)
+                .bind(MAX_SCAN_MESSAGES)
                 .fetch_one(&mut *c)
                 .await?)
             }
 
-            /// The `n` most recent messages visible to the org before
-            /// `before_id`: `(count, oldest id)`.
-            pub async fn scan_window(c: &mut Conn, org_id: i64, before_id: Option<i64>, n: i64) -> Result<(i64, Option<i64>)> {
-                // The org's own messages and those delivered to it, each from
-                // its index (testing visibility row by row is slow on SQLite).
-                Ok(sqlx::query_as(
-                    "SELECT COUNT(*), MIN(id) FROM (SELECT id FROM ( \
-                       SELECT id FROM messages WHERE org_id = $1 AND id < $2 \
-                       UNION SELECT message_id AS id FROM deliveries WHERE org_id = $1 AND message_id < $2) v \
-                     ORDER BY id DESC LIMIT $3) w",
+            /// The window of the (at most) `n` newest messages visible to
+            /// the org below `before`, read from the org's two indexes
+            /// (at most `n` rows from each).
+            pub async fn scan_window(c: &mut Conn, org_id: i64, before: i64, n: i64) -> Result<Window> {
+                type R = (i64, Option<i64>, i64, Option<i64>, i64, Option<i64>);
+                let r: R = sqlx::query_as(
+                    "WITH a AS (SELECT id FROM messages WHERE org_id = $1 AND id < $2 ORDER BY id DESC LIMIT $3), \
+                     b AS (SELECT message_id AS id FROM deliveries WHERE org_id = $1 AND message_id < $2 \
+                           ORDER BY message_id DESC LIMIT $3), \
+                     v AS (SELECT id FROM (SELECT id FROM a UNION SELECT id FROM b) u ORDER BY id DESC LIMIT $3) \
+                     SELECT (SELECT COUNT(*) FROM a), (SELECT MIN(id) FROM a), \
+                            (SELECT COUNT(*) FROM b), (SELECT MIN(id) FROM b), \
+                            (SELECT COUNT(*) FROM v), (SELECT MIN(id) FROM v)",
                 )
                 .bind(org_id)
-                .bind(before_id.unwrap_or(i64::MAX))
+                .bind(before)
                 .bind(n)
                 .fetch_one(&mut *c)
-                .await?)
+                .await?;
+                Ok(window_bounds(n, (r.0, r.1), (r.2, r.3), (r.4, r.5)))
+            }
+
+            /// The window of the (at most) `n` newest messages of a thread
+            /// below `before`, of all orgs (visibility is checked after).
+            async fn thread_window(c: &mut Conn, thread_id: i64, before: i64, n: i64) -> Result<Window> {
+                let r: (i64, Option<i64>) = sqlx::query_as(
+                    "SELECT COUNT(*), MIN(id) FROM (SELECT id FROM messages WHERE thread_id = $1 AND id < $2 \
+                     ORDER BY id DESC LIMIT $3) t",
+                )
+                .bind(thread_id)
+                .bind(before)
+                .bind(n)
+                .fetch_one(&mut *c)
+                .await?;
+                Ok(match r.1 {
+                    None => Window { lo: None, count: 0, exhausted: true },
+                    Some(lo) => Window { lo: Some(lo), count: r.0, exhausted: r.0 < n },
+                })
+            }
+
+            /// Search: steps of [`STEP_MESSAGES`] of the org's window, newest
+            /// first, until the page is full or `q.scan` messages were
+            /// looked at.
+            pub async fn search(c: &mut Conn, org_id: i64, q: &SearchQuery) -> Result<SearchResult> {
+                let sql = search_sql(DIALECT, q.terms.len());
+                let mut out = SearchResult::default();
+                let mut before = q.before_id.unwrap_or(i64::MAX);
+                let mut seen = 0;
+                while seen < q.scan {
+                    let w = scan_window(c, org_id, before, STEP_MESSAGES.min(q.scan - seen)).await?;
+                    let Some(lo) = w.lo else {
+                        return Ok(out);
+                    };
+                    let mut query = sqlx::query_as::<_, HitRow>(&sql)
+                        .bind(org_id)
+                        .bind(before)
+                        .bind(lo)
+                        .bind(q.limit - out.hits.len() as i64);
+                    for t in &q.terms {
+                        query = query.bind(like_pattern(t)).bind(t.clone());
+                    }
+                    for r in query.fetch_all(&mut *c).await? {
+                        out.hits.push(r.into_hit()?);
+                    }
+                    if out.hits.len() as i64 >= q.limit {
+                        out.next_before_id = out.hits.last().map(|h| h.message.id);
+                        return Ok(out);
+                    }
+                    if w.exhausted {
+                        return Ok(out);
+                    }
+                    seen += w.count;
+                    before = lo;
+                }
+                out.next_before_id = Some(before);
+                Ok(out)
             }
 
             /// Live seats of the org with the given names (missing ones are skipped).
@@ -1356,19 +1539,55 @@ macro_rules! impl_store_common {
                 r.map(DelivRow::into_delivery).transpose()
             }
 
-            pub async fn thread(c: &mut Conn, thread_id: i64, org_id: i64, limit: i64) -> Result<Vec<MessageRec>> {
-                let mut rows: Vec<MsgRow> = sqlx::query_as(concat!(
-                    "SELECT ", msg_cols!(), ", m.body FROM messages m", msg_joins!(),
-                    " WHERE m.thread_id = $1 AND (m.org_id = $2 OR EXISTS \
-                     (SELECT 1 FROM deliveries d WHERE d.message_id = m.id AND d.org_id = $2)) ORDER BY m.id DESC LIMIT $3"
+            pub async fn thread(c: &mut Conn, thread_id: i64, org_id: i64, limit: i64, body_bytes: usize) -> Result<Vec<ThreadMessage>> {
+                let w = thread_window(c, thread_id, i64::MAX, MAX_SCAN_MESSAGES).await?;
+                let Some(lo) = w.lo else {
+                    return Ok(Vec::new());
+                };
+                // Headers and body sizes first (the size is read without
+                // the body on both backends).
+                let rows: Vec<SizedRow> = sqlx::query_as(concat!(
+                    "SELECT ", msg_cols!(), ", '' AS body, CAST(octet_length(m.body) AS BIGINT) AS body_bytes \
+                     FROM messages m", msg_joins!(),
+                    " WHERE m.thread_id = $1 AND m.id >= $3 AND (m.org_id = $2 OR EXISTS \
+                     (SELECT 1 FROM deliveries d WHERE d.message_id = m.id AND d.org_id = $2)) ORDER BY m.id DESC LIMIT $4"
                 ))
                 .bind(thread_id)
                 .bind(org_id)
+                .bind(lo)
                 .bind(limit)
                 .fetch_all(&mut *c)
                 .await?;
-                rows.reverse();
-                collect(rows, MsgRow::into_message)
+                // Bodies newest first within the budget.
+                let mut left = body_bytes as i64;
+                let mut out = Vec::with_capacity(rows.len());
+                let mut want = Vec::new();
+                for r in rows {
+                    let size = r.body_bytes.unwrap_or(0);
+                    let m = r.msg.into_message()?;
+                    let fits = size <= left;
+                    if fits {
+                        left -= size;
+                        if size > 0 {
+                            want.push(m.id);
+                        }
+                    }
+                    out.push(ThreadMessage { message: m, body_omitted: !fits });
+                }
+                if !want.is_empty() {
+                    let sql = format!("SELECT id, body FROM messages WHERE id IN ({})", placeholders(1, want.len()));
+                    let mut query = sqlx::query_as::<_, (i64, String)>(&sql);
+                    for id in &want {
+                        query = query.bind(*id);
+                    }
+                    for (id, body) in query.fetch_all(&mut *c).await? {
+                        if let Some(t) = out.iter_mut().find(|t| t.message.id == id) {
+                            t.message.body = body;
+                        }
+                    }
+                }
+                out.reverse();
+                Ok(out)
             }
 
             pub async fn inbox(c: &mut Conn, seat_id: i64, q: &InboxQuery) -> Result<Vec<Entry>> {
@@ -1488,74 +1707,188 @@ macro_rules! impl_store_common {
                 collect(rows, DelivRow::into_delivery)
             }
 
-            /// Built with only the conditions the query has, so that both
-            /// planners can use the id order and the indexes (SQLite cannot
-            /// see through `$n IS NULL OR ...`).
-            pub async fn archive(c: &mut Conn, org_id: i64, q: &ArchiveQuery) -> Result<Vec<MessageRec>> {
-                // A time window as an id range, so that the newest-first
-                // scan starts and stops near it (ids grow with creation
-                // time; a message's id and timestamp are taken within one
-                // send, so the margin covers any reordering).
-                let id_at = |t: i64| {
-                    sqlx::query_scalar::<_, i64>(
-                        "SELECT id FROM messages WHERE created_at >= $1 ORDER BY created_at, id LIMIT 1",
-                    )
-                    .bind(t)
-                };
-                let lo = match q.since {
-                    Some(t) => id_at(t - ID_TIME_MARGIN_MS).fetch_optional(&mut *c).await?,
+            /// Ids of the org's seats called `name` (a deleted seat's name
+            /// can be taken again).
+            async fn own_seat_ids(c: &mut Conn, org_id: i64, name: &str) -> Result<Vec<i64>> {
+                Ok(sqlx::query_scalar("SELECT id FROM seats WHERE org_id = $1 AND name = $2")
+                    .bind(org_id)
+                    .bind(name.to_string())
+                    .fetch_all(&mut *c)
+                    .await?)
+            }
+
+            /// The archive. Every query starts from the org's own data: one
+            /// of its seats' sent mail or mailbox when `from` or `to` names
+            /// one, else the org's messages (or a thread's) newest first in
+            /// steps, at most [`MAX_SCAN_MESSAGES`] per request. Built with
+            /// only the conditions the query has, so that both planners can
+            /// use the id order and the indexes (SQLite cannot see through
+            /// `$n IS NULL OR ...`).
+            pub async fn archive(c: &mut Conn, org_id: i64, q: &ArchiveQuery) -> Result<ArchivePage> {
+                let empty = Ok(ArchivePage::default());
+                // A time window as an id range (ids grow with creation time;
+                // a message's id and timestamp are taken within one send, so
+                // the margin covers any reordering).
+                let lo_t = match q.since {
+                    Some(t) => match id_at(c, t - ID_TIME_MARGIN_MS).await? {
+                        Some(x) => Some(x),
+                        None => return empty,
+                    },
                     None => None,
                 };
-                // No message after the window: no upper bound needed.
-                let hi = match q.until {
-                    Some(t) => id_at(t + ID_TIME_MARGIN_MS).fetch_optional(&mut *c).await?,
+                let hi_t = match q.until {
+                    Some(t) => id_at(c, t + ID_TIME_MARGIN_MS).await?,
                     None => None,
                 };
-                let mut b = sqlx::QueryBuilder::<Db>::new(concat!(
-                    "SELECT ", msg_cols!(), ", '' AS body FROM messages m", msg_joins!(), " WHERE (m.org_id = "
-                ));
-                b.push_bind(org_id)
-                    .push(" OR EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = m.id AND d.org_id = ")
-                    .push_bind(org_id)
-                    .push("))");
-                // `+ 0`: filter by time, but scan by id (the id range below);
-                // a time index scan would read the whole window and sort it.
-                if let Some(t) = q.since {
-                    b.push(" AND m.created_at + 0 >= ").push_bind(t);
+                let upper = q.before_id.unwrap_or(i64::MAX).min(hi_t.unwrap_or(i64::MAX));
+                let me: String = sqlx::query_scalar("SELECT name FROM orgs WHERE id = $1")
+                    .bind(org_id)
+                    .fetch_one(&mut *c)
+                    .await?;
+                let own = |a: &Option<(String, String)>| a.as_ref().filter(|(o, _)| *o == me).map(|(_, n)| n.clone());
+                let own_from = match own(&q.from) {
+                    Some(n) => Some(own_seat_ids(c, org_id, &n).await?),
+                    None => None,
+                };
+                let own_to = match own(&q.to) {
+                    Some(n) => Some(own_seat_ids(c, org_id, &n).await?),
+                    None => None,
+                };
+                if own_from.as_ref().is_some_and(Vec::is_empty) || own_to.as_ref().is_some_and(Vec::is_empty) {
+                    return empty;
                 }
-                if let Some(t) = q.until {
-                    b.push(" AND m.created_at + 0 < ").push_bind(t);
+                let filters = |b: &mut sqlx::QueryBuilder<'_, Db>| {
+                    // `+ 0`: filter by time, but scan by id.
+                    if let Some(t) = q.since {
+                        b.push(" AND m.created_at + 0 >= ").push_bind(t);
+                    }
+                    if let Some(t) = q.until {
+                        b.push(" AND m.created_at + 0 < ").push_bind(t);
+                    }
+                    if let Some(x) = lo_t {
+                        b.push(" AND m.id >= ").push_bind(x);
+                    }
+                    if let Some(t) = q.thread_id {
+                        b.push(" AND m.thread_id = ").push_bind(t);
+                    }
+                    match (&own_from, &q.from) {
+                        (Some(ids), _) => {
+                            b.push(" AND m.sender_seat_id IN (");
+                            let mut l = b.separated(", ");
+                            for id in ids {
+                                l.push_bind(*id);
+                            }
+                            b.push(")");
+                        }
+                        (None, Some((o, n))) => {
+                            b.push(" AND m.sender_seat_id IN (SELECT fs.id FROM seats fs JOIN orgs fo ON fo.id = fs.org_id WHERE fo.name = ")
+                                .push_bind(o.clone())
+                                .push(" AND fs.name = ")
+                                .push_bind(n.clone())
+                                .push(")");
+                        }
+                        _ => {}
+                    }
+                    match (&own_to, &q.to) {
+                        (Some(ids), _) => {
+                            b.push(" AND EXISTS (SELECT 1 FROM deliveries td WHERE td.message_id = m.id AND td.seat_id IN (");
+                            let mut l = b.separated(", ");
+                            for id in ids {
+                                l.push_bind(*id);
+                            }
+                            b.push("))");
+                        }
+                        // Another org's seat: only messages that name it.
+                        // Which of that org's seats a list reached is that
+                        // org's business.
+                        (None, Some((o, n))) => {
+                            b.push(" AND (',' || m.to_addrs || ',' || m.cc_addrs || ',') LIKE ")
+                                .push_bind(addr_pattern(&format!("{n}@{o}")))
+                                .push(" ESCAPE '\\'");
+                        }
+                        _ => {}
+                    }
+                };
+                let select = concat!("SELECT ", msg_cols!(), ", '' AS body FROM ");
+                let page = |mut v: Vec<MessageRec>, limit: i64| {
+                    v.sort_by(|a, b| b.id.cmp(&a.id));
+                    v.dedup_by_key(|m| m.id);
+                    v.truncate(limit as usize);
+                    let next_before_id = (v.len() as i64 == limit).then(|| v.last().map(|m| m.id)).flatten();
+                    ArchivePage { messages: v, next_before_id }
+                };
+                // One of the org's seats: its sent mail, or its mailbox.
+                if let Some(ids) = own_from.as_ref().or(own_to.as_ref()) {
+                    let mut all = Vec::new();
+                    for id in ids {
+                        let mut b = sqlx::QueryBuilder::<Db>::new(select);
+                        if own_from.is_some() {
+                            b.push("messages m").push(msg_joins!()).push(" WHERE m.sender_seat_id = ").push_bind(*id);
+                        } else {
+                            b.push("deliveries sd JOIN messages m ON m.id = sd.message_id")
+                                .push(msg_joins!())
+                                .push(" WHERE sd.seat_id = ")
+                                .push_bind(*id);
+                        }
+                        b.push(" AND m.id < ").push_bind(upper);
+                        filters(&mut b);
+                        // A seat's deliveries are numbered in message order.
+                        b.push(if own_from.is_some() { " ORDER BY m.id DESC LIMIT " } else { " ORDER BY sd.seq DESC LIMIT " })
+                            .push_bind(q.limit);
+                        let rows: Vec<MsgRow> = b.build_query_as().fetch_all(&mut *c).await?;
+                        all.extend(collect(rows, MsgRow::into_message)?);
+                    }
+                    return Ok(page(all, q.limit));
                 }
-                if let Some(x) = lo {
-                    b.push(" AND m.id >= ").push_bind(x);
+                // Steps over the org's messages (or the thread's).
+                let mut out: Vec<MessageRec> = Vec::new();
+                let mut before = upper;
+                let mut seen = 0;
+                while seen < MAX_SCAN_MESSAGES {
+                    let n = STEP_MESSAGES.min(MAX_SCAN_MESSAGES - seen);
+                    let w = match q.thread_id {
+                        Some(t) => thread_window(c, t, before, n).await?,
+                        None => scan_window(c, org_id, before, n).await?,
+                    };
+                    let Some(lo) = w.lo else {
+                        return Ok(ArchivePage { messages: out, next_before_id: None });
+                    };
+                    let mut b = sqlx::QueryBuilder::<Db>::new(select);
+                    b.push("messages m").push(msg_joins!()).push(" WHERE m.id < ").push_bind(before);
+                    b.push(" AND m.id >= ").push_bind(lo);
+                    match q.thread_id {
+                        Some(t) => {
+                            b.push(" AND m.thread_id = ").push_bind(t);
+                            b.push(" AND (m.org_id = ").push_bind(org_id);
+                            b.push(" OR EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = m.id AND d.org_id = ")
+                                .push_bind(org_id)
+                                .push("))");
+                        }
+                        None => {
+                            b.push(" AND m.id IN (SELECT id FROM messages WHERE org_id = ").push_bind(org_id);
+                            b.push(" AND id >= ").push_bind(lo).push(" AND id < ").push_bind(before);
+                            b.push(" UNION SELECT message_id FROM deliveries WHERE org_id = ").push_bind(org_id);
+                            b.push(" AND message_id >= ").push_bind(lo).push(" AND message_id < ").push_bind(before);
+                            b.push(")");
+                        }
+                    }
+                    filters(&mut b);
+                    b.push(" ORDER BY m.id DESC LIMIT ").push_bind(q.limit - out.len() as i64);
+                    let rows: Vec<MsgRow> = b.build_query_as().fetch_all(&mut *c).await?;
+                    out.extend(collect(rows, MsgRow::into_message)?);
+                    if out.len() as i64 >= q.limit {
+                        let next_before_id = out.last().map(|m| m.id);
+                        return Ok(ArchivePage { messages: out, next_before_id });
+                    }
+                    // Nothing older can match: the window reached the start
+                    // of the time range, or the org's (thread's) first message.
+                    if w.exhausted || lo_t.is_some_and(|t| lo <= t) {
+                        return Ok(ArchivePage { messages: out, next_before_id: None });
+                    }
+                    seen += w.count;
+                    before = lo;
                 }
-                if let Some(x) = hi {
-                    b.push(" AND m.id < ").push_bind(x);
-                }
-                if let Some(x) = q.before_id {
-                    b.push(" AND m.id < ").push_bind(x);
-                }
-                if let Some(t) = q.thread_id {
-                    b.push(" AND m.thread_id = ").push_bind(t);
-                }
-                if let Some((o, n)) = &q.from {
-                    b.push(" AND m.sender_seat_id IN (SELECT fs.id FROM seats fs JOIN orgs fo ON fo.id = fs.org_id WHERE fo.name = ")
-                        .push_bind(o.clone())
-                        .push(" AND fs.name = ")
-                        .push_bind(n.clone())
-                        .push(")");
-                }
-                if let Some((o, n)) = &q.to {
-                    b.push(" AND m.id IN (SELECT td.message_id FROM deliveries td JOIN seats ts ON ts.id = td.seat_id \
-                            JOIN orgs tor ON tor.id = ts.org_id WHERE tor.name = ")
-                        .push_bind(o.clone())
-                        .push(" AND ts.name = ")
-                        .push_bind(n.clone())
-                        .push(")");
-                }
-                b.push(" ORDER BY m.id DESC LIMIT ").push_bind(q.limit);
-                let rows: Vec<MsgRow> = b.build_query_as().fetch_all(&mut *c).await?;
-                collect(rows, MsgRow::into_message)
+                Ok(ArchivePage { messages: out, next_before_id: Some(before) })
             }
 
             pub async fn seat_seqs(c: &mut Conn, org_id: i64) -> Result<Vec<(i64, String, i64)>> {
@@ -2617,8 +2950,8 @@ macro_rules! impl_store_common {
                 run!(self.read, |c| q::delivery(c, message_id, seat_id).await)
             }
 
-            async fn thread(&self, thread_id: i64, org_id: i64, limit: i64) -> $crate::Result<Vec<$crate::MessageRec>> {
-                run!(self.read, |c| q::thread(c, thread_id, org_id, limit).await)
+            async fn thread(&self, thread_id: i64, org_id: i64, limit: i64, body_bytes: usize) -> $crate::Result<Vec<$crate::ThreadMessage>> {
+                run!(self.read_query, |c| q::thread(c, thread_id, org_id, limit, body_bytes).await)
             }
 
             async fn inbox(&self, seat_id: i64, query: &$crate::InboxQuery) -> $crate::Result<Vec<$crate::Entry>> {
@@ -2671,9 +3004,9 @@ macro_rules! impl_store_common {
                 run!(self.read, |c| q::recipients(c, message_id).await)
             }
 
-            async fn archive(&self, org_id: i64, query: &$crate::ArchiveQuery) -> $crate::Result<Vec<$crate::MessageRec>> {
+            async fn archive(&self, org_id: i64, query: &$crate::ArchiveQuery) -> $crate::Result<$crate::ArchivePage> {
                 let query = query.clone();
-                run!(self.read, |c| q::archive(c, org_id, &query).await)
+                run!(self.read_query, |c| q::archive(c, org_id, &query).await)
             }
 
             async fn seat_seqs(&self, org_id: i64) -> $crate::Result<Vec<(i64, String, i64)>> {
@@ -2721,26 +3054,15 @@ macro_rules! impl_store_common {
             }
 
             async fn message_count(&self, org_id: i64, since: i64) -> $crate::Result<i64> {
-                run!(self.read, |c| q::message_count(c, org_id, since).await)
+                run!(self.read_query, |c| q::message_count(c, org_id, since).await)
             }
 
             async fn search(&self, org_id: i64, query: &$crate::SearchQuery) -> $crate::Result<$crate::SearchResult> {
-                if query.terms.is_empty() {
+                if query.terms.is_empty() || query.limit < 1 {
                     return Ok($crate::SearchResult::default());
                 }
-                let (scanned_to, exhausted) = match query.scan {
-                    Some(n) => {
-                        let before = query.before_id;
-                        let (count, oldest) = run!(self.read, |c| q::scan_window(c, org_id, before, n).await)?;
-                        (oldest, count < n)
-                    }
-                    None => (None, false),
-                };
-                if query.scan.is_some() && scanned_to.is_none() {
-                    return Ok($crate::SearchResult { messages: Vec::new(), scanned_to: None, scan_exhausted: true });
-                }
-                let messages = self.search_impl(org_id, query, scanned_to).await?;
-                Ok($crate::SearchResult { messages, scanned_to, scan_exhausted: exhausted })
+                let query = query.clone();
+                run!(self.read_query, |c| q::search(c, org_id, &query).await)
             }
 
             async fn presence(&self, org_id: i64, seat: Option<&str>) -> $crate::Result<Vec<$crate::PresenceRec>> {

@@ -39,7 +39,7 @@
           const ids = new Set(r.entries.map((e) => e.message.id));
           const oldest = r.entries.length ? r.entries[0].delivery.seq : Infinity;
           const kept = entries.filter((e) => !ids.has(e.message.id) && e.delivery.seq < oldest);
-          if (!kept.length) more = r.entries.length === PAGE;
+          if (!kept.length) more = r.entries.length === PAGE || !!r.truncated;
           entries = [...kept, ...r.entries];
         })
         .catch((e) => (error = String(e?.message ?? e)));
@@ -61,7 +61,7 @@
     if (tab === 'inbox') {
       const min = Math.min(...entries.map((e) => e.delivery.seq));
       const r = await get<InboxResponse>(`/v1/inbox${qs({ before_seq: min, limit: PAGE })}`);
-      more = r.entries.length === PAGE;
+      more = r.entries.length === PAGE || !!r.truncated;
       entries = [...r.entries, ...entries];
     } else if (sentNext) {
       const r = await get<ArchiveResponse>(`/v1/sent${qs({ limit: PAGE, before_id: sentNext })}`);

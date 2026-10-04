@@ -326,6 +326,7 @@ mod tests {
                 expired: false,
             },
             body: body.into(),
+            body_omitted: false,
         }
     }
 

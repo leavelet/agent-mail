@@ -767,17 +767,25 @@ async fn threads_and_visibility(s: S) {
     side.thread_id = Some(root.thread_id);
     let side = s.send(&side).await.unwrap();
 
-    let ids = |v: Vec<MessageRec>| v.into_iter().map(|m| m.id).collect::<Vec<_>>();
+    let ids = |v: Vec<amail_store::ThreadMessage>| {
+        v.into_iter().map(|t| t.message.id).collect::<Vec<_>>()
+    };
     assert_eq!(
-        ids(s.thread(root.thread_id, o.id, 1000).await.unwrap()),
+        ids(s
+            .thread(root.thread_id, o.id, 1000, usize::MAX)
+            .await
+            .unwrap()),
         vec![root.message_id, reply.message_id, side.message_id]
     );
     assert_eq!(
-        ids(s.thread(root.thread_id, o2.id, 1000).await.unwrap()),
+        ids(s
+            .thread(root.thread_id, o2.id, 1000, usize::MAX)
+            .await
+            .unwrap()),
         vec![root.message_id, reply.message_id, internal.message_id]
     );
     assert_eq!(
-        ids(s.thread(root.thread_id, o.id, 2).await.unwrap()),
+        ids(s.thread(root.thread_id, o.id, 2, usize::MAX).await.unwrap()),
         vec![reply.message_id, side.message_id]
     );
     assert!(s.org_sees_message(o.id, reply.message_id).await.unwrap());
@@ -855,6 +863,7 @@ async fn archive(s: S) {
             s.archive(o.id, &ArchiveQuery { limit, ..f })
                 .await
                 .unwrap()
+                .messages
                 .into_iter()
                 .map(|m| m.id)
                 .collect::<Vec<_>>()
@@ -914,7 +923,8 @@ async fn archive(s: S) {
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .messages;
     assert!(all.iter().all(|m| m.body.is_empty()));
     assert_eq!(
         s.archive(
@@ -926,6 +936,7 @@ async fn archive(s: S) {
         )
         .await
         .unwrap()
+        .messages
         .len(),
         1
     );
@@ -1287,7 +1298,8 @@ async fn empty_send_rejected(s: S) {
             },
         )
         .await
-        .unwrap();
+        .unwrap()
+        .messages;
     assert!(a.is_empty(), "{a:?}");
 }
 

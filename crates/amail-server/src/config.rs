@@ -46,6 +46,9 @@ pub struct Limits {
     /// message it sent, each counted once (`amail_store::message_bytes`).
     /// A send that would go over it is refused.
     pub org_storage_bytes: Option<i64>,
+    /// Search and archive requests (`/archive/search`, `/archive/messages`)
+    /// of one org in progress at the same time; further ones get 429.
+    pub org_queries: Option<usize>,
 }
 
 impl Limits {
@@ -64,6 +67,7 @@ impl Limits {
             org_webhooks_in_flight: Some(16),
             mirror_bytes: Some(256 * 1024 * 1024),
             org_storage_bytes: Some(1 << 30),
+            org_queries: Some(4),
         }
     }
 }

@@ -84,6 +84,11 @@ impl From<StoreError> for ApiError {
             StoreError::Conflict(m) => Self::new(StatusCode::CONFLICT, "conflict", m),
             StoreError::Invalid(m) => Self::bad_request(m),
             StoreError::StorageQuota(stored) => Self::storage_quota(stored, None),
+            StoreError::Timeout => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "query_timeout",
+                "the query took too long and was cancelled; narrow it or retry later",
+            ),
             other => {
                 tracing::error!("store error: {other}");
                 Self::new(

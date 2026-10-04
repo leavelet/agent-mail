@@ -253,6 +253,25 @@ pub struct ArchiveQuery {
     pub limit: i64,
 }
 
+/// One page of [`ArchiveQuery`]: messages newest first, without bodies.
+#[derive(Debug, Clone, Default)]
+pub struct ArchivePage {
+    pub messages: Vec<MessageRec>,
+    /// Where the next (older) page starts (`before_id`): set when the page
+    /// is full, or when the request looked at its share of the org's
+    /// messages ([`amail_proto::limits::MAX_SCAN_MESSAGES`]) without
+    /// filling the page. `None`: nothing older matches.
+    pub next_before_id: Option<i64>,
+}
+
+/// A message of a thread; bodies past the request's byte budget are left
+/// out (`body` empty, `body_omitted` set).
+#[derive(Debug, Clone)]
+pub struct ThreadMessage {
+    pub message: MessageRec,
+    pub body_omitted: bool,
+}
+
 /// A live token, without its secret.
 #[derive(Debug, Clone)]
 pub struct TokenRec {
@@ -344,27 +363,40 @@ pub struct Laggard {
     pub parent_id: Option<i64>,
 }
 
-/// A full-text search (`Store::search`). Every term must occur in the
+/// A substring search (`Store::search`). Every term must occur in the
 /// subject or the body (case-insensitive substring).
 #[derive(Debug, Clone, Default)]
 pub struct SearchQuery {
     pub terms: Vec<String>,
     pub before_id: Option<i64>,
     pub limit: i64,
-    /// `None`: use the index (every term has at least three characters).
-    /// `Some(n)`: scan only the `n` most recent visible messages before
-    /// `before_id`.
-    pub scan: Option<i64>,
+    /// How many of the org's messages, newest first before `before_id`,
+    /// the request looks at.
+    pub scan: i64,
 }
 
-/// Result of [`SearchQuery`]: matches newest first, with bodies, and in scan
-/// mode the oldest message id that was scanned.
+/// One match of a [`SearchQuery`]: the message without its body, and an
+/// excerpt of the body around the first match.
+#[derive(Debug, Clone)]
+pub struct SearchHit {
+    pub message: MessageRec,
+    /// Up to [`SNIPPET_CHARS`] characters of the body.
+    pub excerpt: String,
+    /// Whether the body has text before and after the excerpt.
+    pub cut_before: bool,
+    pub cut_after: bool,
+}
+
+/// Characters of the body a search hit carries.
+pub const SNIPPET_CHARS: i64 = 160;
+
+/// Result of [`SearchQuery`]: matches newest first.
 #[derive(Debug, Clone, Default)]
 pub struct SearchResult {
-    pub messages: Vec<MessageRec>,
-    pub scanned_to: Option<i64>,
-    /// Scan mode: fewer than `scan` messages were left to scan.
-    pub scan_exhausted: bool,
+    pub hits: Vec<SearchHit>,
+    /// Where to continue (`before_id`): set when the page is full or when
+    /// `scan` messages were looked at; `None` when nothing older is left.
+    pub next_before_id: Option<i64>,
 }
 
 /// Mailbox counters of one seat.

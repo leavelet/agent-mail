@@ -73,9 +73,9 @@ amail serve --db postgres://amail:PASSWORD@db.internal/amail --listen 0.0.0.0:80
 ```
 
 Both backends have the same schema and pass the same test suite.
-Migrations run automatically on start. Full-text search on Postgres uses
-the `pg_trgm` extension, which the first migration creates; it is a trusted
-extension, so the database owner may create it. With Postgres the server
+Migrations run automatically on start. The first migration creates the
+`pg_trgm` extension on Postgres (a trusted extension, so the database
+owner may create it); search no longer uses it. With Postgres the server
 always runs in its multi-instance mode (`LISTEN`/`NOTIFY`, presence in the
 database), also as a single instance.
 
@@ -187,6 +187,7 @@ Public mode turns on:
 | registration attempts per hour per client address (failed ones too) | `--max-registrations-per-hour` / `AMAIL_MAX_REGISTRATIONS_PER_HOUR` | 10 |
 | memory for conversation mirrors over all seats (per instance, MiB); beyond it, watchers furthest behind are disconnected and kept events dropped | `--max-mirror-mb` / `AMAIL_MAX_MIRROR_MB` | 256 |
 | mail stored per org, in MiB (see below) | `--max-org-storage-mb` / `AMAIL_MAX_ORG_STORAGE_MB` | 1024 |
+| search and archive requests per org in progress at the same time | `--max-org-queries` / `AMAIL_MAX_ORG_QUERIES` | 4 |
 
 `0` turns a limit off. The limits also apply without `--public` when set
 explicitly. Message rate limits come on top of each seat's own send budget;
@@ -283,8 +284,17 @@ once**; variance is unknown.
 
 No delivery was ever injected twice, also under overload. Wake-up latency
 is the 3-second coalescing window; busy-injection latency is the time to
-the next tool call. Archive and search queries over 10 million messages
-took under 65 ms on both backends (short-term scans on Postgres ~100 ms).
+the next tool call.
+
+Search and the archive start from the org's own messages, so their cost
+does not grow with other orgs' mail. Measured on the same host with 500,000
+messages of one org (bodies of about 600 bytes) and a second org with one
+message: a search or archive request of the small org takes 1–3 ms on
+both backends. A search of the large org that fills its page early takes
+about 6 ms; one that finds nothing looks at its 50,000 newest messages in
+about 290 ms (Postgres) or 80 ms (SQLite) and answers with a cursor to
+search further back. A search reads the bodies it looks at, so its cost
+grows with their size; each query is cancelled after 10 seconds.
 
 Recommendations based on these numbers:
 

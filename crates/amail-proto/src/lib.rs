@@ -253,6 +253,16 @@ pub mod limits {
     pub const MAX_SCAN_MESSAGES: i64 = 50_000;
     /// Messages a search with a term shorter than three characters looks at.
     pub const SHORT_TERM_SCAN_MESSAGES: i64 = 2_000;
+    /// Postgres cancels a search, archive or thread query that runs longer
+    /// than this (`statement_timeout`); the request fails with 503
+    /// `query_timeout`.
+    pub const QUERY_TIMEOUT_MS: u64 = 10_000;
+    /// Members of one list.
+    pub const MAX_LIST_MEMBERS: i64 = 1_000;
+    /// Characters of a seat's role in `GET /seats` (the list); longer roles
+    /// are cut there and marked `role_truncated`. `GET /seats/{name}` has
+    /// the whole role.
+    pub const LIST_ROLE_CHARS: usize = 1_000;
 
     // --- what the node reads (so a server cannot exhaust its memory) ---
 
@@ -388,6 +398,10 @@ pub struct Message {
     #[serde(flatten)]
     pub header: MessageHeader,
     pub body: String,
+    /// `GET /threads/{id}`: the body was left out to keep the answer small
+    /// (`body` is empty); fetch it with `GET /messages/{id}`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub body_omitted: bool,
 }
 
 /// One delivery row: the state of one message in one seat's mailbox.
@@ -428,6 +442,11 @@ pub struct InboxEntry {
 pub struct InboxResponse {
     pub seat: String,
     pub entries: Vec<InboxEntry>,
+    /// The page was cut to stay within [`limits::MAX_PAGE_BYTES`]: more
+    /// entries follow. Continue after the last entry (`after_seq`), or,
+    /// when paging with `before_seq`, before the first.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -477,7 +496,7 @@ pub struct ThreadResponse {
     pub thread_id: i64,
     pub messages: Vec<Message>,
     /// Older messages were left out (a thread answers at most its newest
-    /// 500 messages).
+    /// 500 messages, and headers of at most [`limits::MAX_PAGE_BYTES`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
 }
@@ -562,6 +581,10 @@ pub struct Seat {
     pub display_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// `GET /seats` (the list): `role` holds only the first
+    /// [`limits::LIST_ROLE_CHARS`] characters; `GET /seats/{name}` has all.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub role_truncated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

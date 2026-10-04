@@ -216,7 +216,7 @@ const en = {
   'archive.until': 'Until',
   'archive.apply': 'Apply',
   'archive.empty': 'No messages match.',
-  'archive.scanNote': 'A search term shorter than three characters cannot use the index, so each page scans only the {n} most recent messages. Load more to scan further back.',
+  'archive.scanNote': 'Each page searches the next {n} messages, newest first. Load more to search further back.',
   'archive.results': 'Results for “{q}”',
   'archive.timeline': 'Timeline of the org’s mail',
 
@@ -393,6 +393,8 @@ const en = {
   'op.refreshed': 'updated {time}',
 
   'msg.expired': "Body removed: older than the server's retention period.",
+  'msg.omitted': 'This thread is large, so older message bodies are loaded one at a time.',
+  'msg.loadBody': 'Show message',
 
   'time.now': 'now',
   'time.ago': '{d} ago',
@@ -616,7 +618,7 @@ const zh: Record<Key, string> = {
   'archive.until': '截止',
   'archive.apply': '应用',
   'archive.empty': '没有符合条件的邮件。',
-  'archive.scanNote': '检索词不足三个字符时无法使用索引，每页只扫描最近的 {n} 封邮件。加载更多可以继续往前扫描。',
+  'archive.scanNote': '每页按时间从新到旧检索接下来的 {n} 封邮件。加载更多可以继续往前检索。',
   'archive.results': '“{q}”的检索结果',
   'archive.timeline': '全组织邮件时间线',
 
@@ -793,6 +795,8 @@ const zh: Record<Key, string> = {
   'op.refreshed': '更新于 {time}',
 
   'msg.expired': '正文已清除：超过了服务器的保留期。',
+  'msg.omitted': '这个会话较大，较早邮件的正文需逐封加载。',
+  'msg.loadBody': '显示正文',
 
   'time.now': '刚刚',
   'time.ago': '{d}前',

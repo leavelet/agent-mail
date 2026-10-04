@@ -319,6 +319,10 @@ struct ServeOpts {
     /// message it sent (public default 1024; 0: no limit).
     #[arg(long, env = "AMAIL_MAX_ORG_STORAGE_MB")]
     max_org_storage_mb: Option<i64>,
+    /// Search and archive requests per org in progress at the same time
+    /// (public default 4; 0: no limit).
+    #[arg(long, env = "AMAIL_MAX_ORG_QUERIES")]
+    max_org_queries: Option<usize>,
 }
 
 impl ServeOpts {
@@ -379,6 +383,9 @@ impl ServeOpts {
         }
         if let Some(v) = self.max_org_storage_mb {
             l.org_storage_bytes = (v > 0).then(|| v.saturating_mul(1 << 20));
+        }
+        if let Some(v) = self.max_org_queries {
+            l.org_queries = (v > 0).then_some(v);
         }
         Ok(c)
     }
@@ -1052,8 +1059,17 @@ async fn run(cli: Cli) -> Result<()> {
                 }
                 Err(e) => return Err(e),
             };
+            // Bodies the server left out to keep the answer small, one at
+            // a time (without marking them read, like the thread itself).
+            let mut t: p::ThreadResponse = parse(&v)?;
+            for m in t.messages.iter_mut().filter(|m| m.body_omitted) {
+                let r: p::MessageResponse =
+                    c.get(&format!("/messages/{}?peek=1", m.header.id)).await?;
+                m.body = r.message.body;
+                m.body_omitted = false;
+            }
+            let v = serde_json::to_value(&t)?;
             out.show(&v, || {
-                let t: p::ThreadResponse = parse(&v)?;
                 Ok(t.messages
                     .iter()
                     .map(|m| output::message(m).trim_end().to_string())

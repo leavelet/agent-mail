@@ -60,11 +60,11 @@ test('smoke: org, compose, reply, thread, delivery, search, mirror, needs-you', 
   await expect(first.locator('[data-testid="delivery"]')).toContainText('be-lead');
   await expect(first.locator('[data-dstate="read"]')).toBeVisible();
 
-  // Chinese search: an indexed query and a short (scanned) one.
+  // Chinese search: a query of three characters and a short one.
   await page.goto(`${s.base}/#/archive`);
   await page.locator('input[data-search]').fill('迁移方案');
   await page.keyboard.press('Enter');
-  await expect(page.locator('.results[data-mode="index"] .mrow')).toContainText('数据库迁移方案');
+  await expect(page.locator('.results[data-mode="scan"] .mrow')).toContainText('数据库迁移方案');
   await page.locator('input[data-search]').fill('迁移');
   await page.keyboard.press('Enter');
   await expect(page.locator('[data-mode="scan"]').first()).toBeVisible();

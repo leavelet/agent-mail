@@ -385,13 +385,18 @@ Rate and stream limits are counted per server instance.
 | Lists per org | 500 (*public*) |
 | Live tokens per org | 1,000 (*public*) |
 | Open event streams per org (`/events` and conversation mirrors) | 32 (*public*) |
-| `GET /inbox` page | 50 by default, at most 1,000 |
+| `GET /inbox` page | 50 by default, at most 1,000, and at most 2 MiB (`truncated` says the page was cut) |
 | `POST /claim` | at most 500 deliveries |
-| `GET /changes` page | 500 by default, at most 5,000 |
-| `GET /archive/messages`, `GET /sent` page | 50 by default, at most 500 |
-| `GET /archive/search` | 50 results by default, at most 200; at most 10 terms; terms shorter than 3 characters scan only the 2,000 newest messages |
+| `GET /changes` page | 500 by default, at most 5,000, and at most 2 MiB (`more` says what follows) |
+| `GET /archive/messages`, `GET /sent` page | 50 by default, at most 500, and at most 2 MiB |
+| `GET /archive/search` | 50 results by default, at most 200, and at most 2 MiB; at most 10 terms; each request looks at the org's 50,000 newest messages before its cursor (2,000 when a term is shorter than 3 characters) |
+| Messages one archive request looks at | 50,000 of the org's own, newest first (or of the thread, with `thread=`); then it answers with `next_before_id`. Filters by one of the org's seats (`from=`, `to=`) read that seat's mail directly |
+| Search and archive requests per org in progress | 4 (*public*); further ones get 429 `too_many_queries` |
+| One search, archive or thread query | 10 s, then it is cancelled (503 `query_timeout`) |
 | `GET /attention` | 500 items |
-| `GET /threads/{id}` | the newest 500 messages (`truncated` says when older ones were left out) |
+| `GET /threads/{id}` | the newest 500 messages and at most 2 MiB of headers (`truncated` says when older ones were left out); message bodies up to 1 MiB in total, newest first; the others come with `body_omitted` and are read one at a time with `GET /messages/{id}` |
+| `GET /seats` | a seat's role is cut to its first 1,000 characters (`role_truncated`); `GET /seats/{name}` has all of it |
+| List members | 1,000 per list |
 | Event replay buffer (`Last-Event-ID`) | 4,096 events per org; a subscriber more than 1,024 events behind is disconnected and resynchronizes |
 | Presence report | 5,000 seats per request; an entry is valid for 90 s |
 | Conversation mirror, per watched seat | in memory only while someone watches: the last 1,000 events or 4 MiB kept for watchers that join later; at most 8 MiB waiting to be sent to one watcher (a watcher that falls further behind, for example one that stopped reading, is disconnected and its queue freed; it reconnects and starts again from the kept events); 16 MiB for the seat in all (beyond it, the watchers furthest behind are disconnected); 1,000 events per post; 16,000 characters per event; 2,000 characters per status field |
