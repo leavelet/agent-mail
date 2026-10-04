@@ -83,7 +83,9 @@ macro_rules! entry_select {
     };
 }
 
-/// `SELECT` of delivery + message with body.
+/// `SELECT` of delivery + message with the start of its body (claims):
+/// one character more than `amail_proto::limits::MAX_CLAIM_BODY_CHARS`, so
+/// that a longer body is known to be longer without loading all of it.
 macro_rules! entry_select_body {
     () => {
         concat!(
@@ -91,7 +93,7 @@ macro_rules! entry_select_body {
             deliv_cols!(),
             ", ",
             msg_cols!(),
-            ", m.body FROM deliveries d",
+            ", substr(m.body, 1, 16385) AS body FROM deliveries d",
             deliv_joins!(),
             " JOIN messages m ON m.id = d.message_id",
             msg_joins!()

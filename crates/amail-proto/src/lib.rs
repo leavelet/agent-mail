@@ -278,6 +278,11 @@ pub mod limits {
     /// counts, from the server); further names from the server are ignored.
     pub const NODE_MAX_OTHER_SEATS: usize = 1_000;
 
+    /// The most body characters `POST /claim` works with per delivery:
+    /// `inline_body_max` and `preview_chars` are capped at it, and the
+    /// server loads no more of a body than that for a claim.
+    pub const MAX_CLAIM_BODY_CHARS: usize = 16_384;
+
     // --- browser sessions ---
 
     /// Browser sessions per token; signing in once more ends the oldest.

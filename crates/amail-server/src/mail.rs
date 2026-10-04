@@ -335,13 +335,20 @@ pub async fn claim(
     {
         return Err(ApiError::bad_request("key must be 1..=100 characters"));
     }
+    // Claims load at most this much of each body (see the store).
+    let inline_max = req
+        .inline_body_max
+        .map(|m| (m as usize).min(p::limits::MAX_CLAIM_BODY_CHARS));
+    let preview_chars = req
+        .preview_chars
+        .map(|n| (n as usize).min(p::limits::MAX_CLAIM_BODY_CHARS));
     let filter = ClaimFilter {
         classes: req.classes,
         urgent_only: req.min_priority == Some(Priority::Urgent),
         include_digest: req.include_digest,
         via: req.via,
         limit: req.limit.unwrap_or(50).clamp(1, 500) as i64,
-        read_body_max: match req.inline_body_max {
+        read_body_max: match inline_max {
             Some(max) if req.mark_inlined_read && max > 0 => Some(max as i64),
             _ => None,
         },
@@ -350,7 +357,7 @@ pub async fn claim(
     };
     let (entries, bump) = st.store.claim(seat.id, &filter).await?;
     publish(&st, &seat.name, bump);
-    let max = req.inline_body_max.unwrap_or(0) as usize;
+    let max = inline_max.unwrap_or(0);
     let entries = entries
         .iter()
         .map(|e| {
@@ -358,8 +365,8 @@ pub async fn claim(
             if max > 0 && e.message.body.chars().count() <= max {
                 out.body = Some(e.message.body.clone());
             }
-            if let Some(n) = req.preview_chars {
-                out.preview = Some(render::preview(&e.message.body, n as usize));
+            if let Some(n) = preview_chars {
+                out.preview = Some(render::preview(&e.message.body, n));
             }
             out
         })

@@ -386,7 +386,7 @@ Rate and stream limits are counted per server instance.
 | Live tokens per org | 1,000 (*public*) |
 | Open event streams per org (`/events` and conversation mirrors) | 32 (*public*) |
 | `GET /inbox` page | 50 by default, at most 1,000, and at most 2 MiB (`truncated` says the page was cut) |
-| `POST /claim` | at most 500 deliveries |
+| `POST /claim` | at most 500 deliveries; `inline_body_max` and `preview_chars` at most 16,384 characters (a longer body is not inlined) |
 | `GET /changes` page | 500 by default, at most 5,000, and at most 2 MiB (`more` says what follows) |
 | `GET /archive/messages`, `GET /sent` page | 50 by default, at most 500, and at most 2 MiB |
 | `GET /archive/search` | 50 results by default, at most 200, and at most 2 MiB; at most 10 terms; each request looks at the org's 50,000 newest messages before its cursor (2,000 when a term is shorter than 3 characters) |

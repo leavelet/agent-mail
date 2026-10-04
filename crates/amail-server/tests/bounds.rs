@@ -46,6 +46,7 @@ bound_tests!(
     mirror_memory_limit,
     storage_quota,
     org_deletion_keeps_received_mail,
+    claim_loads_bounded_bodies,
 );
 
 /// Start a server; `None` (test skipped) when Postgres is not configured.
@@ -994,4 +995,42 @@ async fn org_deletion_keeps_received_mail(b: Backend, t: &str) {
     for id in [hostile, reply] {
         assert!(srv.db.store.message(id).await.unwrap().is_none());
     }
+}
+
+// --- claims ----------------------------------------------------------------------
+
+/// A claim works with at most `MAX_CLAIM_BODY_CHARS` of each body: a longer
+/// body is neither inlined nor marked read, whatever `inline_body_max` the
+/// client asks for, and a shorter one is inlined as before.
+async fn claim_loads_bounded_bodies(b: Backend, t: &str) {
+    use amail_proto::limits::MAX_CLAIM_BODY_CHARS;
+    let srv = start!(b, t, public());
+    let acme = srv.org("acme").await;
+    let w = acme.seat("w").await;
+    let long = "y".repeat(MAX_CLAIM_BODY_CHARS + 1);
+    let short = "z".repeat(MAX_CLAIM_BODY_CHARS);
+    acme.send(json!({ "to": ["w"], "subject": "long", "body": long }))
+        .await;
+    acme.send(json!({ "to": ["w"], "subject": "short", "body": short }))
+        .await;
+    let v = w
+        .ok(
+            Method::POST,
+            "/claim",
+            Some(
+                json!({ "classes": ["to"], "via": "test", "inline_body_max": 1_000_000,
+                          "mark_inlined_read": true, "preview_chars": 1_000_000 }),
+            ),
+        )
+        .await;
+    let e = v["entries"].as_array().unwrap();
+    assert_eq!(e.len(), 2, "{v}");
+    assert!(e[0]["body"].is_null(), "long body inlined");
+    assert!(e[0]["delivery"]["read_at"].is_null(), "long body marked read");
+    assert!(
+        e[0]["preview"].as_str().unwrap().chars().count() <= MAX_CLAIM_BODY_CHARS + 1,
+        "preview too long"
+    );
+    assert_eq!(e[1]["body"].as_str().unwrap().len(), MAX_CLAIM_BODY_CHARS);
+    assert!(!e[1]["delivery"]["read_at"].is_null(), "short body not marked read");
 }
