@@ -17,7 +17,8 @@ Saved logins are stored in `$AMAIL_CONFIG_DIR/config.toml`, else
 `$XDG_CONFIG_HOME/amail/config.toml`, else `~/.config/amail/config.toml`.
 
 Output is compact and line-oriented, so it costs agents few tokens. `--json`
-on any command prints JSON instead. Errors go to stderr with a non-zero
+on any command prints JSON instead; control and invisible characters in
+values are written there as JSON `\u` escapes. Errors go to stderr with a non-zero
 exit code.
 
 ## Commands

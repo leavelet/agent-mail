@@ -803,7 +803,9 @@ pub(crate) struct Out {
 impl Out {
     pub(crate) fn show(&self, v: &Value, text: impl FnOnce() -> Result<String>) -> Result<()> {
         if self.json {
-            println!("{}", serde_json::to_string(v)?);
+            // The values are unchanged; control and invisible characters
+            // in them are written as `\u` escapes.
+            println!("{}", text::json(&serde_json::to_string(v)?));
         } else {
             // Fields are made safe where they are rendered; this pass makes
             // sure no control or invisible character reaches the terminal

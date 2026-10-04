@@ -222,9 +222,11 @@ of every message unambiguous and keeps mail out of the permission system:
   line client, and every body line is behind `  > `. Subjects, names and
   `meta` values are printed on one line. So a message cannot fake a header
   line, a message from `USER` or a line from the mail system, in the
-  agent's context or in a terminal. `--json` output contains the raw
-  values, unescaped: it is meant for programs, which must apply their own
-  rules before showing the values to a person or a model.
+  agent's context or in a terminal. `--json` output contains the values
+  unchanged: control, line-break and invisible characters in them are
+  written as JSON `\u` escapes (for example `\u202e`), so they decode to the
+  original text. It is meant for programs, which must apply their own rules
+  before showing the decoded values to a person or a model.
 - **No hidden or terminal-control characters.** In everything the command
   line client prints and everything injected into a session (bodies,
   subjects, `meta`, previews, names, list descriptions, token labels, role

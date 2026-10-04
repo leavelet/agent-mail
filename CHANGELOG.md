@@ -100,7 +100,7 @@ Changes made after a security review, before the first public server.
   zero-width and other invisible characters are shown as visible escapes
   in everything the command line prints and everything injected into a
   session (bodies, subjects, `meta`, names, descriptions, labels, role
-  text).
+  text). In `--json` output they are written as JSON `\u` escapes.
 - Injected mail is packed by its rendered size; messages that do not fit
   wait for the next hook instead of being cut.
 

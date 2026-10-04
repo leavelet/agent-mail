@@ -132,9 +132,56 @@ pub fn quote(body: &str) -> String {
     out
 }
 
+/// JSON text with every unsafe character ([`is_unsafe`]) written as a JSON
+/// `\u` escape (a UTF-16 surrogate pair above U+FFFF). The decoded values
+/// are unchanged; only how they are written changes, so a person or a model
+/// reading the JSON sees the escapes instead of invisible or control
+/// characters.
+///
+/// `s` must be JSON as written by `serde_json`: outside string literals it
+/// has only ASCII characters other than DEL, so every character this
+/// function replaces is inside a string literal, where a `\u` escape is
+/// valid.
+pub fn json(s: &str) -> Cow<'_, str> {
+    if !s.chars().any(is_unsafe) {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 16);
+    for c in s.chars() {
+        if is_unsafe(c) {
+            let mut units = [0u16; 2];
+            for u in c.encode_utf16(&mut units) {
+                let _ = write!(out, "\\u{u:04x}");
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    Cow::Owned(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_escapes() {
+        let v = serde_json::json!({
+            "body": "a\u{202e}b\u{85}c\u{2028}d\u{7f}e\u{fe0f}\u{e0101}\u{9b}31m \u{1b}[2K \"q\" 数据 é ✓",
+            "n": 1,
+        });
+        let raw = serde_json::to_string(&v).unwrap();
+        let safe = json(&raw);
+        assert!(!safe.chars().any(is_unsafe), "{safe}");
+        assert!(safe.contains("\\u202e"), "{safe}");
+        // A character above U+FFFF is written as a surrogate pair.
+        assert!(safe.contains("\\udb40\\udd01"), "{safe}");
+        // Ordinary non-ASCII text is kept.
+        assert!(safe.contains("数据 é ✓"), "{safe}");
+        let back: serde_json::Value = serde_json::from_str(&safe).unwrap();
+        assert_eq!(back, v);
+        assert!(matches!(json("{\"a\":\"plain é\"}"), Cow::Borrowed(_)));
+    }
 
     #[test]
     fn lines() {
