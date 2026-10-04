@@ -1040,6 +1040,7 @@ impl Node {
                 extra,
                 pane,
                 mux_session,
+                permission_mode,
                 ..
             } => Ok(Request::Launch {
                 seat,
@@ -1050,6 +1051,7 @@ impl Node {
                 extra,
                 pane,
                 mux_session,
+                permission_mode,
             }),
             req => Ok(req),
         }

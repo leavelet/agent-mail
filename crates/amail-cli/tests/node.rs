@@ -1650,6 +1650,7 @@ async fn socket_checks_callers(b: Backend) {
             extra: vec![],
             pane: None,
             mux_session: None,
+            permission_mode: None,
         })
         .await;
     let pass = plan["env"]["AMAIL_CODEX_PASS"]
@@ -1781,6 +1782,7 @@ env -u AMAIL_TOKEN CODEX_THREAD_ID={tid} AMAIL_CODEX_PASS={pass} timeout 10 "$B"
             extra: vec![],
             pane: None,
             mux_session: None,
+            permission_mode: None,
         },
     )
     .await;
@@ -1858,6 +1860,7 @@ async fn transcript_paths_are_checked(b: Backend) {
             extra: vec![],
             pane: None,
             mux_session: None,
+            permission_mode: None,
         })
         .await;
     let prompt = plan["args"].as_array().unwrap().last().unwrap().clone();

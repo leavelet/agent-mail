@@ -857,6 +857,7 @@ mod tests {
             claude_bin: "claude".into(),
             codex_bin: "codex".into(),
             codex_auth: root.join("auth.json"),
+            codex_pass: String::new(),
         });
         std::fs::create_dir_all(codex.home()).unwrap();
         let mut t = toml::Table::new();
