@@ -4,6 +4,7 @@
 use crate::AppState;
 use crate::auth::{CSRF_HEADER, SESSION_COOKIE, check_csrf, cookie, hash_token, new_token};
 use crate::error::{ApiError, ApiResult, Json};
+use crate::peer::Peer;
 use amail_proto::{SessionRequest, TokenScope, WhoAmI};
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -47,7 +48,11 @@ pub async fn static_file(method: Method, uri: axum::http::Uri) -> Response {
         return ApiError::not_found("no such endpoint").into_response();
     }
     let path = uri.path().trim_start_matches('/');
-    let path = if path.is_empty() { "index.html" } else { path };
+    // The app's own pages: sign-in, registration, the operator's view.
+    let path = match path {
+        "" | "register" | "admin" => "index.html",
+        p => p,
+    };
     let Some((name, bytes)) = assets::ASSETS.iter().find(|(p, _)| *p == path) else {
         return ApiError::not_found("no such endpoint").into_response();
     };
@@ -90,13 +95,18 @@ pub async fn headers(req: Request, next: Next) -> Response {
     resp
 }
 
-/// Requests that came over HTTPS (through a proxy that says so, or as seen
-/// from the page's origin) get `Secure` cookies.
-fn https(headers: &HeaderMap) -> bool {
-    let fwd = headers
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.eq_ignore_ascii_case("https"));
+/// Whether the session cookie gets `Secure`: always in public mode,
+/// otherwise when the request came over HTTPS (through a trusted proxy that
+/// says so, or as seen from the page's origin).
+fn https(st: &AppState, peer: Peer, headers: &HeaderMap) -> bool {
+    if st.config.secure_cookies {
+        return true;
+    }
+    let fwd = peer.proxied
+        && headers
+            .get("x-forwarded-proto")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.eq_ignore_ascii_case("https"));
     let origin = headers
         .get(header::ORIGIN)
         .and_then(|v| v.to_str().ok())
@@ -113,9 +123,11 @@ fn session_cookie(value: &str, max_age: i64, secure: bool) -> HeaderValue {
     HeaderValue::from_str(&c).expect("cookie is ASCII")
 }
 
-/// `POST /v1/session`: sign a browser in with a user token.
+/// `POST /v1/session`: sign a browser in with a user token (or an operator
+/// token: an operator session).
 pub async fn login(
     State(st): State<AppState>,
+    peer: Peer,
     headers: HeaderMap,
     Json(req): Json<SessionRequest>,
 ) -> ApiResult<Response> {
@@ -126,12 +138,17 @@ pub async fn login(
             "sign-in requests must send X-Amail-Csrf: 1",
         ));
     }
-    check_csrf(&Method::POST, &headers)?;
-    let auth = st
-        .store
-        .token_auth(&hash_token(req.token.trim()))
-        .await?
-        .ok_or_else(|| ApiError::unauthorized("invalid or revoked token"))?;
+    check_csrf(&Method::POST, &headers, peer.proxied)?;
+    let hash = hash_token(req.token.trim());
+    let Some(auth) = st.store.token_auth(&hash).await? else {
+        if let Some(op) = st.store.operator_auth(&hash).await? {
+            return operator_login(&st, peer, &headers, op).await;
+        }
+        return Err(ApiError::unauthorized("invalid or revoked token"));
+    };
+    if auth.org.suspended_at.is_some() {
+        return Err(crate::auth::suspended());
+    }
     if auth.scope != TokenScope::User {
         return Err(ApiError::forbidden(
             "only user tokens can sign in to the web interface",
@@ -154,7 +171,37 @@ pub async fn login(
     let mut resp = Json(body).into_response();
     resp.headers_mut().insert(
         header::SET_COOKIE,
-        session_cookie(&secret, max_age, https(&headers)),
+        session_cookie(&secret, max_age, https(&st, peer, &headers)),
+    );
+    Ok(resp)
+}
+
+/// Operator sessions last a day.
+const OPERATOR_SESSION_S: i64 = 86_400;
+
+async fn operator_login(
+    st: &AppState,
+    peer: Peer,
+    headers: &HeaderMap,
+    token_id: i64,
+) -> ApiResult<Response> {
+    let secret = new_token();
+    st.store
+        .create_operator_session(
+            &hash_token(&secret),
+            token_id,
+            amail_store::now_ms() + OPERATOR_SESSION_S * 1000,
+        )
+        .await?;
+    let mut resp = Json(WhoAmI {
+        org: String::new(),
+        scope: TokenScope::Operator,
+        seat: None,
+    })
+    .into_response();
+    resp.headers_mut().insert(
+        header::SET_COOKIE,
+        session_cookie(&secret, OPERATOR_SESSION_S, https(st, peer, headers)),
     );
     Ok(resp)
 }
@@ -162,15 +209,21 @@ pub async fn login(
 /// `DELETE /v1/session`: sign out (always clears the cookie).
 pub async fn logout(
     State(st): State<AppState>,
+    peer: Peer,
     method: Method,
     headers: HeaderMap,
 ) -> ApiResult<Response> {
     if let Some(secret) = cookie(&headers, SESSION_COOKIE) {
-        check_csrf(&method, &headers)?;
-        st.store.delete_session(&hash_token(secret)).await?;
+        check_csrf(&method, &headers, peer.proxied)?;
+        let hash = hash_token(secret);
+        if !st.store.delete_session(&hash).await? {
+            st.store.delete_operator_session(&hash).await?;
+        }
     }
     let mut resp = StatusCode::NO_CONTENT.into_response();
-    resp.headers_mut()
-        .insert(header::SET_COOKIE, session_cookie("", 0, https(&headers)));
+    resp.headers_mut().insert(
+        header::SET_COOKIE,
+        session_cookie("", 0, https(&st, peer, &headers)),
+    );
     Ok(resp)
 }

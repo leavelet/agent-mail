@@ -20,14 +20,6 @@ fn check_name(name: &str) -> ApiResult<()> {
     }
 }
 
-pub async fn whoami(auth: Auth) -> Json<p::WhoAmI> {
-    Json(p::WhoAmI {
-        org: auth.org.name.clone(),
-        scope: auth.scope,
-        seat: auth.seat.map(|s| s.name),
-    })
-}
-
 pub async fn get_org(auth: Auth) -> ApiResult<Json<p::OrgInfo>> {
     auth.require_directory()?;
     Ok(Json(render::org(&auth.org)))
@@ -52,12 +44,15 @@ pub async fn patch_org(
     check(patch.ack_timeout_min, 1, "ack_timeout_min")?;
     check(patch.focus_max_min, 1, "focus_max_min")?;
     check(patch.digest_interval_min, 1, "digest_interval_min")?;
-    if let Some(Some(url)) = &patch.webhook_url
-        && !crate::webhook::valid_url(url)
-    {
-        return Err(ApiError::bad_request(
-            "webhook_url must be an http:// or https:// URL",
-        ));
+    if let Some(Some(url)) = &patch.webhook_url {
+        if !crate::webhook::valid_url(url) {
+            return Err(ApiError::bad_request(
+                "webhook_url must be an http:// or https:// URL",
+            ));
+        }
+        // Names are checked again whenever the webhook fires.
+        crate::netguard::check_literal(url, st.config.webhook_private_targets)
+            .map_err(|e| ApiError::unprocessable("webhook_target", e))?;
     }
     Ok(Json(render::org(
         &st.store.update_org(auth.org.id, &patch).await?,
@@ -93,9 +88,24 @@ pub async fn create_seat(
     Json(seat): Json<p::NewSeat>,
 ) -> ApiResult<(StatusCode, Json<p::Seat>)> {
     auth.require_user()?;
-    check_name(&seat.name)?;
+    crate::public::check_new_name(&st, &seat.name)?;
     if let Some(g) = &seat.group {
         check_name(g)?;
+    }
+    if let Some(max) = st.config.limits.seats_per_org {
+        let n = st
+            .store
+            .seats(auth.org.id)
+            .await?
+            .iter()
+            .filter(|s| s.kind == amail_proto::SeatKind::Agent)
+            .count() as i64;
+        if n >= max {
+            return Err(ApiError::unprocessable(
+                "seat_limit",
+                format!("this server allows at most {max} agent seats per org"),
+            ));
+        }
     }
     let s = st.store.create_seat(auth.org.id, &seat).await?;
     Ok((StatusCode::CREATED, Json(seat_out(&st, &auth, &s).await?)))
@@ -186,6 +196,11 @@ pub async fn org_token(
         TokenScope::Seat => {
             return Err(ApiError::bad_request(
                 "use POST /v1/seats/{name}/tokens for seat tokens",
+            ));
+        }
+        TokenScope::Operator => {
+            return Err(ApiError::forbidden(
+                "operator tokens are issued on the server's database (amail admin operator-token)",
             ));
         }
     };
@@ -283,7 +298,7 @@ pub async fn create_list(
     Json(list): Json<p::NewList>,
 ) -> ApiResult<(StatusCode, Json<p::List>)> {
     auth.require_user()?;
-    check_name(&list.name)?;
+    crate::public::check_new_name(&st, &list.name)?;
     let l = st.store.create_list(auth.org.id, &list).await?;
     Ok((
         StatusCode::CREATED,
@@ -436,10 +451,12 @@ pub async fn list_links(State(st): State<AppState>, auth: Auth) -> ApiResult<Jso
     ))
 }
 
+/// Another org by name; a suspended org counts as absent.
 async fn peer_org(st: &AppState, name: &str) -> ApiResult<amail_store::Org> {
     st.store
         .org_by_name(name)
         .await?
+        .filter(|o| o.suspended_at.is_none())
         .ok_or_else(|| ApiError::not_found(format!("no org {name:?}")))
 }
 
@@ -449,6 +466,16 @@ pub async fn request_link(
     Json(req): Json<p::NewLink>,
 ) -> ApiResult<Json<p::Link>> {
     auth.require_user()?;
+    // Limited before the lookup, so that probing for org names counts too.
+    if let Some(b) = &st.limiters.link_requests
+        && let Err(ms) = b.take(&auth.org.id)
+    {
+        return Err(ApiError::too_many(
+            "rate_limited",
+            "too many link requests from this org",
+            ms,
+        ));
+    }
     let peer = peer_org(&st, &req.org).await?;
     let state = st.store.request_link(auth.org.id, peer.id).await?;
     Ok(Json(p::Link {

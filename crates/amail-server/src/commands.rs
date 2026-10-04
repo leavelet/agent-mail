@@ -81,6 +81,12 @@ impl NodeHub {
         )
     }
 
+    /// End the org's command streams on this instance.
+    pub fn close_org(&self, org_id: i64) {
+        self.orgs.lock().unwrap().remove(&org_id);
+        self.changed.notify_one();
+    }
+
     /// Forward commands to other instances with `f` (set once, by the
     /// cluster).
     pub fn set_forward(&self, f: Forward) {

@@ -41,6 +41,9 @@ pub trait EventBus: Send + Sync + 'static {
     }
     /// Events may have been missed: make subscribers reconnect and resync.
     fn lost_events(&self) {}
+    /// End this instance's subscriptions of one org (it was suspended or
+    /// deleted).
+    fn close_org(&self, org_id: i64);
 }
 
 const RECENT: usize = 4096;
@@ -134,6 +137,10 @@ impl EventBus for Hub {
             ch.recent.push_back((n, ev.clone()));
             let _ = ch.tx.send(ev);
         }
+    }
+
+    fn close_org(&self, org_id: i64) {
+        self.inner.lock().unwrap().orgs.remove(&org_id);
     }
 
     fn subscribe(&self, org_id: i64, last_event_id: Option<&str>) -> Subscription {

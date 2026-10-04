@@ -15,6 +15,7 @@
 
 use crate::AppState;
 use crate::error::{ApiError, ApiResult};
+use crate::peer::Peer;
 use amail_proto::TokenScope;
 use amail_store::{Org, Seat};
 use axum::extract::FromRequestParts;
@@ -63,8 +64,14 @@ pub fn cookie<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a 
 }
 
 /// Cross-site request protection for cookie-authenticated requests: the
-/// custom header, and `Origin` (when sent) naming this host.
-pub fn check_csrf(method: &axum::http::Method, headers: &axum::http::HeaderMap) -> ApiResult<()> {
+/// custom header, and `Origin` (when sent) naming this host. `proxied`: the
+/// request came through a trusted proxy, so `X-Forwarded-Host` names the
+/// host too.
+pub fn check_csrf(
+    method: &axum::http::Method,
+    headers: &axum::http::HeaderMap,
+    proxied: bool,
+) -> ApiResult<()> {
     let safe = matches!(*method, axum::http::Method::GET | axum::http::Method::HEAD);
     if !safe && headers.get(CSRF_HEADER).is_none() {
         return Err(ApiError::new(
@@ -75,9 +82,14 @@ pub fn check_csrf(method: &axum::http::Method, headers: &axum::http::HeaderMap) 
     }
     if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
         let origin_host = origin.split_once("://").map(|(_, h)| h).unwrap_or(origin);
-        // Behind a reverse proxy the original host may arrive as
+        // Behind a trusted reverse proxy the original host may arrive as
         // X-Forwarded-Host.
-        let matches = [header::HOST.as_str(), "x-forwarded-host"].iter().any(|h| {
+        let names: &[&str] = if proxied {
+            &[header::HOST.as_str(), "x-forwarded-host"]
+        } else {
+            &[header::HOST.as_str()]
+        };
+        let matches = names.iter().any(|h| {
             headers
                 .get(*h)
                 .and_then(|v| v.to_str().ok())
@@ -122,7 +134,8 @@ impl FromRequestParts<AppState> for Auth {
             None => {
                 let secret = cookie(&parts.headers, SESSION_COOKIE)
                     .ok_or_else(|| ApiError::unauthorized("missing bearer token"))?;
-                check_csrf(&parts.method, &parts.headers)?;
+                let peer = parts.extensions.get::<Peer>().copied().unwrap_or_default();
+                check_csrf(&parts.method, &parts.headers, peer.proxied)?;
                 state
                     .store
                     .session_auth(&hash_token(secret))
@@ -130,6 +143,18 @@ impl FromRequestParts<AppState> for Auth {
                     .ok_or_else(|| ApiError::unauthorized("session expired or signed out"))?
             }
         };
+        if auth.org.suspended_at.is_some() {
+            return Err(suspended());
+        }
+        if let Some(b) = &state.limiters.token_requests
+            && let Err(ms) = b.take(&(0, auth.token_id))
+        {
+            return Err(ApiError::too_many(
+                "rate_limited",
+                "too many requests for this token",
+                ms,
+            ));
+        }
         Ok(Auth {
             token_id: auth.token_id,
             scope: auth.scope,
@@ -186,6 +211,7 @@ impl Auth {
                     _ => Ok(own.clone()),
                 }
             }
+            TokenScope::Operator => Err(ApiError::forbidden("operator tokens have no mailbox")),
             TokenScope::User | TokenScope::Node => match seat {
                 Some(name) => state
                     .store
@@ -196,5 +222,65 @@ impl Auth {
                 None => Err(ApiError::bad_request("node tokens must pass seat=<name>")),
             },
         }
+    }
+}
+
+/// The answer for tokens and sessions of a suspended org.
+pub fn suspended() -> ApiError {
+    ApiError::new(
+        axum::http::StatusCode::UNAUTHORIZED,
+        "org_suspended",
+        "this org is suspended by the server's operator",
+    )
+}
+
+/// An authenticated operator (an operator token, or a browser session made
+/// with one). Operators run the server: they see counts, never mail.
+#[derive(Debug, Clone, Copy)]
+pub struct Operator {
+    pub token_id: i64,
+}
+
+impl FromRequestParts<AppState> for Operator {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, ApiError> {
+        let token_id = match parts.headers.get(header::AUTHORIZATION) {
+            Some(value) => {
+                let token = value
+                    .to_str()
+                    .ok()
+                    .and_then(|v| {
+                        v.strip_prefix("Bearer ")
+                            .or_else(|| v.strip_prefix("bearer "))
+                    })
+                    .map(str::trim)
+                    .ok_or_else(|| {
+                        ApiError::unauthorized("expected 'Authorization: Bearer <token>'")
+                    })?;
+                state.store.operator_auth(&hash_token(token)).await?
+            }
+            None => {
+                let secret = cookie(&parts.headers, SESSION_COOKIE)
+                    .ok_or_else(|| ApiError::unauthorized("missing bearer token"))?;
+                let peer = parts.extensions.get::<Peer>().copied().unwrap_or_default();
+                check_csrf(&parts.method, &parts.headers, peer.proxied)?;
+                state
+                    .store
+                    .operator_session_auth(&hash_token(secret))
+                    .await?
+            }
+        };
+        let token_id = token_id.ok_or_else(|| ApiError::forbidden("requires an operator token"))?;
+        if let Some(b) = &state.limiters.token_requests
+            && let Err(ms) = b.take(&(1, token_id))
+        {
+            return Err(ApiError::too_many(
+                "rate_limited",
+                "too many requests for this token",
+                ms,
+            ));
+        }
+        Ok(Operator { token_id })
     }
 }

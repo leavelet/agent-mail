@@ -377,11 +377,31 @@ async fn session_cookie_and_csrf(srv: Server) {
     );
     let cookie = set.split(';').next().unwrap().to_string();
 
-    // Behind an HTTPS proxy the cookie is Secure.
+    // X-Forwarded-Proto counts only from a trusted proxy (none here; see
+    // tests/public.rs).
     let r = http
         .post(url("/session"))
         .header("X-Amail-Csrf", "1")
         .header("X-Forwarded-Proto", "https")
+        .json(&json!({ "token": user.token }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        !r.headers()["set-cookie"]
+            .to_str()
+            .unwrap()
+            .contains("; Secure")
+    );
+    // An HTTPS origin makes it Secure.
+    let r = http
+        .post(url("/session"))
+        .header("X-Amail-Csrf", "1")
+        .header(
+            "Origin",
+            format!("https://{}", srv.base.trim_start_matches("http://")),
+        )
+        .header("Host", srv.base.trim_start_matches("http://"))
         .json(&json!({ "token": user.token }))
         .send()
         .await
@@ -443,7 +463,7 @@ async fn session_cookie_and_csrf(srv: Server) {
         .await
         .unwrap();
     assert_eq!(r.status(), StatusCode::OK);
-    // Behind a proxy the original host may come as X-Forwarded-Host.
+    // X-Forwarded-Host counts only from a trusted proxy (none here).
     let r = http
         .post(url("/messages"))
         .header("Cookie", &cookie)
@@ -454,7 +474,7 @@ async fn session_cookie_and_csrf(srv: Server) {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
+    assert_eq!(r.status(), StatusCode::FORBIDDEN);
     // A bearer token is not subject to the cookie rules.
     user.ok(Method::POST, "/messages", Some(send.clone())).await;
     // Server-sent events work with the cookie.

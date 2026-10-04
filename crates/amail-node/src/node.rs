@@ -2024,6 +2024,7 @@ async fn web_terminal_loop(zellij: String, state_dir: PathBuf, port: u16) {
         // Stopped with the node: `kill_on_drop` when the task ends, and the
         // parent-death signal if the node process dies.
         // SAFETY: prctl is async-signal-safe and touches no memory.
+        #[cfg(target_os = "linux")]
         unsafe {
             c.pre_exec(|| {
                 libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);

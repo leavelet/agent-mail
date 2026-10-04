@@ -42,6 +42,28 @@ pub async fn send(st: &AppState, auth: &Auth, req: SendRequest) -> ApiResult<Sen
             "ack_timeout_s must be between 1 and 2592000 (30 days)",
         ));
     }
+    // Protective limits (public mode): all orgs, then this org.
+    if let Some(b) = &st.limiters.global_send
+        && let Err(ms) = b.take(&())
+    {
+        return Err(ApiError::too_many(
+            "server_busy",
+            "the server is at its message rate limit; retry shortly",
+            ms,
+        ));
+    }
+    if let Some(b) = &st.limiters.org_send
+        && let Err(ms) = b.take(&org.id)
+    {
+        if let Some(g) = &st.limiters.global_send {
+            g.refund(&());
+        }
+        return Err(ApiError::too_many(
+            "org_rate_limited",
+            "this org is at the server's per-org message rate limit; retry shortly",
+            ms,
+        ));
+    }
     let limited = sender.kind != SeatKind::User;
     if limited {
         st.store
@@ -336,6 +358,7 @@ async fn notify_users(
                 seat: user.name.clone(),
                 message: crate::render::header(m, target),
             },
+            st.config.webhook_private_targets,
         );
     }
 }
@@ -456,7 +479,13 @@ impl<'a> Resolver<'a> {
         if let Some(o) = self.orgs.get(name) {
             return Ok(o.clone());
         }
-        let o = self.st.store.org_by_name(name).await?;
+        // A suspended org cannot be reached (as if it did not exist).
+        let o = self
+            .st
+            .store
+            .org_by_name(name)
+            .await?
+            .filter(|o| o.suspended_at.is_none());
         self.orgs.insert(name.to_string(), o.clone());
         Ok(o)
     }

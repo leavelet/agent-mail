@@ -33,6 +33,8 @@ use tokio_stream::wrappers::BroadcastStream;
 
 /// Events kept per watched seat.
 pub const BUFFER: usize = 1000;
+/// Text kept per watched seat, in bytes (oldest events go first).
+pub const BUFFER_BYTES: usize = 4 * 1024 * 1024;
 /// Events accepted in one post.
 const MAX_POST: usize = 1000;
 /// Longest text kept per event, in characters (nodes cut earlier).
@@ -67,6 +69,8 @@ enum Msg {
 struct Chan {
     watchers: usize,
     buffer: VecDeque<TranscriptEvent>,
+    /// Text bytes in `buffer`.
+    bytes: usize,
     status: TranscriptStatus,
     tx: broadcast::Sender<Msg>,
     /// The node that answers for the seat (the first to post).
@@ -114,6 +118,21 @@ impl MirrorHub {
         Self::default()
     }
 
+    /// End every mirror of the org on this instance.
+    pub fn close_org(&self, org_id: i64) {
+        let mut seats = self.seats.lock().unwrap();
+        let keys: Vec<(i64, String)> = seats
+            .keys()
+            .filter(|(o, _)| *o == org_id)
+            .cloned()
+            .collect();
+        for k in keys {
+            if let Some(t) = seats.remove(&k).and_then(|c| c.renewer) {
+                t.abort();
+            }
+        }
+    }
+
     /// Seats being watched in the org (for tests and status).
     pub fn watched(&self, org_id: i64) -> Vec<String> {
         let seats = self.seats.lock().unwrap();
@@ -149,6 +168,7 @@ impl MirrorHub {
         c.answered = true;
         if p.reset {
             c.buffer.clear();
+            c.bytes = 0;
             let _ = c.tx.send(Msg::Reset);
         }
         if let Some(s) = p.status
@@ -169,10 +189,13 @@ impl MirrorHub {
                 }
             }
             for e in &events {
-                if c.buffer.len() == BUFFER {
-                    c.buffer.pop_front();
-                }
+                c.bytes += e.text.len();
                 c.buffer.push_back(e.clone());
+                while c.buffer.len() > BUFFER || (c.bytes > BUFFER_BYTES && c.buffer.len() > 1) {
+                    if let Some(old) = c.buffer.pop_front() {
+                        c.bytes -= old.text.len();
+                    }
+                }
             }
             let _ = c.tx.send(Msg::Events(events));
         }
@@ -266,12 +289,20 @@ pub async fn watch(
             "only agent seats have sessions",
         ));
     }
+    let open = st.limiters.streams.open(auth.org.id).ok_or_else(|| {
+        ApiError::too_many(
+            "too_many_streams",
+            "this org has too many open event streams",
+            5000,
+        )
+    })?;
     let key = (auth.org.id, seat.name.clone());
     let (initial, rx, guard) = {
         let mut seats = st.mirror.seats.lock().unwrap();
         let c = seats.entry(key.clone()).or_insert_with(|| Chan {
             watchers: 0,
             buffer: VecDeque::new(),
+            bytes: 0,
             status: status(
                 TranscriptState::Waiting,
                 "Asking the node that hosts this seat for its session.",
@@ -301,7 +332,7 @@ pub async fn watch(
     let stream = stream::iter(initial.into_iter().map(Ok))
         .chain(live)
         .filter_map(move |m| {
-            let _keep = &guard;
+            let _keep = (&guard, &open);
             std::future::ready(m.ok().map(|m| Ok(sse(m))))
         });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))

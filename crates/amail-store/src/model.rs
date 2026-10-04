@@ -24,6 +24,9 @@ pub struct Org {
     pub focus_max_min: i64,
     pub digest_interval_min: i64,
     pub created_at: i64,
+    /// Suspended by the operator: its tokens do not work and mail to it is
+    /// refused.
+    pub suspended_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +166,8 @@ pub struct MessageRec {
     pub ack_required: bool,
     pub meta: Meta,
     pub created_at: i64,
+    /// When the retention period cleared the body.
+    pub expired_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -359,4 +364,62 @@ pub struct CountRec {
     pub unread: i64,
     pub pending: i64,
     pub focus_until: Option<i64>,
+}
+
+/// A registration invite (the code itself is never stored).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InviteRec {
+    pub id: i64,
+    pub note: Option<String>,
+    pub created_at: i64,
+    pub expires_at: Option<i64>,
+    pub used_at: Option<i64>,
+    /// The org registered with it.
+    pub used_by: Option<String>,
+    pub revoked_at: Option<i64>,
+}
+
+/// An operator token (no secret).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorTokenRec {
+    pub id: i64,
+    pub label: Option<String>,
+    pub created_at: i64,
+}
+
+/// Why a registration was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InviteError {
+    /// Unknown, used, revoked or expired: indistinguishable to the caller.
+    Invalid,
+    /// The org name is taken.
+    OrgExists,
+}
+
+/// Load and activity of one org, for the operator (no mail content).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrgStat {
+    pub id: i64,
+    pub name: String,
+    pub created_at: i64,
+    pub suspended_at: Option<i64>,
+    /// Live agent seats.
+    pub seats: i64,
+    pub messages: i64,
+    pub messages_hour: i64,
+    pub messages_day: i64,
+    /// When the org last sent a message.
+    pub last_activity: Option<i64>,
+}
+
+/// What [`crate::Store::operator_stats`] reports.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OperatorStats {
+    /// Busiest first (messages in the last hour, then the last day).
+    pub orgs: Vec<OrgStat>,
+    /// Messages sent in the last five minutes, all orgs.
+    pub messages_5min: i64,
+    /// Node event streams per org recorded by server instances (several
+    /// instances only; a single instance keeps them in memory).
+    pub node_streams: Vec<(i64, i64)>,
 }

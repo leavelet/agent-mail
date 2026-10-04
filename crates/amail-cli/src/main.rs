@@ -1,7 +1,11 @@
 //! `amail`: mail and mailing lists for teams of coding agents.
 
+mod admin;
 mod client;
+mod onboard;
 mod output;
+mod profiles;
+mod service;
 mod team_cmd;
 
 use amail_proto::{self as p, DeliveryMode, PostPolicy};
@@ -24,7 +28,9 @@ struct Cli {
     /// Print JSON instead of compact text.
     #[arg(long, global = true)]
     json: bool,
-    /// TOML file with `url` and `token` (default: AMAIL_URL / AMAIL_TOKEN).
+    /// A saved login (see `amail profile ls`), or a TOML file with `url`
+    /// and `token`. Default: AMAIL_URL / AMAIL_TOKEN, then the current
+    /// login.
     #[arg(long, global = true, env = "AMAIL_PROFILE")]
     profile: Option<PathBuf>,
     #[command(subcommand)]
@@ -38,7 +44,7 @@ enum Cmd {
         /// `sqlite://path` or `postgres://...`
         #[arg(long, env = "AMAIL_DB")]
         db: String,
-        #[arg(long, default_value = "127.0.0.1:8025")]
+        #[arg(long, env = "AMAIL_LISTEN", default_value = "127.0.0.1:8025")]
         listen: String,
         /// Postgres pool size, or SQLite read pool size.
         #[arg(long, default_value_t = 32)]
@@ -48,10 +54,60 @@ enum Cmd {
         /// `http://<listen address>` unless it is a wildcard address.
         #[arg(long, env = "AMAIL_ADVERTISE_URL")]
         advertise_url: Option<String>,
+        #[command(flatten)]
+        opts: Box<ServeOpts>,
     },
     /// Administration that works directly on the database.
     #[command(subcommand)]
-    Admin(AdminCmd),
+    Admin(admin::AdminCmd),
+    /// Log in to a server with a token; saved (mode 0600) under
+    /// ~/.config/amail and used by later commands and the node.
+    Login {
+        /// The server, e.g. https://mail.example.com
+        url: String,
+        /// Profile name (default: <org>@<host>).
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Register an org on a public server with an invite code; the new
+    /// user token is saved as a login (and printed once).
+    Register {
+        /// The server, e.g. https://mail.example.com
+        url: String,
+        #[arg(long)]
+        invite: String,
+        /// The new org's name.
+        #[arg(long)]
+        org: String,
+        /// Name of your own seat (default: owner).
+        #[arg(long)]
+        user_name: Option<String>,
+        /// Profile name (default: <org>@<host>).
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Saved logins: list, switch, forget.
+    #[command(subcommand)]
+    Profile(onboard::ProfileCmd),
+    /// Write a commented sample team file (amail.toml) here.
+    Init {
+        #[arg(short, long, default_value = "amail.toml")]
+        file: PathBuf,
+        #[arg(long)]
+        force: bool,
+    },
+    /// Check this host and the configuration, with hints.
+    Doctor {
+        /// The team file to check, if present.
+        #[arg(short, long, default_value = "amail.toml")]
+        file: PathBuf,
+    },
+    /// Exit 0 when the server answers (for container health checks).
+    #[command(hide = true)]
+    Healthcheck {
+        #[arg(default_value = "http://127.0.0.1:8025")]
+        url: String,
+    },
     /// Send a message. The body comes from -m or stdin.
     Send {
         /// Comma-separated recipients (`name` or `name@org`).
@@ -198,8 +254,117 @@ struct NodeCli {
     run: NodeArgs,
 }
 
+#[derive(Args)]
+struct ServeOpts {
+    /// Public mode: registration with invite codes, the protective limits
+    /// below (with these defaults), reserved names, always-Secure cookies,
+    /// no webhooks to private addresses.
+    #[arg(long, env = "AMAIL_PUBLIC")]
+    public: bool,
+    /// Believe X-Forwarded-For/-Host/-Proto from these peers (addresses or
+    /// CIDR ranges; repeat or separate with commas), e.g. 127.0.0.1 for a
+    /// proxy or tunnel on the same host.
+    #[arg(
+        long = "trusted-proxy",
+        env = "AMAIL_TRUSTED_PROXIES",
+        value_delimiter = ','
+    )]
+    trusted_proxies: Vec<String>,
+    /// Whether webhooks may target loopback, private, link-local and
+    /// reserved addresses: `allow` or `deny` (default: deny with --public).
+    #[arg(long, env = "AMAIL_WEBHOOK_PRIVATE_TARGETS")]
+    webhook_private_targets: Option<String>,
+    /// Clear message bodies older than this many days (headers stay).
+    #[arg(long, env = "AMAIL_RETENTION_DAYS")]
+    retention_days: Option<u32>,
+    /// Agent seats per org (public default 200; 0: no limit).
+    #[arg(long, env = "AMAIL_MAX_SEATS_PER_ORG")]
+    max_seats_per_org: Option<i64>,
+    /// Messages per second, all orgs, per instance (public default 500).
+    #[arg(long, env = "AMAIL_MAX_SENDS_PER_SEC")]
+    max_sends_per_sec: Option<f64>,
+    /// Messages per second per org (public default 50).
+    #[arg(long, env = "AMAIL_MAX_ORG_SENDS_PER_SEC")]
+    max_org_sends_per_sec: Option<f64>,
+    /// Open event streams per org (public default 32).
+    #[arg(long, env = "AMAIL_MAX_ORG_STREAMS")]
+    max_org_streams: Option<usize>,
+    /// Requests per second per token, bursts of twice that (public
+    /// default 200).
+    #[arg(long, env = "AMAIL_MAX_TOKEN_REQUESTS_PER_SEC")]
+    max_token_requests_per_sec: Option<f64>,
+    /// Link requests per hour per org (public default 20).
+    #[arg(long, env = "AMAIL_MAX_LINK_REQUESTS_PER_HOUR")]
+    max_link_requests_per_hour: Option<f64>,
+    /// Registration attempts per hour per client address (public default 10).
+    #[arg(long, env = "AMAIL_MAX_REGISTRATIONS_PER_HOUR")]
+    max_registrations_per_hour: Option<f64>,
+}
+
+impl ServeOpts {
+    fn config(&self) -> Result<amail_server::config::Config> {
+        use amail_server::config::Config;
+        let mut c = if self.public {
+            Config::public()
+        } else {
+            Config::default()
+        };
+        for p in &self.trusted_proxies {
+            if !p.trim().is_empty() {
+                c.trusted_proxies.push(
+                    p.parse()
+                        .map_err(|e: String| anyhow::anyhow!("--trusted-proxy: {e}"))?,
+                );
+            }
+        }
+        if let Some(w) = &self.webhook_private_targets {
+            c.webhook_private_targets = match w.as_str() {
+                "allow" => true,
+                "deny" => false,
+                _ => bail!("--webhook-private-targets: expected allow or deny"),
+            };
+        }
+        c.retention_days = self.retention_days;
+        let l = &mut c.limits;
+        let pos_f = |v: f64| (v > 0.0).then_some(v);
+        if let Some(v) = self.max_seats_per_org {
+            l.seats_per_org = (v > 0).then_some(v);
+        }
+        if let Some(v) = self.max_sends_per_sec {
+            l.global_send_per_sec = pos_f(v);
+        }
+        if let Some(v) = self.max_org_sends_per_sec {
+            l.org_send_per_sec = pos_f(v);
+        }
+        if let Some(v) = self.max_org_streams {
+            l.org_streams = (v > 0).then_some(v);
+        }
+        if let Some(v) = self.max_token_requests_per_sec {
+            l.token_requests_per_sec = pos_f(v);
+        }
+        if let Some(v) = self.max_link_requests_per_hour {
+            l.link_requests_per_hour = pos_f(v);
+        }
+        if let Some(v) = self.max_registrations_per_hour {
+            l.registrations_per_hour = pos_f(v);
+        }
+        Ok(c)
+    }
+}
+
 #[derive(Subcommand)]
 enum NodeCmd {
+    /// Run the node in the background (log and pid in the state
+    /// directory). Takes the same options as `amail node`.
+    Start {
+        #[command(flatten)]
+        run: Box<NodeArgs>,
+    },
+    /// Stop a node started with `amail node start`.
+    Stop {
+        #[arg(long, env = "AMAIL_STATE_DIR")]
+        state_dir: Option<PathBuf>,
+    },
     /// Issue a node token (needs a user token). With --save, also write it
     /// with the server URL to <state dir>/node.toml for `amail node`.
     Token {
@@ -325,18 +490,6 @@ impl SendOpts {
 }
 
 #[derive(Subcommand)]
-enum AdminCmd {
-    /// Create an org and its user seat; prints the user token.
-    CreateOrg {
-        org: String,
-        #[arg(long, default_value = "owner")]
-        user_name: String,
-        #[arg(long, env = "AMAIL_DB")]
-        db: String,
-    },
-}
-
-#[derive(Subcommand)]
 enum SeatCmd {
     Add {
         name: String,
@@ -437,11 +590,23 @@ enum TokenCmd {
     Ls,
     /// Revoke a token by id (see `amail token ls`).
     Revoke { id: i64 },
+    /// Replace the user token in use: print a new one, revoke this one
+    /// (saved logins that held it are updated).
+    Rotate {
+        #[arg(long)]
+        label: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
 enum OrgCmd {
     Show,
+    /// Delete the org and all its data (seats, mail, lists, links, tokens).
+    /// Asks you to type the org's name unless --confirm gives it.
+    Delete {
+        #[arg(long)]
+        confirm: Option<String>,
+    },
     Set {
         #[arg(long)]
         send_rate_per_min: Option<i64>,
@@ -490,7 +655,9 @@ fn main() -> ExitCode {
         extra,
     } = &cli.cmd
     {
-        return match run_seat(seat, harness.clone(), socket.clone(), extra.clone()) {
+        return match linux_only("amail run")
+            .and_then(|()| run_seat(seat, harness.clone(), socket.clone(), extra.clone()))
+        {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("error: {e:#}");
@@ -559,11 +726,74 @@ async fn run(cli: Cli) -> Result<()> {
             listen,
             max_connections,
             advertise_url,
-        } => return serve(&db, &listen, max_connections, advertise_url).await,
-        Cmd::Admin(AdminCmd::CreateOrg { org, user_name, db }) => {
-            return create_org(&db, &org, &user_name, &out).await;
+            opts,
+        } => return serve(&db, &listen, max_connections, advertise_url, opts.config()?).await,
+        Cmd::Admin(cmd) => return admin::run(cmd, &out).await,
+        Cmd::Login { url, name } => return onboard::login(&url, name, &out).await,
+        Cmd::Register {
+            url,
+            invite,
+            org,
+            user_name,
+            name,
+        } => return onboard::register(&url, &invite, &org, user_name, name, &out).await,
+        Cmd::Profile(cmd) => return onboard::profile(cmd, &out),
+        Cmd::Init { file, force } => return onboard::init(&file, force, &out),
+        Cmd::Doctor { file } => {
+            if !onboard::doctor(cli.profile.as_deref(), &file, &out).await? {
+                bail!("doctor found problems");
+            }
+            return Ok(());
         }
-        Cmd::Node(NodeCli { cmd: None, run }) => return node_daemon(run).await,
+        Cmd::Healthcheck { url } => {
+            let r = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()?
+                .get(format!("{}/healthz", url.trim_end_matches('/')))
+                .send()
+                .await?;
+            if !r.status().is_success() {
+                bail!("HTTP {}", r.status());
+            }
+            return Ok(());
+        }
+        Cmd::Node(NodeCli { cmd: None, run }) => {
+            linux_only("amail node")?;
+            return node_daemon(run).await;
+        }
+        Cmd::Node(NodeCli {
+            cmd: Some(NodeCmd::Start { run }),
+            ..
+        }) => {
+            linux_only("amail node")?;
+            let state = run
+                .state_dir
+                .clone()
+                .unwrap_or_else(amail_node::paths::state_dir);
+            let socket = run.socket.clone().unwrap_or_else(amail_node::paths::socket);
+            let (args, token) = node_args(&run);
+            let msg = service::start(&state, &socket, args, token)?;
+            return out.show(&json!({ "started": true }), || Ok(msg));
+        }
+        Cmd::Node(NodeCli {
+            cmd: Some(NodeCmd::Stop { state_dir }),
+            ..
+        }) => {
+            let state = state_dir.unwrap_or_else(amail_node::paths::state_dir);
+            let msg = service::stop(&state)?;
+            return out.show(&json!({ "stopped": true }), || Ok(msg));
+        }
+        Cmd::Up { .. }
+        | Cmd::Down { .. }
+        | Cmd::Ps
+        | Cmd::Attach { .. }
+        | Cmd::Sleep { .. }
+        | Cmd::Wake { .. }
+            if !cfg!(target_os = "linux") =>
+        {
+            linux_only("amail up, down, ps, attach, sleep and wake")?;
+        }
         Cmd::Down { only } => return team_cmd::down(&only, &out),
         Cmd::Ps => return team_cmd::ps(&out),
         Cmd::Attach { target } => return team_cmd::attach(&target),
@@ -611,6 +841,12 @@ async fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
         Cmd::Serve { .. }
         | Cmd::Admin(_)
+        | Cmd::Login { .. }
+        | Cmd::Register { .. }
+        | Cmd::Profile(_)
+        | Cmd::Init { .. }
+        | Cmd::Doctor { .. }
+        | Cmd::Healthcheck { .. }
         | Cmd::Hook { .. }
         | Cmd::Run { .. }
         | Cmd::Down { .. }
@@ -620,7 +856,13 @@ async fn run(cli: Cli) -> Result<()> {
         | Cmd::Wake { .. }
         | Cmd::Node(NodeCli { cmd: None, .. })
         | Cmd::Node(NodeCli {
-            cmd: Some(NodeCmd::Status | NodeCmd::WebToken { .. }),
+            cmd:
+                Some(
+                    NodeCmd::Status
+                    | NodeCmd::WebToken { .. }
+                    | NodeCmd::Start { .. }
+                    | NodeCmd::Stop { .. },
+                ),
             ..
         }) => unreachable!(),
         Cmd::Node(NodeCli {
@@ -886,11 +1128,33 @@ async fn run(cli: Cli) -> Result<()> {
                 .await?;
             out.show(&v, || Ok(format!("revoked token {id}")))
         }
+        Cmd::Token(TokenCmd::Rotate { label }) => {
+            let v = c
+                .raw(
+                    Method::POST,
+                    "/tokens/rotate",
+                    Some(&json!({ "label": label })),
+                )
+                .await?;
+            let new = parse::<p::TokenResponse>(&v)?.token;
+            let updated = onboard::replace_saved_token(c.token(), &new)?;
+            out.show(&v, || {
+                if updated.is_empty() {
+                    eprintln!("the old token is revoked; the new user token (shown once):");
+                } else {
+                    eprintln!(
+                        "the old token is revoked; saved login {} now uses the new one:",
+                        updated.join(", ")
+                    );
+                }
+                Ok(new.clone())
+            })
+        }
         Cmd::Token(cmd) => {
             let (scope, label) = match cmd {
                 TokenCmd::Node { label } => ("node", label),
                 TokenCmd::User { label } => ("user", label),
-                TokenCmd::Ls | TokenCmd::Revoke { .. } => unreachable!(),
+                TokenCmd::Ls | TokenCmd::Revoke { .. } | TokenCmd::Rotate { .. } => unreachable!(),
             };
             let v = c
                 .raw(
@@ -900,6 +1164,34 @@ async fn run(cli: Cli) -> Result<()> {
                 )
                 .await?;
             out.show(&v, || Ok(parse::<p::TokenResponse>(&v)?.token))
+        }
+        Cmd::Org(OrgCmd::Delete { confirm }) => {
+            let me: p::WhoAmI = c.get("/whoami").await?;
+            let confirm = match confirm {
+                Some(c) => c,
+                None => {
+                    use std::io::IsTerminal;
+                    if !std::io::stdin().is_terminal() {
+                        bail!("pass --confirm {} to delete the org", me.org);
+                    }
+                    eprint!(
+                        "This deletes org {} with all its seats, mail, lists, links and tokens, \
+                         and the mail it sent to linked orgs. Type the org's name to confirm: ",
+                        me.org
+                    );
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    line.trim().to_string()
+                }
+            };
+            if confirm != me.org {
+                bail!("not deleted: the name does not match");
+            }
+            c.raw(Method::DELETE, "/org", Some(&json!({ "confirm": confirm })))
+                .await?;
+            out.show(&json!({ "deleted": me.org }), || {
+                Ok(format!("deleted org {} and all its data", me.org))
+            })
         }
         Cmd::Org(OrgCmd::Show) => {
             let v = c.raw(Method::GET, "/org", None).await?;
@@ -1182,6 +1474,7 @@ async fn serve(
     listen: &str,
     max_connections: u32,
     advertise_url: Option<String>,
+    config: amail_server::config::Config,
 ) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -1196,7 +1489,7 @@ async fn serve(
         .await
         .with_context(|| format!("binding {listen}"))?;
     let addr = listener.local_addr()?;
-    let state = if store.backend() == "postgres" {
+    let mut state = if store.backend() == "postgres" {
         let url = advertise_url
             .or_else(|| (!addr.ip().is_unspecified()).then(|| format!("http://{addr}")));
         if url.is_none() {
@@ -1208,9 +1501,12 @@ async fn serve(
     } else {
         amail_server::AppState::new(store)
     };
+    let public = config.public;
+    state.set_config(config);
     tracing::info!(
-        "amail listening on http://{addr} ({} backend{})",
+        "amail listening on http://{addr} ({} backend{}{})",
         state.store.backend(),
+        if public { ", public mode" } else { "" },
         state
             .cluster
             .as_ref()
@@ -1226,26 +1522,6 @@ async fn serve(
     };
     amail_server::serve(listener, state, shutdown).await?;
     Ok(())
-}
-
-async fn create_org(db: &str, org: &str, user_name: &str, out: &Out) -> Result<()> {
-    for n in [org, user_name] {
-        if !p::valid_name(n) {
-            bail!("invalid name {n:?}: must match [a-z0-9][a-z0-9._-]{{0,62}}");
-        }
-    }
-    let store = amail_store::open(db, &amail_store::OpenOptions { max_connections: 2 })
-        .await
-        .with_context(|| format!("opening {db}"))?;
-    let token = amail_server::new_token();
-    store
-        .create_org(org, user_name, &amail_server::hash_token(&token))
-        .await?;
-    let v = json!({ "org": org, "user_seat": user_name, "token": token });
-    out.show(&v, || {
-        eprintln!("created org {org} with user seat {user_name}; user token:");
-        Ok(token.clone())
-    })
 }
 
 fn parse_meta(items: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
@@ -1270,9 +1546,59 @@ struct NodeFile {
     label: Option<String>,
 }
 
+/// Commands that need what only Linux offers today (`/proc`, the
+/// parent-death signal, the harnesses' local sockets as tested).
+fn linux_only(what: &str) -> Result<()> {
+    if cfg!(target_os = "linux") {
+        Ok(())
+    } else {
+        bail!(
+            "{what} is supported on Linux only for now (this is {}); the server and the mail \
+             commands work here. See docs/harnesses.md.",
+            std::env::consts::OS
+        )
+    }
+}
+
+/// The command line of `amail node` for `amail node start` (the token goes
+/// in the environment instead).
+fn node_args(a: &NodeArgs) -> (Vec<String>, Option<String>) {
+    let mut v = Vec::new();
+    let mut opt = |k: &str, val: Option<String>| {
+        if let Some(x) = val {
+            v.push(k.to_string());
+            v.push(x);
+        }
+    };
+    opt("--url", a.url.clone());
+    opt("--label", a.label.clone());
+    opt("--claude-bin", Some(a.claude_bin.clone()));
+    opt("--codex-bin", Some(a.codex_bin.clone()));
+    opt("--zellij-bin", Some(a.zellij_bin.clone()));
+    opt("--start-limit", Some(a.start_limit.to_string()));
+    opt(
+        "--codex-auth",
+        a.codex_auth.as_ref().map(|p| p.display().to_string()),
+    );
+    opt("--wake-window-ms", Some(a.wake_window_ms.to_string()));
+    opt("--wake-confirm-ms", Some(a.wake_confirm_ms.to_string()));
+    opt(
+        "--web-terminal-port",
+        a.web_terminal_port.map(|p| p.to_string()),
+    );
+    opt("--web-terminal-url", a.web_terminal_url.clone());
+    (v, a.token.clone())
+}
+
 fn hostname() -> Option<String> {
     std::fs::read_to_string("/proc/sys/kernel/hostname")
         .ok()
+        .or_else(|| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        })
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
@@ -1288,10 +1614,17 @@ async fn node_daemon(a: NodeArgs) -> Result<()> {
         Ok(t) => toml::from_str(&t).context("parsing node.toml")?,
         Err(_) => NodeFile::default(),
     };
+    let saved = profiles::Config::load().ok();
     let url = a
         .url
         .or_else(|| std::env::var("AMAIL_URL").ok())
         .or(file.url)
+        .or_else(|| {
+            saved
+                .as_ref()
+                .and_then(|c| c.get(None))
+                .map(|(_, p)| p.url.clone())
+        })
         .unwrap_or_else(|| client::DEFAULT_URL.to_string());
     let token = a.token.or(file.token).context(
         "no node token: pass --token, set AMAIL_NODE_TOKEN, or run `amail node token --save`",

@@ -336,6 +336,7 @@ mod tests {
                 lines: 12,
                 created_at: "2026-01-01T00:00:00Z".into(),
                 meta: Default::default(),
+                expired: false,
             },
             body: body.map(str::to_string),
             preview: None,

@@ -20,7 +20,7 @@ use tokio_stream::wrappers::BroadcastStream;
 /// in threads the seat takes part in.
 pub async fn can_read(st: &AppState, auth: &Auth, m: &MessageRec) -> ApiResult<bool> {
     match auth.scope {
-        TokenScope::Node => Ok(false),
+        TokenScope::Node | TokenScope::Operator => Ok(false),
         TokenScope::User => Ok(st.store.org_sees_message(auth.org.id, m.id).await?),
         TokenScope::Seat => {
             let seat = auth.mail_seat()?;
@@ -295,6 +295,13 @@ pub async fn events(
             None => None,
         },
     };
+    let guard = st.limiters.streams.open(auth.org.id).ok_or_else(|| {
+        ApiError::too_many(
+            "too_many_streams",
+            "this org has too many open event streams",
+            5000,
+        )
+    })?;
     let last = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
@@ -388,7 +395,10 @@ pub async fn events(
     let stream = stream::select(mailbox, others)
         .take_while(|e| std::future::ready(e.is_some()))
         .filter_map(std::future::ready)
-        .map(Ok);
+        .map(move |e| {
+            let _open = &guard;
+            Ok(e)
+        });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
 }
 

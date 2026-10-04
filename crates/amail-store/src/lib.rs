@@ -289,4 +289,59 @@ pub trait Store: Send + Sync + 'static {
     /// Recipients that have not acknowledged the message (not the sender,
     /// not `archive` members).
     async fn laggards(&self, message_id: i64) -> Result<Vec<Laggard>>;
+
+    // --- public mode ----------------------------------------------------------
+
+    /// Store a registration invite (by the hash of its code).
+    async fn create_invite(
+        &self,
+        hash: &str,
+        note: Option<&str>,
+        expires_at: Option<i64>,
+    ) -> Result<i64>;
+    /// Every invite, oldest first.
+    async fn invites(&self) -> Result<Vec<InviteRec>>;
+    /// Revoke an unused invite; false if there was none.
+    async fn revoke_invite(&self, id: i64) -> Result<bool>;
+    /// Use the invite with this hash and create the org (see
+    /// [`Store::create_org`]), atomically: an invite is used at most once,
+    /// and only if the org could be created.
+    async fn register(
+        &self,
+        invite_hash: &str,
+        org: &str,
+        user_seat: &str,
+        token_hash: &str,
+    ) -> Result<std::result::Result<(Org, Seat), InviteError>>;
+    async fn create_operator_token(&self, hash: &str, label: Option<&str>) -> Result<i64>;
+    /// Live operator tokens.
+    async fn operator_tokens(&self) -> Result<Vec<OperatorTokenRec>>;
+    async fn revoke_operator_token(&self, id: i64) -> Result<bool>;
+    /// The id of the live operator token with this hash.
+    async fn operator_auth(&self, hash: &str) -> Result<Option<i64>>;
+    /// The operator token behind a live browser session.
+    async fn operator_session_auth(&self, hash: &str) -> Result<Option<i64>>;
+    async fn create_operator_session(
+        &self,
+        hash: &str,
+        token_id: i64,
+        expires_at: i64,
+    ) -> Result<()>;
+    async fn delete_operator_session(&self, hash: &str) -> Result<bool>;
+    /// Every org, by name.
+    async fn orgs(&self) -> Result<Vec<Org>>;
+    /// Suspend (`Some(time)`) or resume (`None`) an org; false if none.
+    async fn set_org_suspended(&self, org_id: i64, at: Option<i64>) -> Result<bool>;
+    /// Delete an org with all its data (see the backends); false if none.
+    async fn delete_org(&self, org_id: i64) -> Result<bool>;
+    /// Clear the bodies of up to `limit` messages created before `cutoff`;
+    /// returns how many were cleared.
+    async fn expire_bodies(&self, cutoff: i64, limit: i64) -> Result<u64>;
+    /// Load and activity per org, for the operator.
+    async fn operator_stats(&self) -> Result<OperatorStats>;
+    /// Replace a user token: issue `new`, move `old`'s browser sessions to
+    /// it, revoke `old`. Returns the new token's id.
+    async fn rotate_token(&self, org_id: i64, old: i64, new: &NewToken) -> Result<i64>;
+    /// Revoke all user tokens of the org and issue one with this hash.
+    async fn reset_user_tokens(&self, org_id: i64, hash: &str) -> Result<()>;
 }

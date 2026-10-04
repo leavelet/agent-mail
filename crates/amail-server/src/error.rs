@@ -41,6 +41,12 @@ impl ApiError {
     pub fn unprocessable(code: &'static str, msg: impl Into<String>) -> Self {
         Self::new(StatusCode::UNPROCESSABLE_ENTITY, code, msg)
     }
+    /// 429 with a retry time.
+    pub fn too_many(code: &'static str, msg: impl Into<String>, retry_after_ms: u64) -> Self {
+        let mut e = Self::new(StatusCode::TOO_MANY_REQUESTS, code, msg);
+        e.retry_after_ms = Some(retry_after_ms);
+        e
+    }
     pub fn rate_limited(retry_after_ms: u64) -> Self {
         let mut e = Self::new(
             StatusCode::TOO_MANY_REQUESTS,

@@ -42,35 +42,69 @@ impl std::fmt::Display for ApiError {
 impl std::error::Error for ApiError {}
 
 impl Client {
-    /// Configuration: the `--profile` file (TOML with `url` and `token`) if
-    /// given, with `AMAIL_URL` / `AMAIL_TOKEN` filling in missing values.
+    /// Configuration, first match wins:
+    ///
+    /// 1. `--profile` / `AMAIL_PROFILE`: a TOML file with `url` and `token`
+    ///    (a path), or the name of a saved login; `AMAIL_URL` /
+    ///    `AMAIL_TOKEN` fill in what a file leaves out;
+    /// 2. `AMAIL_TOKEN` (with `AMAIL_URL`): how agents' sessions are set up;
+    /// 3. inside a Codex session (`CODEX_THREAD_ID`), the seat's credentials
+    ///    from the node;
+    /// 4. the current saved login (`amail login`).
     pub fn from_config(profile: Option<&Path>) -> Result<Client> {
-        let p: Profile = match profile {
+        let env_url = std::env::var("AMAIL_URL").ok().filter(|v| !v.is_empty());
+        let env_token = std::env::var("AMAIL_TOKEN").ok().filter(|v| !v.is_empty());
+        let (url, token) = match profile {
+            Some(p) if is_saved_name(p) => {
+                let name = p.to_string_lossy();
+                let cfg = crate::profiles::Config::load()?;
+                let (_, pr) = cfg
+                    .get(Some(&name))
+                    .with_context(|| format!("no saved login {name:?} (see `amail profile ls`)"))?;
+                (pr.url.clone(), pr.token.clone())
+            }
             Some(path) => {
                 let text = std::fs::read_to_string(path)
                     .with_context(|| format!("reading profile {}", path.display()))?;
-                toml::from_str(&text)
-                    .with_context(|| format!("parsing profile {}", path.display()))?
+                let p: Profile = toml::from_str(&text)
+                    .with_context(|| format!("parsing profile {}", path.display()))?;
+                let url = p.url.or(env_url).unwrap_or_else(|| DEFAULT_URL.to_string());
+                let token = p
+                    .token
+                    .or(env_token)
+                    .context("no token: the profile has none and AMAIL_TOKEN is not set")?;
+                (url, token)
             }
-            None => Profile::default(),
-        };
-        let url = p
-            .url
-            .or_else(|| std::env::var("AMAIL_URL").ok())
-            .unwrap_or_else(|| DEFAULT_URL.to_string());
-        let token = p.token.or_else(|| std::env::var("AMAIL_TOKEN").ok());
-        let (url, token) = match token {
-            Some(t) => (url, t),
-            None => match node_credentials() {
-                Some(c) => (c.url, c.token),
-                None => bail!("no token: set AMAIL_TOKEN or use --profile"),
+            None => match env_token {
+                Some(t) => (env_url.unwrap_or_else(|| DEFAULT_URL.to_string()), t),
+                None => match node_credentials() {
+                    Some(c) => (c.url, c.token),
+                    None => {
+                        let cfg = crate::profiles::Config::load()?;
+                        let (_, pr) = cfg.get(None).context(
+                            "no token: run `amail login <url>`, set AMAIL_TOKEN, or use --profile",
+                        )?;
+                        (pr.url.clone(), pr.token.clone())
+                    }
+                },
             },
         };
-        Ok(Client {
+        Ok(Client::new(&url, &token))
+    }
+
+    pub fn new(url: &str, token: &str) -> Client {
+        Client {
             base: url.trim_end_matches('/').to_string(),
-            token,
-            http: reqwest::Client::builder().no_proxy().build()?,
-        })
+            token: token.to_string(),
+            http: reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .expect("building the HTTP client"),
+        }
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
     }
 
     pub fn base(&self) -> &str {
@@ -114,6 +148,12 @@ impl Client {
     pub async fn raw(&self, method: Method, path: &str, body: Option<&Value>) -> Result<Value> {
         self.call(method, path, body).await
     }
+}
+
+/// `--profile x` names a saved login when it is not a path to a file.
+fn is_saved_name(p: &Path) -> bool {
+    let s = p.to_string_lossy();
+    !p.exists() && !s.contains('/') && !s.ends_with(".toml")
 }
 
 /// Inside a Codex session, tool commands run in the shared Codex daemon and

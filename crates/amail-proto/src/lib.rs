@@ -100,7 +100,12 @@ string_enum!(
     PostPolicy { Anyone => "anyone", Members => "members", UserOnly => "user_only" }
 );
 
-string_enum!(TokenScope { User => "user", Seat => "seat", Node => "node" });
+string_enum!(
+    /// What a token may do. `operator` tokens belong to no org: they run a
+    /// public server (stats, suspending and deleting orgs) and never see
+    /// mail.
+    TokenScope { User => "user", Seat => "seat", Node => "node", Operator => "operator" }
+);
 
 string_enum!(
     /// How a seat's harness is launched with respect to permission prompts.
@@ -272,6 +277,9 @@ pub struct MessageHeader {
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Meta::is_empty")]
     pub meta: Meta,
+    /// The retention period cleared the body (the header is kept).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub expired: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1048,4 +1056,77 @@ pub struct TranscriptPost {
 pub struct TranscriptPostResponse {
     /// Browsers currently watching the seat.
     pub subscribers: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Public mode: registration, server information, the operator
+
+/// Response of `GET /v1/info` (no authentication).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServerInfo {
+    pub version: String,
+    /// The server runs in public mode (`amail serve --public`).
+    pub public: bool,
+    /// `POST /v1/register` accepts invite codes.
+    pub registration: bool,
+    /// Message bodies older than this many days are cleared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_days: Option<u32>,
+}
+
+/// Body of `POST /v1/register`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterRequest {
+    pub invite: String,
+    pub org: String,
+    /// Name of the user seat (default `owner`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_name: Option<String>,
+}
+
+/// Response of `POST /v1/register`: the user token is shown only here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterResponse {
+    pub org: String,
+    pub user_seat: String,
+    pub token: String,
+}
+
+/// Body of `DELETE /v1/org` and of the operator's org deletion: the org's
+/// name, typed again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteOrgRequest {
+    pub confirm: String,
+}
+
+/// One org as the operator sees it (no mail content).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrgStatInfo {
+    pub name: String,
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspended_at: Option<String>,
+    /// Live agent seats.
+    pub seats: i64,
+    /// Connected node event streams.
+    pub nodes: i64,
+    pub messages: i64,
+    pub messages_hour: i64,
+    pub messages_day: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_activity: Option<String>,
+}
+
+/// Response of `GET /v1/operator/stats`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OperatorStatsResponse {
+    pub orgs: i64,
+    pub suspended: i64,
+    pub seats: i64,
+    pub nodes_online: i64,
+    /// Messages sent in the last five minutes, all orgs.
+    pub mail_last_5min: i64,
+    pub mail_last_hour: i64,
+    /// Busiest first.
+    pub list: Vec<OrgStatInfo>,
 }

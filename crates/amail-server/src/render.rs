@@ -77,6 +77,7 @@ pub fn header(m: &MessageRec, viewer: &Org) -> p::MessageHeader {
         lines: m.lines,
         created_at: ts(m.created_at),
         meta: m.meta.clone(),
+        expired: m.expired_at.is_some(),
     }
 }
 

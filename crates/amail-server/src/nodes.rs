@@ -19,7 +19,9 @@ const MAX_PRESENCE_BATCH: usize = 5000;
 fn require_node_or_user(auth: &Auth) -> ApiResult<()> {
     match auth.scope {
         TokenScope::Node | TokenScope::User => Ok(()),
-        TokenScope::Seat => Err(ApiError::forbidden("requires a node or user token")),
+        TokenScope::Seat | TokenScope::Operator => {
+            Err(ApiError::forbidden("requires a node or user token"))
+        }
     }
 }
 

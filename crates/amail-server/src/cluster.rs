@@ -429,6 +429,10 @@ impl EventBus for ClusterBus {
     fn lost_events(&self) {
         self.hub.reset();
     }
+
+    fn close_org(&self, org_id: i64) {
+        self.hub.close_org(org_id);
+    }
 }
 
 #[cfg(test)]
