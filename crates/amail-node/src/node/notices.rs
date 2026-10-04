@@ -183,7 +183,7 @@ impl Node {
                                 .unwrap_or(PermissionMode::Default)
                                 .as_str()
                                 .to_string(),
-                            git_access: (m.harness == "codex")
+                            git_access: matches!(m.harness.as_str(), "codex" | "dsh")
                                 .then(|| m.git_access.unwrap_or_default().as_str().to_string()),
                             dsh_jail: (m.harness == "dsh").then(|| {
                                 if m.dsh_jail.unwrap_or(true) {
@@ -430,7 +430,7 @@ mod tests {
             local_policy: "open".into(),
             seats: [
                 ("cx".to_string(), seat("unattended", Some("worktree"), None)),
-                ("d".to_string(), seat("unattended", None, Some("on"))),
+                ("d".to_string(), seat("unattended", Some("worktree"), Some("on"))),
                 ("quiet".to_string(), seat("default", Some("worktree"), None)),
             ]
             .into(),
@@ -446,6 +446,7 @@ mod tests {
                 ("cx", NoticeSetting::PermissionMode, "unattended"),
                 ("cx", NoticeSetting::GitAccess, "worktree"),
                 ("d", NoticeSetting::PermissionMode, "unattended"),
+                ("d", NoticeSetting::GitAccess, "worktree"),
                 ("d", NoticeSetting::DshJail, "on"),
             ]
         );
