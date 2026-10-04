@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Vis from '../components/Vis.svelte';
   import { store } from '../lib/store.svelte';
   import { t, ui } from '../lib/ui.svelte';
   import { href, go } from '../lib/router.svelte';
@@ -105,11 +106,11 @@
                 {:else if it.message}
                   {#if it.message.priority === 'urgent'}<span class="chip urgent">{t('mail.urgent')}</span>{/if}
                   {#if it.message.source === 'external' || it.message.source === 'system'}<span class="chip neutral" title={t(`mail.source.${it.message.source}.long`)}>{t(`mail.source.${it.message.source}`)}</span>{/if}
-                  <span class="subj">{it.message.subject || t('mail.noSubject')}</span>
+                  <span class="subj">{#if it.message.subject}<Vis text={it.message.subject} />{:else}{t('mail.noSubject')}{/if}</span>
                 {/if}
               </div>
-              {#if it.kind === 'seat' && it.hint}<div class="l2 muted">{it.hint}</div>{/if}
-              {#if it.kind !== 'seat' && seat}<div class="l2 faint">{seat.role?.split('\n', 1)[0] ?? ''}</div>{/if}
+              {#if it.kind === 'seat' && it.hint}<div class="l2 muted"><Vis text={it.hint} /></div>{/if}
+              {#if it.kind !== 'seat' && seat}<div class="l2 faint"><Vis text={seat.role?.split('\n', 1)[0] ?? ''} /></div>{/if}
             </div>
             <span class="age faint" title={it.since}>{t('needs.waiting', { d: waited(it) })}</span>
           </div>
@@ -124,7 +125,7 @@
       <div class="seatcard card">
         <div class="row"><h2 class="mono">{current.seat}</h2>{#if current.state}<StateBadge state={current.state} />{/if}</div>
         <p class="error"><strong>⚠ {current.attention ? attnLabel(current.attention) : t('flag.wakeFailed')}</strong></p>
-        {#if current.hint}<p>{current.hint}</p>{/if}
+        {#if current.hint}<p><Vis text={current.hint} /></p>{/if}
         {#if terminalHref(seat?.presence?.terminal_url)}
           <p><a href={terminalHref(seat?.presence?.terminal_url)} target="_blank" rel="noopener noreferrer">{t('seat.openTerminal')} ↗</a></p>
         {:else}

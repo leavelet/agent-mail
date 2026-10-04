@@ -5,7 +5,8 @@
 //! is written by someone else. Shown as is, it could contain line breaks
 //! that start a line looking like a header or a line of the mail system,
 //! terminal escape sequences, or characters that a reader cannot see
-//! (bidirectional controls, zero-width characters, Unicode tag characters).
+//! (bidirectional controls, zero-width characters, variation selectors,
+//! Unicode tag characters).
 //! The functions here replace line breaks with spaces and show every other
 //! such character as a visible escape, `\u{202e}`.
 
@@ -26,13 +27,20 @@ pub fn is_line_break(c: char) -> bool {
 }
 
 /// Characters that are not shown, or change how other characters are shown:
-/// the Unicode format characters (category Cf: bidirectional controls,
-/// zero-width spaces and joiners, the byte order mark, soft hyphens, tag
-/// characters) and the Hangul filler characters, which render as blanks.
+/// every code point with the Unicode property Default_Ignorable_Code_Point
+/// (bidirectional controls, zero-width spaces and joiners, the byte order
+/// mark, soft hyphens, variation selectors, tag characters, Hangul fillers,
+/// and the reserved code points of that property), every format character
+/// (category Cf), and U+2800 BRAILLE PATTERN BLANK, which renders as a blank.
+///
+/// The ranges are generated from Unicode 17.0.0 (`DerivedCoreProperties.txt`
+/// and `UnicodeData.txt`) by `scripts/invisible-chars.py`. The web UI keeps
+/// the same list in `web/src/lib/visible.ts`.
 pub fn is_invisible(c: char) -> bool {
     matches!(
         c as u32,
         0x00AD
+            | 0x034F
             | 0x0600..=0x0605
             | 0x061C
             | 0x06DD
@@ -40,22 +48,23 @@ pub fn is_invisible(c: char) -> bool {
             | 0x0890..=0x0891
             | 0x08E2
             | 0x115F..=0x1160
-            | 0x180E
+            | 0x17B4..=0x17B5
+            | 0x180B..=0x180F
             | 0x200B..=0x200F
             | 0x202A..=0x202E
-            | 0x2060..=0x2064
-            | 0x2066..=0x206F
+            | 0x2060..=0x206F
+            | 0x2800
             | 0x3164
+            | 0xFE00..=0xFE0F
             | 0xFEFF
             | 0xFFA0
-            | 0xFFF9..=0xFFFB
+            | 0xFFF0..=0xFFFB
             | 0x110BD
             | 0x110CD
             | 0x13430..=0x1343F
             | 0x1BCA0..=0x1BCA3
             | 0x1D173..=0x1D17A
-            | 0xE0001
-            | 0xE0020..=0xE007F
+            | 0xE0000..=0xE0FFF
     )
 }
 
@@ -145,6 +154,39 @@ mod tests {
         assert_eq!(line("数据库 schema ✓ é"), "数据库 schema ✓ é");
         for s in ["a\u{1b}[2Kb", "\u{202e}", "x\u{e0020}"] {
             assert!(!line(s).chars().any(is_unsafe));
+        }
+    }
+
+    #[test]
+    fn default_ignorable_code_points() {
+        // Variation selectors (which can encode arbitrary bytes), the
+        // combining grapheme joiner, Khmer inherent vowels, Mongolian free
+        // variation selectors, the braille blank and reserved
+        // default-ignorable code points are escaped.
+        for c in [
+            '\u{fe00}',
+            '\u{fe0f}',
+            '\u{e0100}',
+            '\u{e0101}',
+            '\u{e01ef}',
+            '\u{34f}',
+            '\u{17b4}',
+            '\u{17b5}',
+            '\u{180b}',
+            '\u{180f}',
+            '\u{2065}',
+            '\u{2800}',
+            '\u{fff0}',
+            '\u{e0000}',
+            '\u{e0fff}',
+        ] {
+            assert!(is_invisible(c), "{:x}", c as u32);
+            assert_eq!(line(&format!("a{c}b")), format!("a\\u{{{:x}}}b", c as u32));
+        }
+        assert_eq!(quote("ok\u{fe0f}\u{e0101}"), "  > ok\\u{fe0f}\\u{e0101}");
+        // Neighbours that are visible stay as they are.
+        for c in ['\u{17b3}', '\u{17b6}', '\u{2801}', '\u{fe10}', '\u{e1000}'] {
+            assert!(!is_invisible(c), "{:x}", c as u32);
         }
     }
 

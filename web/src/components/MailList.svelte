@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Vis from './Vis.svelte';
   import type { MailRow } from '../lib/mailrows';
   import { t, ui } from '../lib/ui.svelte';
   import { shortTime } from '../lib/time';
@@ -45,8 +46,8 @@
         {#if r.priority === 'urgent'}<span class="chip urgent">{t('mail.urgent')}</span>{/if}
         {#if r.ack_required}<span class="chip {r.acked ? 'ok' : 'ack'}">{r.acked ? t('mail.acked') : t('mail.ackReq')}</span>{/if}
         {#if r.via}<span class="chip neutral" title={t('mail.viaList.long', { list: r.via })}>{r.cls === 'cc' ? 'cc · ' : ''}{t('mail.viaList', { list: r.via })}</span>{:else if r.cls === 'cc'}<span class="chip neutral">cc</span>{/if}
-        <span class="s">{r.subject || t('mail.noSubject')}</span>
-        {#if r.snippet}<span class="snip faint">— {r.snippet}</span>{/if}
+        <span class="s">{#if r.subject}<Vis text={r.subject} />{:else}{t('mail.noSubject')}{/if}</span>
+        {#if r.snippet}<span class="snip faint">— <Vis text={r.snippet} /></span>{/if}
         {#if r.meta?.commit}<span class="chip neutral mono" title={r.meta.commit}>{r.meta.commit.slice(0, 8)}</span>{/if}
       </div>
       <div class="when faint" title={r.created_at}>{shortTime(r.created_at, ui.now, ui.lang)}</div>

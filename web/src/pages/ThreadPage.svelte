@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Vis from '../components/Vis.svelte';
   import { tick } from 'svelte';
   import { get, enc } from '../lib/api';
   import { t } from '../lib/ui.svelte';
@@ -33,7 +34,7 @@
     <p class="faint">{t('app.loading')}</p>
   {:else}
     <div class="page-head">
-      <h1>{data.messages[0]?.subject || t('mail.noSubject')}</h1>
+      <h1>{#if data.messages[0]?.subject}<Vis text={data.messages[0].subject} />{:else}{t('mail.noSubject')}{/if}</h1>
       <span class="faint">{t('thread.title', { id: data.thread_id })} · {t('thread.messages', { n: data.messages.length })}</span>
       <span class="spacer"></span>
       <span class="parts">{#each participants as p}<a class="mono chip neutral" href={p.includes('@') ? undefined : href(['org', p])}>{p}</a>{/each}</span>

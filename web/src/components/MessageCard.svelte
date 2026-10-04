@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Vis from './Vis.svelte';
   import type { Snippet } from 'svelte';
   import type { Message, MessageResponse } from '../lib/types';
   import { get } from '../lib/api';
@@ -52,7 +53,7 @@
       <span class="faint id">#{message.id}</span>
       <time class="faint" datetime={message.created_at}>{fullTime(message.created_at, ui.lang)}</time>
     </div>
-    <h2 id="subj-{message.id}">{message.subject || t('mail.noSubject')}</h2>
+    <h2 id="subj-{message.id}">{#if message.subject}<Vis text={message.subject} />{:else}{t('mail.noSubject')}{/if}</h2>
     <div class="rcpt">
       <span class="k">{t('mail.to')}</span><span class="mono">{message.to.join(', ') || '—'}</span>
       {#if message.cc.length}<span class="k">{t('mail.cc')}</span><span class="mono">{message.cc.join(', ')}</span>{/if}
@@ -72,7 +73,7 @@
       {#if fetchError}<span class="error" role="alert">{fetchError}</span>{/if}
     </p>
   {:else}
-    <pre class="body">{body}</pre>
+    <pre class="body"><Vis text={body} /></pre>
   {/if}
   <footer class="row wrap">
     {@render actions?.()}

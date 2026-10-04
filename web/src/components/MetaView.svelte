@@ -1,4 +1,6 @@
 <script lang="ts">
+  import Vis from './Vis.svelte';
+  import { visible } from '../lib/visible';
   import { t } from '../lib/ui.svelte';
 
   let { meta }: { meta: Record<string, string> } = $props();
@@ -10,16 +12,16 @@
 <div class="meta">
   {#if hasGit}
     <div class="git" aria-label="git">
-      {#if meta.repo}<span class="f"><span class="k">{t('meta.repo')}</span><span class="v mono">{meta.repo}</span></span>{/if}
-      {#if meta.branch}<span class="f"><span class="k">{t('meta.branch')}</span><span class="v mono branch">⎇ {meta.branch}</span></span>{/if}
-      {#if meta.commit}<span class="f"><span class="k">{t('meta.commit')}</span><span class="v mono commit" title={meta.commit}>{meta.commit.slice(0, 12)}</span></span>{/if}
+      {#if meta.repo}<span class="f"><span class="k">{t('meta.repo')}</span><span class="v mono"><Vis text={meta.repo} /></span></span>{/if}
+      {#if meta.branch}<span class="f"><span class="k">{t('meta.branch')}</span><span class="v mono branch">⎇ <Vis text={meta.branch} /></span></span>{/if}
+      {#if meta.commit}<span class="f"><span class="k">{t('meta.commit')}</span><span class="v mono commit" title={visible(meta.commit)}><Vis text={meta.commit.slice(0, 12)} /></span></span>{/if}
     </div>
   {/if}
   {#if rest.length}
     <dl>
       {#each rest as [k, v]}
         <dt class="mono">{k}</dt>
-        <dd class="mono">{v}</dd>
+        <dd class="mono"><Vis text={v} /></dd>
       {/each}
     </dl>
   {/if}

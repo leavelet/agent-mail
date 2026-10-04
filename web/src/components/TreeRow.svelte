@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { visible } from '../lib/visible';
   import type { Row } from '../lib/tree';
   import type { Seat, SeatCounts, SeatState } from '../lib/types';
   import { SEAT_STATES } from '../lib/types';
@@ -76,7 +77,7 @@
     {:else}
       <span class="caret-space"></span>
     {/if}
-    <span class="mono seatname" title={seat.display_name ?? seat.name}>{seat.name}</span>
+    <span class="mono seatname" title={visible(seat.display_name ?? seat.name)}>{seat.name}</span>
     {#if isUser}<span class="chip neutral">{t('org.you')}</span>{/if}
     {#if row.hasChildren && !row.expanded && below}
       <span class="below" title={t('org.subtree', { n: size })}>
@@ -88,10 +89,10 @@
       </span>
     {/if}
   </div>
-  <div class="hm faint">{isUser ? '' : hm}</div>
+  <div class="hm faint">{isUser ? '' : visible(hm)}</div>
   <div class="state">{#if !isUser}<StateBadge state={seatState} {age} />{/if}</div>
   <div class="flags">
-    {#if attnLabel}<span class="chip attn" title={p?.attention_hint ?? t('flag.attention')}>⚠ {attnLabel}</span>{/if}
+    {#if attnLabel}<span class="chip attn" title={visible(p?.attention_hint ?? t('flag.attention'))}>⚠ {attnLabel}</span>{/if}
     {#if p?.wake_failed && p?.attention !== 'wake-failed'}<span class="chip attn" title={t('flag.wakeFailed.long')}>{t('flag.wakeFailed')}</span>{/if}
     {#if focus}<span class="chip focus" title={t('flag.focus.long')}>◐ {t('flag.focus', { time: shortTime(focus, now, ui.lang) })}</span>{/if}
     {#if waiting}<span class="chip you" title={t('flag.waitingYou.long')}>✉ {t('flag.waitingYou')}</span>{/if}

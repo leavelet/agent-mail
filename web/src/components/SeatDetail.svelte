@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Vis from './Vis.svelte';
   import { store } from '../lib/store.svelte';
   // Lists of the org, to say through which one mail arrived.
   const isList = (a: string) => store.lists.some((l) => l.name === a);
@@ -92,7 +93,7 @@
     <div class="head">
       <div class="title">
         <h1 class="mono">{seat.name}</h1>
-        {#if seat.display_name}<span class="muted">{seat.display_name}</span>{/if}
+        {#if seat.display_name}<span class="muted"><Vis text={seat.display_name} /></span>{/if}
         {#if seat.kind === 'agent'}<StateBadge state={seatState} {age} />{:else}<span class="chip neutral">{t('org.you')}</span>{/if}
         {#if focus}<span class="chip focus" title={t('flag.focus.long')}>◐ {t('flag.focus', { time: shortTime(focus, now, ui.lang) })}</span>{/if}
       </div>
@@ -111,7 +112,7 @@
     {#if attnText || p?.wake_failed}
       <div class="alert" role="alert">
         <strong>⚠ {t('seat.attention')}{attnText ? `: ${attnText}` : ''}</strong>
-        {#if p?.attention_hint}<span>{p.attention_hint}</span>{:else if p?.wake_failed}<span>{t('seat.wakeFailed')}</span>{/if}
+        {#if p?.attention_hint}<span><Vis text={p.attention_hint} /></span>{:else if p?.wake_failed}<span>{t('seat.wakeFailed')}</span>{/if}
       </div>
     {/if}
 
@@ -128,10 +129,10 @@
         <dt>{t('seat.state')}</dt>
         <dd>{t(`state.${seatState}.long`)}{#if age !== undefined} · {t('seat.for', { d: duration(age, ui.lang) })}{/if}</dd>
         <dt>{t('seat.harness')}</dt>
-        <dd>{[seat.harness ?? p?.harness, seat.model].filter(Boolean).join(' · ') || '—'}{#if seat.permission_mode} · <span class="faint">{seat.permission_mode}</span>{/if}</dd>
+        <dd><Vis text={[seat.harness ?? p?.harness, seat.model].filter(Boolean).join(' · ') || '—'} />{#if seat.permission_mode} · <span class="faint">{seat.permission_mode}</span>{/if}</dd>
         <dt>{t('seat.node')}</dt>
         <dd>{#if p?.node}<span class="mono">{p.node}</span>{:else if p}<span class="faint">—</span>{:else}<span class="faint">{t('seat.noNode')}</span>{/if}</dd>
-        {#if seat.group}<dt>{t('seat.group')}</dt><dd class="mono">{seat.group}</dd>{/if}
+        {#if seat.group}<dt>{t('seat.group')}</dt><dd class="mono"><Vis text={seat.group} /></dd>{/if}
         <dt>{t('seat.terminal')}</dt>
         <dd>
           {#if terminalHref(p?.terminal_url)}
@@ -146,7 +147,7 @@
     </dl>
     <details class="role" open={!!seat.role && seat.role.length < 400}>
       <summary>{t('seat.role')}</summary>
-      {#if seat.role}<pre>{seat.role}</pre>{:else}<p class="faint">{t('seat.noRole')}</p>{/if}
+      {#if seat.role}<pre><Vis text={seat.role} /></pre>{:else}<p class="faint">{t('seat.noRole')}</p>{/if}
     </details>
 
     <div class="tabs" role="tablist">
