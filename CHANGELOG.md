@@ -100,7 +100,7 @@ Changes made after a security review, before the first public server.
   zero-width and other invisible characters are shown as visible escapes
   in everything the command line prints and everything injected into a
   session (bodies, subjects, `meta`, names, descriptions, labels, role
-  text).
+  text). In `--json` output they are written as JSON `\u` escapes.
 - Injected mail is packed by its rendered size; messages that do not fit
   wait for the next hook instead of being cut.
 
@@ -180,3 +180,83 @@ Changes made after a security review, before the first public server.
 - GitHub Actions are pinned by commit, release archives carry build
   provenance attestations, and `install.sh` downloads over https only and
   accepts a separately obtained checksum (`AMAIL_SHA256`).
+
+#### Second review
+
+- Pending and unread counts come from per-seat counters kept with each
+  delivery change, not from counting deliveries. A thread the caller cannot
+  see is refused before anything is loaded. Requests whose cost depends on
+  the data (search, archive, threads, attention, overview, delivery status,
+  lists, changes, large inbox and sent pages) take one of the org's query
+  slots (1 per org and 8 per server in public mode, `--max-org-queries`,
+  `--max-queries`), and every org has a request limit over all its tokens
+  (500 per second in public mode, `--max-org-requests-per-sec`); a
+  request over it is refused before the database is asked, and the 429
+  answer is sent after one second. On SQLite the writer's checkpoint waits
+  at most 100 ms for readers. `amail-bench tenants` measures one org's
+  latency while another org loads the server.
+- The storage quota also counts a fixed amount per message and per
+  delivery and the address lists; an org at its quota cannot send at all.
+  Mail kept after the sending org was deleted is charged to the orgs that
+  keep it. Existing counts are recomputed on upgrade.
+- Codex seats have a per-seat `git_access` setting (`worktree` by default,
+  `full`, `off`). With `worktree` the root of the repository's git
+  directory stays read-only; `packed-refs` is moved into `.git/amail/` so
+  that commits, rebases and merges in a linked worktree still work; branch
+  and tag deletion need the person or a `full` seat. The staged-merge
+  template gives a Codex root seat `full`, and `amail up` says so. Codex
+  seats and `amail up` refuse git directories that contain symbolic links
+  in `refs/` or `logs/`.
+- Every default-ignorable code point (variation selectors included) is
+  shown as an escape in the command line and in injected mail, and the web
+  interface shows invisible and control characters as visible escapes.
+- A full rate-limiter key table no longer refuses new clients;
+  registrations are also limited per IPv6 /48. An invite code is spent
+  after three answers that a name is taken. Link requests that are not
+  accepted within 30 days expire, to unknown names and to existing orgs
+  alike.
+- Revocation ends only the streams of the revoked credential. Delivery
+  status counts the seats of a third org behind another org's list.
+  Webhook notices from other orgs share a separate in-flight limit.
+  An empty `AMAIL_MAX_*` or `AMAIL_RETENTION_DAYS` value counts as not set.
+  `install.sh` requires curl.
+- The node has a local policy, `local_policy`: `open` (every process of
+  the person's OS user, including agent sessions, may manage seats and
+  obtain any seat's credentials through the node) or `restricted` (the
+  earlier checks by parent process: a session gets only its own seat's
+  credentials and cannot manage seats). It is set with `amail node
+  --local-policy`, `AMAIL_LOCAL_POLICY` or `node.toml`; a team file can
+  only choose `restricted`. The default is `open`. `amail up`, `amail ps`,
+  `amail node status` and `amail doctor` print the policy in effect.
+- The node tells the person by system mail, written by the server from
+  fixed texts and sent only to the org's own user seat: when its local
+  policy, or a supervised seat's permission mode or `git_access`, differs
+  from what it reported last (at start and after `amail up`), and, under
+  the open policy, when a process of an agent session manages seats,
+  obtains a seat's credentials or sends a hook in another seat's name (at
+  most one mail per session every five minutes). Recognizing a session's
+  processes is best effort. Reports are limited per org.
+- The supervisor waits for the multiplexer to mark a pane exited before
+  running it again after a stop it asked for, so restarting a seat stuck
+  at a prompt is no longer counted as a failed start; a screen check of an
+  earlier launch no longer marks the new launch as stuck.
+
+Changes users will notice in this review:
+
+- An org at its storage quota cannot send at all, and deliveries count
+  toward the quota (existing counts are recomputed on upgrade).
+- Search, archive, thread, attention, overview, status, list, changes and
+  large inbox and sent pages of one org run one at a time on a public
+  server (429 `too_many_queries` beyond that); an org that sends more than 500
+  requests per second gets 429 answers after one second.
+- Codex seats cannot write the root of the repository's git directory
+  unless their `git_access` is `full`; branch and tag deletion from a
+  `worktree` seat fails; seats refuse to start while `refs/` or `logs/`
+  contain a symbolic link.
+- Invisible characters show as escapes in the command line, in injected
+  mail and in the web interface.
+- A registration with a valid invite and a taken name spends one of the
+  invite's three tries; link requests expire after 30 days.
+- The user's inbox gets a system mail when a node first starts or changes
+  its local policy or a seat's permission mode or `git_access`, and,
+  under the open policy, when agent sessions manage seats.

@@ -37,6 +37,18 @@ impl Peer {
             None => "unknown".into(),
         }
     }
+
+    /// The /48 network of an IPv6 client, as a key for a limit shared by
+    /// all /64 networks inside it; `None` for other clients.
+    pub fn net48_key(&self) -> Option<String> {
+        match self.ip.map(crate::config::canonical) {
+            Some(IpAddr::V6(v6)) => {
+                let net = u128::from(v6) & (u128::MAX << 80);
+                Some(format!("{}/48", std::net::Ipv6Addr::from(net)))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Work out the [`Peer`] of a request (see the module docs).
@@ -111,6 +123,17 @@ mod tests {
         assert_ne!(key("2001:db8:1:3::1"), key("2001:db8:1:2::1"));
         assert_eq!(key("192.0.2.7"), "192.0.2.7");
         assert_eq!(key("::ffff:192.0.2.7"), "192.0.2.7");
+        let net = |s: &str| {
+            Peer {
+                ip: Some(s.parse().unwrap()),
+                proxied: false,
+            }
+            .net48_key()
+        };
+        assert_eq!(net("2001:db8:1:2::1").unwrap(), "2001:db8:1::/48");
+        assert_eq!(net("2001:db8:1:ffff::1"), net("2001:db8:1:2::1"));
+        assert_eq!(net("192.0.2.7"), None);
+        assert_eq!(net("::ffff:192.0.2.7"), None);
     }
     use crate::config::Config;
     use axum::http::HeaderMap;

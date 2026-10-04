@@ -159,6 +159,8 @@ impl Env {
                     tab: s.to_string(),
                     paste_fallback: false,
                     permission_mode: None,
+                    git_access: None,
+                    dsh_jail: None,
                 }
             })
             .collect();

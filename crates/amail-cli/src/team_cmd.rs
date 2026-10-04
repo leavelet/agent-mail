@@ -5,7 +5,7 @@
 use crate::Out;
 use crate::client::{Client, enc};
 use amail_node::team::{self, Team};
-use amail_node::wire::{PsRow, Request, SeatPlacement};
+use amail_node::wire::{GitAccess, PsRow, Request, SeatPlacement};
 use amail_proto::{self as p, PostPolicy, SeatKind, TokenScope};
 use anyhow::{Context, Result, bail};
 use reqwest::Method;
@@ -25,6 +25,28 @@ fn node(req: &Request, timeout: Duration) -> Result<Value> {
         );
     }
     amail_node::request(&sock, req, timeout)
+}
+
+/// The node's local policy as `ps`, `up` and `doctor` show it, from a
+/// `Ps`, `Up` or `Status` answer.
+pub fn policy_line(v: &Value) -> Option<String> {
+    let p = v["local_policy"].as_str()?;
+    let source = v["local_policy_source"]
+        .as_str()
+        .map(|s| format!(" ({s})"))
+        .unwrap_or_default();
+    let what = match p {
+        "open" => {
+            "agent sessions on this host may manage seats and obtain any seat's credentials; \
+             the node reports such requests to you by system mail"
+        }
+        "restricted" => {
+            "agent sessions on this host get only their own seat's credentials and cannot \
+             manage seats (best effort)"
+        }
+        _ => "",
+    };
+    Some(format!("local policy: {p}{source}: {what}"))
 }
 
 fn ps_rows() -> Result<Vec<PsRow>> {
@@ -373,9 +395,37 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
                 tab,
                 paste_fallback: plan.paste_fallback,
                 permission_mode: plan.permission_mode,
+                git_access: Some(t.git_access(&s)),
+                dsh_jail: plan.dsh_jail,
             }
         })
         .collect();
+    for p in &placements {
+        if p.harness == "dsh"
+            && p.dsh_jail == Some(false)
+            && p.permission_mode == Some(p::PermissionMode::Unattended)
+        {
+            report.push(format!(
+                "seat {}: dsh_jail off: this unattended dsh seat runs without the jail, so \
+                 its agent can read every file your OS user can read (saved logins and keys \
+                 included)",
+                p.seat
+            ));
+        }
+        if p.harness == "codex" && p.git_access == Some(GitAccess::Full) {
+            let why = if t.seat(&p.seat).is_some_and(|s| s.git_access.is_some()) {
+                "set in the team file"
+            } else {
+                "the staged-merge root merges in the main checkout"
+            };
+            report.push(format!(
+                "seat {}: git_access full ({why}): its Codex sessions can write the whole \
+                 git directory and the main checkout, including git hooks and config, so \
+                 they can make git run commands outside their sandbox",
+                p.seat
+            ));
+        }
+    }
     let v = node(
         &Request::Up {
             seats: placements,
@@ -389,6 +439,9 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
         if let Some(c) = c.as_str() {
             report.push(format!("settings changed (in effect now): {c}"));
         }
+    }
+    if let Some(l) = policy_line(&v) {
+        report.push(l);
     }
     let mut by_action: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for s in v["seats"].as_array().into_iter().flatten() {
@@ -468,7 +521,9 @@ pub fn ps(out: &Out) -> Result<()> {
     let rows: Vec<PsRow> = serde_json::from_value(v["seats"].clone())?;
     out.show(&v, || {
         if rows.is_empty() {
-            return Ok("no supervised seats (start a team with amail up)".into());
+            let mut lines = vec!["no supervised seats (start a team with amail up)".to_string()];
+            lines.extend(policy_line(&v));
+            return Ok(lines.join("\n"));
         }
         let mut table = vec![[
             "SEAT".to_string(),
@@ -523,6 +578,7 @@ pub fn ps(out: &Out) -> Result<()> {
         if v["connected"].as_bool() == Some(false) {
             lines.push("(the node is not connected to the server)".into());
         }
+        lines.extend(policy_line(&v));
         Ok(lines.join("\n"))
     })
 }

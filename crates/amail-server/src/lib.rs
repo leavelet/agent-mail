@@ -1,5 +1,6 @@
 //! The agent-mail HTTP API (`/v1`).
 
+pub mod activity;
 pub mod attention;
 pub mod auth;
 pub mod cluster;
@@ -12,6 +13,7 @@ pub mod limits;
 mod mail;
 pub mod netguard;
 mod nodes;
+mod notices;
 mod operator;
 pub mod peer;
 pub mod presence;
@@ -54,6 +56,8 @@ pub struct AppState {
     pub limiters: Arc<limits::Limiters>,
     /// Open streams by credential, to end them on revocation.
     pub revocations: Arc<revoke::Revocations>,
+    /// Recent mail per org, for the overview.
+    pub activity: Arc<activity::Activity>,
 }
 
 impl AppState {
@@ -73,6 +77,7 @@ impl AppState {
             config: Arc::new(config::Config::default()),
             limiters: Arc::new(limits::Limiters::new(&config::Limits::default())),
             revocations: Arc::new(revoke::Revocations::default()),
+            activity: Arc::new(activity::Activity::default()),
         }
     }
 
@@ -143,6 +148,10 @@ pub fn start_background(state: &AppState) -> Vec<tokio::task::JoinHandle<()>> {
         tasks.extend(c.start(state));
     }
     tasks.push(tokio::spawn(attention::run(state.clone())));
+    tasks.push(tokio::spawn(activity::run(
+        state.activity.clone(),
+        state.store.clone(),
+    )));
     tasks.push(tokio::spawn(public::sweep(state.clone())));
     if state.config.retention_days.is_some() {
         tasks.push(tokio::spawn(public::retention(state.clone())));
@@ -206,6 +215,7 @@ pub fn router(state: AppState) -> Router {
         .route("/tokens/{id}", axum::routing::delete(d::revoke_token))
         .route("/pending", get(nodes::pending))
         .route("/presence", post(nodes::presence))
+        .route("/node/notices", post(notices::post))
         .route("/seats/{name}/launch", get(nodes::launch))
         .route("/seats", get(d::list_seats).post(d::create_seat))
         .route(
@@ -264,6 +274,9 @@ pub async fn serve(
         .await;
     for t in tasks {
         t.abort();
+    }
+    if let Err(e) = state.activity.flush(&*state.store).await {
+        tracing::warn!("writing mail counts: {e}");
     }
     if let Some(c) = &state.cluster {
         c.leave(&*state.store).await;

@@ -68,6 +68,29 @@ pub fn check_new_name(st: &AppState, name: &str) -> ApiResult<()> {
     Ok(())
 }
 
+/// Take a registration attempt from the client's address. An IPv6
+/// client's /48 network is checked first, and a request that it refuses
+/// adds no entry for the client's /64; a /64 out of attempts does not use up
+/// its /48's.
+fn registration_slot(st: &AppState, peer: &Peer) -> ApiResult<()> {
+    let refused = |ms| {
+        ApiError::too_many(
+            "rate_limited",
+            "too many registration attempts from this address",
+            ms,
+        )
+    };
+    let Some(b) = &st.limiters.registrations else {
+        return Ok(());
+    };
+    let key = peer.key();
+    b.check(&key).map_err(refused)?;
+    if let (Some(nets), Some(net)) = (&st.limiters.registration_nets, peer.net48_key()) {
+        nets.take(&net).map_err(refused)?;
+    }
+    b.take(&key).map_err(refused)
+}
+
 /// `POST /v1/register` (public mode): use an invite code to create an org
 /// with its user seat; answers the user token, once.
 pub async fn register(
@@ -80,15 +103,7 @@ pub async fn register(
             "registration is not open on this server",
         ));
     }
-    if let Some(b) = &st.limiters.registrations
-        && let Err(ms) = b.take(&peer.key())
-    {
-        return Err(ApiError::too_many(
-            "rate_limited",
-            "too many registration attempts from this address",
-            ms,
-        ));
-    }
+    registration_slot(&st, &peer)?;
     let org = req.org.trim();
     if !valid_name(org) {
         return Err(ApiError::unprocessable(

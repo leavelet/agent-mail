@@ -44,9 +44,12 @@ org, and serves the local hook clients over a Unix socket. It:
   `offline`) and what needs a person;
 - relays a seat's conversation to the server while someone watches it.
 
-It answers each request on its socket according to the process that sent
-it: a session gets only its own seat's mail and credentials, and requests
-meant for the person are refused to sessions (see
+Its local policy decides what the processes of the person's user may ask
+on its socket: under `open` every such process is served, and requests of
+agent sessions that manage seats or obtain other seats' credentials are
+reported to the person by system mail; under `restricted` a session gets
+only its own seat's mail and credentials, and requests meant for the
+person are refused to sessions (see
 [security](security.md#trust-boundaries)).
 
 **Hook client (`amail hook <harness>`).** The command the harnesses run on
@@ -70,13 +73,18 @@ resumes them when mail arrives. See [team files](teams.md).
    `/v1/messages`. The server checks the sender's token, budget, addresses,
    links and list policies, expands lists, and in one transaction stores the
    message and one delivery per recipient seat, each with the seat's next
-   sequence number. It answers with the recipients and notes on who will
-   not see it at once.
+   sequence number. In the same transaction each recipient seat's pending
+   and unread counters grow, and the seats are recorded as taking part in
+   the thread (claims, reads and acknowledgements change the counters
+   through triggers in the database). It answers with the recipients
+   and notes on who will not see it at once.
 2. **Event.** After the commit, the server publishes a mailbox event
    (org, seat, counter) to the org's event streams. With several instances
    it also sends it to the other instances (Postgres `NOTIFY`).
 3. **Node.** The node of the host running `be-1` receives the event and
    refreshes the seat's pending counts (events are coalesced for 30 ms).
+   The server reads them from the seat's counters, not from its
+   deliveries.
 4. **Busy session.** If `be-1` is in a turn, its next hook asks the node.
    On `PostToolUse` (after each tool call) only `to` and urgent mail is
    taken; on `UserPromptSubmit` all classes; on `Stop` the node keeps the

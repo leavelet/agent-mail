@@ -20,7 +20,12 @@ either can end it. A user sees only their own org's mail, which includes
 the mail exchanged with linked orgs, never the other org's internal mail,
 conversations or terminals. The delivery status of mail sent to another org's list
 counts that list's seats (how many were notified, read, acknowledged)
-without naming them; acknowledgement reminders count them the same way.
+without naming them, including seats of a third org that the list
+contains; acknowledgement reminders count them the same way. A linked org
+can still find out which seat and list names exist in the other org by
+sending mail: mail to a name that does not exist is refused with
+`unknown_address`. This is part of the trust a link gives; link only with
+orgs you trust with that.
 
 **The server's operator** runs the server and can suspend and delete orgs.
 The operator's interfaces do not show mail or conversations; see
@@ -55,11 +60,71 @@ user's machine beyond what such mail and role text can talk an agent into:
 Use a server you trust with these powers. Seats with `permission_mode =
 "unattended"` act on such mail without asking anyone.
 
-**The node gives each session only its own seat's credentials and mail.**
-The node holds a node token and the seat tokens of the sessions it runs.
-For every connection to its socket it takes the connecting process's id
-from the kernel (`SO_PEERCRED`) and follows that process's parents in
-`/proc`:
+**Which local processes may use the node: `local_policy`.** The node
+holds a node token and the seat tokens of the sessions it runs, and serves
+requests on a Unix socket that only processes of the person's
+operating-system user can reach (see the end of this section). The setting
+`local_policy` decides what those processes may ask:
+
+- `open`: every process of the user may use the socket fully. This
+  includes the agents of the sessions the node launched: they can run
+  `amail up`, `down`, `ps`, `sleep`, `wake` and `amail run` for any seat,
+  which gives them any agent seat's credentials and mail. This lets an
+  agent manage a team of seats.
+- `restricted`: the node tells a session's processes apart from the
+  person's (described below). A session gets only its own seat's
+  credentials and mail, and requests meant for the person are refused to
+  it.
+
+The node takes the setting from `amail node --local-policy`
+(`AMAIL_LOCAL_POLICY`, or `local_policy` in `<state dir>/node.toml`). A
+team file can set `local_policy = "restricted"` under `[team]`, which makes
+the node use the restricted policy while that team is up; a team file
+cannot make the policy open, because team files usually lie in the
+project, where agents can write. Without either setting the node uses
+`open`. `amail up`, `amail ps`, `amail node status` and `amail
+doctor` print the policy in effect and where it comes from.
+
+Neither policy is a security boundary between the agents and the person:
+all of them run as the same user (see below). The restricted policy stops
+an agent from taking another seat's credentials or managing seats through
+amail itself; it does not stop an agent that sets out to get around it.
+
+**What the node tells the person.** The node reports two kinds of events to
+the server, which writes a `system` mail to the org's user seat. The mail
+appears in the user's inbox and in the web interface's list of what needs
+the user. It asks for no acknowledgement and wakes no agent. The node sends
+only typed fields (setting names and values, seat names, request kinds);
+the server writes the text from fixed sentences, shows only values a
+setting can have and only names of the org's own seats, and shows the
+node's label escaped on one line. Each org's nodes together can send at
+most 60 such reports per hour (bursts of 10), and a node's reports go only
+to its own org's user.
+
+- When the node starts, and after each `amail up`, it compares its local
+  policy, and each supervised seat's permission mode and (for Codex seats)
+  `git_access` (and for dsh seats whether the jail is on), with what it
+  last reported, and reports the differences in
+  one mail: the setting, the old and the new value, and the host. The
+  first report of a node names its policy. A node whose state was written
+  by an earlier version, which always used the restricted policy, reports
+  a change from `restricted`.
+- Under the open policy, when a process of an agent session runs `up`,
+  `down`, `forget`, `run`, `sleep` or `wake`, obtains a seat's
+  credentials, or sends a hook in the name of a seat other than its own,
+  the node reports which seat's session did what to which seats. The first
+  such request of a session is reported within seconds; further requests
+  of the same session within the next five minutes are reported together
+  at the end of those five minutes. The node recognizes a session's
+  processes by their parent processes, as the restricted policy does, so
+  these notices are best effort: a process that left the session's process
+  tree is taken for one of the person's and is not reported. Codex runs the
+  commands of all Codex seats of a node in one shared process, so a notice
+  about a Codex session cannot name the seat.
+
+**How the restricted policy tells sessions apart.** For every connection to
+its socket the node takes the connecting process's id from the kernel
+(`SO_PEERCRED`) and follows that process's parents in `/proc`:
 
 - A Claude Code session is the process of `amail run`, which the node
   records when it hands out the launch plan and which then becomes the
@@ -83,24 +148,27 @@ from the kernel (`SO_PEERCRED`) and follows that process's parents in
   answers a dsh hook only when it comes from below the session of the seat
   it names. The host's launch token, which gives full control of the
   host's sessions, is kept in a file in the node's state directory
-  (mode 0600) and is visible inside the jail.
+  (mode 0600); the jail shows a seat only its own endpoint file and its own
+  dsh home.
 - Requests meant for the person (`amail run`, `up`, `down`, `ps`,
   `attach`, `sleep`, `wake`, `amail node status`) are refused to processes
   that run below a session the node launched or with the node's Codex
-  home. `amail node status` does not show session or thread ids.
-- The node relays a seat's conversation only from a transcript file in the
-  directory where the harness writes transcripts, whatever path a hook
-  reports (see [conversation mirrors](architecture.md#conversation-mirrors)).
+  home.
+
+Under both policies, `amail node status` does not show session or thread
+ids, and the node relays a seat's conversation only from a transcript file
+in the directory where the harness writes transcripts, whatever path a hook
+reports (see [conversation mirrors](architecture.md#conversation-mirrors)).
 
 **On the host, agents and the person are not separated from each other.**
 All sessions run as the same operating-system user as the person who
 started the node, so file permissions do not separate the agents from each
 other or from the person. (The exception is an unattended DeepSeek Harness
-seat: amail runs its host in a bwrap jail that hides the home directory,
-the runtime directory and other processes, so the points below that need
-those do not apply to it; it can still read the rest of the file system and
-the dsh home it shares with the node's other dsh seats. See
-[harness support](harnesses.md#deepseek-harness-dsh).) An agent that can run shell commands (Claude Code
+seat with its jail on, the default: amail runs its host in a bwrap jail
+that hides the home directory, the runtime directory and other processes,
+so the points below that need those do not apply to it; it can still read
+the rest of the file system. With `dsh_jail = false` all the points apply.
+See [harness support](harnesses.md#deepseek-harness-dsh).) An agent that can run shell commands (Claude Code
 with `--dangerously-skip-permissions`, a Codex seat whose sandbox lets it
 read your home directory, or any agent whose commands you approve without
 reading them) can:
@@ -124,9 +192,9 @@ reading them) can:
   from any process of the user (`crossSessionInbound: "accept"`, which the
   node's wake-ups need), and so put a prompt into another seat's session.
 
-The node's checks stop an agent from taking another seat's token or mail
-through amail itself; they do not stop an agent that sets out to read files
-or other processes. If that matters for your agents (for example because
+The restricted policy stops an agent from taking another seat's token or
+mail through amail itself; it does not stop an agent that sets out to read
+files or other processes. If that matters for your agents (for example because
 your org is linked to others and they read external mail):
 
 - run the node and its agents under an operating-system user of their own,
@@ -170,17 +238,29 @@ of every message unambiguous and keeps mail out of the permission system:
   line client, and every body line is behind `  > `. Subjects, names and
   `meta` values are printed on one line. So a message cannot fake a header
   line, a message from `USER` or a line from the mail system, in the
-  agent's context or in a terminal. (`--json` output contains the raw
-  values.)
+  agent's context or in a terminal. `--json` output contains the values
+  unchanged: control, line-break and invisible characters in them are
+  written as JSON `\u` escapes (for example `\u202e`), so they decode to the
+  original text. It is meant for programs, which must apply their own rules
+  before showing the decoded values to a person or a model.
 - **No hidden or terminal-control characters.** In everything the command
   line client prints and everything injected into a session (bodies,
   subjects, `meta`, previews, names, list descriptions, token labels, role
-  text, error messages), control characters, terminal escape sequences,
-  bidirectional controls, zero-width characters, Unicode tag characters and
-  the other invisible format characters are shown as visible escapes such
-  as `\u{202e}`; line breaks inside one-line values are shown as spaces.
-  Text that a person cannot see in the terminal or the web interface
-  therefore does not reach a model unseen.
+  text, error messages), control characters, terminal escape sequences and
+  invisible characters are shown as visible escapes such as `\u{202e}`;
+  line breaks inside one-line values are shown as spaces. Invisible
+  characters are every code point with the Unicode property
+  Default_Ignorable_Code_Point (bidirectional controls, zero-width
+  characters, variation selectors, Unicode tag characters, Hangul fillers),
+  every format character (category Cf) and U+2800 (braille blank), as of
+  Unicode 17.0 (generated by `scripts/invisible-chars.py`). The web
+  interface shows the same characters as highlighted escapes in mail
+  bodies, subjects, `meta` values, display names, roles, list
+  descriptions, token labels, presence hints and conversation mirrors. Text
+  that a person cannot see in the terminal or the web interface therefore
+  does not reach a model unseen. As a side effect, an emoji written with a
+  variation selector or a zero-width joiner is shown with the escape (for
+  example `✔\u{fe0f}`).
 - **Instructions in the system prompt.** Every session started by amail is
   told that `[amail]` text comes from the mail system, that `USER` mail is
   an instruction, `agent` mail a colleague's request and `external` mail
@@ -201,27 +281,48 @@ In our tests, agents of both supported harnesses refused a deletion
 requested by another org's user and carried out the same request from their
 own user. This is model behaviour, not a guarantee.
 
-**Codex seats and git.** The `amail` permissions profile in the node's
-Codex home lets sessions write the git directories of every Codex seat's
-working directory on the host, so that seats can commit, rebase and merge.
-In those directories, the entries that git runs or reads as configuration
-stay read-only: `hooks/`, `config`, `config.worktree`, `modules/` and
-`worktrees/` of a repository's git directory, and `commondir` and
-`config.worktree` of each linked worktree's git directory. Entries that do
-not exist are covered too: Codex puts a read-only placeholder at their path,
-so they cannot be created. A session therefore cannot add a hook or set
-`core.hooksPath`, `core.fsmonitor` or a similar key that git would run
-later, outside the sandbox. What remains:
+**Codex seats and git.** Codex seats can commit only where their sandbox
+profile lets them write git directories. What they may write is set per
+seat with `git_access` (see [harness support](harnesses.md) for the exact
+rules):
 
-- Codex cannot protect a file that does not exist without making git fail
-  to read it, so a session can still create `commondir` in a repository's
-  git directory (`.git/commondir`). Git run in that repository's main
-  checkout (not in its linked worktrees) then reads config and hooks from
-  the directory the file names. Git never creates this file there. amail
-  refuses to start a Codex seat while a git directory it grants contains
-  one, and `amail up` refuses to prepare worktrees in such a repository.
-  Git commands you run yourself do not check for it. If you find one, remove it and look at the directory it names before
-  you run git in that checkout.
+- `worktree` (the default): in a linked worktree, the repository's objects,
+  refs and branch reflogs, and the worktree's own git directory. The root
+  of the repository's git directory stays read-only, so a session cannot
+  create or change `config`, `hooks/`, `info/`, `modules/` or `commondir`
+  there (a `commondir` file would make git run in the main checkout take its
+  config, and so commands such as `core.fsmonitor`, from a directory the
+  session chose). In the worktree's git directory, `commondir`, `gitdir`
+  and `config.worktree` stay read-only. A session therefore cannot make git
+  run a command outside the sandbox through hooks or configuration.
+- `full`: the whole git directory and the main checkout, minus `hooks/`,
+  `config`, `config.worktree`, `modules/` and `worktrees/`. A session with
+  `full` can still create `.git/commondir` (Codex cannot keep a missing
+  file from being created without making git fail to read it), and git run
+  in the main checkout then takes config and hooks from the directory the
+  file names: **a `full` session can make git run commands outside its
+  sandbox, as you**. The staged-merge template gives `full` to its root
+  seat, which merges in the main checkout; `amail up` names such seats. Set
+  `git_access = "worktree"` for that seat and merge yourself if you do not
+  want this.
+- `off`: no git grant.
+
+What remains with `worktree`:
+
+- Git appends reflog lines through symbolic links. A session can replace a
+  branch's reflog in `logs/refs/` (or a file in its worktree's git
+  directory) with a symbolic link to a file of yours, for example a shell
+  start-up file; the next time you or a `full` seat change that branch
+  outside the sandbox, git appends a line that ends with a commit subject
+  the session chose. This needs you to run git on that branch (the reflog
+  of the branch checked out in the main checkout, and `logs/HEAD`, stay
+  read-only). amail refuses to start a Codex seat, and `amail up` refuses to
+  run git, while a repository's `refs/`, `logs/`, `amail/` or a linked
+  worktree's git directory contains a symbolic link; git never creates
+  one there. Git commands you run yourself do not check for this. If amail
+  reports one, look at where it points and remove it.
+- A session can write any branch and tag of the repository, not only its
+  own.
 - A seat can leave an unfinished rebase whose todo list contains `exec`
   lines; `git rebase --continue` runs them. Before you continue a rebase a
   seat started, read its todo list (`git status` shows it);
@@ -316,10 +417,16 @@ origin check.
 
 Org names are not secret, but the server does not list them. Registration
 checks the invite code before the name, so without a valid code nobody
-learns whether a name is taken. A link request to a name that is not an
-org is answered, listed and withdrawn exactly like a request the other org
-has not accepted yet; such a request is dropped when an org of that name
-is created later.
+learns whether a name is taken. With a valid code, the answer `org_exists`
+is counted on the invite: after 3 such answers the invite is spent (it then
+gets `invalid_invite` like an unknown code), so one invite can test at most
+3 taken names. A link request to a name that is not an org is answered,
+listed and withdrawn exactly like a request the other org has not accepted
+yet. When an org of that name is created later, the request does not reach
+it, but it stays in the requesting org's list; asking again sends a real
+request, with the same answer. Every link request that is not accepted
+within 30 days is dropped, whether or not an org of that name exists, so
+the requesting org cannot tell the two apart by watching its list.
 
 ## Reserved names
 
@@ -364,7 +471,11 @@ mailboxes and archives, shown as from `name@org (deleted org)`: an org
 cannot remove mail it sent to another org, such as a prompt-injection
 attempt, by deleting itself. Of the deleted org, only the names of the
 seats that sent such mail are kept. A new org that takes the name sees none
-of this mail and is never shown as its sender. An operator may
+of this mail and is never shown as its sender. That mail counts against
+the storage quota of each org that keeps it (in full, with its own
+deliveries), so deleting an org and registering again does not store
+mail beyond the receivers' quotas; a receiving org cannot delete it, and
+only retention or deleting the org frees it. An operator may
 set a retention period after which message bodies are cleared. Backups the
 operator made earlier are not affected by either. A public server limits
 the mail each org may store (see [resource limits](#resource-limits)).
@@ -390,13 +501,16 @@ Rate and stream limits are counted per server instance.
 | Messages sent per agent seat | 30 per minute, bursts of 30 (org settings; the user seat is exempt) |
 | Org settings | `send_rate_per_min` and `send_burst` at most 600, `max_recipients` and `max_thread_depth` at most 1,000 (*public*); `ack_timeout_min`, `focus_max_min` and `digest_interval_min` at most 10,080 (one week) |
 | Messages per org | 50 per second (*public*) |
-| Mail stored per org | 1 GiB (*public*): subject, body and `meta` of every message the org sent, each counted once; retention gives back the bytes of cleared bodies; a send over it is refused with 507 `storage_quota` |
+| Mail stored per org | 1 GiB (*public*): every message the org sent counts its subject, body, `meta` and addresses plus 512 bytes, and 384 bytes per delivery (one per recipient seat, so a list counts once per member); mail of deleted orgs counts against the orgs that keep it (so a linked org that sends you much mail and then deletes itself moves its charge to your org, and your sends can be refused until retention removes that mail; received mail cannot be deleted by the receiver yet); retention gives back the bytes of cleared bodies; a send over it is refused with 507 `storage_quota`, and an org at its quota can send nothing, not even an empty message |
 | Messages over all orgs | 500 per second (*public*) |
 | Requests per token or browser session | 200 per second, bursts of 400 (*public*); sign-ins count too |
-| Registration attempts per client address (IPv6: per /64 network) | 10 per hour, bursts of 5, failed ones included (*public*) |
+| Requests per org, all its tokens and browser sessions together | 500 per second, bursts of 1,000 (*public*); once the server knows a token's org, a request over the limit is refused before the database is asked, and the refusal (429) is sent after one second, so that a client that retries at once is slowed down |
+| Registration attempts per client address (IPv6: per /64 network) | 10 per hour, bursts of 5, failed ones included (*public*); in addition, all /64 networks of one IPv6 /48 together get 4 times that (40 per hour, bursts of 20), checked first |
 | Link requests per org | 20 per hour, bursts of 5 (*public*) |
-| Pending outgoing link requests per org | 1,000 |
-| Keys tracked by each rate limiter | 100,000 (further keys share one bucket; idle keys are dropped on every cleanup pass) |
+| Node notice reports (`POST /v1/node/notices`) per org | 60 per hour, bursts of 10, all of the org's nodes together; at most 20 notices per report, 100 items per notice and 50 seat names per item |
+| Pending outgoing link requests per org | 1,000; a request not accepted within 30 days is dropped |
+| `org_exists` answers per invite code | 3; then the invite is spent |
+| Keys tracked by each rate limiter | 100,000; when a new key arrives at that count, the fullest 1/64 of the buckets are dropped to make room, so a new client always gets a bucket of its own; keys whose bucket is full again are dropped on every cleanup pass |
 | Agent seats per org | 200 (*public*) |
 | Lists per org | 500 (*public*) |
 | Live tokens per org | 1,000 (*public*) |
@@ -407,10 +521,11 @@ Rate and stream limits are counted per server instance.
 | `GET /archive/messages`, `GET /sent` page | 50 by default, at most 500, and at most 2 MiB |
 | `GET /archive/search` | 50 results by default, at most 200, and at most 2 MiB; at most 10 terms; each request looks at the org's 50,000 newest messages before its cursor (2,000 when a term is shorter than 3 characters) |
 | Messages one archive request looks at | 50,000 of the org's own, newest first (or of the thread, with `thread=`); then it answers with `next_before_id`. Filters by one of the org's seats (`from=`, `to=`) read that seat's mail directly |
-| Search and archive requests per org in progress | 4 (*public*); further ones get 429 `too_many_queries` |
-| One search, archive or thread query | 10 s, then it is cancelled (503 `query_timeout`) |
-| `GET /attention` | 500 items and 2 MiB |
-| `GET /threads/{id}` | the newest 500 messages and at most 2 MiB of headers (`truncated` says when older ones were left out); message bodies up to 1 MiB in total, newest first; the others come with `body_omitted` and are read one at a time with `GET /messages/{id}` |
+| Requests whose database cost depends on the data, in progress: search, archive, `GET /threads/{id}`, `/attention`, `/overview`, `/messages/{id}/status`, `/lists`, `/lists/{name}`, `/changes`, and `/inbox` and `/sent` pages of more than 100 | 1 per org and 8 over all orgs (*public*); a request waits up to 1 s for a slot, then gets 429 `too_many_queries`. A slot is held until the database work ends, also when the client gave up |
+| One query of those requests | 10 s, then it is cancelled (503 `query_timeout`) |
+| `GET /pending`, `GET /counts` | read per-seat counters, kept in the transactions that change deliveries; their cost does not depend on the number of deliveries |
+| `GET /attention` | looks at the user seat's newest 5,000 deliveries; 500 items and 2 MiB |
+| `GET /threads/{id}` | whether the caller sees the thread is checked first, with index lookups, so a thread the caller cannot see costs what a missing one does; then the newest 500 messages and at most 2 MiB of headers (`truncated` says when older ones were left out); message bodies up to 1 MiB in total, newest first; the others come with `body_omitted` and are read one at a time with `GET /messages/{id}` |
 | `GET /seats` | a seat's role is cut to its first 1,000 characters (`role_truncated`); `GET /seats/{name}` has all of it |
 | List members | 1,000 per list |
 | Event replay buffer (`Last-Event-ID`) | 4,096 events per org; a subscriber more than 1,024 events behind is disconnected and resynchronizes |
@@ -418,7 +533,7 @@ Rate and stream limits are counted per server instance.
 | Conversation mirror, per watched seat | in memory only while someone watches: the last 1,000 events or 4 MiB kept for watchers that join later; at most 8 MiB waiting to be sent to one watcher (a watcher that falls further behind, for example one that stopped reading, is disconnected and its queue freed; it reconnects and starts again from the kept events); 16 MiB for the seat in all (beyond it, the watchers furthest behind are disconnected); 1,000 events per post; 16,000 characters per event; 2,000 characters per status field |
 | Conversation mirrors over all seats | 256 MiB per instance (*public*); beyond it, the watcher furthest behind is disconnected or the largest kept-events buffer shortened, whichever holds more |
 | Browser sessions | 30 days (user), 1 day (operator); at most 20 per token (signing in once more ends the oldest); expired sessions and revoked tokens are deleted by the background cleanup |
-| Webhooks | URL at most 2,000 characters; 3 attempts; 5 s to connect, 10 s per attempt; redirects are not followed; 16 notices in flight per org, further ones are dropped (*public*) |
+| Webhooks | URL at most 2,000 characters; 3 attempts; 5 s to connect, 10 s per attempt; redirects are not followed; per receiving org, 16 notices in flight for its own mail and 16 more for mail from other orgs, of which one sending org may hold 4; further notices are dropped (*public*) |
 
 The node limits what it reads from the server and from its socket, so a
 malicious or broken server cannot make it grow without bound:

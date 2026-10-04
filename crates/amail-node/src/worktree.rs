@@ -26,24 +26,102 @@ fn git(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Refuse a repository whose own git directory (`<repo>/.git`) contains a
-/// `commondir` file. Git never creates one there; with it, git run in the
-/// repository takes its config and hooks from the directory it names. A
-/// Codex seat's sandbox cannot keep such a file from being created (see the
-/// Codex adapter), so this is checked before amail runs git in the
-/// repository.
+/// Refuse a repository whose own git directory (`<repo>/.git`) was
+/// changed in a way git itself never does (see [`check_common_dir`]).
+/// Checked before amail runs git in the repository.
 pub fn check_git_dir(repo: &Path) -> Result<()> {
     let dir = repo.join(".git");
-    if dir.is_dir() && dir.join("commondir").exists() {
+    if dir.is_dir() {
+        check_common_dir(&dir)?;
+    }
+    Ok(())
+}
+
+/// Most directory levels [`check_common_dir`] descends.
+const MAX_SCAN_DEPTH: usize = 32;
+
+/// Refuse a repository's git directory `common` (the common directory of
+/// all its worktrees) if it contains something git never creates there
+/// and that would make git run by a person do what a sandboxed session
+/// wants:
+///
+/// - a `commondir` file: git run in the main checkout then takes its
+///   config and hooks from the directory the file names;
+/// - a symbolic link in `refs/`, `logs/`, `amail/` or a linked worktree's
+///   git directory (`worktrees/<name>/` and its `logs/`): git appends
+///   reflog lines and writes some files through symbolic links, so it
+///   would write to the file the link names, for example a shell start-up
+///   file, with text (a commit subject) a session chose.
+///
+/// Codex seats may write some of these directories (see the Codex
+/// adapter), so the node checks this before it starts a Codex session and
+/// `amail up` before it runs git.
+pub fn check_common_dir(common: &Path) -> Result<()> {
+    if common.join("commondir").exists() {
         bail!(
             "{} contains a commondir file, which git does not create in a \
              repository's git directory; git run in that repository would take \
              its config and hooks from the directory it names. Check it and \
              remove it first",
-            dir.display()
+            common.display()
+        );
+    }
+    let mut found = None;
+    for sub in ["refs", "logs", "amail"] {
+        find_symlink(&common.join(sub), MAX_SCAN_DEPTH, &mut found);
+    }
+    if let Ok(rd) = std::fs::read_dir(common.join("worktrees")) {
+        for e in rd.flatten() {
+            let wt = e.path();
+            find_symlink(&wt, 0, &mut found);
+            find_symlink(&wt.join("logs"), MAX_SCAN_DEPTH, &mut found);
+        }
+    }
+    if let Some(p) = found {
+        bail!(
+            "{} is a symbolic link. Git does not create symbolic links there, and \
+             git run by you would write through it to the file it names (for \
+             example, append a reflog line that ends with a commit subject). \
+             Check it and remove it first",
+            p.display()
         );
     }
     Ok(())
+}
+
+/// Set `found` to the first symbolic link in `dir` (an entry of it, or
+/// `dir` itself), descending at most `depth` more levels. Symbolic links
+/// are not followed.
+fn find_symlink(dir: &Path, depth: usize, found: &mut Option<PathBuf>) {
+    if found.is_some() {
+        return;
+    }
+    let Ok(m) = std::fs::symlink_metadata(dir) else {
+        return;
+    };
+    if m.file_type().is_symlink() {
+        *found = Some(dir.to_path_buf());
+        return;
+    }
+    if !m.is_dir() {
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let Ok(t) = e.file_type() else { continue };
+        if t.is_symlink() {
+            *found = Some(e.path());
+            return;
+        }
+        if t.is_dir() && depth > 0 {
+            find_symlink(&e.path(), depth - 1, found);
+            if found.is_some() {
+                return;
+            }
+        }
+    }
 }
 
 /// Check that `repo` is a git repository with at least one commit.
@@ -198,6 +276,38 @@ mod tests {
         let e = check_repo(&repo).unwrap_err().to_string();
         assert!(e.contains("commondir"), "{e}");
         assert!(prepare(&repo, "main", &[]).is_err());
+    }
+
+    /// A symbolic link where git appends reflog lines (or in a linked
+    /// worktree's git directory) is refused before running git.
+    #[test]
+    fn symlinks_in_git_dir_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        init_repo(&repo);
+        git(&repo, &["worktree", "add", "-q", "-b", "w", "../wt"]).unwrap();
+        check_repo(&repo).unwrap();
+        let target = tmp.path().join("victim");
+        for link in [
+            ".git/logs/refs/heads/evil",
+            ".git/refs/heads/evil",
+            ".git/worktrees/wt/logs/HEAD",
+            ".git/worktrees/wt/ORIG_HEAD",
+        ] {
+            let p = repo.join(link);
+            let had = std::fs::read(&p).ok();
+            let _ = std::fs::remove_file(&p);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&target, &p).unwrap();
+            let e = check_repo(&repo).unwrap_err().to_string();
+            assert!(e.contains("symbolic link"), "{link}: {e}");
+            std::fs::remove_file(&p).unwrap();
+            if let Some(b) = had {
+                std::fs::write(&p, b).unwrap();
+            }
+            check_repo(&repo).unwrap();
+        }
     }
 
     #[test]

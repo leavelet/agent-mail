@@ -18,15 +18,18 @@
 //! state is kept and re-synchronized on reconnect. Live sessions, Codex
 //! registrations and undelivered mail are persisted in the state directory.
 //!
-//! Requests on the socket are checked against the process that sent them
-//! (see [`caller`]): a seat's hooks and credentials are served only to that
-//! seat's session, and requests for the person only to processes outside
-//! the sessions the node launched.
+//! What the socket serves depends on the local policy (see [`notices`]).
+//! Under `restricted`, requests are checked against the process that sent
+//! them (see [`caller`]): a seat's hooks and credentials are served only to
+//! that seat's session, and requests for the person only to processes
+//! outside the sessions the node launched. Under `open`, every process of
+//! the user is served, and the requests of sessions that manage seats or
+//! obtain other seats' credentials are reported to the person.
 
 use crate::adapter::{Adapter, AdapterEnv, Event, Harness, Hook, LaunchCtx, Output};
 use crate::persist::{self, LiveSession, Reservation, Saved, SessionReg};
 use crate::server::{ClaimSpec, ServerClient};
-use crate::wire::{Credentials, LaunchPlan, Request};
+use crate::wire::{Credentials, GitAccess, LaunchPlan, Request};
 use amail_proto::{
     DeliveryClass, InboxEntry, MailboxEvent, PendingCounts, PermissionMode, PresenceReport,
     PresenceUpdate, Priority, SeatState,
@@ -42,6 +45,7 @@ use tokio::sync::{Notify, OnceCell};
 
 mod caller;
 mod mirror;
+mod notices;
 mod supervise;
 
 /// Node configuration.
@@ -112,6 +116,18 @@ pub struct Config {
     /// that drive the socket from processes the node did not launch turn
     /// this off.
     pub check_callers: bool,
+    /// Which processes may use the node socket (see
+    /// [`amail_proto::LocalPolicy`]); `None`: the team file's, else
+    /// [`amail_proto::LocalPolicy::DEFAULT`]. A team file can choose
+    /// `restricted` but cannot loosen the node's setting.
+    pub local_policy: Option<amail_proto::LocalPolicy>,
+    /// Report setting changes and seat management by agent sessions to the
+    /// server, which tells the person by system mail.
+    pub notices: bool,
+    /// At most one notice about one session's requests per this long.
+    pub notice_window: Duration,
+    /// How often due notices are sent.
+    pub notice_tick: Duration,
     /// Claude Code's configuration directory as the node sees it
     /// (`$CLAUDE_CONFIG_DIR`, else `~/.claude`). Claude Code transcripts are
     /// followed only under its `projects` directory, or under that of the
@@ -168,6 +184,10 @@ impl Config {
             web_terminal: None,
             digest_every: None,
             check_callers: true,
+            local_policy: None,
+            notices: true,
+            notice_window: Duration::from_secs(300),
+            notice_tick: Duration::from_secs(2),
             claude_config_dir: std::env::var_os("CLAUDE_CONFIG_DIR")
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from)
@@ -302,6 +322,14 @@ struct State {
     mirrors: HashMap<String, mirror::MirrorRt>,
     /// The org's digest interval (ms), from the server.
     digest_every: i64,
+    /// Requests of agent sessions to report, by session (seat name; empty
+    /// for Codex).
+    notices: BTreeMap<String, notices::Pending>,
+    /// The settings may differ from those last reported.
+    settings_due: bool,
+    /// The state file existed when the node started (an earlier version
+    /// may have run, which always used the restricted policy).
+    prior_state: bool,
 }
 
 impl Default for State {
@@ -317,6 +345,9 @@ impl Default for State {
             start_queue: Default::default(),
             mirrors: HashMap::new(),
             digest_every: DIGEST_EVERY_DEFAULT,
+            notices: BTreeMap::new(),
+            settings_due: true,
+            prior_state: false,
         }
     }
 }
@@ -622,6 +653,7 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
 
     let state_file = cfg.state_dir.join("node-state.json");
     let mut st = State {
+        prior_state: state_file.exists(),
         saved: persist::load(&state_file),
         ..Default::default()
     };
@@ -758,6 +790,10 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
     tasks.push(tokio::spawn(async move { n.supervise_loop().await }));
     let n = node.clone();
     tasks.push(tokio::spawn(async move { n.retry_loop().await }));
+    if node.cfg.notices {
+        let n = node.clone();
+        tasks.push(tokio::spawn(async move { n.notice_loop().await }));
+    }
     Ok(NodeHandle { node, tasks })
 }
 
@@ -905,12 +941,21 @@ impl Node {
         }
         let started = Instant::now();
         let req = serde_json::from_str::<Request>(&line);
+        // Under the open policy every process of the person's OS user is
+        // served; the callers of seat management and credential requests
+        // are still identified, to tell the person about agent sessions
+        // that make them (see `notices`).
+        let restricted = self.local_policy() == amail_proto::LocalPolicy::Restricted;
         let caller = match (&req, self.cfg.check_callers) {
             (Ok(r), true) => match peer {
                 Some((pid, uid)) if pid > 0 && uid == crate::paths::uid() => {
                     let for_person =
                         !matches!(r, Request::Hook { .. } | Request::Credentials { .. });
-                    Some(self.caller(pid, for_person))
+                    if restricted {
+                        Some(self.caller(pid, for_person))
+                    } else {
+                        Some(self.open_caller(pid, r))
+                    }
                 }
                 _ => {
                     let _ = w
@@ -929,6 +974,7 @@ impl Node {
                 budget_ms,
             }) => {
                 if let Some(c) = &caller
+                    && restricted
                     && !self.hook_allowed(c, &harness, &env)
                 {
                     tracing::warn!(
@@ -938,6 +984,18 @@ impl Node {
                     );
                     let _ = w.write_all(b"{\"stdout\":\"\"}\n").await;
                     return;
+                }
+                // Open policy: a Claude Code or dsh session sending a hook
+                // in another seat's name reads and claims that seat's mail.
+                // (dsh sessions are identified from inside their jail too.)
+                if let Some(c) = &caller
+                    && !restricted
+                    && let Some(seat) = env.get("AMAIL_SEAT")
+                    && let Some((own, h)) = &c.session
+                    && matches!(h, Harness::Claude | Harness::Dsh)
+                    && own != seat
+                {
+                    self.note_request(c, amail_proto::NoticeOp::Hook, vec![seat.clone()]);
                 }
                 let deadline = budget_ms
                     .map(|b| started + Duration::from_millis(b).saturating_sub(LATE_MARGIN));
@@ -963,6 +1021,7 @@ impl Node {
             }
             Ok(req) => match &caller {
                 None => self.handle(req).await,
+                Some(c) if !restricted => self.handle(self.authorize_open(c, req)).await,
                 Some(c) => match self.authorize(c, req) {
                     Ok(req) => self.handle(req).await,
                     Err(e) => {
@@ -995,6 +1054,8 @@ impl Node {
                 pane,
                 mux_session,
                 permission_mode,
+                git_access,
+                dsh_jail,
             } => match self
                 .launch(
                     &seat,
@@ -1005,6 +1066,8 @@ impl Node {
                     pane,
                     mux_session,
                     permission_mode,
+                    git_access,
+                    dsh_jail,
                 )
                 .await
             {
@@ -1055,6 +1118,8 @@ impl Node {
                 pane,
                 mux_session,
                 permission_mode,
+                git_access,
+                dsh_jail,
                 ..
             } => Ok(Request::Launch {
                 seat,
@@ -1066,8 +1131,83 @@ impl Node {
                 pane,
                 mux_session,
                 permission_mode,
+                git_access,
+                dsh_jail,
             }),
             req => Ok(req),
+        }
+    }
+
+    /// The caller of `req` under the open policy: identified (by its
+    /// parent processes) only for requests that are reported when an agent
+    /// session makes them.
+    fn open_caller(&self, pid: u32, req: &Request) -> caller::Caller {
+        let watched = match req {
+            Request::Hook { env, .. } => env.contains_key("AMAIL_SEAT"),
+            Request::Credentials { .. } => true,
+            r => notices::request_op(r).is_some(),
+        };
+        if !self.cfg.notices || !watched {
+            return caller::Caller {
+                pid,
+                ..Default::default()
+            };
+        }
+        let hook = matches!(req, Request::Hook { .. });
+        self.caller(pid, !hook)
+    }
+
+    /// Serve `req` from `caller` under the open policy: a launch's pid is
+    /// the caller's; requests of agent sessions that manage seats or obtain
+    /// another seat's credentials are recorded for a notice.
+    fn authorize_open(&self, caller: &caller::Caller, req: Request) -> Request {
+        if let Some((op, targets)) = notices::request_op(&req) {
+            self.note_request(caller, op, targets);
+        }
+        match req {
+            Request::Credentials { codex_thread, pass } => {
+                // Codex sessions use this for their own seat; a Claude Code
+                // session has no reason to.
+                if caller.is_claude() {
+                    let seat = self
+                        .lock()
+                        .saved
+                        .sessions
+                        .get(&codex_thread)
+                        .map(|r| r.seat.clone());
+                    self.note_request(
+                        caller,
+                        amail_proto::NoticeOp::Credentials,
+                        seat.into_iter().collect(),
+                    );
+                }
+                Request::Credentials { codex_thread, pass }
+            }
+            Request::Launch {
+                seat,
+                cwd,
+                harness,
+                extra,
+                pane,
+                mux_session,
+                permission_mode,
+                git_access,
+                dsh_jail,
+                ..
+            } => Request::Launch {
+                seat,
+                cwd,
+                // `amail run` becomes the harness: its process is the session.
+                pid: caller.pid,
+                harness,
+                extra,
+                pane,
+                mux_session,
+                permission_mode,
+                git_access,
+                dsh_jail,
+            },
+            req => req,
         }
     }
 
@@ -1173,7 +1313,7 @@ impl Node {
     }
 
     /// Directories where the harness writes `seat`'s transcripts: for
-    /// Codex the dedicated home's `sessions`; for dsh the node's dsh home's
+    /// Codex the dedicated home's `sessions`; for dsh the seat's dsh home's
     /// `sessions`; for Claude Code `projects` of
     /// the configuration directory the seat's session was started with
     /// (from its environment) and of the node's.
@@ -1183,7 +1323,7 @@ impl Node {
                 vec![crate::adapter::codex::home_in(&self.cfg.state_dir).join("sessions")]
             }
             Harness::Dsh => {
-                vec![crate::adapter::dsh::home_in(&self.cfg.state_dir).join("sessions")]
+                vec![crate::adapter::dsh::seat_home_in(&self.cfg.state_dir, seat).join("sessions")]
             }
             Harness::Claude => {
                 let mut v = vec![self.cfg.claude_config_dir.join("projects")];
@@ -1249,10 +1389,9 @@ impl Node {
     ) -> (Output, Vec<InboxEntry>) {
         let hint = adapter.session_hint(env, hook);
         let cap = self.cfg.stop_block_cap;
-        let transcript = hook
-            .transcript_path
-            .as_deref()
-            .and_then(|p| self.accept_transcript(adapter.harness(), seat, p));
+        let transcript = adapter
+            .transcript(hook, seat)
+            .and_then(|p| self.accept_transcript(adapter.harness(), seat, &p));
         // 1. State transition and plan, under the lock.
         let plan = {
             let mut st = self.lock();
@@ -1642,6 +1781,8 @@ impl Node {
         pane: Option<u32>,
         mux_session: Option<String>,
         permission_mode: Option<PermissionMode>,
+        git_access: Option<GitAccess>,
+        dsh_jail: Option<bool>,
     ) -> Result<LaunchPlan> {
         let managed = self.lock().saved.managed.get(seat).cloned();
         let harness = harness.or(managed.as_ref().map(|m| m.harness.as_str()));
@@ -1670,6 +1811,14 @@ impl Node {
             tracing::warn!("{n}");
         }
         info.permission_mode = Some(mode);
+        // Git access, like the permission mode, is decided on this machine.
+        let git_access = git_access
+            .or(managed.as_ref().and_then(|m| m.git_access))
+            .unwrap_or_default();
+        // So is the jail of unattended dsh seats (on unless turned off).
+        let dsh_jail = dsh_jail
+            .or(managed.as_ref().and_then(|m| m.dsh_jail))
+            .unwrap_or(true);
         if let Some(m) = info.model.take_if(|m| !valid_model(m)) {
             tracing::warn!("seat {seat}: ignoring the server's model {m:?}");
         }
@@ -1715,6 +1864,8 @@ impl Node {
             .launch(&LaunchCtx {
                 info: &info,
                 permission_mode: mode,
+                git_access,
+                dsh_jail,
                 cwd,
                 extra,
                 nonce: &nonce,
@@ -1737,6 +1888,11 @@ impl Node {
             );
             st.save_dirty = true;
         }
+        // The adapter's notice (if any) follows the node's.
+        let notice = match (notice, plan.notice.clone()) {
+            (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
+            (a, b) => a.or(b),
+        };
         let plan = LaunchPlan { notice, ..plan };
         if managed.is_some() {
             let lazy = self.adapter(h).resume_is_lazy();
@@ -1774,6 +1930,7 @@ impl Node {
     }
 
     fn status(&self) -> Value {
+        let (policy, source) = (self.local_policy(), self.policy_source());
         let st = self.lock();
         let now = Instant::now();
         let mut seats: Vec<Value> = st
@@ -1823,6 +1980,8 @@ impl Node {
                 .count(),
             "mirrors": mirrors,
             "seats": seats,
+            "local_policy": policy,
+            "local_policy_source": source,
         })
     }
 

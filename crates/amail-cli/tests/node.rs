@@ -49,6 +49,8 @@ node_tests!(
     lost_claim_answer_is_recovered,
     socket_checks_callers,
     transcript_paths_are_checked,
+    open_policy_serves_sessions_and_reports_them,
+    setting_changes_are_reported_once,
 );
 
 use amail_store::testutil::Backend;
@@ -339,6 +341,7 @@ async fn claude_ignores_internal_agents(b: Backend) {
 async fn codex_registration_and_rows(b: Backend) {
     let opts = Opts {
         check_callers: Some(true),
+        local_policy: Some(amail_proto::LocalPolicy::Restricted),
         ..Opts::default()
     };
     let Some(h) = setup(b, "codex_registration_and_rows", opts).await else {
@@ -393,6 +396,8 @@ async fn codex_registration_and_rows(b: Backend) {
             pane: None,
             mux_session: None,
             permission_mode: Some(amail_proto::PermissionMode::Unattended),
+            git_access: None,
+            dsh_jail: None,
         })
         .await;
     assert!(plan.get("error").is_none(), "{plan}");
@@ -440,6 +445,8 @@ async fn codex_registration_and_rows(b: Backend) {
             pane: None,
             mux_session: None,
             permission_mode: None,
+            git_access: None,
+            dsh_jail: None,
         })
         .await;
     assert!(
@@ -462,6 +469,8 @@ async fn codex_registration_and_rows(b: Backend) {
             pane: None,
             mux_session: None,
             permission_mode: None,
+            git_access: None,
+            dsh_jail: None,
         })
         .await;
     assert!(prompting.get("error").is_none(), "{prompting}");
@@ -1591,9 +1600,10 @@ fn untrusted_socket_is_refused() {
 /// Codex credentials need the node's Codex pass and are never given to a
 /// Claude Code session; a launch records the process that asked.
 async fn socket_checks_callers(b: Backend) {
-    // Fake harness binaries; caller checks on.
+    // Fake harness binaries; caller checks on, restricted policy.
     let opts = Opts {
         supervise: true,
+        local_policy: Some(amail_proto::LocalPolicy::Restricted),
         ..Opts::default()
     };
     let Some(h) = setup(b, "socket_checks_callers", opts).await else {
@@ -1651,6 +1661,8 @@ async fn socket_checks_callers(b: Backend) {
             pane: None,
             mux_session: None,
             permission_mode: None,
+            git_access: None,
+            dsh_jail: None,
         })
         .await;
     let pass = plan["env"]["AMAIL_CODEX_PASS"]
@@ -1783,6 +1795,8 @@ env -u AMAIL_TOKEN CODEX_THREAD_ID={tid} AMAIL_CODEX_PASS={pass} timeout 10 "$B"
             pane: None,
             mux_session: None,
             permission_mode: None,
+            git_access: None,
+            dsh_jail: None,
         },
     )
     .await;
@@ -1861,6 +1875,8 @@ async fn transcript_paths_are_checked(b: Backend) {
             pane: None,
             mux_session: None,
             permission_mode: None,
+            git_access: None,
+            dsh_jail: None,
         })
         .await;
     let prompt = plan["args"].as_array().unwrap().last().unwrap().clone();
@@ -2021,4 +2037,256 @@ async fn hostile_server_is_bounded() {
     .unwrap();
     assert!(answer.contains("larger than"), "{answer}");
     node.shutdown();
+}
+
+/// System mail in the user's inbox: `(subject, body)`, oldest first.
+async fn system_mail(h: &Harness) -> Vec<(String, String)> {
+    let inbox = h.api.get("/inbox?limit=100").await;
+    let mut out = Vec::new();
+    for e in inbox["entries"].as_array().into_iter().flatten() {
+        if e["message"]["source"] != "system" {
+            continue;
+        }
+        let id = e["message"]["id"].as_i64().unwrap();
+        let m = h.api.get(&format!("/messages/{id}?peek=1")).await;
+        out.push((
+            e["message"]["subject"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            m["message"]["body"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        ));
+    }
+    out
+}
+
+/// Start a session of `seat` (the fake harness) the way a person does.
+fn start_session(h: &Harness, seat: &str, work: &std::path::Path) -> std::process::Child {
+    let mut c = std::process::Command::new(BIN);
+    c.args(["run", seat, "--socket"])
+        .arg(&h.sock)
+        .current_dir(work)
+        .env("FAKE_AMAIL", BIN)
+        .env("AMAIL_HOOK_TIMEOUT_MS", "5000")
+        .env("CLAUDE_CONFIG_DIR", h.dir.path().join("cc2"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    for k in [
+        "AMAIL_SEAT",
+        "AMAIL_TOKEN",
+        "AMAIL_PROFILE",
+        "AMAIL_CODEX_PASS",
+    ] {
+        c.env_remove(k);
+    }
+    c.spawn().unwrap()
+}
+
+/// Run `script` in `seat`'s session (as an agent's tool command) and
+/// return its output.
+async fn run_in_session(h: &Harness, seat: &str, script: &str) -> String {
+    let fake = h.fake.clone();
+    let ran = fake.join(format!("{seat}.ran"));
+    let _ = std::fs::remove_file(&ran);
+    let full = format!(
+        "B=\"$FAKE_AMAIL\"\ncd '{dir}'\nmkdir -p nocfg\n\
+         export AMAIL_CONFIG_DIR=\"$PWD/nocfg\" XDG_CONFIG_HOME=\"$PWD/nocfg\"\n{script}\n",
+        dir = h.dir.path().display()
+    );
+    std::fs::write(fake.join(format!("{seat}.run")), full).unwrap();
+    h.wait("the session ran the commands", || async { ran.exists() })
+        .await;
+    std::fs::read_to_string(&ran).unwrap()
+}
+
+/// The open policy: an agent session may use the node as the person can
+/// (node status, ps, seat management, another seat's hook), and the person
+/// gets one system mail per session and window that lists what it did.
+async fn open_policy_serves_sessions_and_reports_them(b: Backend) {
+    let opts = Opts {
+        supervise: true,
+        local_policy: Some(amail_proto::LocalPolicy::Open),
+        notices: true,
+        ..Opts::default()
+    };
+    let Some(h) = setup(b, "open_policy_serves_sessions_and_reports_them", opts).await else {
+        return;
+    };
+    h.seat("w1", "claude").await;
+    h.seat("w2", "claude").await;
+    let work = h.dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    // The first report of a fresh node names its policy.
+    h.wait("the settings notice", || async {
+        system_mail(&h).await.len() == 1
+    })
+    .await;
+    let (subject, body) = system_mail(&h).await.remove(0);
+    assert!(
+        subject.starts_with("Node settings changed on host"),
+        "{subject}"
+    );
+    assert!(
+        body.contains("- local policy: not reported before -> open"),
+        "{body}"
+    );
+    assert!(body.contains("may manage seats"), "{body}");
+
+    let mut session = start_session(&h, "w1", &work);
+    h.wait("w1 started", || async { h.state("w1").await == "idle" })
+        .await;
+    h.api.send(&["w2"], &[], "mail for w2", false).await;
+    h.wait_pending("w2", 1, 0, 0).await;
+    std::fs::write(
+        h.dir.path().join("up.json"),
+        claude("UserPromptSubmit").to_string(),
+    )
+    .unwrap();
+
+    let ran = run_in_session(
+        &h,
+        "w1",
+        r#"timeout 10 "$B" node status > /dev/null; echo "status-exit=$?"
+timeout 10 "$B" ps; echo "ps-exit=$?"
+timeout 10 "$B" down; echo "down-exit=$?"
+timeout 10 "$B" down; echo "down2-exit=$?"
+AMAIL_SEAT=w2 "$B" hook claude < up.json > w2.out; echo "w2-hook-bytes=$(wc -c < w2.out)""#,
+    )
+    .await;
+    for want in ["status-exit=0", "ps-exit=0", "down-exit=0", "down2-exit=0"] {
+        assert!(ran.contains(want), "missing {want:?} in:\n{ran}");
+    }
+    assert!(ran.contains("local policy: open"), "{ran}");
+    // The session read w2's mail.
+    assert!(!ran.contains("w2-hook-bytes=0"), "{ran}");
+
+    // More requests of the same session right away.
+    run_in_session(&h, "w1", r#"timeout 10 "$B" down; timeout 10 "$B" down"#).await;
+
+    // Everything is reported: four `down` requests and the hook, in
+    // notices at least one window (3 s here) apart.
+    let agent = || async {
+        let inbox = h.api.get("/inbox?limit=100").await;
+        let mut out = Vec::new();
+        for e in inbox["entries"].as_array().into_iter().flatten() {
+            let subject = e["message"]["subject"].as_str().unwrap_or_default();
+            if e["message"]["source"] != "system" || subject.starts_with("Node settings") {
+                continue;
+            }
+            assert!(
+                subject.starts_with("Agent seat w1 used the node"),
+                "{subject}"
+            );
+            let id = e["message"]["id"].as_i64().unwrap();
+            let m = h.api.get(&format!("/messages/{id}?peek=1")).await;
+            let at: jiff::Timestamp = e["message"]["created_at"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            out.push((at, m["message"]["body"].as_str().unwrap().to_string()));
+        }
+        out
+    };
+    let downs = |body: &str| -> u32 {
+        body.lines()
+            .filter(|l| l.starts_with("- stop seats (amail down)"))
+            .map(|l| {
+                l.rsplit_once(" (")
+                    .and_then(|(_, n)| n.strip_suffix(" requests)"))
+                    .map_or(1, |n| n.parse().unwrap())
+            })
+            .sum()
+    };
+    h.wait("the session's notices", || async {
+        let n = agent().await;
+        n.iter().map(|(_, b)| downs(b)).sum::<u32>() == 4
+            && n.iter().any(|(_, b)| {
+                b.contains(
+                    "- send a hook in another seat's name, which reads and claims that \
+                     seat's mail: w2\n",
+                )
+            })
+    })
+    .await;
+    let n = agent().await;
+    assert!(n.len() <= 3, "{n:?}");
+    for w in n.windows(2) {
+        let gap = w[1].0.duration_since(w[0].0).as_millis();
+        assert!(gap >= 2900, "notices {gap} ms apart: {n:?}");
+    }
+    assert!(n[0].1.contains("best effort"), "{}", n[0].1);
+
+    // Requests of the person (this test process) are not reported.
+    let before = system_mail(&h).await.len();
+    socket_request(&h.sock, amail_node::wire::Request::Down { seats: vec![] }).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert_eq!(system_mail(&h).await.len(), before);
+
+    session.kill().ok();
+    session.wait().ok();
+}
+
+/// A node reports its local policy when it differs from the one it last
+/// reported, with one system mail per change; the team file can make the
+/// policy restricted but not open.
+async fn setting_changes_are_reported_once(b: Backend) {
+    let opts = Opts {
+        local_policy: Some(amail_proto::LocalPolicy::Restricted),
+        notices: true,
+        ..Opts::default()
+    };
+    let Some(mut h) = setup(b, "setting_changes_are_reported_once", opts).await else {
+        return;
+    };
+    h.wait("the first notice", || async {
+        system_mail(&h).await.len() == 1
+    })
+    .await;
+    assert!(
+        system_mail(&h).await[0]
+            .1
+            .contains("- local policy: not reported before -> restricted")
+    );
+    // Same settings after a restart: nothing new.
+    h.restart_node().await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(system_mail(&h).await.len(), 1);
+
+    h.cfg.local_policy = Some(amail_proto::LocalPolicy::Open);
+    h.restart_node().await;
+    h.wait("the change notice", || async {
+        system_mail(&h).await.len() == 2
+    })
+    .await;
+    let (subject, body) = system_mail(&h).await.remove(1);
+    assert!(subject.contains("\"test-node\""), "{subject}");
+    assert!(
+        body.contains("- local policy: restricted -> open"),
+        "{body}"
+    );
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        system_mail(&h).await.len(),
+        2,
+        "exactly one mail per change"
+    );
+    let st = socket_request(&h.sock, amail_node::wire::Request::Status).await;
+    assert_eq!(st["local_policy"], "open", "{st}");
+    assert_eq!(st["local_policy_source"], "node setting", "{st}");
+
+    // Without a node setting the default applies.
+    h.cfg.local_policy = None;
+    h.restart_node().await;
+    let st = socket_request(&h.sock, amail_node::wire::Request::Status).await;
+    assert_eq!(
+        st["local_policy"],
+        amail_proto::LocalPolicy::DEFAULT.as_str(),
+        "{st}"
+    );
+    assert_eq!(st["local_policy_source"], "default", "{st}");
 }

@@ -208,6 +208,21 @@ impl ServerClient {
         Ok(())
     }
 
+    /// Report notices for the person (see [`amail_proto::NodeNotice`]).
+    pub async fn notices(&self, report: &amail_proto::NodeNotices) -> Result<()> {
+        let resp = self
+            .req(reqwest::Method::POST, "/node/notices")
+            .timeout(Duration::from_secs(10))
+            .json(report)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            bail!("HTTP {}: {}", status, error_text(resp).await);
+        }
+        Ok(())
+    }
+
     /// Forward transcript events of `seat` to the server's watchers.
     pub async fn post_transcript(
         &self,

@@ -354,11 +354,17 @@ pub async fn revoke_token(
 
 // --- lists -------------------------------------------------------------------
 
+/// The org's lists with their member counts (up to 500 lists of 1,000
+/// members in public mode): in one of the org's query slots.
+async fn lists_of(st: &AppState, auth: &Auth) -> ApiResult<Vec<amail_store::List>> {
+    let (store, org_id) = (st.store.clone(), auth.org.id);
+    crate::mail::limited(st, auth, async move { Ok(store.lists(org_id).await?) }).await
+}
+
 pub async fn list_lists(State(st): State<AppState>, auth: Auth) -> ApiResult<Json<Vec<p::List>>> {
     auth.require_directory()?;
     Ok(Json(
-        st.store
-            .lists(auth.org.id)
+        lists_of(&st, &auth)
             .await?
             .iter()
             .map(|l| render::list(l, None))
@@ -379,7 +385,7 @@ pub async fn create_list(
         p::limits::MAX_DESCRIPTION_CHARS,
     )?;
     if let Some(max) = st.config.limits.lists_per_org
-        && st.store.lists(auth.org.id).await?.len() as i64 >= max
+        && lists_of(&st, &auth).await?.len() as i64 >= max
     {
         return Err(ApiError::unprocessable(
             "list_limit",
@@ -399,15 +405,17 @@ pub async fn get_list(
     Path(name): Path<String>,
 ) -> ApiResult<Json<p::List>> {
     auth.require_directory()?;
-    let l = st
-        .store
-        .list_by_name(auth.org.id, &name)
-        .await?
-        .ok_or_else(|| ApiError::not_found(format!("no list {name:?}")))?;
-    let members = st
-        .store
-        .list_members(l.id)
-        .await?
+    let (store, org_id) = (st.store.clone(), auth.org.id);
+    let (l, members) = crate::mail::limited(&st, &auth, async move {
+        let l = store
+            .list_by_name(org_id, &name)
+            .await?
+            .ok_or_else(|| ApiError::not_found(format!("no list {name:?}")))?;
+        let members = store.list_members(l.id).await?;
+        Ok((l, members))
+    })
+    .await?;
+    let members = members
         .into_iter()
         .map(|m| p::ListMember {
             address: m.address,
@@ -589,8 +597,12 @@ pub async fn request_link(
         return Err(ApiError::bad_request("an org cannot link to itself"));
     }
     let links = st.store.links(auth.org.id).await?;
+    let peer = find_peer(&st, name).await?;
     if let Some(l) = links.iter().find(|l| l.peer_name == name) {
-        if l.state != p::LinkState::Invited {
+        // A request made while no org had the name is replaced by a request
+        // to the org that has it now; the answer is the same.
+        let stale = l.peer_org_id == 0 && peer.is_some();
+        if l.state != p::LinkState::Invited && !stale {
             return Ok(Json(p::Link {
                 org: name.to_string(),
                 state: l.state,
@@ -609,7 +621,7 @@ pub async fn request_link(
             ),
         ));
     }
-    let state = match find_peer(&st, name).await? {
+    let state = match peer {
         Some(peer) => st.store.request_link(auth.org.id, peer.id).await?,
         None => {
             st.store.request_unknown_link(auth.org.id, name).await?;
@@ -649,7 +661,8 @@ pub async fn revoke_link(
         None => false,
     };
     // A request made to the name while no (active) org had it.
-    if removed || st.store.revoke_unknown_link(auth.org.id, &org).await? {
+    let unknown = st.store.revoke_unknown_link(auth.org.id, &org).await?;
+    if removed || unknown {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found(format!("no link with {org:?}")))

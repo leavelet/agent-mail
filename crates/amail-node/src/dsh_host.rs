@@ -60,6 +60,7 @@ pub fn jail_args(
     ro: &[String],
     empty_dirs: &[String],
     empty_files: &[String],
+    empty_file: &str,
 ) -> Vec<String> {
     let mut args: Vec<String> = [
         "--ro-bind",
@@ -126,7 +127,9 @@ pub fn jail_args(
                 "--remount-ro".into(),
                 p,
             ]),
-            M::EmptyFile => args.extend(["--ro-bind".into(), "/dev/null".into(), p]),
+            // An empty regular file (`/dev/null` would be unreadable:
+            // bwrap's bind mounts do not allow device files).
+            M::EmptyFile => args.extend(["--ro-bind".into(), empty_file.to_string(), p]),
         }
     }
     args
@@ -211,6 +214,12 @@ async fn run_inner(a: HostArgs) -> Result<i32> {
         ro.extend(runtime_paths(&home));
         let mut c = tokio::process::Command::new("bwrap");
         let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_default();
+        let empty = a.endpoint.with_file_name("empty");
+        if !empty.is_file() || std::fs::metadata(&empty).is_ok_and(|m| m.len() > 0) {
+            let _ = std::fs::remove_file(&empty);
+            std::fs::write(&empty, b"")?;
+        }
+        std::fs::set_permissions(&empty, std::os::unix::fs::PermissionsExt::from_mode(0o444))?;
         c.args(jail_args(
             &home,
             &runtime,
@@ -218,6 +227,7 @@ async fn run_inner(a: HostArgs) -> Result<i32> {
             &ro,
             &a.empty_dirs,
             &a.empty_files,
+            &empty.to_string_lossy(),
         ))
         .arg("--")
         .arg(program)
@@ -478,6 +488,7 @@ mod tests {
             std::slice::from_ref(&d),
             &[format!("{deep}/hooks")],
             &[format!("{deep}/config")],
+            "/e",
         );
         let s = args.join(" ");
         assert!(s.starts_with("--ro-bind / / --dev /dev --unshare-pid --proc /proc --tmpfs /tmp"));
@@ -491,7 +502,7 @@ mod tests {
         assert!(pos(&format!("--bind {work} {work}")) < pos(&format!("--bind {deep} {deep}")));
         assert!(!s.contains("missing"));
         assert!(s.contains(&format!("--tmpfs {deep}/hooks --remount-ro {deep}/hooks")));
-        assert!(s.contains(&format!("--ro-bind /dev/null {deep}/config")));
+        assert!(s.contains(&format!("--ro-bind /e {deep}/config")));
         assert!(pos(&format!("--bind {deep} {deep}")) < pos(&format!("{deep}/hooks")));
     }
 

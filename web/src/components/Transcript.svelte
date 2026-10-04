@@ -1,4 +1,6 @@
 <script lang="ts">
+  import Vis from './Vis.svelte';
+  import { visible } from '../lib/visible';
   import { onDestroy, tick } from 'svelte';
   import type { TranscriptEvent, TranscriptStatus } from '../lib/types';
   import { t, ui } from '../lib/ui.svelte';
@@ -135,20 +137,20 @@
           <div class="body">
             {#if ev.kind === 'tool_call'}
               <details>
-                <summary><span class="tool mono">{ev.tool ?? t('tr.call')}</span> <span class="mono preview">{firstLine(ev.text)}</span></summary>
-                <pre>{ev.text}</pre>
+                <summary><span class="tool mono">{visible(ev.tool ?? t('tr.call'))}</span> <span class="mono preview"><Vis text={firstLine(ev.text)} /></span></summary>
+                <pre><Vis text={ev.text} /></pre>
               </details>
             {:else if ev.kind === 'tool_result'}
               <details>
                 <summary>
-                  <span class="faint">{t('tr.result')}{ev.tool ? ` · ${ev.tool}` : ''}</span>
+                  <span class="faint">{t('tr.result')}{ev.tool ? ` · ${visible(ev.tool)}` : ''}</span>
                   {#if ev.error}<span class="chip attn">{t('tr.error')}</span>{/if}
-                  <span class="mono preview">{firstLine(ev.text)}</span>
+                  <span class="mono preview"><Vis text={firstLine(ev.text)} /></span>
                 </summary>
-                <pre>{ev.text}</pre>
+                <pre><Vis text={ev.text} /></pre>
               </details>
             {:else}
-              <pre>{ev.text}</pre>
+              <pre><Vis text={ev.text} /></pre>
             {/if}
             {#if ev.truncated}<span class="chip neutral trunc">✂ {t('tr.truncated')}</span>{/if}
           </div>

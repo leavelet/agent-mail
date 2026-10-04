@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Vis from '../../components/Vis.svelte';
   import { get, post, del, enc } from '../../lib/api';
   import { t, ui } from '../../lib/ui.svelte';
   import { fullTime } from '../../lib/time';
@@ -68,7 +69,7 @@
           <td class="num faint">{tk.id}</td>
           <td><span class="chip neutral">{tk.scope}</span></td>
           <td class="mono">{tk.seat ?? ''}</td>
-          <td>{tk.label ?? ''}</td>
+          <td><Vis text={tk.label ?? ''} /></td>
           <td class="faint">{fullTime(tk.created_at, ui.lang)}</td>
           <td class="acts"><button class="small danger" onclick={() => revoke(tk.id)}>{t('admin.revoke')}</button></td>
         </tr>

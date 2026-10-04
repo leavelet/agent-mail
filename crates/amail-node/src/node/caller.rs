@@ -19,9 +19,11 @@
 //!   `/proc` give the node pids of its own namespace, so the chain of
 //!   parents reaches that process.
 //!
-//! Requests that tie a caller to a seat (hooks, credentials) are served only
-//! to that seat's session; requests for the person (launch, status,
-//! supervision) are refused to sessions.
+//! Under the restricted local policy, requests that tie a caller to a seat
+//! (hooks, credentials) are served only to that seat's session; requests
+//! for the person (launch, status, supervision) are refused to sessions.
+//! Under the open policy the same identification only decides which
+//! requests are reported to the person (see `super::notices`).
 
 use super::*;
 

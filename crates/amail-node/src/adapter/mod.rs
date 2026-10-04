@@ -7,7 +7,7 @@ pub mod claude;
 pub mod codex;
 pub mod dsh;
 
-use crate::wire::LaunchPlan;
+use crate::wire::{GitAccess, LaunchPlan};
 use amail_proto::{LaunchInfo, PermissionMode, SeatState};
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -132,6 +132,12 @@ pub struct LaunchCtx<'a> {
     /// The permission mode chosen on this machine (team file or `amail run`
     /// flag). Only `Unattended` turns off the harness's permission prompts.
     pub permission_mode: PermissionMode,
+    /// The git access chosen on this machine (team file or `amail run`
+    /// flag). Used by the Codex adapter's sandbox profile.
+    pub git_access: GitAccess,
+    /// Whether an unattended dsh seat's host runs in its bwrap jail (chosen
+    /// on this machine; on by default).
+    pub dsh_jail: bool,
     pub cwd: &'a str,
     pub extra: &'a [String],
     /// One-time registration nonce, for adapters that register sessions.
@@ -177,6 +183,12 @@ pub trait Adapter: Send + Sync + 'static {
     }
 
     fn session_hint(&self, env: &BTreeMap<String, String>, hook: &Hook) -> SessionHint;
+
+    /// The transcript file of `hook`'s session of `seat` (default: the
+    /// path the hook reports).
+    fn transcript(&self, hook: &Hook, _seat: &str) -> Option<String> {
+        hook.transcript_path.clone()
+    }
 
     /// Seat state after `SessionStart` (`None`: unchanged).
     fn session_start_state(&self, source: &str) -> Option<SeatState>;

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import Vis from '../../components/Vis.svelte';
   import { get, post, put, del, enc } from '../../lib/api';
   import { store } from '../../lib/store.svelte';
   import { t } from '../../lib/ui.svelte';
@@ -70,7 +71,7 @@
         {#each store.lists as l (l.name)}
           <tr class:sel={open === l.name}>
             <td class="mono"><button class="linkish" onclick={() => show(l.name)}>{l.name}</button>{#if l.managed} <span class="chip neutral">{t('admin.managed')}</span>{/if}</td>
-            <td class="muted">{l.description ?? ''}</td>
+            <td class="muted"><Vis text={l.description ?? ''} /></td>
             <td class="faint">{l.post_policy}</td>
             <td class="num">{l.member_count}</td>
             <td class="acts"><button class="small danger" onclick={() => confirm(t('admin.confirmDelete', { name: l.name })) && act(() => del(`/v1/lists/${enc(l.name)}`))}>{t('admin.delete')}</button></td>

@@ -1,4 +1,6 @@
 <script lang="ts">
+  import Vis from '../../components/Vis.svelte';
+  import { visible } from '../../lib/visible';
   import { get, post, patch, del, enc } from '../../lib/api';
   import { store } from '../../lib/store.svelte';
   import { t } from '../../lib/ui.svelte';
@@ -141,10 +143,10 @@
             <td class="mono"><a href={href(['org', s.name])}>{s.name}</a></td>
             <td class="faint">{s.kind}</td>
             <td class="mono">{s.parent ?? ''}</td>
-            <td>{[s.harness, s.model].filter(Boolean).join(' · ')}</td>
+            <td><Vis text={[s.harness, s.model].filter(Boolean).join(' · ')} /></td>
             <td class="faint">{s.permission_mode ?? ''}</td>
             <td class="mono faint">{s.group ?? ''}</td>
-            <td class="role" title={s.role ?? ''}>{s.role?.split('\n', 1)[0] ?? ''}</td>
+            <td class="role" title={visible(s.role ?? '')}><Vis text={s.role?.split('\n', 1)[0] ?? ''} /></td>
             <td class="acts">
               {#if s.kind === 'agent'}
                 <button class="small" onclick={() => startEdit(s)}>{t('admin.edit')}</button>

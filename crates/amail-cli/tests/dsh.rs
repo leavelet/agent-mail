@@ -149,6 +149,8 @@ async fn launch(h: &Harness, seat: &str, cwd: &Path) -> Value {
             pane: None,
             mux_session: None,
             permission_mode: Some(amail_proto::PermissionMode::Unattended),
+            git_access: None,
+            dsh_jail: None,
         })
         .await;
     assert!(plan.get("error").is_none(), "{plan}");
@@ -178,6 +180,40 @@ async fn dsh_hooks_and_wake(b: Backend) {
     assert_eq!(&args[sep + 1..sep + 4], ["dsh", "web", "--patch"]);
     assert_eq!(args[sep + 5], "--no-open");
     assert!(args.ends_with(&["--port".into(), "0".into()]), "{args:?}");
+    // The jail can be turned off on this machine (`amail run --dsh-jail
+    // off`, or `dsh_jail = false` in the team file): no jail, and the plan
+    // says what that means.
+    let off = h
+        .node
+        .as_ref()
+        .unwrap()
+        .node
+        .handle(amail_node::wire::Request::Launch {
+            seat: "ds".into(),
+            cwd: cwd.to_string_lossy().into(),
+            pid: std::process::id(),
+            harness: None,
+            extra: vec![],
+            pane: None,
+            mux_session: None,
+            permission_mode: Some(amail_proto::PermissionMode::Unattended),
+            git_access: None,
+            dsh_jail: Some(false),
+        })
+        .await;
+    let off_args: Vec<String> = serde_json::from_value(off["args"].clone()).unwrap();
+    assert!(!off_args.iter().any(|a| a == "--jail"), "{off_args:?}");
+    assert!(
+        off["notice"]
+            .as_str()
+            .unwrap()
+            .contains("can read every file"),
+        "{off}"
+    );
+    // Launched again with the default (on): the seat's session is the one
+    // below, as before.
+    let plan = launch(&h, "ds", &cwd).await;
+    let args: Vec<String> = serde_json::from_value(plan["args"].clone()).unwrap();
     // Unattended: the host runs in a jail; the working directory is
     // writable in it, the dsh home too, the node state files read-only.
     assert!(args.iter().any(|a| a == "--jail"), "{args:?}");
@@ -191,9 +227,20 @@ async fn dsh_hooks_and_wake(b: Backend) {
     assert!(
         flagged("--rw")
             .iter()
+            .any(|p| p.ends_with("state/dsh-home/ds"))
+    );
+    assert!(
+        flagged("--ro")
+            .iter()
+            .any(|p| p.ends_with("state/dsh/run/ds"))
+    );
+    // Not the other seats' endpoint files or dsh homes.
+    assert!(!flagged("--ro").iter().any(|p| p.ends_with("state/dsh/run")));
+    assert!(
+        !flagged("--rw")
+            .iter()
             .any(|p| p.ends_with("state/dsh-home"))
     );
-    assert!(flagged("--ro").iter().any(|p| p.ends_with("state/dsh/run")));
     assert!(flagged("--ro").iter().any(|p| p.ends_with("ds.patch.yml")));
     let prompt = &args[args.iter().position(|a| a == "--prompt").unwrap() + 1];
     assert!(prompt.starts_with("[amail]"), "{prompt}");
@@ -206,7 +253,7 @@ async fn dsh_hooks_and_wake(b: Backend) {
         env["DSH_HOME"]
             .as_str()
             .unwrap()
-            .ends_with("state/dsh-home")
+            .ends_with("state/dsh-home/ds")
     );
     let endpoint = env["AMAIL_DSH_ENDPOINT"].as_str().unwrap().to_string();
     // The agent's commands find their token through a profile file (dsh
@@ -220,7 +267,7 @@ async fn dsh_hooks_and_wake(b: Backend) {
         "{patch}"
     );
     let home_patch =
-        std::fs::read_to_string(h.dir.path().join("state/dsh-home/cordis.patch.yml")).unwrap();
+        std::fs::read_to_string(h.dir.path().join("state/dsh-home/ds/cordis.patch.yml")).unwrap();
     assert!(home_patch.contains("dsh-hooks-codex"), "{home_patch}");
 
     // The wrapper's endpoint file, for a host that is up.
@@ -313,7 +360,16 @@ async fn dsh_hooks_and_wake(b: Backend) {
 /// session and queues the first prompt, reports a cancelled turn, cleans up;
 /// with `--resume` it loads the session and sends nothing.
 async fn dsh_host_wrapper(b: Backend) {
-    let Some(h) = Harness::start(b, "dsh_host_wrapper", Opts::default()).await else {
+    // The restricted local policy: the node answers a dsh hook only from
+    // below the process it launched for the seat the hook names.
+    let opts = Opts {
+        tweak: Some(|c| {
+            c.check_callers = true;
+            c.local_policy = Some(amail_proto::LocalPolicy::Restricted);
+        }),
+        ..Opts::default()
+    };
+    let Some(h) = Harness::start(b, "dsh_host_wrapper", opts).await else {
         return;
     };
     h.seat("dw", "dsh").await;
@@ -486,6 +542,14 @@ async fn dsh_host_wrapper(b: Backend) {
     let read = std::fs::read_to_string(work.join("read.txt")).unwrap();
     assert!(!read.contains("s3cret"), "{read}");
     assert!(read.contains("No such file"), "{read}");
+    // A hook naming a seat this process tree was not launched for is
+    // refused.
+    let other = vec![("AMAIL_SEAT".to_string(), "nobody".to_string())];
+    assert_eq!(
+        h.hook("dsh", other, dsh("UserPromptSubmit", "session-old"))
+            .await,
+        Value::Null
+    );
     // A hook run inside the jail (its own PID namespace) is identified as
     // the seat's: the node follows its parents up to the launched process.
     h.hook("dsh", env.clone(), dsh("UserPromptSubmit", "session-old"))

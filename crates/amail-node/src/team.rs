@@ -10,6 +10,7 @@
 //! idle_sleep = "30m"            # or "off" (default)
 //! max_live = 40
 //! restart = "on-failure"        # or "never"
+//! local_policy = "restricted"   # can only make the node's policy stricter
 //!
 //! [defaults]
 //! harness = "claude"
@@ -27,6 +28,7 @@
 //! workers = { count = 3, prefix = "be" }   # be-1 .. be-3, reporting to be-lead
 //! ```
 
+use crate::wire::GitAccess;
 use amail_proto::{PermissionMode, valid_name};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
@@ -60,6 +62,7 @@ struct TeamRaw {
     idle_sleep: Option<String>,
     max_live: Option<u32>,
     restart: Option<String>,
+    local_policy: Option<String>,
 }
 
 /// Settings a seat inherits from `[defaults]` (or a group's `workers`).
@@ -69,6 +72,8 @@ struct SeatOpts {
     harness: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
+    git_access: Option<String>,
+    dsh_jail: Option<bool>,
     /// Allow the guarded terminal-paste wake-up (see the node).
     paste_fallback: Option<bool>,
 }
@@ -81,6 +86,8 @@ struct SeatRaw {
     harness: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
+    git_access: Option<String>,
+    dsh_jail: Option<bool>,
     role: Option<String>,
     role_file: Option<PathBuf>,
     cwd: Option<PathBuf>,
@@ -109,6 +116,8 @@ struct WorkersRaw {
     harness: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
+    git_access: Option<String>,
+    dsh_jail: Option<bool>,
     role: Option<String>,
     role_file: Option<PathBuf>,
 }
@@ -130,6 +139,11 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_live: Option<u32>,
     pub restart: Restart,
+    /// `[team] local_policy`: `restricted` makes the node use the
+    /// restricted policy whatever its own setting; `open` does not loosen
+    /// the node's setting (see [`amail_proto::LocalPolicy`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_policy: Option<amail_proto::LocalPolicy>,
 }
 
 impl Default for Settings {
@@ -138,6 +152,7 @@ impl Default for Settings {
             idle_sleep_ms: None,
             max_live: None,
             restart: Restart::OnFailure,
+            local_policy: None,
         }
     }
 }
@@ -182,6 +197,11 @@ pub struct SeatPlan {
     pub harness: String,
     pub model: Option<String>,
     pub permission_mode: Option<PermissionMode>,
+    /// `git_access` as written in the file (see [`Team::git_access`]).
+    pub git_access: Option<GitAccess>,
+    /// `dsh_jail` (dsh seats): `false` runs an unattended seat's host
+    /// without its bwrap jail. `None`: on.
+    pub dsh_jail: Option<bool>,
     /// The seat's own role text (`role` or the contents of `role_file`).
     pub role: Option<String>,
     /// Explicit working directory (absolute).
@@ -338,10 +358,19 @@ pub fn parse(text: &str, base: &Path) -> Result<Team, TeamError> {
     if t.max_live == Some(0) {
         return err("[team] max_live must be at least 1");
     }
+    let local_policy = match t.local_policy.as_deref().map(str::trim) {
+        None => None,
+        Some(s) => Some(s.parse::<amail_proto::LocalPolicy>().map_err(|_| {
+            TeamError(format!(
+                "[team] local_policy {s:?}: expected \"open\" or \"restricted\""
+            ))
+        })?),
+    };
     let settings = Settings {
         idle_sleep_ms: idle_sleep.map(|d| d.as_millis() as u64),
         max_live: t.max_live,
         restart,
+        local_policy,
     };
 
     let defaults = &raw.defaults;
@@ -403,6 +432,18 @@ pub fn parse(text: &str, base: &Path) -> Result<Team, TeamError> {
                 ))
             })?),
         };
+        let git_access = match s
+            .git_access
+            .clone()
+            .or_else(|| inherit.git_access.clone())
+            .or_else(|| defaults.git_access.clone())
+        {
+            None => None,
+            Some(g) => Some(
+                g.parse::<GitAccess>()
+                    .map_err(|e| TeamError(format!("{what}: {e}")))?,
+            ),
+        };
         if s.role.is_some() && s.role_file.is_some() {
             return err(format!("{what}: give role or role_file, not both"));
         }
@@ -429,6 +470,8 @@ pub fn parse(text: &str, base: &Path) -> Result<Team, TeamError> {
                 .or_else(|| inherit.model.clone())
                 .or_else(|| defaults.model.clone()),
             permission_mode: pm,
+            git_access,
+            dsh_jail: s.dsh_jail.or(inherit.dsh_jail).or(defaults.dsh_jail),
             role,
             cwd: s.cwd.as_deref().map(|p| abs(base, p)),
             display_name: s.display_name.clone(),
@@ -512,6 +555,8 @@ pub fn parse(text: &str, base: &Path) -> Result<Team, TeamError> {
                     harness: w.harness.clone(),
                     model: w.model.clone(),
                     permission_mode: w.permission_mode.clone(),
+                    git_access: w.git_access.clone(),
+                    dsh_jail: w.dsh_jail,
                     paste_fallback: None,
                 };
                 for n in 1..=w.count {
@@ -684,6 +729,22 @@ impl Team {
             Template::Custom(dir) => crate::template::custom_workdir(dir) == "worktree",
             Template::None => false,
         }
+    }
+
+    /// The seat's git access: the file's `git_access`, else `full` for the
+    /// root of a staged-merge team that has subordinates (it merges into
+    /// the main branch in the main checkout), else `worktree`.
+    pub fn git_access(&self, name: &str) -> GitAccess {
+        if let Some(g) = self.seat(name).and_then(|s| s.git_access) {
+            return g;
+        }
+        if self.template == Template::StagedMerge
+            && self.position(name) == Position::Root
+            && !self.children(name).is_empty()
+        {
+            return GitAccess::Full;
+        }
+        GitAccess::Worktree
     }
 
     /// The seat's working directory.
@@ -970,6 +1031,21 @@ cwd = "docs"
     }
 
     #[test]
+    fn local_policy_setting() {
+        let base = "[team]\nworkroot = \"/w\"\n";
+        let seat = "[defaults]\nharness = \"claude\"\n[[seat]]\nname = \"a\"\n";
+        let t = team(&format!("{base}{seat}")).unwrap();
+        assert_eq!(t.settings.local_policy, None);
+        let t = team(&format!("{base}local_policy = \"restricted\"\n{seat}")).unwrap();
+        assert_eq!(
+            t.settings.local_policy,
+            Some(amail_proto::LocalPolicy::Restricted)
+        );
+        let e = team(&format!("{base}local_policy = \"loose\"\n{seat}")).unwrap_err();
+        assert!(e.to_string().contains("local_policy"), "{e}");
+    }
+
+    #[test]
     fn mixed_groups_two_ways() {
         let t = team(
             r#"
@@ -1118,6 +1194,84 @@ harness = "codex"
             let e = team(text).expect_err(text).0;
             assert!(e.contains(want), "{text:?}: got {e:?}, want {want:?}");
         }
+    }
+
+    #[test]
+    fn dsh_jail_setting() {
+        let t = team(
+            "[defaults]\nharness = \"dsh\"\ndsh_jail = false\n[[seat]]\nname = \"a\"\ncwd = \"/x\"\n\
+             [[seat]]\nname = \"b\"\ncwd = \"/y\"\ndsh_jail = true\n[[seat]]\nname = \"c\"\ncwd = \"/z\"\n",
+        )
+        .unwrap();
+        assert_eq!(t.seat("a").unwrap().dsh_jail, Some(false));
+        assert_eq!(t.seat("b").unwrap().dsh_jail, Some(true));
+        assert_eq!(t.seat("c").unwrap().dsh_jail, Some(false));
+        let t =
+            team("[defaults]\nharness = \"dsh\"\n[[seat]]\nname = \"a\"\ncwd = \"/x\"\n").unwrap();
+        assert_eq!(t.seat("a").unwrap().dsh_jail, None);
+    }
+
+    #[test]
+    fn git_access_defaults_and_overrides() {
+        let t = team(EXAMPLE).unwrap();
+        // No staged-merge template: everyone gets the default.
+        assert!(
+            t.seats
+                .iter()
+                .all(|s| t.git_access(&s.name) == GitAccess::Worktree)
+        );
+        let t = team(
+            r#"
+[team]
+template = "staged-merge"
+repo = "/repo"
+workroot = "/wt"
+
+[defaults]
+harness = "codex"
+
+[[seat]]
+name = "root"
+
+[[group]]
+name = "g"
+parent = "root"
+lead = { name = "lead" }
+workers = [{ name = "w1" }, { name = "w2", git_access = "off" }]
+"#,
+        )
+        .unwrap();
+        // The staged-merge root merges in the main checkout.
+        assert_eq!(t.git_access("root"), GitAccess::Full);
+        assert_eq!(t.git_access("lead"), GitAccess::Worktree);
+        assert_eq!(t.git_access("w1"), GitAccess::Worktree);
+        assert_eq!(t.git_access("w2"), GitAccess::Off);
+        let t = team(
+            r#"
+[team]
+template = "staged-merge"
+repo = "/repo"
+workroot = "/wt"
+
+[defaults]
+harness = "codex"
+git_access = "worktree"
+
+[[seat]]
+name = "root"
+
+[[seat]]
+name = "w"
+parent = "root"
+"#,
+        )
+        .unwrap();
+        // An explicit setting (here from [defaults]) wins.
+        assert_eq!(t.git_access("root"), GitAccess::Worktree);
+        let e =
+            team("[defaults]\nharness = \"codex\"\ngit_access = \"all\"\n[[seat]]\nname = \"a\"\n")
+                .unwrap_err();
+        assert!(e.0.contains("git_access"), "{e:?}");
     }
 
     #[test]

@@ -125,11 +125,20 @@ pub struct NewMessage {
     pub storage_quota: Option<i64>,
 }
 
-/// The bytes a message adds to its org's `stored_bytes`: its subject, body
-/// and meta as stored (a JSON object, or nothing when empty). Addresses and
-/// per-recipient delivery rows are not counted.
-pub fn message_bytes(subject: &str, body: &str, meta_db: &str) -> i64 {
-    (subject.len() + body.len() + meta_db.len()) as i64
+/// The bytes a message counts against the storage quota without its
+/// deliveries: its subject, body, meta (a JSON object, or nothing when
+/// empty) and address lists as stored, plus
+/// [`amail_proto::limits::STORED_BYTES_PER_MESSAGE`]. Each of its deliveries
+/// adds [`amail_proto::limits::STORED_BYTES_PER_DELIVERY`].
+///
+/// Who is charged: the sending org, for the message and all its deliveries
+/// (in any org). Once the sending org is deleted, each org that keeps
+/// deliveries of the message is charged the message's full bytes and its
+/// own deliveries. The SQL form of this rule is in the migration
+/// `0013_storage_deliveries.sql`.
+pub fn message_bytes(subject: &str, body: &str, meta_db: &str, to_db: &str, cc_db: &str) -> i64 {
+    amail_proto::limits::STORED_BYTES_PER_MESSAGE
+        + (subject.len() + body.len() + meta_db.len() + to_db.len() + cc_db.len()) as i64
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -421,6 +430,9 @@ pub struct InviteRec {
     /// The org registered with it.
     pub used_by: Option<String>,
     pub revoked_at: Option<i64>,
+    /// Registrations refused with `org_exists`; at
+    /// `amail_proto::limits::MAX_INVITE_NAME_CONFLICTS` the invite is spent.
+    pub name_conflicts: i64,
 }
 
 /// An operator token (no secret).

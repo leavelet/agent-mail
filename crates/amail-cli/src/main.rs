@@ -240,6 +240,21 @@ enum Cmd {
         /// The server's seat setting is never used.
         #[arg(long, value_parser = parse_permission_mode)]
         permission_mode: Option<p::PermissionMode>,
+        /// Codex seats: what the session's sandbox may write in the git
+        /// repository. `worktree` (commit, rebase and merge in a linked
+        /// worktree; git config and hooks stay read-only), `full` (the
+        /// whole git directory and the main checkout; the session can then
+        /// make git run commands outside its sandbox) or `off`. Without it,
+        /// a supervised seat uses its team file's `git_access`, any other
+        /// seat `worktree`.
+        #[arg(long, value_parser = parse_git_access)]
+        git_access: Option<amail_node::wire::GitAccess>,
+        /// dsh seats: run an unattended seat's host in its bwrap jail (`on`,
+        /// the default) or not (`off`: the agent can read every file your
+        /// user can read). Without it, a supervised seat uses its team
+        /// file's `dsh_jail`.
+        #[arg(long, value_parser = parse_on_off)]
+        dsh_jail: Option<bool>,
         /// The node socket (default: AMAIL_NODE_SOCK, then the standard path).
         #[arg(long)]
         socket: Option<PathBuf>,
@@ -335,6 +350,10 @@ struct ServeOpts {
     /// default 200).
     #[arg(long, env = "AMAIL_MAX_TOKEN_REQUESTS_PER_SEC")]
     max_token_requests_per_sec: Option<f64>,
+    /// Requests per second per org, all its tokens and browser sessions
+    /// together, bursts of twice that (public default 500).
+    #[arg(long, env = "AMAIL_MAX_ORG_REQUESTS_PER_SEC")]
+    max_org_requests_per_sec: Option<f64>,
     /// Link requests per hour per org (public default 20).
     #[arg(long, env = "AMAIL_MAX_LINK_REQUESTS_PER_HOUR")]
     max_link_requests_per_hour: Option<f64>,
@@ -345,14 +364,20 @@ struct ServeOpts {
     /// MiB (public default 256).
     #[arg(long, env = "AMAIL_MAX_MIRROR_MB")]
     max_mirror_mb: Option<usize>,
-    /// MiB of mail an org may store: subject, body and meta of each
-    /// message it sent (public default 1024; 0: no limit).
+    /// MiB of mail an org may store: each message it sent with its
+    /// deliveries, and mail of deleted orgs it keeps (public default 1024;
+    /// 0: no limit).
     #[arg(long, env = "AMAIL_MAX_ORG_STORAGE_MB")]
     max_org_storage_mb: Option<i64>,
-    /// Search and archive requests per org in progress at the same time
-    /// (public default 4; 0: no limit).
+    /// Search, archive and other requests whose cost depends on the data
+    /// (threads, attention, overview, delivery status, lists) per org in
+    /// progress at the same time (public default 1; 0: no limit).
     #[arg(long, env = "AMAIL_MAX_ORG_QUERIES")]
     max_org_queries: Option<usize>,
+    /// The same over all orgs (public default 8; 0: no limit). Keep it
+    /// below the database pool size (`--max-connections`).
+    #[arg(long, env = "AMAIL_MAX_QUERIES")]
+    max_queries: Option<usize>,
 }
 
 impl ServeOpts {
@@ -402,6 +427,9 @@ impl ServeOpts {
         if let Some(v) = self.max_token_requests_per_sec {
             l.token_requests_per_sec = pos_f(v);
         }
+        if let Some(v) = self.max_org_requests_per_sec {
+            l.org_requests_per_sec = pos_f(v);
+        }
         if let Some(v) = self.max_link_requests_per_hour {
             l.link_requests_per_hour = pos_f(v);
         }
@@ -416,6 +444,9 @@ impl ServeOpts {
         }
         if let Some(v) = self.max_org_queries {
             l.org_queries = (v > 0).then_some(v);
+        }
+        if let Some(v) = self.max_queries {
+            l.queries = (v > 0).then_some(v);
         }
         Ok(c)
     }
@@ -511,6 +542,13 @@ struct NodeArgs {
     /// http://127.0.0.1:PORT), e.g. behind an HTTPS reverse proxy.
     #[arg(long, value_name = "URL", requires = "web_terminal_port")]
     web_terminal_url: Option<String>,
+    /// Which processes of your OS user may use the node: `open` (all of
+    /// them, including agent sessions, which may then manage seats; the
+    /// node reports their requests to you) or `restricted` (agent sessions
+    /// get only their own seat's credentials). Default: <state
+    /// dir>/node.toml, else `open` (see docs/security.md).
+    #[arg(long, env = "AMAIL_LOCAL_POLICY", value_name = "POLICY")]
+    local_policy: Option<amail_proto::LocalPolicy>,
 }
 
 #[derive(Subcommand)]
@@ -713,8 +751,45 @@ enum OrgCmd {
     },
 }
 
+/// Whether the environment variable `name` is a server limit, the
+/// retention period or the webhook target setting, and is set to the empty
+/// string.
+fn empty_limit_env(name: &std::ffi::OsStr) -> bool {
+    let n = name.to_string_lossy();
+    (n.starts_with("AMAIL_MAX_")
+        || n == "AMAIL_RETENTION_DAYS"
+        || n == "AMAIL_WEBHOOK_PRIVATE_TARGETS")
+        && std::env::var_os(name).is_some_and(|v| v.is_empty())
+}
+
+/// Treat `AMAIL_MAX_*=`, `AMAIL_RETENTION_DAYS=` and
+/// `AMAIL_WEBHOOK_PRIVATE_TARGETS=` (set, but empty) as not set, so that an empty line in an `.env` file means "the default"
+/// instead of stopping the server.
+fn unset_empty_limit_env(mut cmd: clap::Command) -> clap::Command {
+    let ids: Vec<clap::Id> = cmd
+        .get_arguments()
+        .filter(|a| a.get_env().is_some_and(empty_limit_env))
+        .map(|a| a.get_id().clone())
+        .collect();
+    for id in ids {
+        cmd = cmd.mut_arg(id, |a| a.env(None::<&'static str>));
+    }
+    let subs: Vec<String> = cmd
+        .get_subcommands()
+        .map(|s| s.get_name().to_string())
+        .collect();
+    for name in subs {
+        cmd = cmd.mut_subcommand(name, unset_empty_limit_env);
+    }
+    cmd
+}
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = {
+        use clap::{CommandFactory, FromArgMatches};
+        let matches = unset_empty_limit_env(Cli::command()).get_matches();
+        Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())
+    };
     // The hook client runs on every harness hook: no runtime, no failures.
     if let Cmd::Hook { harness } = &cli.cmd {
         let out = amail_node::hook_client::run(harness);
@@ -765,6 +840,8 @@ fn main() -> ExitCode {
         seat,
         harness,
         permission_mode,
+        git_access,
+        dsh_jail,
         socket,
         extra,
     } = &cli.cmd
@@ -774,6 +851,8 @@ fn main() -> ExitCode {
                 seat,
                 harness.clone(),
                 *permission_mode,
+                *git_access,
+                *dsh_jail,
                 socket.clone(),
                 extra.clone(),
             )
@@ -807,7 +886,9 @@ pub(crate) struct Out {
 impl Out {
     pub(crate) fn show(&self, v: &Value, text: impl FnOnce() -> Result<String>) -> Result<()> {
         if self.json {
-            println!("{}", serde_json::to_string(v)?);
+            // The values are unchanged; control and invisible characters
+            // in them are written as `\u` escapes.
+            println!("{}", text::json(&serde_json::to_string(v)?));
         } else {
             // Fields are made safe where they are rendered; this pass makes
             // sure no control or invisible character reaches the terminal
@@ -1011,10 +1092,16 @@ async fn run(cli: Cli) -> Result<()> {
                 let dir = state_dir.unwrap_or_else(amail_node::paths::state_dir);
                 std::fs::create_dir_all(&dir)?;
                 let path = dir.join("node.toml");
+                // Settings the person set in the file stay.
+                let old: NodeFile = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|t| toml::from_str(&t).ok())
+                    .unwrap_or_default();
                 let text = toml::to_string(&NodeFile {
                     url: Some(c.base().to_string()),
                     token: Some(token.clone()),
-                    label: None,
+                    label: old.label,
+                    local_policy: old.local_policy,
                 })?;
                 amail_node::persist::write_atomic(&path, text.as_bytes(), 0o600)?;
                 eprintln!("saved to {}", path.display());
@@ -1676,6 +1763,18 @@ fn parse_permission_mode(s: &str) -> Result<p::PermissionMode, String> {
         .map_err(|_| format!("{s:?}: expected \"default\" or \"unattended\""))
 }
 
+fn parse_git_access(s: &str) -> Result<amail_node::wire::GitAccess, String> {
+    s.parse()
+}
+
+fn parse_on_off(s: &str) -> Result<bool, String> {
+    match s {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err(format!("{s:?}: expected \"on\" or \"off\"")),
+    }
+}
+
 fn parse_meta(items: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
     let mut m = std::collections::BTreeMap::new();
     for it in items {
@@ -1696,6 +1795,8 @@ struct NodeFile {
     token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    local_policy: Option<amail_proto::LocalPolicy>,
 }
 
 /// A database URL without its password, for messages and logs.
@@ -1754,6 +1855,10 @@ fn node_args(a: &NodeArgs) -> (Vec<String>, Option<String>) {
         a.web_terminal_port.map(|p| p.to_string()),
     );
     opt("--web-terminal-url", a.web_terminal_url.clone());
+    opt(
+        "--local-policy",
+        a.local_policy.map(|p| p.as_str().to_string()),
+    );
     (v, a.token.clone())
 }
 
@@ -1802,6 +1907,7 @@ async fn node_daemon(a: NodeArgs) -> Result<()> {
         cfg.socket = s;
     }
     cfg.label = a.label.or(file.label).or_else(hostname);
+    cfg.local_policy = a.local_policy.or(file.local_policy);
     cfg.claude_bin = a.claude_bin;
     cfg.codex_bin = a.codex_bin;
     cfg.dsh_bin = a.dsh_bin;
@@ -1898,6 +2004,8 @@ fn run_seat(
     seat: &str,
     harness: Option<String>,
     permission_mode: Option<p::PermissionMode>,
+    git_access: Option<amail_node::wire::GitAccess>,
+    dsh_jail: Option<bool>,
     socket: Option<PathBuf>,
     extra: Vec<String>,
 ) -> Result<()> {
@@ -1922,6 +2030,8 @@ fn run_seat(
             pane,
             mux_session,
             permission_mode,
+            git_access,
+            dsh_jail,
         },
         std::time::Duration::from_secs(180),
     )?;

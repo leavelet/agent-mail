@@ -55,6 +55,30 @@ pub struct Saved {
     /// [`crate::wire::CODEX_PASS_ENV`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_pass: Option<String>,
+    /// The settings the server last accepted a report of (see
+    /// [`crate::node`]'s settings notices).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported: Option<Reported>,
+}
+
+/// Settings of a node as reported to the server.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reported {
+    pub local_policy: String,
+    /// Supervised seat -> its settings.
+    #[serde(default)]
+    pub seats: BTreeMap<String, ReportedSeat>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportedSeat {
+    pub permission_mode: String,
+    /// Codex seats only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_access: Option<String>,
+    /// dsh seats only: `on` or `off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsh_jail: Option<String>,
 }
 
 /// A session process the node launched (see [`Saved::roots`]).
@@ -134,6 +158,12 @@ pub struct Managed {
     /// The permission mode from the team file (see `SeatPlacement`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<amail_proto::PermissionMode>,
+    /// The git access from the team file (see `SeatPlacement`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_access: Option<crate::wire::GitAccess>,
+    /// The dsh jail setting from the team file (see `SeatPlacement`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsh_jail: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

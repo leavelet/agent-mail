@@ -22,6 +22,7 @@ name = "amail-bench"
 version = "0.1.0"
 dependencies = [
  "amail-node",
+ "amail-proto",
  "amail-server",
  "amail-store",
  "anyhow",
@@ -31,6 +32,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sqlx",
  "tokio",
 ]
 

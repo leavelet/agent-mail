@@ -12,6 +12,50 @@ use std::collections::BTreeMap;
 /// seats of a node.
 pub const CODEX_PASS_ENV: &str = "AMAIL_CODEX_PASS";
 
+/// How much of a git repository a seat's sandboxed sessions may write
+/// (`git_access` in the team file, `amail run --git-access`). Only Codex
+/// seats use it; see the Codex adapter for the exact rules.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GitAccess {
+    /// Commit, rebase and merge in a linked worktree: the repository's
+    /// objects, refs and branch reflogs, and the worktree's own git
+    /// directory. The root of the repository's git directory (config,
+    /// hooks) stays read-only. The default.
+    #[default]
+    Worktree,
+    /// Write access to the whole git directory and to the main checkout,
+    /// for a seat that merges in the main checkout. Such a session can
+    /// make git run commands outside its sandbox.
+    Full,
+    /// No access to git directories beyond what the sandbox gives anyway.
+    Off,
+}
+
+impl GitAccess {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GitAccess::Worktree => "worktree",
+            GitAccess::Full => "full",
+            GitAccess::Off => "off",
+        }
+    }
+}
+
+impl std::str::FromStr for GitAccess {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "worktree" => Ok(GitAccess::Worktree),
+            "full" => Ok(GitAccess::Full),
+            "off" => Ok(GitAccess::Off),
+            _ => Err(format!(
+                "git_access {s:?} must be \"worktree\", \"full\" or \"off\""
+            )),
+        }
+    }
+}
+
 /// Environment variables the hook client forwards to the node. Hooks of
 /// some harnesses run in a daemon, so most of these may be absent.
 pub const HOOK_ENV: &[&str] = &[
@@ -38,7 +82,8 @@ pub enum Request {
         budget_ms: Option<u64>,
     },
     /// `amail run`: prepare a session for `seat` and say how to start it.
-    /// Refused from processes of the sessions the node launched.
+    /// Under the restricted local policy, refused from processes of the
+    /// sessions the node launched.
     Launch {
         seat: String,
         cwd: String,
@@ -59,6 +104,15 @@ pub enum Request {
         /// from its team file. The server's value is never used.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         permission_mode: Option<PermissionMode>,
+        /// The git access chosen on this machine (`amail run
+        /// --git-access`). A supervised seat without it uses its team file's.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        git_access: Option<GitAccess>,
+        /// Whether an unattended dsh seat's host runs in its bwrap jail
+        /// (`amail run --dsh-jail on|off`). A supervised seat without it
+        /// uses its team file's `dsh_jail`; the default is on.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dsh_jail: Option<bool>,
     },
     /// Mail credentials for the seat that owns a harness thread (for agents
     /// whose tool commands do not inherit the launch environment). `pass`
@@ -69,8 +123,8 @@ pub enum Request {
         pass: Option<String>,
     },
     /// Node state, for people and tests. This and the requests below are
-    /// for the person: the node refuses them from processes of the
-    /// sessions it launched.
+    /// for the person: under the restricted local policy, the node refuses
+    /// them from processes of the sessions it launched.
     Status,
     /// `amail up`: supervise these seats (replacing earlier placements of
     /// the same seats) and, with `start`, start the ones not running (only
@@ -120,6 +174,13 @@ pub struct SeatPlacement {
     /// harness's normal prompting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<PermissionMode>,
+    /// The seat's `git_access` from the team file (with the template's
+    /// default applied); `None` means the default, `worktree`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_access: Option<GitAccess>,
+    /// The seat's `dsh_jail` from the team file; `None` means on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsh_jail: Option<bool>,
 }
 
 /// A row of `amail ps`.

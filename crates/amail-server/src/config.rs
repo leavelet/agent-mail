@@ -29,26 +29,37 @@ pub struct Limits {
     /// Requests per second per token (or browser session); bursts of twice
     /// as many.
     pub token_requests_per_sec: Option<f64>,
+    /// Requests per second per org, all its tokens and browser sessions
+    /// together; bursts of twice as many.
+    pub org_requests_per_sec: Option<f64>,
     /// Link requests (`POST /v1/links`) per hour per org.
     pub link_requests_per_hour: Option<f64>,
     /// Registrations (`POST /v1/register`, also failed ones) per hour per
     /// client address.
     pub registrations_per_hour: Option<f64>,
     /// Webhook notices of one org being sent at the same time; further
-    /// notices are dropped while that many are in flight.
+    /// notices are dropped while that many are in flight. The cap counts the
+    /// org's own mail; notices of mail from other orgs have a cap of the
+    /// same size, of which each sending org may hold a quarter.
     pub org_webhooks_in_flight: Option<usize>,
     /// Bytes held by all conversation mirrors of the instance (replay
     /// events and what waits to be sent to watchers). Beyond it, the
     /// watcher furthest behind is disconnected or the largest replay buffer
     /// shortened, whichever holds more.
     pub mirror_bytes: Option<usize>,
-    /// Bytes of mail an org may store: the subject, body and meta of every
-    /// message it sent, each counted once (`amail_store::message_bytes`).
-    /// A send that would go over it is refused.
+    /// Bytes of mail an org may store: every message it sent with all its
+    /// deliveries, and the mail of deleted orgs it keeps
+    /// (`amail_store::message_bytes`). A send that would go over it is
+    /// refused, so an org at its quota can send nothing.
     pub org_storage_bytes: Option<i64>,
-    /// Search and archive requests (`/archive/search`, `/archive/messages`)
-    /// of one org in progress at the same time; further ones get 429.
+    /// Requests whose database cost depends on the data (search, archive,
+    /// threads, attention, overview, delivery status, lists) of one org in
+    /// progress at the same time; a further one waits briefly for a slot,
+    /// then gets 429.
     pub org_queries: Option<usize>,
+    /// The same over all orgs, so that several orgs together cannot take
+    /// every database connection.
+    pub queries: Option<usize>,
 }
 
 impl Limits {
@@ -62,12 +73,14 @@ impl Limits {
             org_send_per_sec: Some(50.0),
             org_streams: Some(32),
             token_requests_per_sec: Some(200.0),
+            org_requests_per_sec: Some(500.0),
             link_requests_per_hour: Some(20.0),
             registrations_per_hour: Some(10.0),
             org_webhooks_in_flight: Some(16),
             mirror_bytes: Some(256 * 1024 * 1024),
             org_storage_bytes: Some(1 << 30),
-            org_queries: Some(4),
+            org_queries: Some(1),
+            queries: Some(8),
         }
     }
 }

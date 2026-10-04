@@ -94,7 +94,9 @@ docker compose exec amail amail admin create-org acme
 
 The server is published on `127.0.0.1:${AMAIL_PORT:-8025}` only. Every
 setting of the table above can be set in `.env` (see `.env.example`), for
-example `AMAIL_PUBLIC=true`. For the single-container image with SQLite:
+example `AMAIL_PUBLIC=true`. An empty `AMAIL_MAX_*=`,
+`AMAIL_RETENTION_DAYS=` or `AMAIL_WEBHOOK_PRIVATE_TARGETS=` counts as not
+set (the default applies). For the single-container image with SQLite:
 
 ```sh
 docker build -t amail .
@@ -171,7 +173,7 @@ Public mode turns on:
   `operator`, `postmaster`, `owner`, `user`, `me`, ...) cannot be created.
   Existing seats keep their names;
 - **always-`Secure` session cookies** (serve it over HTTPS);
-- **no webhooks to private addresses** or to the server's own networks, only to ports 80 and 443, and at most 16 notices of one org in flight (see [security](security.md));
+- **no webhooks to private addresses** or to the server's own networks, only to ports 80 and 443, and at most 16 notices of one org in flight for its own mail, plus 16 for mail from other orgs, at most 4 of them from any one org (see [security](security.md));
 - **protective limits**, each configurable:
 
 | limit | flag / environment | public default |
@@ -183,11 +185,13 @@ Public mode turns on:
 | messages per second per org | `--max-org-sends-per-sec` / `AMAIL_MAX_ORG_SENDS_PER_SEC` | 50 |
 | open event streams per org (event streams and conversation mirrors) | `--max-org-streams` / `AMAIL_MAX_ORG_STREAMS` | 32 |
 | requests per second per token or browser session, sign-ins included (bursts of twice that) | `--max-token-requests-per-sec` / `AMAIL_MAX_TOKEN_REQUESTS_PER_SEC` | 200 |
+| requests per second per org, all its tokens and browser sessions together (bursts of twice that) | `--max-org-requests-per-sec` / `AMAIL_MAX_ORG_REQUESTS_PER_SEC` | 500 |
 | link requests per hour per org | `--max-link-requests-per-hour` / `AMAIL_MAX_LINK_REQUESTS_PER_HOUR` | 20 |
-| registration attempts per hour per client address (failed ones too) | `--max-registrations-per-hour` / `AMAIL_MAX_REGISTRATIONS_PER_HOUR` | 10 |
+| registration attempts per hour per client address (failed ones too; IPv6 per /64, and 4 times that per /48) | `--max-registrations-per-hour` / `AMAIL_MAX_REGISTRATIONS_PER_HOUR` | 10 |
 | memory for conversation mirrors over all seats (per instance, MiB); beyond it, watchers furthest behind are disconnected and kept events dropped | `--max-mirror-mb` / `AMAIL_MAX_MIRROR_MB` | 256 |
 | mail stored per org, in MiB (see below) | `--max-org-storage-mb` / `AMAIL_MAX_ORG_STORAGE_MB` | 1024 |
-| search and archive requests per org in progress at the same time | `--max-org-queries` / `AMAIL_MAX_ORG_QUERIES` | 4 |
+| requests per org whose database cost depends on the data (see below), in progress at the same time | `--max-org-queries` / `AMAIL_MAX_ORG_QUERIES` | 1 |
+| the same over all orgs (keep it below `--max-connections`, the database pool size, 32 by default) | `--max-queries` / `AMAIL_MAX_QUERIES` | 8 |
 
 `0` turns a limit off. The limits also apply without `--public` when set
 explicitly. Message rate limits come on top of each seat's own send budget;
@@ -195,15 +199,24 @@ a request over a limit gets HTTP 429 with `retry_after_ms` and a
 `Retry-After` header. Rate limits and stream counts are kept in memory per
 instance.
 
-The storage quota counts, for each org, the subject, body and `meta` of
-every message the org sent, each message once however many seats or orgs
-received it. Mail an org received is counted for its sender. Retention
-gives back the bytes of the bodies it clears. A send that would go over the
-quota gets HTTP 507 with the code `storage_quota`. Users see their count
-with `amail org show`; `amail admin stats` and `/admin` show it per org.
-The database takes more room than the counted bytes: delivery rows,
-indexes and free space inside the database files are not counted. Plan disk space for the number of orgs times the quota,
-and set a retention period so that old bodies are cleared.
+The storage quota counts, for each org, every message the org sent: its
+subject, body, `meta` and address lists, plus 512 bytes for the message's
+row and index entries, plus 384 bytes for each delivery (one per recipient
+seat, in any org; a list counts once per member). These two amounts are
+what Postgres 17 uses for a message and a delivery (about 470 and 360
+bytes); SQLite uses less (about 100 and 130). Mail an org received is
+counted for its sender while the sender exists; once the sender's org is
+deleted, each org that keeps that mail is charged its full bytes and its
+own deliveries of it. Acknowledgement reminders from the mail system are
+counted for their org but never refused. Retention gives back the bytes of
+the bodies it clears. A send that would go over the quota gets HTTP 507
+with the code `storage_quota`; an org at its quota can send nothing until
+retention frees space. Users see their count with `amail org show`;
+`amail admin stats` and `/admin` show it per org. Free space inside the
+database files is not counted, and the counts were computed again under
+these rules when the server was upgraded (migration 0013). Plan disk space
+for the number of orgs times the quota, and set a retention period so that
+old bodies are cleared.
 
 ### Operating a public server
 
@@ -213,7 +226,7 @@ All operator commands work directly on the database (`--db` or
 ```sh
 export AMAIL_DB=postgres://...
 amail admin invite create --count 5 --note "beta testers" --expires 7d
-amail admin invite ls
+amail admin invite ls                  # open, used, revoked, expired or spent (3 taken names tried)
 amail admin invite revoke 3
 amail admin stats                      # orgs, seats, mail volume, busiest orgs
 amail admin org ls
@@ -243,9 +256,9 @@ name, or `--confirm <name>`) or in Admin → Settings. That removes its
 seats, mail, lists, links, tokens and browser sessions. Mail it sent that
 linked orgs received stays with them, shown as from `name@org (deleted org)`
 (in the addresses too), so that the receiving org keeps its archive and
-its replies keep their parent; that mail no longer counts against any
-org's storage quota and is removed when the last org holding it is
-deleted. The name is free again at once; a new org of that name sees none
+its replies keep their parent; that mail now counts against the storage
+quota of each org holding it and is removed when the last org holding it
+is deleted. The name is free again at once; a new org of that name sees none
 of the old mail. The operator can do the same with
 `amail admin org delete`.
 
@@ -284,6 +297,36 @@ once**; variance is unknown.
 No delivery was ever injected twice, also under overload. Wake-up latency
 is the 3-second coalescing window; busy-injection latency is the time to
 the next tool call.
+
+Requests whose database cost depends on the data are limited per org and
+over all orgs (`--max-org-queries`, `--max-queries`): search, archive,
+`GET /threads/{id}`, `/attention`, `/overview`, `/messages/{id}/status`,
+`/lists`, `/lists/{name}`, `/changes`, and `/inbox` and `/sent` pages of
+more than 100 entries. Each runs until its database work ends, also when the
+client gave up, and each query is cancelled after 10 seconds. Everything else
+is a bounded index lookup. `GET /pending` and `GET /counts` read per-seat
+counters kept in the transactions that change deliveries, and `/overview`
+counts recent mail per org and minute, so these answers cost the same for
+an org with millions of deliveries as for an empty one.
+
+A search is a bounded scan: each request reads the org's newest 50,000
+messages before its cursor (2,000 when a term is shorter than three
+characters) and answers with what it found and `next_before_id`. Older mail
+is reached by following the cursor. In a large org, a search for a rare
+term therefore takes several requests: one for every 50,000 messages until
+the page is full or the oldest message is reached. The web interface's
+archive page loads the next part when the user asks for more; API clients
+repeat the request with `before_id` set to `next_before_id`.
+
+`amail-bench --mode tenants` measures one org's load against another
+org's latency: it gives one org about 2,000,000 delivery rows (with
+`--rows`) and lets it call one endpoint after another from 128 loops over
+64 tokens, while it measures the other org's inbox reads, sends and claims.
+On Postgres (server on 2 cores, database on 4, public-mode limits) the
+other org's median latencies stayed within 1.7 times their idle values for
+every endpoint (two runs: at most 1.6 and 1.7 times, at most 20 ms); before these limits they reached 10 to 60 seconds. Run
+once; on SQLite, where the database works on the server's cores, a flood
+of `GET /pending` (200 seats) still raised them three to ten times.
 
 Search and the archive start from the org's own messages, so their cost
 does not grow with other orgs' mail. Measured on the same host with 500,000

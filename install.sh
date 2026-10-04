@@ -42,17 +42,11 @@ case "${AMAIL_DOWNLOAD_BASE:-}" in
     *) die "AMAIL_DOWNLOAD_BASE must be an https URL" ;;
 esac
 
+# curl only: wget cannot be told to refuse a redirect from https to http
+# (its --https-only applies to recursive downloads only).
 fetch() { # url dest
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --proto "$proto" --proto-redir '=https' -o "$2" "$1"
-    elif command -v wget >/dev/null 2>&1; then
-        case "$1" in
-            https://*) wget -q --https-only -O "$2" "$1" ;;
-            *) wget -q --max-redirect=0 -O "$2" "$1" ;;
-        esac
-    else
-        die "curl or wget is required"
-    fi
+    command -v curl >/dev/null 2>&1 || die "curl is required"
+    curl -fsSL --proto "$proto" --proto-redir '=https' -o "$2" "$1"
 }
 
 os=$(uname -s)

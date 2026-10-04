@@ -74,9 +74,17 @@ impl Endpoint {
     }
 }
 
-/// The dsh home of a node with state directory `state_dir`.
+/// The directory of the dsh homes of a node with state directory
+/// `state_dir`.
 pub fn home_in(state_dir: &Path) -> PathBuf {
     state_dir.join("dsh-home")
+}
+
+/// The dsh home of `seat`: each seat has its own, so that a seat cannot
+/// read or change another seat's session logs or the secret that signs
+/// another host's browser sessions.
+pub fn seat_home_in(state_dir: &Path, seat: &str) -> PathBuf {
+    home_in(state_dir).join(seat)
 }
 
 /// Read `NAME=value` lines (blank lines, `#` comments and a leading
@@ -315,17 +323,24 @@ impl Dsh {
         Dsh { env }
     }
 
-    /// The dsh home all dsh seats of this node share.
+    /// The parent of the seats' dsh homes.
     pub fn home(&self) -> PathBuf {
         home_in(&self.env.state_dir)
+    }
+
+    /// The dsh home of `seat`.
+    pub fn seat_home(&self, seat: &str) -> PathBuf {
+        seat_home_in(&self.env.state_dir, seat)
     }
 
     fn run_dir(&self) -> PathBuf {
         self.env.state_dir.join("dsh").join("run")
     }
 
+    /// The seat's endpoint file, in a directory of its own (the only one
+    /// of the endpoint directories its jail shows).
     pub fn endpoint_path(&self, seat: &str) -> PathBuf {
-        self.run_dir().join(format!("{seat}.json"))
+        self.run_dir().join(seat).join("endpoint.json")
     }
 
     fn seat_patch_path(&self, seat: &str) -> PathBuf {
@@ -345,65 +360,103 @@ impl Dsh {
             .join(format!("{seat}.toml"))
     }
 
-    /// What an unattended seat's jail exposes.
+    /// What an unattended seat's jail exposes, and a notice for the person
+    /// when the seat's git access cannot be given in its working directory.
     ///
-    /// Writable: the working directory, its git directories (a worktree's
-    /// git directory and the repository's common one lie outside it; the
-    /// same rules as for Codex seats keep `hooks/`, `config` and the other
-    /// entries git takes commands from read-only, and those that do not
-    /// exist are covered by empty read-only placeholders so they cannot be
-    /// created) and the dsh home (session logs). Read-only: the `amail` and
-    /// `dsh` installations, the seat's profile and patch, the endpoint
+    /// Writable: the working directory and the dsh home (session logs). Git
+    /// follows the seat's `git_access`, with the same rules as for Codex
+    /// seats (`super::codex::seat_git_rules`): with `worktree` (the
+    /// default) a seat in a linked worktree may write the repository's
+    /// objects, refs and branch reflogs and its worktree's own git
+    /// directory, while the root of the repository's git directory (config,
+    /// hooks) stays read-only; with `full` (the default for the root of a
+    /// staged-merge team, which merges in the main checkout) the main
+    /// checkout and the whole git directory are writable except the entries
+    /// git takes commands from; with `off` nothing. Read-only entries that
+    /// do not exist are covered by empty read-only placeholders, so they
+    /// cannot be created. The working directory's own `.git` stays
+    /// read-only unless a rule makes it writable. Read-only: the `amail`
+    /// and `dsh` installations, the seat's profile and patch, the endpoint
     /// files, and the node socket's directory. Everything else under the
     /// home directory is hidden; the rest of the system is read-only.
-    pub fn jail_paths(&self, cwd: &str, seat: &str) -> Result<Jail> {
+    pub fn jail_paths(
+        &self,
+        cwd: &str,
+        seat: &str,
+        access: crate::wire::GitAccess,
+    ) -> Result<(Jail, Option<String>)> {
         let s = |p: PathBuf| p.to_string_lossy().into_owned();
+        let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| PathBuf::from(cwd));
         let mut j = Jail {
-            rw: vec![cwd.to_string(), s(self.home())],
+            rw: vec![s(cwd.clone()), s(self.seat_home(seat))],
             ..Jail::default()
         };
-        for d in super::codex::git_dirs(cwd) {
-            let dir = Path::new(&d);
-            if super::codex::git_dir_kind(dir) == Some(super::codex::GitDir::Redirected) {
-                bail!(
-                    "{d} contains a commondir file, which git does not create in a \
-                     repository's git directory; git run in that repository would take \
-                     its config and hooks from the directory it names. Check it and \
-                     remove it before starting dsh seats"
-                );
-            }
-            for (path, mode) in super::codex::git_dir_rules(dir) {
-                let p = Path::new(&path);
-                match mode {
-                    "write" => j.rw.push(path),
-                    _ if p.exists() => j.ro.push(path),
-                    // Entries git reads as directories, and files.
-                    _ if matches!(
-                        p.file_name().and_then(|n| n.to_str()),
-                        Some("hooks" | "modules" | "worktrees")
-                    ) =>
-                    {
-                        j.empty_dirs.push(path)
-                    }
-                    _ => j.empty_files.push(path),
+        let dirs = super::codex::git_dirs(&cwd);
+        let (rules, notice) = super::codex::seat_git_rules(
+            &cwd,
+            dirs.as_ref(),
+            seat,
+            access,
+            "dsh jail",
+            "the DeepSeek Harness section of docs/harnesses.md",
+        )?;
+        // The repository's git directories are visible as they are (config,
+        // HEAD, packed-refs, ...), read-only unless a rule below grants more:
+        // the jail empties the home directory and `/tmp`, so otherwise only
+        // the granted subdirectories would appear.
+        if let Some(d) = &dirs {
+            for g in [&d.common, &d.git_dir] {
+                if !rules
+                    .iter()
+                    .any(|(p, m)| *m == "write" && Path::new(p) == g.as_path())
+                {
+                    j.ro.push(s(g.clone()));
                 }
+            }
+        }
+        let dot_git = cwd.join(".git");
+        if dot_git.exists()
+            && !rules
+                .iter()
+                .any(|(p, m)| *m == "write" && Path::new(p) == dot_git)
+        {
+            j.ro.push(s(dot_git));
+        }
+        for (path, mode) in rules {
+            let p = Path::new(&path);
+            match mode {
+                "write" => j.rw.push(path),
+                _ if p.exists() => j.ro.push(path),
+                // Entries git reads as directories, and files.
+                _ if matches!(
+                    p.file_name().and_then(|n| n.to_str()),
+                    Some("hooks" | "modules" | "worktrees" | "info")
+                ) =>
+                {
+                    j.empty_dirs.push(path)
+                }
+                _ => j.empty_files.push(path),
             }
         }
         j.ro.extend(self.env.amail_dir());
         j.ro.extend(dsh_install_root(&self.env.dsh_bin).map(s));
         j.ro.push(s(self.seat_profile_path(seat)));
         j.ro.push(s(self.seat_patch_path(seat)));
-        j.ro.push(s(self.run_dir()));
+        j.ro.extend(
+            self.endpoint_path(seat)
+                .parent()
+                .map(|p| s(p.to_path_buf())),
+        );
         j.ro.extend(self.env.node_socket.parent().map(|p| s(p.to_path_buf())));
         for v in [&mut j.rw, &mut j.ro, &mut j.empty_dirs, &mut j.empty_files] {
             v.sort();
             v.dedup();
         }
-        Ok(j)
+        Ok((j, notice))
     }
 
-    fn hooks_path(&self) -> PathBuf {
-        self.home().join("amail-hooks.json")
+    fn hooks_path(&self, seat: &str) -> PathBuf {
+        self.seat_home(seat).join("amail-hooks.json")
     }
 
     pub fn hook_command(&self) -> String {
@@ -430,17 +483,17 @@ impl Dsh {
 
     /// The home-level patch: plain JSONL logs (readable by the mirror) and
     /// the hook bridge. YAML 1.2 accepts JSON, so it is written as JSON.
-    pub fn home_patch(&self) -> Value {
+    pub fn home_patch(&self, seat: &str) -> Value {
         json!([
             {"id": "session-persistence-jsonl", "config": {
-                "root": self.home().join("sessions").to_string_lossy(),
+                "root": self.seat_home(seat).join("sessions").to_string_lossy(),
                 "compression": "none",
             }},
             {"insert": [{
                 "id": "amail-hooks",
                 "name": "@deepseek-ai/dsh-hooks-codex",
                 "config": {
-                    "configPath": self.hooks_path().to_string_lossy(),
+                    "configPath": self.hooks_path(seat).to_string_lossy(),
                     "model": "dsh",
                     "defaultTimeoutMs": HOOK_TIMEOUT_MS,
                 },
@@ -482,7 +535,7 @@ impl Dsh {
             return Some((ep, session));
         }
         let dir = std::fs::read_dir(self.run_dir()).ok()?;
-        dir.filter_map(|e| Endpoint::read(&e.ok()?.path()))
+        dir.filter_map(|e| Endpoint::read(&e.ok()?.path().join("endpoint.json")))
             .find(|ep| ep.session.as_deref() == Some(target) && ep.alive())
             .map(|ep| (ep, target.to_string()))
     }
@@ -510,10 +563,11 @@ impl Adapter for Dsh {
         };
         let session_id = str_field(input, "session_id").map(str::to_string);
         // The bridge reports no transcript path; the log's place follows
-        // from the session's directory and id.
+        // from the session's directory and id, under the seat's dsh home
+        // (see `transcript`): this is the path relative to that home.
         let transcript_path = match (&session_id, str_field(input, "cwd")) {
             (Some(s), Some(cwd)) if !cwd.is_empty() => Some(
-                transcript_path(&self.home(), cwd, s)
+                transcript_path(Path::new(""), cwd, s)
                     .to_string_lossy()
                     .into_owned(),
             ),
@@ -529,6 +583,16 @@ impl Adapter for Dsh {
 
     fn seat_from_env(&self, env: &BTreeMap<String, String>) -> Option<String> {
         env.get("AMAIL_SEAT").filter(|s| !s.is_empty()).cloned()
+    }
+
+    fn transcript(&self, hook: &Hook, seat: &str) -> Option<String> {
+        let rel = hook.transcript_path.as_deref()?;
+        Some(
+            self.seat_home(seat)
+                .join(rel)
+                .to_string_lossy()
+                .into_owned(),
+        )
     }
 
     fn accepts(&self, env: &BTreeMap<String, String>, hook: &Hook) -> bool {
@@ -594,22 +658,10 @@ impl Adapter for Dsh {
     }
 
     async fn prepare(&self) -> Result<()> {
-        let home = self.home();
-        std::fs::create_dir_all(&home)?;
-        std::fs::set_permissions(&home, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
-        let run = self.run_dir();
-        std::fs::create_dir_all(&run)?;
-        std::fs::set_permissions(&run, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
-        crate::persist::write_atomic(
-            &self.hooks_path(),
-            serde_json::to_string_pretty(&self.hooks())?.as_bytes(),
-            0o600,
-        )?;
-        let text = format!(
-            "# Managed by amail.\n{}\n",
-            serde_json::to_string_pretty(&self.home_patch())?
-        );
-        crate::persist::write_atomic(&home.join("cordis.patch.yml"), text.as_bytes(), 0o600)?;
+        for dir in [self.home(), self.run_dir()] {
+            std::fs::create_dir_all(&dir)?;
+            std::fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+        }
         Ok(())
     }
 
@@ -624,6 +676,23 @@ impl Adapter for Dsh {
             serde_json::to_string_pretty(&Self::seat_patch(info))?
         );
         crate::persist::write_atomic(&patch, text.as_bytes(), 0o600)?;
+        // The seat's own dsh home: plain JSONL logs and the hook bridge.
+        let home = self.seat_home(&info.seat);
+        let run = self.endpoint_path(&info.seat);
+        for dir in [Some(home.as_path()), run.parent()].into_iter().flatten() {
+            std::fs::create_dir_all(dir)?;
+            std::fs::set_permissions(dir, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+        }
+        crate::persist::write_atomic(
+            &self.hooks_path(&info.seat),
+            serde_json::to_string_pretty(&self.hooks())?.as_bytes(),
+            0o600,
+        )?;
+        let text = format!(
+            "# Managed by amail.\n{}\n",
+            serde_json::to_string_pretty(&self.home_patch(&info.seat))?
+        );
+        crate::persist::write_atomic(&home.join("cordis.patch.yml"), text.as_bytes(), 0o600)?;
         // dsh removes variables with credential-shaped names (`*TOKEN*`,
         // `*KEY*`, ...) from the environment of the agent's commands, so
         // `AMAIL_TOKEN` would not reach them; a profile file does.
@@ -641,12 +710,22 @@ impl Adapter for Dsh {
             endpoint.to_string_lossy().into_owned(),
         ];
         let unattended = ctx.permission_mode == PermissionMode::Unattended;
-        if unattended {
+        let mut notice = None;
+        if unattended && !ctx.dsh_jail {
+            notice = Some(format!(
+                "seat {}: dsh_jail is off, so this unattended dsh seat runs without the \
+                 jail: its agent can read every file this user can read (saved logins and \
+                 keys included) and write every file this user can write.",
+                info.seat
+            ));
+        }
+        if unattended && ctx.dsh_jail {
             // The whole host runs in a jail (see `crate::dsh_host`): dsh's
             // own sandbox limits writes only, and its file tools run inside
             // the host without any sandbox.
             args.push("--jail".into());
-            let j = self.jail_paths(ctx.cwd, &info.seat)?;
+            let (j, git_notice) = self.jail_paths(ctx.cwd, &info.seat, ctx.git_access)?;
+            notice = git_notice;
             for (flag, list) in [
                 ("--rw", j.rw),
                 ("--ro", j.ro),
@@ -690,10 +769,7 @@ impl Adapter for Dsh {
         }
         args.extend(ctx.extra.iter().cloned());
         let mut env = BTreeMap::from([
-            (
-                "DSH_HOME".to_string(),
-                self.home().to_string_lossy().into_owned(),
-            ),
+            ("DSH_HOME".to_string(), home.to_string_lossy().into_owned()),
             ("AMAIL_SEAT".to_string(), info.seat.clone()),
             ("AMAIL_URL".to_string(), self.env.server_url.clone()),
             ("AMAIL_TOKEN".to_string(), info.token.clone()),
@@ -726,7 +802,7 @@ impl Adapter for Dsh {
             env,
             unset_env: vec!["DSH_PERMISSION_MODE".into()],
             path_prepend: self.env.amail_dir().into_iter().collect(),
-            notice: None,
+            notice,
         })
     }
 
@@ -785,7 +861,12 @@ mod tests {
         );
         assert_eq!(
             h.transcript_path.as_deref(),
-            Some("/s/dsh-home/sessions/--w-a--/session-1/session.v4.jsonl")
+            Some("sessions/--w-a--/session-1/session.v4.jsonl")
+        );
+        // Under the seat's own dsh home.
+        assert_eq!(
+            d.transcript(&h, "w").as_deref(),
+            Some("/s/dsh-home/w/sessions/--w-a--/session-1/session.v4.jsonl")
         );
         for (name, ev) in [
             ("PostToolUse", Event::PostToolUse),
@@ -851,7 +932,7 @@ mod tests {
     fn resolves_session_ids_among_running_hosts() {
         let dir = tempfile::tempdir().unwrap();
         let d = dsh(dir.path());
-        std::fs::create_dir_all(d.run_dir()).unwrap();
+        std::fs::create_dir_all(d.endpoint_path("w").parent().unwrap()).unwrap();
         let ep = Endpoint {
             pid: std::process::id(),
             url: "http://127.0.0.1:9".into(),
@@ -893,11 +974,39 @@ mod tests {
         assert!(ok, "git {args:?}");
     }
 
-    /// A seat in a worktree: its git directories are writable except the
-    /// entries git takes commands from; under bwrap, writes there fail and
-    /// git's own state files can be written.
-    #[test]
-    fn jail_git_rules() {
+    fn bwrap_ok() -> bool {
+        std::process::Command::new("bwrap")
+            .args(["--ro-bind", "/", "/", "--", "true"])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// Run `script` in the jail `j`; returns its stdout.
+    fn in_jail(j: &Jail, script: &str) -> String {
+        let empty = tempfile::NamedTempFile::new().unwrap();
+        let args = crate::dsh_host::jail_args(
+            "",
+            "",
+            &j.rw,
+            &j.ro,
+            &j.empty_dirs,
+            &j.empty_files,
+            &empty.path().to_string_lossy(),
+        );
+        let out = std::process::Command::new("bwrap")
+            .args(&args)
+            .args(["--", "sh", "-c", script])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    const ID: &str = "-c user.name=t -c user.email=t@t";
+
+    /// A repository with a commit on `main` and a linked worktree `wt` on
+    /// branch `w`; returns (root, repo, worktree).
+    fn repo_with_worktree() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         let repo = root.join("repo");
@@ -922,61 +1031,126 @@ mod tests {
             &repo,
             &["worktree", "add", "-q", "-b", "w", wt.to_str().unwrap()],
         );
-        let d = dsh(&root.join("state"));
-        let j = d.jail_paths(wt.to_str().unwrap(), "w").unwrap();
-        let common = repo.join(".git");
-        let linked = common.join("worktrees").join("wt");
-        let p = |x: &Path| x.to_string_lossy().into_owned();
-        assert!(
-            j.rw.contains(&p(&common)) && j.rw.contains(&p(&linked)),
-            "{j:?}"
-        );
-        assert!(j.ro.contains(&p(&common.join("config"))), "{j:?}");
-        assert!(j.ro.contains(&p(&common.join("hooks"))), "{j:?}");
-        assert!(j.ro.contains(&p(&common.join("worktrees"))), "{j:?}");
-        assert!(j.ro.contains(&p(&linked.join("commondir"))), "{j:?}");
-        assert!(j.empty_dirs.contains(&p(&common.join("modules"))), "{j:?}");
-        assert!(
-            j.empty_files.contains(&p(&common.join("config.worktree"))),
-            "{j:?}"
-        );
+        (dir, repo, wt)
+    }
 
-        let bwrap_ok = std::process::Command::new("bwrap")
-            .args(["--ro-bind", "/", "/", "--", "true"])
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
-        if !bwrap_ok {
+    /// `worktree` (the default) in a linked worktree: objects, refs, branch
+    /// reflogs and the worktree's own git directory are writable; the root
+    /// of the repository's git directory (config, hooks, commondir) and the
+    /// worktree's `.git` file are not. Committing, tagging and rebasing
+    /// work; deleting a ref does not (as for Codex seats).
+    #[test]
+    fn jail_git_worktree() {
+        let (dir, repo, wt) = repo_with_worktree();
+        let d = dsh(&dir.path().canonicalize().unwrap().join("state"));
+        let (j, notice) = d
+            .jail_paths(wt.to_str().unwrap(), "w", crate::wire::GitAccess::Worktree)
+            .unwrap();
+        assert_eq!(notice, None);
+        let c = repo.join(".git");
+        let l = c.join("worktrees").join("wt");
+        let p = |x: &Path| x.to_string_lossy().into_owned();
+        for w in [
+            c.join("objects"),
+            c.join("refs"),
+            c.join("logs/refs"),
+            l.clone(),
+        ] {
+            assert!(j.rw.contains(&p(&w)), "{w:?} {j:?}");
+        }
+        assert!(!j.rw.contains(&p(&c)), "{j:?}");
+        assert!(j.ro.contains(&p(&l.join("commondir"))), "{j:?}");
+        assert!(j.ro.contains(&p(&wt.join(".git"))), "{j:?}");
+        if !bwrap_ok() {
             eprintln!("bwrap cannot run here: jail check skipped");
             return;
         }
-        let args = crate::dsh_host::jail_args("", "", &j.rw, &j.ro, &j.empty_dirs, &j.empty_files);
-        let script = format!(
-            "cd {wt}; \
-             (echo x >> {c}/config) 2>/dev/null && echo config-writable; \
-             (touch {c}/hooks/pre-commit) 2>/dev/null && echo hooks-writable; \
-             (mkdir {c}/modules/x) 2>/dev/null && echo modules-writable; \
-             (echo x > {l}/commondir) 2>/dev/null && echo commondir-writable; \
-             touch {c}/amail-test.lock && echo lock-ok; \
-             git -c user.name=t -c user.email=t@t commit -q --allow-empty -m j && echo commit-ok",
-            wt = wt.display(),
-            c = common.display(),
-            l = linked.display(),
+        let out = in_jail(
+            &j,
+            &format!(
+                "cd {wt}; \
+                 (echo x >> {c}/config) 2>/dev/null && echo config-writable; \
+                 (mkdir -p {c}/hooks && touch {c}/hooks/pre-commit) 2>/dev/null && echo hooks-writable; \
+                 (echo x > {l}/commondir) 2>/dev/null && echo commondir-writable; \
+                 (echo 'gitdir: /tmp/x' > {wt}/.git) 2>/dev/null && echo dotgit-writable; \
+                 git {ID} commit -q --allow-empty -m j && echo commit-ok; \
+                 git tag t1 && echo tag-ok; \
+                 git {ID} rebase -q main 2>/dev/null && echo rebase-ok; \
+                 git tag -d t1 >/dev/null 2>&1 || echo no-ref-delete",
+                wt = wt.display(),
+                c = c.display(),
+                l = l.display(),
+            ),
         );
-        let out = std::process::Command::new("bwrap")
-            .args(&args)
-            .args(["--", "sh", "-c", &script])
-            .output()
+        // As for Codex seats: deleting a branch or tag rewrites
+        // `packed-refs`, which stays read-only.
+        assert_eq!(out, "commit-ok\ntag-ok\nrebase-ok\nno-ref-delete");
+    }
+
+    /// `full` for a maintainer in the main checkout: commits and merges
+    /// there; config and hooks stay read-only.
+    #[test]
+    fn jail_git_full() {
+        let (dir, repo, _wt) = repo_with_worktree();
+        let d = dsh(&dir.path().canonicalize().unwrap().join("state"));
+        let (j, notice) = d
+            .jail_paths(repo.to_str().unwrap(), "root", crate::wire::GitAccess::Full)
             .unwrap();
-        let out = String::from_utf8_lossy(&out.stdout);
-        assert_eq!(out.trim(), "lock-ok\ncommit-ok", "{out}");
-        // The placeholders left nothing behind that git would read.
-        assert!(
-            !common.join("config.worktree").exists()
-                || std::fs::read(common.join("config.worktree"))
-                    .unwrap()
-                    .is_empty()
+        assert_eq!(notice, None);
+        let c = repo.join(".git");
+        let p = |x: &Path| x.to_string_lossy().into_owned();
+        assert!(j.rw.contains(&p(&c)), "{j:?}");
+        assert!(j.ro.contains(&p(&c.join("config"))), "{j:?}");
+        if !bwrap_ok() {
+            return;
+        }
+        let out = in_jail(
+            &j,
+            &format!(
+                "cd {r}; \
+                 (echo x >> {c}/config) 2>/dev/null && echo config-writable; \
+                 (touch {c}/hooks/pre-commit) 2>/dev/null && echo hooks-writable; \
+                 git {ID} merge -q --no-ff -m m w && echo merge-ok; \
+                 git {ID} commit -q --allow-empty -m j && echo commit-ok",
+                r = repo.display(),
+                c = c.display(),
+            ),
         );
+        assert_eq!(out, "merge-ok\ncommit-ok");
+    }
+
+    /// `off`, and `worktree` in a main checkout (with a notice): git stays
+    /// read-only.
+    #[test]
+    fn jail_git_off_and_main_checkout() {
+        let (dir, repo, wt) = repo_with_worktree();
+        let d = dsh(&dir.path().canonicalize().unwrap().join("state"));
+        let (off, n) = d
+            .jail_paths(wt.to_str().unwrap(), "w", crate::wire::GitAccess::Off)
+            .unwrap();
+        assert_eq!(n, None);
+        let (main, n) = d
+            .jail_paths(
+                repo.to_str().unwrap(),
+                "m",
+                crate::wire::GitAccess::Worktree,
+            )
+            .unwrap();
+        assert!(n.unwrap().contains("main checkout"));
+        if !bwrap_ok() {
+            return;
+        }
+        for (j, cwd) in [(&off, &wt), (&main, &repo)] {
+            let out = in_jail(
+                j,
+                &format!(
+                    "cd {}; git {ID} commit -q --allow-empty -m j 2>/dev/null && echo commit-ok; \
+                     touch file && echo workdir-ok",
+                    cwd.display()
+                ),
+            );
+            assert_eq!(out, "workdir-ok", "{cwd:?}");
+        }
     }
 
     #[test]
@@ -988,7 +1162,9 @@ mod tests {
         git(&repo, &["init", "-q"]);
         std::fs::write(repo.join(".git").join("commondir"), ".\n").unwrap();
         let d = dsh(&root.join("state"));
-        let e = d.jail_paths(repo.to_str().unwrap(), "w").unwrap_err();
+        let e = d
+            .jail_paths(repo.to_str().unwrap(), "w", crate::wire::GitAccess::Full)
+            .unwrap_err();
         assert!(e.to_string().contains("commondir"), "{e}");
     }
 
@@ -1001,11 +1177,12 @@ mod tests {
             "/opt/amail/bin/amail hook dsh"
         );
         assert_eq!(hooks["hooks"].as_object().unwrap().len(), EVENTS.len());
-        let p = d.home_patch();
+        let p = d.home_patch("w");
         assert_eq!(p[0]["config"]["compression"], "none");
+        assert_eq!(p[0]["config"]["root"], "/s/dsh-home/w/sessions");
         assert_eq!(
             p[1]["insert"][0]["config"]["configPath"],
-            "/s/dsh-home/amail-hooks.json"
+            "/s/dsh-home/w/amail-hooks.json"
         );
     }
 }

@@ -109,6 +109,21 @@ pub fn check_csrf(
     Ok(())
 }
 
+/// How long a request over its org's request limit waits before it is
+/// refused: a client that sends again as soon as it is refused thus sends
+/// about one request per second per connection, and refusals cost the
+/// server little.
+pub const ORG_REFUSAL_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
+async fn org_rate_limited(ms: u64) -> ApiError {
+    tokio::time::sleep(ORG_REFUSAL_DELAY).await;
+    ApiError::too_many(
+        "rate_limited",
+        "too many requests for this org (all its tokens together)",
+        ms,
+    )
+}
+
 impl FromRequestParts<AppState> for Auth {
     type Rejection = ApiError;
 
@@ -117,7 +132,9 @@ impl FromRequestParts<AppState> for Auth {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         let mut session = None;
-        let auth = match parts.headers.get(header::AUTHORIZATION) {
+        // The credential: a bearer token, or the session cookie (then the
+        // request must pass the cross-site checks).
+        let (hash, is_session) = match parts.headers.get(header::AUTHORIZATION) {
             Some(value) => {
                 let value = value
                     .to_str()
@@ -129,27 +146,48 @@ impl FromRequestParts<AppState> for Auth {
                         ApiError::unauthorized("expected 'Authorization: Bearer <token>'")
                     })?
                     .trim();
-                state
-                    .store
-                    .token_auth(&hash_token(token))
-                    .await?
-                    .ok_or_else(|| ApiError::unauthorized("invalid or revoked token"))?
+                (hash_token(token), false)
             }
             None => {
                 let secret = cookie(&parts.headers, SESSION_COOKIE)
                     .ok_or_else(|| ApiError::unauthorized("missing bearer token"))?;
                 let peer = parts.extensions.get::<Peer>().copied().unwrap_or_default();
                 check_csrf(&parts.method, &parts.headers, peer.proxied)?;
-                let hash = hash_token(secret);
-                let a = state
-                    .store
-                    .session_auth(&hash)
-                    .await?
-                    .ok_or_else(|| ApiError::unauthorized("session expired or signed out"))?;
-                session = Some(hash);
-                a
+                (hash_token(secret), true)
             }
         };
+        // An org over its request limit is refused before the database is
+        // asked, when this credential's org is known from earlier requests.
+        let org_limit = state.limiters.org_requests.as_ref();
+        let known_org = org_limit.and_then(|_| state.limiters.credential_orgs.get(&hash));
+        if let (Some(b), Some(org)) = (org_limit, known_org)
+            && let Err(ms) = b.take(&org)
+        {
+            return Err(org_rate_limited(ms).await);
+        }
+        let auth = if is_session {
+            let a = state
+                .store
+                .session_auth(&hash)
+                .await?
+                .ok_or_else(|| ApiError::unauthorized("session expired or signed out"))?;
+            session = Some(hash.clone());
+            a
+        } else {
+            state
+                .store
+                .token_auth(&hash)
+                .await?
+                .ok_or_else(|| ApiError::unauthorized("invalid or revoked token"))?
+        };
+        if let Some(b) = org_limit
+            && known_org != Some(auth.org.id)
+        {
+            state.limiters.credential_orgs.insert(&hash, auth.org.id);
+            if let Err(ms) = b.take(&auth.org.id) {
+                return Err(org_rate_limited(ms).await);
+            }
+        }
         if auth.org.suspended_at.is_some() {
             return Err(suspended());
         }

@@ -102,7 +102,13 @@ pub async fn attention(
     auth: Auth,
 ) -> ApiResult<Json<p::AttentionResponse>> {
     auth.require_user()?;
-    let mut items = attention_items(&st, &auth).await?;
+    let (st2, auth2) = (st.clone(), auth.clone());
+    let mut items = crate::mail::limited(
+        &st,
+        &auth,
+        async move { attention_items(&st2, &auth2).await },
+    )
+    .await?;
     render::fit(&mut items, MAX_PAGE_BYTES, false);
     Ok(Json(p::AttentionResponse { items }))
 }
@@ -110,8 +116,18 @@ pub async fn attention(
 /// `GET /v1/overview`: seats per state and recent mail volume.
 pub async fn overview(State(st): State<AppState>, auth: Auth) -> ApiResult<Json<p::Overview>> {
     auth.require_user()?;
+    let (st2, auth2) = (st.clone(), auth.clone());
+    let out =
+        crate::mail::limited(&st, &auth, async move { overview_of(&st2, &auth2).await }).await?;
+    Ok(Json(out))
+}
+
+/// The overview: the seats and their presence, the counters of recent mail
+/// and of the user seat, and the attention items (see
+/// [`amail_store::Store::attention`]).
+async fn overview_of(st: &AppState, auth: &Auth) -> ApiResult<p::Overview> {
     let seats = st.store.seats(auth.org.id).await?;
-    let presence = presences(&st, auth.org.id).await?;
+    let presence = presences(st, auth.org.id).await?;
     let mut out = p::Overview::default();
     for s in [
         SeatState::Busy,
@@ -135,10 +151,13 @@ pub async fn overview(State(st): State<AppState>, auth: Auth) -> ApiResult<Json<
         }
     }
     let now = amail_store::now_ms();
-    out.mail_last_hour = st.store.message_count(auth.org.id, now - 3_600_000).await?;
+    out.mail_last_hour = st
+        .activity
+        .count(&*st.store, auth.org.id, now - 3_600_000)
+        .await?;
     out.mail_last_day = st
-        .store
-        .message_count(auth.org.id, now - 86_400_000)
+        .activity
+        .count(&*st.store, auth.org.id, now - 86_400_000)
         .await?;
     let user = auth.mail_seat()?;
     out.user_unread = st
@@ -147,8 +166,8 @@ pub async fn overview(State(st): State<AppState>, auth: Auth) -> ApiResult<Json<
         .await?
         .first()
         .map_or(0, |c| c.unread);
-    out.attention = attention_items(&st, &auth).await?.len() as i64;
-    Ok(Json(out))
+    out.attention = attention_items(st, auth).await?.len() as i64;
+    Ok(out)
 }
 
 #[derive(Deserialize)]
@@ -210,7 +229,15 @@ pub async fn sent(
         limit,
         ..Default::default()
     };
-    let page = st.store.archive(auth.org.id, &query).await?;
+    let page = if limit > p::limits::SMALL_PAGE {
+        let (store, org_id) = (st.store.clone(), auth.org.id);
+        crate::mail::limited(&st, &auth, async move {
+            Ok(store.archive(org_id, &query).await?)
+        })
+        .await?
+    } else {
+        st.store.archive(auth.org.id, &query).await?
+    };
     Ok(Json(crate::mail::archive_response(page, &auth.org)))
 }
 
@@ -251,8 +278,11 @@ pub async fn search(
         limit,
         scan,
     };
-    let _slot = crate::mail::query_slot(&st, &auth)?;
-    let r = st.store.search(auth.org.id, &query).await?;
+    let (store, org_id) = (st.store.clone(), auth.org.id);
+    let r = crate::mail::limited(&st, &auth, async move {
+        Ok(store.search(org_id, &query).await?)
+    })
+    .await?;
     let mut messages: Vec<p::SearchHit> = r
         .hits
         .iter()

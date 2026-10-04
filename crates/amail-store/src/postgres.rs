@@ -94,7 +94,9 @@ impl PgStore {
             Box::pin(async move {
                 let now = now_ms();
                 let meta = meta_to_db(&m.meta);
-                let bytes = message_bytes(&m.subject, &m.body, &meta);
+                let (to, cc) = (join_addrs(&m.to_addrs), join_addrs(&m.cc_addrs));
+                let bytes = message_bytes(&m.subject, &m.body, &meta, &to, &cc)
+                    + amail_proto::limits::STORED_BYTES_PER_DELIVERY * m.deliveries.len() as i64;
                 let mut seat_ids: Vec<i64> = m.deliveries.iter().map(|d| d.seat_id).collect();
                 seat_ids.sort_unstable();
                 seat_ids.dedup();
@@ -106,10 +108,42 @@ impl PgStore {
                     .bind(&seat_ids)
                     .execute(&mut *c)
                     .await?;
+                // Advance their sequence counters and add the new deliveries
+                // to their pending and unread counters (see migration 0012).
+                let urgent = m.priority == amail_proto::Priority::Urgent;
+                let one = |b: bool| i32::from(b);
+                let (mut ids, mut pt, mut pc, mut pl, mut pu, mut pd, mut un) =
+                    (vec![], vec![], vec![], vec![], vec![], vec![], vec![]);
+                for d in &m.deliveries {
+                    let now_ = d.mode == amail_proto::DeliveryMode::Immediate;
+                    ids.push(d.seat_id);
+                    pt.push(one(now_ && d.class == amail_proto::DeliveryClass::To));
+                    pc.push(one(now_ && d.class == amail_proto::DeliveryClass::Cc));
+                    pl.push(one(now_ && d.class == amail_proto::DeliveryClass::List));
+                    pu.push(one(now_ && urgent));
+                    pd.push(one(d.mode == amail_proto::DeliveryMode::Digest));
+                    un.push(one(d.mode != amail_proto::DeliveryMode::Archive));
+                }
                 let bumped: Vec<(i64, i64)> = sqlx::query_as(
-                    "UPDATE seats SET last_seq = last_seq + 1 WHERE id = ANY($1) RETURNING id, last_seq",
+                    "UPDATE seats s SET last_seq = s.last_seq + 1, \
+                     pending_to = s.pending_to + v.pt, pending_cc = s.pending_cc + v.pc, \
+                     pending_list = s.pending_list + v.pl, pending_urgent = s.pending_urgent + v.pu, \
+                     pending_digest = s.pending_digest + v.pd, unread = s.unread + v.un, \
+                     pending_digest_since = CASE WHEN v.pd > 0 THEN COALESCE(s.pending_digest_since, $9) \
+                       ELSE s.pending_digest_since END \
+                     FROM UNNEST($2::bigint[], $3::int[], $4::int[], $5::int[], $6::int[], $7::int[], $8::int[]) \
+                       AS v(id, pt, pc, pl, pu, pd, un) \
+                     WHERE s.id = ANY($1) AND s.id = v.id RETURNING s.id, s.last_seq",
                 )
                 .bind(&seat_ids)
+                .bind(&ids)
+                .bind(&pt)
+                .bind(&pc)
+                .bind(&pl)
+                .bind(&pu)
+                .bind(&pd)
+                .bind(&un)
+                .bind(now)
                 .fetch_all(&mut *c)
                 .await?;
                 let seq_of = |seat: i64| bumped.iter().find(|(id, _)| *id == seat).map(|(_, s)| *s);
@@ -132,8 +166,8 @@ impl PgStore {
                 .bind(&m.subject)
                 .bind(&m.body)
                 .bind(line_count(&m.body))
-                .bind(join_addrs(&m.to_addrs))
-                .bind(join_addrs(&m.cc_addrs))
+                .bind(&to)
+                .bind(&cc)
                 .bind(m.priority.as_str())
                 .bind(m.ack_required)
                 .bind(now)
@@ -166,10 +200,25 @@ impl PgStore {
                 .bind(&seqv)
                 .execute(&mut *c)
                 .await?;
+                // The recipients take part in the thread (see migration 0012).
+                sqlx::query(
+                    "INSERT INTO thread_seats (thread_id, org_id, seat_id) \
+                     SELECT $1, o, s FROM UNNEST($2::bigint[], $3::bigint[]) AS t(o, s) \
+                     ORDER BY 2, 3 ON CONFLICT DO NOTHING",
+                )
+                .bind(thread_id)
+                .bind(&orgs)
+                .bind(&seats)
+                .execute(&mut *c)
+                .await?;
                 // Last, so the org's row stays locked only until the commit.
+                // The message and every delivery are charged (see
+                // `message_bytes`); refused over the quota, and when the org
+                // was deleted meanwhile.
                 let added: Option<i64> = sqlx::query_scalar(
                     "UPDATE orgs SET stored_bytes = stored_bytes + $1 \
-                     WHERE id = $2 AND ($3::bigint IS NULL OR stored_bytes + $1 <= $3) RETURNING id",
+                     WHERE id = $2 AND deleted_at IS NULL \
+                     AND ($3::bigint IS NULL OR stored_bytes + $1 <= $3) RETURNING id",
                 )
                 .bind(bytes)
                 .bind(m.org_id)

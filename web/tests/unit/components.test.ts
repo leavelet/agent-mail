@@ -4,6 +4,7 @@ import TreeRow from '../../src/components/TreeRow.svelte';
 import Transcript from '../../src/components/Transcript.svelte';
 import MessageCard from '../../src/components/MessageCard.svelte';
 import { ui } from '../../src/lib/ui.svelte';
+import { isUnsafe } from '../../src/lib/visible';
 
 const mounted: Record<string, unknown>[] = [];
 function render<P extends Record<string, unknown>>(C: Component<P>, props: P): HTMLElement {
@@ -105,5 +106,31 @@ describe('untrusted text', () => {
     expect(el.textContent).toContain(evil);
     expect(el.textContent).toContain('0123456789ab');
     expect(el.textContent).toContain('amail/w1');
+  });
+  it('shows characters that are not shown as visible escapes', () => {
+    ui.lang = 'en';
+    const el = render(MessageCard, {
+      message: {
+        id: 6,
+        thread_id: 6,
+        from: 'evil@other',
+        source: 'external',
+        to: ['w1'],
+        cc: [],
+        subject: 'sub\u202ej\ufe0f',
+        priority: 'normal',
+        ack_required: false,
+        lines: 2,
+        created_at: '2026-10-04T11:00:00Z',
+        meta: { note: 'a\u{e0041}b' },
+        body: 'line one\nhidden\u200b\u{e0101}\u2800 text\tend',
+      },
+    });
+    const text = el.textContent ?? '';
+    expect(text).toContain('sub\\u{202e}j\\u{fe0f}');
+    expect(text).toContain('a\\u{e0041}b');
+    expect(el.querySelector('pre.body')?.textContent).toBe('line one\nhidden\\u{200b}\\u{e0101}\\u{2800} text\tend');
+    expect(el.querySelectorAll('.esc').length).toBe(4);
+    expect([...text].filter((c) => isUnsafe(c))).toEqual([]);
   });
 });

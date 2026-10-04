@@ -454,6 +454,42 @@ async fn webhook_secrets_stay_out_of_logs() {
     }
 }
 
+/// An empty `AMAIL_MAX_*=`, `AMAIL_RETENTION_DAYS=` or
+/// `AMAIL_WEBHOOK_PRIVATE_TARGETS=` (as an `.env` file may set; the compose
+/// file passes all three) means "not set"; a value that is not valid still
+/// fails.
+#[test]
+fn empty_limit_env_values_are_unset() {
+    let mut env = Env::new();
+    let db = format!(
+        "sqlite://{}?mode=rwc",
+        env.dir.path().join("db.sqlite").display()
+    );
+    for k in [
+        "AMAIL_MAX_ORG_QUERIES",
+        "AMAIL_MAX_SEATS_PER_ORG",
+        "AMAIL_MAX_SENDS_PER_SEC",
+        "AMAIL_RETENTION_DAYS",
+        "AMAIL_WEBHOOK_PRIVATE_TARGETS",
+    ] {
+        env.extra.push((k.into(), String::new()));
+    }
+    let log = env.dir.path().join("serve.log");
+    // `serve` waits until the server answers.
+    let (server, _url) = serve(&env, &db, &["--public"], &log);
+    drop(server);
+    let err = env.fails(
+        &["serve", "--db", &db, "--listen", "127.0.0.1:1"],
+        &[("AMAIL_MAX_ORG_QUERIES", "x")],
+    );
+    assert!(err.contains("--max-org-queries"), "{err}");
+    let err = env.fails(
+        &["serve", "--db", &db, "--listen", "127.0.0.1:1"],
+        &[("AMAIL_WEBHOOK_PRIVATE_TARGETS", "maybe")],
+    );
+    assert!(err.contains("--webhook-private-targets"), "{err}");
+}
+
 #[test]
 fn init_and_doctor() {
     let env = Env::new();
@@ -568,11 +604,21 @@ fn node_start_and_stop() {
         None,
     );
     assert!(out.contains("node started"), "{out}");
-    let status = env.ok(&["node", "status"], &[], None);
-    assert!(
-        status.contains(&format!("node connected to server {url}")),
-        "{status}"
-    );
+    // The node answers on its socket before its first connection to the
+    // server is made.
+    let want = format!("node connected to server {url}");
+    let t0 = std::time::Instant::now();
+    loop {
+        let status = env.ok(&["node", "status"], &[], None);
+        if status.contains(&want) {
+            break;
+        }
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(10),
+            "{status}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
     let err = env.fails(&["node", "start"], &[]);
     assert!(err.contains("already running"), "{err}");
     let out = env.ok(&["node", "stop"], &[], None);

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { visible } from '../lib/visible';
   import { store } from '../lib/store.svelte';
   import { t } from '../lib/ui.svelte';
   import { currentToken, completeToken, suggest, type Suggestion } from '../lib/compose';
@@ -12,7 +13,7 @@
     focused && token
       ? suggest(
           token,
-          store.seats.filter((s) => s.kind === 'agent').map((s) => ({ name: s.name, detail: [s.harness, s.role?.split('\n', 1)[0]].filter(Boolean).join(' · ') })),
+          store.seats.filter((s) => s.kind === 'agent').map((s) => ({ name: s.name, detail: visible([s.harness, s.role?.split('\n', 1)[0]].filter(Boolean).join(' · ')) })),
           store.lists.map((l) => l.name),
           store.links.filter((l) => l.state === 'active').map((l) => l.org),
         )

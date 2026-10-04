@@ -101,35 +101,72 @@ keep the session on the shared daemon are allowed (`-m`, `-a`, `-s`, `-C`,
 
 **Sandbox and permissions.** `unattended` Codex seats (chosen in the team
 file or with `amail run --permission-mode`, as for Claude Code) run with `-a never`
-under the home's `amail` permissions profile: the workspace sandbox (the
-working directory, `/tmp` and `$TMPDIR` writable, everything else
-read-only), network access, and write access to the git directory and the
-repository's common git directory of every Codex seat's working directory,
-so that a seat in a git worktree can commit, rebase and create branches
-(the plain workspace sandbox keeps `.git` read-only, and a worktree's git
-directory lies outside it). The write grant covers each of these
-directories except `hooks/`, `config`, `config.worktree`, `modules/` and
-`worktrees/` of the repository's git directory, and `commondir` and
-`config.worktree` of each linked worktree's git directory (each existing
-linked worktree's git directory is writable, because `git gc` locks every
-worktree's reflog). These entries stay read-only, and those that do not
-exist cannot be created; see [security](security.md) ("Codex seats and
-git") for the reason and the remaining gap (`.git/commondir`). Codex accepts only directories as write
-roots, and git creates lock and state files next to the files it changes,
-so the grant cannot be narrowed to a list of files. Consequences:
+under a permissions profile in the dedicated home: the workspace sandbox
+(the working directory, `/tmp` and `$TMPDIR` writable, everything else
+read-only), network access, and the git grants of the seat's `git_access`.
+The plain workspace sandbox keeps `.git` read-only, and a linked worktree's
+git directory lies outside the worktree, so without a grant a session
+cannot commit. `git_access` is set per seat in the team file (or with
+`amail run --git-access`):
+
+| `git_access` | profile | what sessions may write |
+|---|---|---|
+| `worktree` (default) | `amail` | In a linked worktree: the repository's `objects/`, `refs/`, branch reflogs (`logs/refs/`) and `amail/` (see below), and the worktree's own git directory except its `commondir`, `gitdir` and `config.worktree`. Nothing else in the root of the repository's git directory: `config`, `hooks/`, `info/`, `commondir` and the main checkout's `HEAD`, `index` and `logs/HEAD` stay read-only, and so does the reflog of the branch checked out in the main checkout. In a main checkout: nothing (the session cannot commit; `amail run` says so). |
+| `full` | `amail-full` | The whole git directory of the repository and its main checkout, except `hooks/`, `config`, `config.worktree`, `modules/` and `worktrees/` (and `commondir`, `gitdir` and `config.worktree` in each linked worktree's git directory). For a seat that merges in the main checkout. |
+| `off` | `amail-off` | No git grant. |
+
+The staged-merge template gives its root seat `full` when the team has
+other seats (the root merges into the main branch in the main checkout);
+`amail up` names such seats in its output. Everyone else gets `worktree`
+unless the team file says otherwise. With `full`, a session can make git
+run commands outside its sandbox (see [security](security.md), "Codex seats
+and git"); give it only to seats that need it.
+
+How it is set up:
+
+- All Codex seats of a host share one Codex home, and with it one
+  `default_permissions` (`amail`). The `amail` profile holds the
+  `worktree` grants of every such seat on the host: a session can also write
+  the git directories of the other seats' worktrees. A seat with `full` or
+  `off` gets its own profile through a project config amail writes into
+  its working directory, `.codex/config.toml` (with a `.codex/.gitignore`
+  so git ignores both); Codex reads `default_permissions` from there, and
+  keeps `.codex/` read-only inside the sandbox. amail removes the file when
+  the seat goes back to `worktree`. A seat does not start when a
+  `.codex/config.toml` amail did not write sets `default_permissions` in
+  its working directory or a directory above it in the checkout, or when
+  another seat with another `git_access` uses the same directory.
+- Git takes the lock `packed-refs.lock` in the directory of `packed-refs`
+  whenever it deletes a ref, which a rebase does. So that `worktree`
+  sessions can take it without write access to the root of the git
+  directory, the node moves `packed-refs` into `.git/amail/` and leaves a
+  symbolic link `.git/packed-refs -> amail/packed-refs` (git follows it when
+  it reads, locks and rewrites the file). The file itself stays read-only
+  in the sandbox. To undo, move `.git/amail/packed-refs` back over the link.
+- Codex accepts only directories as write roots (a file as a write root
+  stops the sandbox from starting), and a missing file can only be made
+  read-only as an empty placeholder, so the grants are directories minus
+  read-only entries, not a list of files.
+
+Consequences:
 
 - Codex needs network access in its sandbox to reach the amail server:
   with networking disabled, the sandbox refuses both TCP and Unix-socket
   connections. The dedicated home allows it.
-- Permissions are per host, not per seat: every Codex session on a host may
-  write the git directories of all Codex seats' repositories on that host.
-- Sessions cannot change git config (`git config`, `git remote add`,
-  `git branch --set-upstream-to`, which prints an error but exits with
-  status 0), add worktrees, or initialise or commit in submodules. Do these
-  outside the session.
-- A Codex seat does not start while a git directory in the profile contains
-  a `commondir` file where git never creates one (a repository's own git
-  directory).
+- With `worktree`, sessions commit, amend, rebase, merge, cherry-pick,
+  stash, reset, tag and create branches in a linked worktree. They cannot
+  delete branches or tags (`git branch -d` rewrites `packed-refs`), change
+  git config (`git config`, `git remote add`, `git branch
+  --set-upstream-to`, which prints an error but exits with status 0), add
+  worktrees, or initialise or commit in submodules. Do these outside the
+  session. A Codex seat whose working directory is a main checkout needs a
+  linked worktree (`amail up` creates them for the staged-merge template)
+  or `full` to commit.
+- A Codex seat does not start while a repository it may write contains a
+  `commondir` file in its git directory (git never creates one there), or a
+  symbolic link in `refs/`, `logs/`, `amail/` or a linked worktree's git
+  directory (git never creates those either). `amail up` checks the same
+  before it runs git in the repository.
 - Codex's sandbox needs unprivileged user namespaces. Some distributions
   restrict them (for example `kernel.apparmor_restrict_unprivileged_userns
   = 1`); then every sandboxed command fails. `amail doctor` checks this.
@@ -158,9 +195,10 @@ loads its earlier session), and sends the first prompt. The same line
 appears in the seat's pane: open that URL in a browser to use the
 session. The pane shows the host's log, not the conversation.
 
-All dsh seats of a host share one dsh home (`<state dir>/dsh-home`), which
+Each dsh seat has its own dsh home (`<state dir>/dsh-home/<seat>`), which
 amail sets up to write uncompressed JSONL session logs; your own `~/.dsh`
-is not used. A per-seat `--patch` overlay sets the system prompt (the mail
+is not used. The endpoint file with the host's address and launch token is
+in a directory of its own for each seat (`<state dir>/dsh/run/<seat>/`). A per-seat `--patch` overlay sets the system prompt (the mail
 instructions and the seat's role) and the model (for example
 `deepseek-flash`, or `<provider>/<model>`). The node finds the launcher as
 `dsh` on `PATH`, or as `amail node --dsh-bin` (`AMAIL_DSH_BIN`).
@@ -178,8 +216,15 @@ finds its token through a profile file (`AMAIL_PROFILE`), not
 
 **Hooks.** dsh's Codex hook bridge runs `amail hook dsh` for
 `SessionStart`, `UserPromptSubmit`, `PostToolUse` and `Stop`. Hooks run as
-children of the host and see the seat's `AMAIL_SEAT`; the node answers
-them only from below the process it launched for that seat. The bridge has
+children of the host and see the seat's `AMAIL_SEAT`. The node identifies
+them by their parent processes, also inside the jail described below,
+which has its own process namespace: the kernel reports a connecting
+process's id in the node's namespace, so the chain of parents reaches the
+process the node launched for the seat. Under the restricted local policy
+the node answers a dsh hook only when it comes from below the session of
+the seat it names; under the open policy (the default) it answers it and
+reports a hook sent in another seat's name to you (see
+[security](security.md#trust-boundaries)). The bridge has
 no `SessionEnd`, permission or interrupt event. When a turn is cancelled in
 the GUI or fails, dsh runs no hook, so the wrapper follows the session log
 and reports a `turn/end` that did not complete as the end of the turn.
@@ -192,50 +237,79 @@ starts a turn; on a busy one it runs as the next turn; a session that is
 not loaded is loaded first. A sleeping seat is started again, its host
 loads the saved session, and the nudge follows.
 
-**Unattended seats run in a jail.** dsh's own sandbox modes (`read-only`,
-`workspace-write`, `danger-full-access`) limit writes only, and its file
-tools (`read`, `grep`, `glob`) read files inside the host process without
-any sandbox. So for a seat with `permission_mode = "unattended"` (in the
-team file or with `amail run --permission-mode unattended`) amail runs the
-whole host under bubblewrap (`bwrap`):
+**Unattended seats run in a jail by default.** dsh's own sandbox modes
+(`read-only`, `workspace-write`, `danger-full-access`) limit writes only,
+and its file tools (`read`, `grep`, `glob`) read files inside the host
+process without any sandbox. So for a seat with `permission_mode =
+"unattended"` (in the team file or with `amail run --permission-mode
+unattended`) amail runs the whole host under bubblewrap (`bwrap`), unless
+the jail is turned off for the seat (see below):
 
 - the system is mounted read-only, and the jail has its own process
   namespace (other processes and their environments are not visible);
 - the home directory, `/tmp` and `$XDG_RUNTIME_DIR` are empty;
 - the Docker, Podman and containerd sockets are covered by `/dev/null`
   (a Unix socket can be used through a read-only mount);
-- mounted back writable: the seat's working directory, its git directory
-  and the repository's common git directory, and the dsh home;
-- in the git directories, the same entries as for Codex seats stay
-  read-only (`hooks/`, `config`, `config.worktree`, `modules/`,
-  `worktrees/`, and `commondir` and `config.worktree` of linked worktrees);
-  those that do not exist are covered by an empty read-only placeholder,
-  which leaves an empty file or directory of that name in the git
-  directory. A seat does not start while a repository's git directory
-  contains a `commondir` file;
+- mounted back writable: the seat's working directory and its own dsh
+  home;
+- git follows the seat's `git_access` (in the team file or `amail run
+  --git-access`), with the same rules as for Codex seats (see
+  [Codex](#codex)): with `worktree` (the default) a seat in a linked
+  worktree may write the repository's `objects/`, `refs/`, `logs/refs/` and
+  `amail/` (where `packed-refs` is moved) and its worktree's own git
+  directory, and everything else in the repository's git directory stays
+  read-only, so it can commit, tag, rebase and merge but not delete
+  branches or tags or change git config; a seat in a main checkout cannot
+  commit with `worktree` (`amail run` says so). `full` (the default for the
+  root of a staged-merge team that has subordinates, which merges in the
+  main checkout) makes the main checkout and the whole git directory
+  writable except `hooks/`, `config`, `config.worktree`, `modules/`,
+  `worktrees/` and, in linked worktrees' git directories, `commondir`,
+  `gitdir` and `config.worktree`. `off` makes git read-only. The working
+  directory's `.git` stays read-only unless `full` makes it writable.
+  Read-only entries that do not exist are covered by an empty read-only
+  placeholder, which leaves an empty file or directory of that name in the
+  git directory. A seat does not start while a repository's git directory
+  contains a `commondir` file or a symbolic link where git never creates
+  one;
 - mounted back read-only: the `amail` and `dsh` installations, the Node.js
-  runtime, `~/.gitconfig`, the seat's profile and patch, the endpoint
-  files and the node socket's directory;
+  runtime, `~/.gitconfig`, the repository's git directories (except what
+  the rules above make writable), the seat's profile and patch, its own
+  endpoint directory and the node socket's directory;
 - the network is shared (the model API and the amail server).
 
 Inside the jail dsh runs with `DSH_PERMISSION_MODE=danger-full-access`;
-the jail is the limit. If `bwrap` cannot run (not installed, or user
-namespaces not allowed), the seat does not start; it never runs without
-the jail. `amail doctor` checks `bwrap`. A seat that is not `unattended`
-has no jail: dsh asks for approvals in the browser, and its file tools can
-read any file the user can read.
+the jail is the limit. If the jail is on and `bwrap` cannot run (not
+installed, or user namespaces not allowed), the seat does not start and
+`amail run` prints why; it does not fall back to running without the
+jail. `amail doctor` checks `bwrap`. A seat that is not `unattended` has no
+jail: dsh asks for approvals in the browser, and its file tools can read
+any file the user can read.
 
 **What a jailed seat can still read or reach:**
 
 - every file outside the home directory and the runtime directory, read
   only;
-- the dsh home, which all dsh seats of the host share: the other dsh
-  seats' session logs, and the home's credential store
-  (`.credentials.yaml`, with the GUI's cookie secret and any key saved
-  through the GUI);
+- its own dsh home, including its credential store (`.credentials.yaml`,
+  with the GUI's cookie secret and any key saved through the GUI);
 - its own host's environment, which holds the model provider's key (dsh's
   in-process tools run in the host process);
 - the network.
+
+**Turning the jail off.** The jail is a local setting with a default, not
+a rule. To run an unattended dsh seat without it, set `dsh_jail = false`
+for the seat in the team file (or in `[defaults]` or a `workers` table),
+or start it with `amail run <seat> --dsh-jail off`. Such a seat runs with
+`DSH_PERMISSION_MODE=danger-full-access` and nothing else around it: its
+agent can read every file your operating-system user can read, including
+saved logins (`~/.config/amail/config.toml`, `~/.claude`, `~/.codex`),
+SSH keys and API keys in files, and other sessions' environments in
+`/proc`, and it can write every file your user can write. `amail up` names
+every unattended dsh seat with the jail off, `amail run` prints the same
+warning, and the node reports a change of the setting to you by system
+mail, like a change of the permission mode or of `git_access`. Turn it off
+only on a host and an account where that is acceptable, for example a
+throwaway machine or a container.
 
 **Other notes.**
 

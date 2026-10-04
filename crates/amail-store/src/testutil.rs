@@ -84,6 +84,80 @@ pub async fn open(backend: Backend, test: &str) -> Option<TestDb> {
 }
 
 impl TestDb {
+    /// Run SQL statements directly on the database (bulk test data), then
+    /// update the planner's statistics.
+    pub async fn exec(&self, statements: &[String]) {
+        if self.url.starts_with("sqlite:") {
+            let mut c = sqlx::SqliteConnection::connect(&self.url)
+                .await
+                .expect("connect");
+            for s in statements {
+                sqlx::raw_sql(s).execute(&mut c).await.expect(s);
+            }
+            sqlx::raw_sql("ANALYZE")
+                .execute(&mut c)
+                .await
+                .expect("analyze");
+        } else {
+            let mut c = sqlx::PgConnection::connect(&self.url)
+                .await
+                .expect("connect");
+            for s in statements {
+                sqlx::raw_sql(s).execute(&mut c).await.expect(s);
+            }
+            sqlx::raw_sql("ANALYZE")
+                .execute(&mut c)
+                .await
+                .expect("analyze");
+        }
+    }
+
+    /// Recount the pending and unread counters of the org's seats from
+    /// their deliveries, and record their threads, after deliveries were
+    /// inserted directly (sending keeps both; on Postgres a direct insert
+    /// does not).
+    pub async fn recount_seats(&self, org_id: i64) {
+        self.exec(&[
+            format!("UPDATE seats SET \
+ pending_to = (SELECT COUNT(*) FROM deliveries d WHERE d.seat_id = seats.id AND d.notified_at IS NULL AND d.mode = 'immediate' AND d.class = 'to'), \
+ pending_cc = (SELECT COUNT(*) FROM deliveries d WHERE d.seat_id = seats.id AND d.notified_at IS NULL AND d.mode = 'immediate' AND d.class = 'cc'), \
+ pending_list = (SELECT COUNT(*) FROM deliveries d WHERE d.seat_id = seats.id AND d.notified_at IS NULL AND d.mode = 'immediate' AND d.class = 'list'), \
+ pending_urgent = (SELECT COUNT(*) FROM deliveries d JOIN messages m ON m.id = d.message_id WHERE d.seat_id = seats.id AND d.notified_at IS NULL AND d.mode = 'immediate' AND m.priority = 'urgent'), \
+ pending_digest = (SELECT COUNT(*) FROM deliveries d WHERE d.seat_id = seats.id AND d.notified_at IS NULL AND d.mode = 'digest'), \
+ unread = (SELECT COUNT(*) FROM deliveries d WHERE d.seat_id = seats.id AND d.read_at IS NULL AND d.mode <> 'archive'), \
+ pending_digest_since = (SELECT MIN(m.created_at) FROM deliveries d JOIN messages m ON m.id = d.message_id WHERE d.seat_id = seats.id AND d.notified_at IS NULL AND d.mode = 'digest') WHERE org_id = {org_id}"),
+            format!(
+                "INSERT INTO thread_seats (thread_id, org_id, seat_id) \
+                 SELECT DISTINCT m.thread_id, d.org_id, d.seat_id FROM deliveries d \
+                 JOIN messages m ON m.id = d.message_id WHERE d.org_id = {org_id} \
+                 ON CONFLICT DO NOTHING"
+            ),
+        ])
+            .await;
+    }
+
+    /// Rows of a query whose columns are all integers (`BIGINT`), in order.
+    pub async fn rows_i64(&self, sql: &str) -> Vec<Vec<i64>> {
+        use sqlx::Row;
+        if self.url.starts_with("sqlite:") {
+            let mut c = sqlx::SqliteConnection::connect(&self.url)
+                .await
+                .expect("connect");
+            let rows = sqlx::query(sql).fetch_all(&mut c).await.expect(sql);
+            rows.iter()
+                .map(|r| (0..r.len()).map(|i| r.get::<i64, _>(i)).collect())
+                .collect()
+        } else {
+            let mut c = sqlx::PgConnection::connect(&self.url)
+                .await
+                .expect("connect");
+            let rows = sqlx::query(sql).fetch_all(&mut c).await.expect(sql);
+            rows.iter()
+                .map(|r| (0..r.len()).map(|i| r.get::<i64, _>(i)).collect())
+                .collect()
+        }
+    }
+
     /// Store `n` messages from seat `seat_id` of org `org_id` directly in
     /// the database, each its own thread with subject `filler <i>` and the
     /// given body, without deliveries (for tests that need much mail).
@@ -126,6 +200,50 @@ impl TestDb {
                 .execute(&mut c)
                 .await
                 .expect("analyze");
+        }
+    }
+}
+
+impl TestDb {
+    /// For every org: `(id, stored_bytes, the same count computed from
+    /// scratch)`. The second count comes from running the storage migration
+    /// (`0013_storage_deliveries.sql`) again in a transaction that is then
+    /// rolled back.
+    pub async fn storage_counts(&self) -> Vec<(i64, i64, i64)> {
+        const SQLITE: &str = include_str!("../migrations/sqlite/0013_storage_deliveries.sql");
+        const PG: &str = include_str!("../migrations/postgres/0013_storage_deliveries.sql");
+        const READ: &str = "SELECT id, stored_bytes FROM orgs ORDER BY id";
+        // Concurrent sends wait until the counts are read: SQLite takes the
+        // write lock at once, Postgres locks `orgs` (a send updates its
+        // org's row last, so its rows are either all visible or none).
+        macro_rules! run {
+            ($c:expr, $begin:expr, $recount:expr) => {{
+                sqlx::raw_sql($begin).execute(&mut $c).await.expect("begin");
+                let now: Vec<(i64, i64)> =
+                    sqlx::query_as(READ).fetch_all(&mut $c).await.expect("read");
+                sqlx::raw_sql($recount)
+                    .execute(&mut $c)
+                    .await
+                    .expect("recount");
+                let new: Vec<(i64, i64)> =
+                    sqlx::query_as(READ).fetch_all(&mut $c).await.expect("read");
+                sqlx::raw_sql("ROLLBACK")
+                    .execute(&mut $c)
+                    .await
+                    .expect("rollback");
+                now.iter().zip(&new).map(|(a, b)| (a.0, a.1, b.1)).collect()
+            }};
+        }
+        if self.url.starts_with("sqlite:") {
+            let mut c = sqlx::SqliteConnection::connect(&self.url)
+                .await
+                .expect("connect");
+            run!(c, "BEGIN IMMEDIATE", SQLITE)
+        } else {
+            let mut c = sqlx::PgConnection::connect(&self.url)
+                .await
+                .expect("connect");
+            run!(c, "BEGIN; LOCK TABLE orgs IN SHARE ROW EXCLUSIVE MODE", PG)
         }
     }
 }
