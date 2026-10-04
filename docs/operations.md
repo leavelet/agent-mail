@@ -317,6 +317,16 @@ the page is full or the oldest message is reached. The web interface's
 archive page loads the next part when the user asks for more; API clients
 repeat the request with `before_id` set to `next_before_id`.
 
+`amail-bench --mode tenants` measures one org's load against another
+org's latency: it gives one org about 2,000,000 delivery rows (with
+`--rows`) and lets it call one endpoint after another from 128 loops over
+64 tokens, while it measures the other org's inbox reads, sends and claims.
+On Postgres (server on 2 cores, database on 4, public-mode limits) the
+other org's median latencies stayed within 1.6 times their idle values for
+every endpoint; before these limits they reached 10 to 60 seconds. Run
+once; on SQLite, where the database works on the server's cores, a flood
+of `GET /pending` (200 seats) still tripled them.
+
 Search and the archive start from the org's own messages, so their cost
 does not grow with other orgs' mail. Measured on the same host with 500,000
 messages of one org (bodies of about 600 bytes) and a second org with one
