@@ -111,7 +111,7 @@ pub struct Opts {
     /// tenants: comma-separated phases (see `tenants.rs`).
     #[arg(
         long,
-        default_value = "pending,counts,overview,attention,thread,own-thread,search,archive,lists,status,changes,inbox,all"
+        default_value = "pending,counts,overview,attention,thread,own-thread,search,archive,lists,status,changes,inbox,claim,all"
     )]
     phases: String,
     /// Write per-rate results as JSON lines to this file.

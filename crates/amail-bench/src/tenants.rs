@@ -21,7 +21,8 @@
 //! Phases (`--phases`, comma-separated): `pending`, `counts`, `overview`,
 //! `attention`, `thread` (the victim's thread, which the attacker cannot
 //! see), `own-thread`, `search`, `archive`, `lists`, `status`, `changes`,
-//! `inbox`, `all` (every endpoint above at once).
+//! `inbox`, `claim` (claims of `to` mail by a seat with only list mail
+//! pending), `all` (every endpoint above at once).
 
 use crate::{Opts, pct};
 use anyhow::{Context, Result, bail};
@@ -70,8 +71,13 @@ pub async fn run(o: &Opts, http: &reqwest::Client) -> Result<()> {
                         let path = &paths[n % paths.len()];
                         let token = &tokens[n % tokens.len()];
                         n += 1;
-                        let code = match http
-                            .get(format!("{base}{path}"))
+                        let req = match path.strip_prefix("POST ") {
+                            Some(p) => http
+                                .post(format!("{base}{p}"))
+                                .json(&json!({"via": "bench", "classes": ["to"], "limit": 1})),
+                            None => http.get(format!("{base}{path}")),
+                        };
+                        let code = match req
                             .bearer_auth(token)
                             .timeout(Duration::from_secs(60))
                             .send()
@@ -137,10 +143,32 @@ pub async fn run(o: &Opts, http: &reqwest::Client) -> Result<()> {
                 )?;
             }
         }
-        // Let the server finish what the attacker left running.
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        settle(http, &base, &s.vic[0]).await;
     }
     Ok(())
+}
+
+/// Wait until the server has finished what the attacker left running: ten
+/// victim inbox reads in a row under 50 ms (at most three minutes).
+async fn settle(http: &reqwest::Client, base: &str, token: &str) {
+    let until = Instant::now() + Duration::from_secs(180);
+    let mut fast = 0;
+    while fast < 10 && Instant::now() < until {
+        let t = Instant::now();
+        let ok = http
+            .get(format!("{base}/v1/inbox?limit=50"))
+            .bearer_auth(token)
+            .timeout(Duration::from_secs(60))
+            .send()
+            .await
+            .is_ok();
+        if ok && t.elapsed() < Duration::from_millis(50) {
+            fast += 1;
+        } else {
+            fast = 0;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 fn attack_paths(phase: &str, s: &Setup) -> Result<Vec<String>> {
@@ -158,6 +186,8 @@ fn attack_paths(phase: &str, s: &Setup) -> Result<Vec<String>> {
             "status" => format!("/v1/messages/{}/status", s.atk_message),
             "changes" => "/v1/changes?seat=a001&limit=5000".to_string(),
             "inbox" => "/v1/inbox?seat=a001&limit=1000".to_string(),
+            // A claim of `to` mail only, of a seat with only list mail pending.
+            "claim" => "POST /v1/claim?seat=a001".to_string(),
             other => bail!("unknown phase {other:?}"),
         }])
     };
@@ -176,6 +206,7 @@ fn attack_paths(phase: &str, s: &Setup) -> Result<Vec<String>> {
             "status",
             "changes",
             "inbox",
+            "claim",
         ] {
             v.extend(one(p)?);
         }
