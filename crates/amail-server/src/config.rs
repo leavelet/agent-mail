@@ -16,6 +16,10 @@ use std::time::Duration;
 pub struct Limits {
     /// Live agent seats per org.
     pub seats_per_org: Option<i64>,
+    /// Lists per org.
+    pub lists_per_org: Option<i64>,
+    /// Live tokens per org (all scopes; launch tokens replace each other).
+    pub tokens_per_org: Option<i64>,
     /// Messages per second over all orgs.
     pub global_send_per_sec: Option<f64>,
     /// Messages per second per org (on top of each seat's send budget).
@@ -37,6 +41,8 @@ impl Limits {
     pub fn public() -> Self {
         Limits {
             seats_per_org: Some(200),
+            lists_per_org: Some(500),
+            tokens_per_org: Some(1000),
             global_send_per_sec: Some(500.0),
             org_send_per_sec: Some(50.0),
             org_streams: Some(32),

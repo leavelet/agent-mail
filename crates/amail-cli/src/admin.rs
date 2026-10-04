@@ -141,7 +141,7 @@ pub enum TokenAdminCmd {
 async fn open(db: &str) -> Result<Arc<dyn Store>> {
     amail_store::open(db, &amail_store::OpenOptions { max_connections: 2 })
         .await
-        .with_context(|| format!("opening {db}"))
+        .with_context(|| format!("opening {}", crate::redact_db_url(db)))
 }
 
 fn ts(ms: i64) -> String {

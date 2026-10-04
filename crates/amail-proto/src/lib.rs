@@ -361,6 +361,10 @@ pub struct RecipientStatus {
 pub struct ThreadResponse {
     pub thread_id: i64,
     pub messages: Vec<Message>,
+    /// Older messages were left out (a thread answers at most its newest
+    /// 500 messages).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

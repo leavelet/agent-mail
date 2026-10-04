@@ -41,6 +41,7 @@ public_tests!(
     token_rotation_and_reset,
     seat_and_send_limits,
     stream_request_and_link_limits,
+    list_token_and_sign_in_limits,
     webhook_targets_public_mode,
     webhook_redirects_not_followed,
     forwarded_headers_need_trusted_proxy,
@@ -681,6 +682,74 @@ async fn stream_request_and_link_limits(b: Backend, t: &str) {
         .await;
     assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{v}");
     drop(l1);
+}
+
+async fn list_token_and_sign_in_limits(b: Backend, t: &str) {
+    let mut cfg = public();
+    cfg.limits.lists_per_org = Some(2);
+    cfg.limits.tokens_per_org = Some(3); // the user token counts
+    cfg.limits.token_requests_per_sec = Some(1.0); // a burst of two
+    let srv = start!(b, t, cfg);
+    let acme = srv.org("acme").await;
+    let beta = srv.org("beta").await;
+    for n in ["l1", "l2"] {
+        acme.ok(Method::POST, "/lists", Some(json!({ "name": n })))
+            .await;
+    }
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    let (s, v) = acme
+        .call(Method::POST, "/lists", Some(json!({ "name": "l3" })))
+        .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+    assert_eq!(v["error"]["code"], "list_limit");
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    acme.ok(Method::POST, "/seats", Some(json!({ "name": "a" })))
+        .await;
+    acme.ok(Method::POST, "/seats/a/tokens", None).await;
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    let node = acme
+        .ok(Method::POST, "/tokens", Some(json!({ "scope": "node" })))
+        .await;
+    let (s, v) = acme.call(Method::POST, "/seats/a/tokens", None).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+    assert_eq!(v["error"]["code"], "token_limit");
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    // Revoking makes room.
+    let id = acme
+        .ok(Method::GET, "/tokens", None)
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["scope"] == "node")
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    acme.ok(Method::DELETE, &format!("/tokens/{id}"), None)
+        .await;
+    let _ = node;
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    acme.ok(Method::POST, "/seats/a/tokens", None).await;
+    // Other orgs are not affected.
+    beta.ok(Method::POST, "/lists", Some(json!({ "name": "l1" })))
+        .await;
+    // Sign-ins count against the token's request rate.
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    let codes: Vec<StatusCode> = {
+        let mut v = Vec::new();
+        for _ in 0..3 {
+            v.push(srv.login(&acme.token, &[]).await.0);
+        }
+        v
+    };
+    assert_eq!(
+        codes,
+        vec![
+            StatusCode::OK,
+            StatusCode::OK,
+            StatusCode::TOO_MANY_REQUESTS
+        ]
+    );
 }
 
 /// A tiny HTTP server that records requests; `redirect` answers every

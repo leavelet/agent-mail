@@ -170,6 +170,9 @@ pub async fn status(
     }))
 }
 
+/// The most messages `GET /v1/threads/{id}` answers (the newest ones).
+pub const MAX_THREAD_MESSAGES: i64 = 500;
+
 pub async fn thread(
     State(st): State<AppState>,
     auth: Auth,
@@ -179,12 +182,20 @@ pub async fn thread(
     if auth.scope == TokenScope::Seat && !st.store.seat_in_thread(seat.id, id).await? {
         return Err(ApiError::not_found(format!("no thread {id}")));
     }
-    let messages = st.store.thread(id, auth.org.id).await?;
+    let mut messages = st
+        .store
+        .thread(id, auth.org.id, MAX_THREAD_MESSAGES + 1)
+        .await?;
     if messages.is_empty() {
         return Err(ApiError::not_found(format!("no thread {id}")));
     }
+    let truncated = messages.len() as i64 > MAX_THREAD_MESSAGES;
+    if truncated {
+        messages.remove(0);
+    }
     Ok(Json(p::ThreadResponse {
         thread_id: id,
+        truncated,
         messages: messages
             .iter()
             .map(|m| render::message(m, &auth.org))

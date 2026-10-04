@@ -157,8 +157,9 @@ pub trait Store: Send + Sync + 'static {
     /// True if the seat sent or received any message in the thread.
     async fn seat_in_thread(&self, seat_id: i64, thread_id: i64) -> Result<bool>;
     async fn delivery(&self, message_id: i64, seat_id: i64) -> Result<Option<DeliveryRec>>;
-    /// Messages of a thread visible to `org_id`, oldest first, with bodies.
-    async fn thread(&self, thread_id: i64, org_id: i64) -> Result<Vec<MessageRec>>;
+    /// Messages of a thread visible to `org_id`, with bodies: the newest
+    /// `limit`, oldest first.
+    async fn thread(&self, thread_id: i64, org_id: i64, limit: i64) -> Result<Vec<MessageRec>>;
     async fn inbox(&self, seat_id: i64, q: &InboxQuery) -> Result<Vec<Entry>>;
     /// Mark the seat's delivery read. `None` if the seat has no delivery.
     async fn mark_read(

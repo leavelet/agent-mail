@@ -161,6 +161,7 @@ pub async fn seat_token(
         .seat_by_name(auth.org.id, &name)
         .await?
         .ok_or_else(|| ApiError::not_found(format!("no seat {name:?}")))?;
+    check_token_room(&st, auth.org.id).await?;
     let token = new_token();
     let label = body.and_then(|b| b.label);
     st.store
@@ -204,6 +205,7 @@ pub async fn org_token(
             ));
         }
     };
+    check_token_room(&st, auth.org.id).await?;
     let token = new_token();
     st.store
         .create_token(&NewToken {
@@ -225,6 +227,19 @@ pub async fn org_token(
 }
 
 /// `GET /v1/tokens`: live tokens of the org (labels and scopes only).
+/// Public mode: refuse a new token when the org holds the most it may.
+async fn check_token_room(st: &AppState, org_id: i64) -> ApiResult<()> {
+    if let Some(max) = st.config.limits.tokens_per_org
+        && st.store.tokens(org_id).await?.len() as i64 >= max
+    {
+        return Err(ApiError::unprocessable(
+            "token_limit",
+            format!("this server allows at most {max} live tokens per org; revoke some first"),
+        ));
+    }
+    Ok(())
+}
+
 pub async fn list_tokens(
     State(st): State<AppState>,
     auth: Auth,
@@ -299,6 +314,14 @@ pub async fn create_list(
 ) -> ApiResult<(StatusCode, Json<p::List>)> {
     auth.require_user()?;
     crate::public::check_new_name(&st, &list.name)?;
+    if let Some(max) = st.config.limits.lists_per_org
+        && st.store.lists(auth.org.id).await?.len() as i64 >= max
+    {
+        return Err(ApiError::unprocessable(
+            "list_limit",
+            format!("this server allows at most {max} lists per org"),
+        ));
+    }
     let l = st.store.create_list(auth.org.id, &list).await?;
     Ok((
         StatusCode::CREATED,

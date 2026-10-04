@@ -280,6 +280,12 @@ struct ServeOpts {
     /// Agent seats per org (public default 200; 0: no limit).
     #[arg(long, env = "AMAIL_MAX_SEATS_PER_ORG")]
     max_seats_per_org: Option<i64>,
+    /// Lists per org (public default 500; 0: no limit).
+    #[arg(long, env = "AMAIL_MAX_LISTS_PER_ORG")]
+    max_lists_per_org: Option<i64>,
+    /// Live tokens per org (public default 1000; 0: no limit).
+    #[arg(long, env = "AMAIL_MAX_TOKENS_PER_ORG")]
+    max_tokens_per_org: Option<i64>,
     /// Messages per second, all orgs, per instance (public default 500).
     #[arg(long, env = "AMAIL_MAX_SENDS_PER_SEC")]
     max_sends_per_sec: Option<f64>,
@@ -329,6 +335,12 @@ impl ServeOpts {
         let pos_f = |v: f64| (v > 0.0).then_some(v);
         if let Some(v) = self.max_seats_per_org {
             l.seats_per_org = (v > 0).then_some(v);
+        }
+        if let Some(v) = self.max_lists_per_org {
+            l.lists_per_org = (v > 0).then_some(v);
+        }
+        if let Some(v) = self.max_tokens_per_org {
+            l.tokens_per_org = (v > 0).then_some(v);
         }
         if let Some(v) = self.max_sends_per_sec {
             l.global_send_per_sec = pos_f(v);
@@ -1484,7 +1496,7 @@ async fn serve(
     let _lock = lock_sqlite(db)?;
     let store = amail_store::open(db, &amail_store::OpenOptions { max_connections })
         .await
-        .with_context(|| format!("opening {db}"))?;
+        .with_context(|| format!("opening {}", redact_db_url(db)))?;
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .with_context(|| format!("binding {listen}"))?;
@@ -1544,6 +1556,21 @@ struct NodeFile {
     token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     label: Option<String>,
+}
+
+/// A database URL without its password, for messages and logs.
+fn redact_db_url(db: &str) -> String {
+    let Some((scheme, rest)) = db.split_once("://") else {
+        return db.to_string();
+    };
+    let (auth, host) = match rest.rsplit_once('@') {
+        Some(x) => x,
+        None => return db.to_string(),
+    };
+    match auth.split_once(':') {
+        Some((user, _)) => format!("{scheme}://{user}:***@{host}"),
+        None => db.to_string(),
+    }
 }
 
 /// Commands that need what only Linux offers today (`/proc`, the
@@ -1769,4 +1796,19 @@ fn run_seat(
     }
     let err = cmd.exec();
     Err(anyhow::anyhow!("starting {}: {err}", plan.program))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn db_urls_are_redacted() {
+        assert_eq!(
+            super::redact_db_url("postgres://amail:s3cret@db:5432/amail"),
+            "postgres://amail:***@db:5432/amail"
+        );
+        assert_eq!(
+            super::redact_db_url("sqlite:///data/amail.db"),
+            "sqlite:///data/amail.db"
+        );
+    }
 }

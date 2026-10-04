@@ -149,6 +149,16 @@ pub async fn login(
     if auth.org.suspended_at.is_some() {
         return Err(crate::auth::suspended());
     }
+    // Each sign-in stores a session: it counts against the token's rate.
+    if let Some(b) = &st.limiters.token_requests
+        && let Err(ms) = b.take(&(0, auth.token_id))
+    {
+        return Err(ApiError::too_many(
+            "rate_limited",
+            "too many requests for this token",
+            ms,
+        ));
+    }
     if auth.scope != TokenScope::User {
         return Err(ApiError::forbidden(
             "only user tokens can sign in to the web interface",

@@ -1314,16 +1314,18 @@ macro_rules! impl_store_common {
                 r.map(DelivRow::into_delivery).transpose()
             }
 
-            pub async fn thread(c: &mut Conn, thread_id: i64, org_id: i64) -> Result<Vec<MessageRec>> {
-                let rows: Vec<MsgRow> = sqlx::query_as(concat!(
+            pub async fn thread(c: &mut Conn, thread_id: i64, org_id: i64, limit: i64) -> Result<Vec<MessageRec>> {
+                let mut rows: Vec<MsgRow> = sqlx::query_as(concat!(
                     "SELECT ", msg_cols!(), ", m.body FROM messages m", msg_joins!(),
                     " WHERE m.thread_id = $1 AND (m.org_id = $2 OR EXISTS \
-                     (SELECT 1 FROM deliveries d WHERE d.message_id = m.id AND d.org_id = $2)) ORDER BY m.id"
+                     (SELECT 1 FROM deliveries d WHERE d.message_id = m.id AND d.org_id = $2)) ORDER BY m.id DESC LIMIT $3"
                 ))
                 .bind(thread_id)
                 .bind(org_id)
+                .bind(limit)
                 .fetch_all(&mut *c)
                 .await?;
+                rows.reverse();
                 collect(rows, MsgRow::into_message)
             }
 
@@ -2372,8 +2374,8 @@ macro_rules! impl_store_common {
                 run!(self.read, |c| q::delivery(c, message_id, seat_id).await)
             }
 
-            async fn thread(&self, thread_id: i64, org_id: i64) -> $crate::Result<Vec<$crate::MessageRec>> {
-                run!(self.read, |c| q::thread(c, thread_id, org_id).await)
+            async fn thread(&self, thread_id: i64, org_id: i64, limit: i64) -> $crate::Result<Vec<$crate::MessageRec>> {
+                run!(self.read, |c| q::thread(c, thread_id, org_id, limit).await)
             }
 
             async fn inbox(&self, seat_id: i64, query: &$crate::InboxQuery) -> $crate::Result<Vec<$crate::Entry>> {

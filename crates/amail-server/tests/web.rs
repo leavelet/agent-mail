@@ -79,7 +79,14 @@ impl Server {
         Some(Server {
             base,
             db,
-            http: reqwest::Client::new(),
+            // No idle connections: with keep-alive connections next to
+            // several open event streams, a request occasionally waited
+            // forever for a pooled connection (seen about once in 25 runs
+            // of transcript_relay, in the HTTP client, not the server).
+            http: reqwest::Client::builder()
+                .pool_max_idle_per_host(0)
+                .build()
+                .unwrap(),
             state,
         })
     }

@@ -768,12 +768,16 @@ async fn threads_and_visibility(s: S) {
 
     let ids = |v: Vec<MessageRec>| v.into_iter().map(|m| m.id).collect::<Vec<_>>();
     assert_eq!(
-        ids(s.thread(root.thread_id, o.id).await.unwrap()),
+        ids(s.thread(root.thread_id, o.id, 1000).await.unwrap()),
         vec![root.message_id, reply.message_id, side.message_id]
     );
     assert_eq!(
-        ids(s.thread(root.thread_id, o2.id).await.unwrap()),
+        ids(s.thread(root.thread_id, o2.id, 1000).await.unwrap()),
         vec![root.message_id, reply.message_id, internal.message_id]
+    );
+    assert_eq!(
+        ids(s.thread(root.thread_id, o.id, 2).await.unwrap()),
+        vec![reply.message_id, side.message_id]
     );
     assert!(s.org_sees_message(o.id, reply.message_id).await.unwrap());
     assert!(!s.org_sees_message(o.id, internal.message_id).await.unwrap());
