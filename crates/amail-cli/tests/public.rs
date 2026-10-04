@@ -274,7 +274,7 @@ async fn onboarding(backend: Backend) {
     // An agent's environment wins over the saved login.
     let as_w1 = [("AMAIL_URL", url.as_str()), ("AMAIL_TOKEN", w1.as_str())];
     let inbox = env.ok(&["inbox"], &as_w1, None);
-    assert!(inbox.contains("owner (user): Kickoff"), "{inbox}");
+    assert!(inbox.contains("owner (USER): Kickoff"), "{inbox}");
     let id = inbox
         .trim_start_matches('#')
         .split_whitespace()

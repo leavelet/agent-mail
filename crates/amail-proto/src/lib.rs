@@ -7,6 +7,7 @@ use std::fmt;
 use std::str::FromStr;
 
 mod address;
+pub mod text;
 pub use address::{Address, AddressError, valid_name};
 
 /// Declares a string-valued enum with `as_str`, `FromStr`, `Display` and serde

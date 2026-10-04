@@ -8,7 +8,7 @@ mod profiles;
 mod service;
 mod team_cmd;
 
-use amail_proto::{self as p, DeliveryMode, PostPolicy};
+use amail_proto::{self as p, DeliveryMode, PostPolicy, text};
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use client::{Client, enc, is_not_found};
@@ -672,7 +672,7 @@ fn main() -> ExitCode {
         {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
-                eprintln!("error: {e:#}");
+                eprintln!("error: {}", text::multiline(&format!("{e:#}")));
                 ExitCode::FAILURE
             }
         };
@@ -684,7 +684,8 @@ fn main() -> ExitCode {
     match rt.block_on(run(cli)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("error: {e:#}");
+            // Error messages can quote what the server sent.
+            eprintln!("error: {}", text::multiline(&format!("{e:#}")));
             ExitCode::FAILURE
         }
     }
@@ -700,9 +701,12 @@ impl Out {
         if self.json {
             println!("{}", serde_json::to_string(v)?);
         } else {
+            // Fields are made safe where they are rendered; this pass makes
+            // sure no control or invisible character reaches the terminal
+            // from a renderer that missed one.
             let t = text()?;
             if !t.is_empty() {
-                println!("{t}");
+                println!("{}", text::multiline(&t));
             }
         }
         Ok(())
@@ -1101,7 +1105,7 @@ async fn run(cli: Cli) -> Result<()> {
                 for e in &r.entries {
                     text.push(output::entry_line(e));
                     if let Some(b) = &e.body {
-                        text.extend(b.lines().map(|l| format!("  {l}")));
+                        text.push(amail_proto::text::quote(b));
                     }
                 }
                 Ok(text.join("\n"))

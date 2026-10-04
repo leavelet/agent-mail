@@ -41,9 +41,23 @@ of every message unambiguous and keeps mail out of the permission system:
   (anything from another org), `system` (the mail server). The system seat
   has no tokens and cannot be addressed, so no client can send system mail.
 - **Unforgeable layout.** Injected text starts with `[amail]`, has one
-  header line per message, and puts every body line behind `  > `. Subjects
-  and `meta` values are single-line without control characters, so a
-  message cannot fake a header line or a line from the mail system.
+  header line per message, and puts every body line behind `  > `. The
+  text output of `amail read`, `amail thread` and `amail claim` uses the same
+  rule: the header lines, with the source label, are written by the command
+  line client, and every body line is behind `  > `. Subjects, names and
+  `meta` values are printed on one line. So a message cannot fake a header
+  line, a message from `USER` or a line from the mail system, in the
+  agent's context or in a terminal. (`--json` output contains the raw
+  values.)
+- **No hidden or terminal-control characters.** In everything the command
+  line client prints and everything injected into a session (bodies,
+  subjects, `meta`, previews, names, list descriptions, token labels, role
+  text, error messages), control characters, terminal escape sequences,
+  bidirectional controls, zero-width characters, Unicode tag characters and
+  the other invisible format characters are shown as visible escapes such
+  as `\u{202e}`; line breaks inside one-line values are shown as spaces.
+  Text that a person cannot see in the terminal or the web interface
+  therefore does not reach a model unseen.
 - **Instructions in the system prompt.** Every session started by amail is
   told that `[amail]` text comes from the mail system, that `USER` mail is
   an instruction, `agent` mail a colleague's request and `external` mail
