@@ -402,6 +402,12 @@ struct ServeOpts {
     /// pool size (`--max-connections`).
     #[arg(long, env = "AMAIL_MAX_QUERIES")]
     max_queries: Option<usize>,
+    /// Failed authentications per minute per client address, bursts of
+    /// three minutes' worth; beyond them, requests from that address with
+    /// a credential not seen valid lately get 429 (public default 10; 0: no
+    /// limit).
+    #[arg(long, env = "AMAIL_MAX_AUTH_FAILURES_PER_MIN")]
+    max_auth_failures_per_min: Option<f64>,
 }
 
 impl ServeOpts {
@@ -471,6 +477,9 @@ impl ServeOpts {
         }
         if let Some(v) = self.max_queries {
             l.queries = (v > 0).then_some(v);
+        }
+        if let Some(v) = self.max_auth_failures_per_min {
+            l.auth_failures_per_min = pos_f(v);
         }
         Ok(c)
     }

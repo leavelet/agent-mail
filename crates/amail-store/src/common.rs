@@ -2337,6 +2337,66 @@ macro_rules! impl_store_common {
                 Ok(())
             }
 
+            /// Notice mail the org received since `since`: `(mails, bytes of
+            /// subjects and bodies)`.
+            pub async fn notice_usage(c: &mut Conn, org_id: i64, since: i64) -> Result<(i64, i64)> {
+                Ok(sqlx::query_as(
+                    "SELECT CAST(COUNT(*) AS BIGINT), \
+                     CAST(COALESCE(SUM(octet_length(subject) + octet_length(body)), 0) AS BIGINT) \
+                     FROM messages WHERE org_id = $1 AND notice AND created_at >= $2",
+                )
+                .bind(org_id)
+                .bind(since)
+                .fetch_one(&mut *c)
+                .await?)
+            }
+
+            /// Delete up to `limit` notice mails created before `cutoff`
+            /// (oldest first) with their deliveries; returns how many.
+            /// Notice mail is charged to nobody, so no stored bytes change.
+            pub async fn delete_old_notices(c: &mut Conn, cutoff: i64, limit: i64) -> Result<u64> {
+                let ids: Vec<i64> = sqlx::query_scalar(
+                    "SELECT id FROM messages WHERE notice AND created_at < $1 ORDER BY created_at, id LIMIT $2",
+                )
+                .bind(cutoff)
+                .bind(limit)
+                .fetch_all(&mut *c)
+                .await?;
+                for chunk in ids.chunks(500) {
+                    let list = placeholders(1, chunk.len());
+                    // Deleting deliveries changes their seats' counters
+                    // (triggers): take the seats in id order first, as
+                    // sending does, so that a concurrent send cannot
+                    // deadlock with this.
+                    let mut steps = vec![
+                        format!("UPDATE messages SET parent_id = NULL WHERE parent_id IN ({list})"),
+                        format!("DELETE FROM deliveries WHERE message_id IN ({list})"),
+                        format!("DELETE FROM messages WHERE id IN ({list})"),
+                        format!(
+                            "DELETE FROM thread_seats WHERE thread_id IN ({list}) \
+                             AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = thread_seats.thread_id)"
+                        ),
+                    ];
+                    if DIALECT == Dialect::Postgres {
+                        steps.insert(
+                            0,
+                            format!(
+                                "SELECT id FROM seats WHERE id IN (SELECT seat_id FROM deliveries \
+                                 WHERE message_id IN ({list})) ORDER BY id FOR NO KEY UPDATE"
+                            ),
+                        );
+                    }
+                    for sql in &steps {
+                        let mut q = sqlx::query(sql);
+                        for id in chunk {
+                            q = q.bind(*id);
+                        }
+                        q.execute(&mut *c).await?;
+                    }
+                }
+                Ok(ids.len() as u64)
+            }
+
             /// The ids of `tokens` that are live, and the hashes of
             /// `sessions` that are live (unexpired, with a live token).
             pub async fn live_credentials(c: &mut Conn, tokens: &[i64], sessions: &[String], now: i64) -> Result<(Vec<i64>, Vec<String>)> {
@@ -2916,7 +2976,8 @@ macro_rules! impl_store_common {
                 let rows: Vec<(i64, i64, i64)> = sqlx::query_as(
                     "UPDATE messages SET expired_at = $1 WHERE id IN (SELECT id FROM messages \
                      WHERE created_at < $2 AND expired_at IS NULL ORDER BY created_at LIMIT $3) \
-                     AND expired_at IS NULL RETURNING id, org_id, CAST(octet_length(body) AS BIGINT)",
+                     AND expired_at IS NULL \
+                     RETURNING id, org_id, CAST(CASE WHEN notice THEN 0 ELSE octet_length(body) END AS BIGINT)",
                 )
                 .bind(now)
                 .bind(cutoff)
@@ -2938,9 +2999,10 @@ macro_rules! impl_store_common {
                     q.execute(&mut *c).await?;
                 }
                 // Each body's bytes go back to whoever is charged for it
-                // (see `message_bytes`), in org id order.
+                // (see `message_bytes`; notice mail is charged to nobody,
+                // its size is 0 here), in org id order.
                 let mut by_sender: std::collections::BTreeMap<i64, Vec<(i64, i64)>> = Default::default();
-                for (id, org, n) in &rows {
+                for (id, org, n) in rows.iter().filter(|r| r.2 != 0) {
                     by_sender.entry(*org).or_default().push((*id, *n));
                 }
                 // (`stored_bytes`, `kept_bytes`) freed per org.
@@ -3118,14 +3180,16 @@ macro_rules! impl_store_common {
                     );
                     with_ids!(sqlx::query(&sql), &all).execute(&mut *c).await?;
                 }
-                // What each message is charged now, without deliveries.
+                // What each message is charged now, without deliveries;
+                // `None` for notice mail, which is charged to nobody.
                 let bytes_sql = message_bytes_sql!().replace("$2", &amail_proto::limits::STORED_BYTES_PER_MESSAGE.to_string());
                 let sql = format!(
-                    "SELECT m.id, m.org_id, m.thread_id, CAST({bytes_sql} AS BIGINT) FROM messages m WHERE m.id IN ({})",
+                    "SELECT m.id, m.org_id, m.thread_id, CAST(CASE WHEN m.notice THEN NULL ELSE {bytes_sql} END AS BIGINT) \
+                     FROM messages m WHERE m.id IN ({})",
                     ids(1, &all)
                 );
-                let rows: Vec<(i64, i64, i64, i64)> = with_ids!(sqlx::query_as(&sql), &all).fetch_all(&mut *c).await?;
-                let info: std::collections::HashMap<i64, (i64, i64, i64)> =
+                let rows: Vec<(i64, i64, i64, Option<i64>)> = with_ids!(sqlx::query_as(&sql), &all).fetch_all(&mut *c).await?;
+                let info: std::collections::HashMap<i64, (i64, i64, Option<i64>)> =
                     rows.into_iter().map(|(id, o, t, b)| (id, (o, t, b))).collect();
                 // The deliveries that go: (message, org, seat).
                 let mut gone: Vec<(i64, i64, i64)> = Vec::new();
@@ -3177,7 +3241,9 @@ macro_rules! impl_store_common {
                         continue;
                     }
                     let Some((_, _, b)) = info.get(m) else { continue };
-                    freed.entry(*o).or_default().1 += b + per_delivery * n;
+                    if let Some(b) = b {
+                        freed.entry(*o).or_default().1 += b + per_delivery * n;
+                    }
                     if org.is_some() {
                         deleted.insert(*m);
                     }
@@ -3185,8 +3251,10 @@ macro_rules! impl_store_common {
                 for (m, sender) in &removed {
                     if own_set.contains(m) {
                         let Some((_, _, b)) = info.get(m) else { continue };
-                        let n = held.range((*m, i64::MIN)..=(*m, i64::MAX)).map(|(_, n)| n).sum::<i64>();
-                        freed.entry(*sender).or_default().0 += b + per_delivery * n;
+                        if let Some(b) = b {
+                            let n = held.range((*m, i64::MIN)..=(*m, i64::MAX)).map(|(_, n)| n).sum::<i64>();
+                            freed.entry(*sender).or_default().0 += b + per_delivery * n;
+                        }
                         deleted.insert(*m);
                     } else if org.is_none() {
                         deleted.insert(*m);
@@ -3735,6 +3803,14 @@ macro_rules! impl_store_common {
             async fn cleanup(&self) -> $crate::Result<()> {
                 let now = now_ms();
                 run!(self.write, |c| q::cleanup(c, now).await)
+            }
+
+            async fn notice_usage(&self, org_id: i64, since: i64) -> $crate::Result<(i64, i64)> {
+                run!(self.read, |c| q::notice_usage(c, org_id, since).await)
+            }
+
+            async fn delete_old_notices(&self, cutoff: i64, limit: i64) -> $crate::Result<u64> {
+                run!(self.write, |c| q::delete_old_notices(c, cutoff, limit).await)
             }
 
             async fn set_focus(&self, seat_id: i64, until: Option<i64>) -> $crate::Result<$crate::SeqBump> {

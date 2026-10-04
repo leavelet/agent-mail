@@ -259,6 +259,19 @@ pub mod limits {
     pub const MAX_NOTICE_ITEMS: usize = 100;
     /// Seat names listed for one action (more are counted, not named).
     pub const MAX_NOTICE_TARGETS: usize = 50;
+    /// Bytes of the body of one notice mail. One report becomes at most one
+    /// mail; items that do not fit are left out and counted.
+    pub const MAX_NOTICE_BODY_BYTES: usize = 4096;
+    /// Notice mails one org may receive in 24 hours (a sliding window,
+    /// counted in the database); reports beyond it are dropped.
+    pub const NOTICE_MAILS_PER_DAY: i64 = 50;
+    /// Bytes of notice mail (subject and body) one org may receive in 24
+    /// hours; reports beyond it are dropped.
+    pub const NOTICE_BYTES_PER_DAY: i64 = 128 * 1024;
+    /// Days after which notice mail is deleted, independent of the server's
+    /// retention setting. Notice mail is not charged to the org's storage
+    /// quota; this and the daily budget bound it instead.
+    pub const NOTICE_RETENTION_DAYS: i64 = 7;
 
     // --- responses ---
 
@@ -320,6 +333,11 @@ pub mod limits {
     /// Days after which a link request that was not accepted is dropped,
     /// whether or not an org of that name exists.
     pub const LINK_REQUEST_DAYS: i64 = 30;
+    /// Failed authentications from one client address (IPv6: one /64)
+    /// after which its requests with a credential the server has not seen
+    /// valid lately are refused before the database is asked, as a
+    /// multiple of the per-minute rate (`auth_failures_per_min`).
+    pub const AUTH_FAILURE_BURST_MINUTES: f64 = 3.0;
 
     // --- what the node reads (so a server cannot exhaust its memory) ---
 
@@ -1088,7 +1106,9 @@ pub struct NodeNotices {
     pub notices: Vec<NodeNotice>,
 }
 
-/// Answer to `POST /v1/node/notices`: the number of mails written.
+/// Answer to `POST /v1/node/notices`: the number of mails written (one
+/// report becomes at most one mail; 0 when the report was empty or the org
+/// is over its daily notice budget, in which case the report is dropped).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeNoticesAccepted {
     pub sent: usize,

@@ -292,7 +292,8 @@ pub struct StorageCount {
 /// `amail_store::message_bytes`: `stored_bytes` is the mail the org sent
 /// with all its deliveries; `kept_bytes` is, for each message of a deleted
 /// org that the org keeps deliveries of, the message's full bytes and the
-/// org's own deliveries of it. Deleted orgs count nothing. Portable
+/// org's own deliveries of it. Notice mail (`messages.notice`) counts for
+/// nobody, and deleted orgs count nothing. Portable
 /// between SQLite and Postgres.
 pub const RECOUNT: &str = "
 UPDATE orgs SET stored_bytes = 0, kept_bytes = 0;
@@ -300,13 +301,13 @@ UPDATE orgs SET stored_bytes = COALESCE((
     SELECT SUM(512 + octet_length(m.subject) + octet_length(m.body) + octet_length(m.meta)
                + octet_length(m.to_addrs) + octet_length(m.cc_addrs)
                + 384 * (SELECT COUNT(*) FROM deliveries d WHERE d.message_id = m.id))
-      FROM messages m WHERE m.org_id = orgs.id
+      FROM messages m WHERE m.org_id = orgs.id AND NOT m.notice
 ), 0), kept_bytes = COALESCE((
     SELECT SUM(512 + octet_length(m.subject) + octet_length(m.body) + octet_length(m.meta)
                + octet_length(m.to_addrs) + octet_length(m.cc_addrs)
                + 384 * (SELECT COUNT(*) FROM deliveries d WHERE d.message_id = m.id AND d.org_id = orgs.id))
       FROM messages m
-     WHERE m.org_id IN (SELECT o.id FROM orgs o WHERE o.deleted_at IS NOT NULL)
+     WHERE m.org_id IN (SELECT o.id FROM orgs o WHERE o.deleted_at IS NOT NULL) AND NOT m.notice
        AND EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = m.id AND d.org_id = orgs.id)
 ), 0) WHERE deleted_at IS NULL;
 ";

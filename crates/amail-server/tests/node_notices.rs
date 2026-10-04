@@ -33,6 +33,9 @@ notice_tests!(
     notices_go_to_the_own_user_seat_only,
     notice_fields_are_checked,
     notices_are_rate_limited,
+    one_report_is_one_bounded_mail,
+    notice_mail_has_a_daily_budget_and_no_charge,
+    old_notice_mail_is_deleted,
 );
 
 struct Server {
@@ -51,16 +54,18 @@ struct Client {
 impl Server {
     async fn start(backend: Backend, test: &str) -> Option<Server> {
         let db = amail_store::testutil::open(backend, test).await?;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let mut state = AppState::new(db.store.clone());
-        state.set_config(Config::default());
-        tokio::spawn(amail_server::serve(listener, state, std::future::pending()));
+        let base = serve(&db, |_| {}).await;
         Some(Server {
             base,
             db,
             http: reqwest::Client::new(),
         })
+    }
+
+    /// Another server instance on the same database (or the same server
+    /// after a restart): its base URL.
+    async fn instance(&self, f: impl FnOnce(&mut AppState)) -> String {
+        serve(&self.db, f).await
     }
 
     async fn org(&self, name: &str) -> Client {
@@ -76,6 +81,16 @@ impl Server {
             http: self.http.clone(),
         }
     }
+}
+
+async fn serve(db: &TestDb, f: impl FnOnce(&mut AppState)) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let mut state = AppState::new(db.store.clone());
+    state.set_config(Config::default());
+    f(&mut state);
+    tokio::spawn(amail_server::serve(listener, state, std::future::pending()));
+    base
 }
 
 macro_rules! start {
@@ -202,10 +217,11 @@ async fn notices_go_to_the_own_user_seat_only(b: Backend, t: &str) {
             })),
         )
         .await;
-    assert_eq!(v["sent"], 2, "{v}");
+    // One report is one mail.
+    assert_eq!(v["sent"], 1, "{v}");
 
     let mail = acme.system_mail().await;
-    assert_eq!(mail.len(), 3, "{mail:?}");
+    assert_eq!(mail.len(), 2, "{mail:?}");
     let (subject, body) = &mail[0];
     assert_eq!(
         subject,
@@ -234,7 +250,11 @@ async fn notices_go_to_the_own_user_seat_only(b: Backend, t: &str) {
     );
 
     let (subject, body) = &mail[1];
-    assert_eq!(subject, "Agent seat w1 used the node on host \"box\"");
+    assert_eq!(subject, "2 notices from the amail node on host \"box\"");
+    assert!(
+        body.starts_with("A process of the session of seat w1 on host \"box\""),
+        "{body}"
+    );
     assert!(
         body.contains(
             "- start or update seats (amail up): w2 (1 name that is not a seat of this org) (3 requests)"
@@ -246,9 +266,10 @@ async fn notices_go_to_the_own_user_seat_only(b: Backend, t: &str) {
         "{body}"
     );
     assert!(!body.contains("Ignore"), "{body}");
-    let (subject, body) = &mail[2];
-    assert_eq!(subject, "An agent session used the node on host \"box\"");
-    assert!(body.contains("a seat that is not in this org"), "{body}");
+    assert!(
+        body.contains("\n-----\n\nA process of the session of a seat that is not in this org"),
+        "{body}"
+    );
     assert!(!body.contains("trust me"), "{body}");
 
     // Nothing reached the other org, and its own nodes can only write to it.
@@ -258,7 +279,7 @@ async fn notices_go_to_the_own_user_seat_only(b: Backend, t: &str) {
         .ok(Method::POST, "/node/notices", Some(settings("o")))
         .await;
     assert_eq!(other.system_mail().await.len(), 1);
-    assert_eq!(acme.system_mail().await.len(), 3);
+    assert_eq!(acme.system_mail().await.len(), 2);
 }
 
 /// Only node tokens; only values a setting can have; bounded sizes.
@@ -324,4 +345,308 @@ async fn notices_are_rate_limited(b: Backend, t: &str) {
         .await
         .ok(Method::POST, "/node/notices", Some(settings("o")))
         .await;
+}
+
+/// Every org's stored bytes equal what the storage migration computes from
+/// scratch; returns them by org id.
+async fn stored(srv: &Server) -> Vec<(i64, i64)> {
+    let mut out = Vec::new();
+    for c in srv.db.storage_counts().await {
+        assert_eq!(
+            (c.stored_bytes, c.kept_bytes),
+            (c.stored_recount, c.kept_recount),
+            "org {}: counts differ from scratch",
+            c.org_id
+        );
+        out.push((c.org_id, c.stored_bytes));
+    }
+    out
+}
+
+/// Each seat's unread counter equals its unread deliveries.
+async fn counters_consistent(srv: &Server) {
+    for r in srv
+        .db
+        .rows_i64(
+            "SELECT id, CAST(unread AS BIGINT), (SELECT CAST(COUNT(*) AS BIGINT) FROM deliveries d \
+             WHERE d.seat_id = seats.id AND d.read_at IS NULL AND d.mode <> 'archive') FROM seats",
+        )
+        .await
+    {
+        assert_eq!(
+            r[1], r[2],
+            "seat {}: unread {} counted {}",
+            r[0], r[1], r[2]
+        );
+    }
+}
+
+/// A report near the request size limit (6 notices of 100 actions, each
+/// naming 50 seats of the org) becomes one mail of at most
+/// `MAX_NOTICE_BODY_BYTES`; what does not fit is counted. The mail is not
+/// charged to the org's storage.
+async fn one_report_is_one_bounded_mail(b: Backend, t: &str) {
+    let srv = start!(b, t);
+    let acme = srv.org("acme").await;
+    let names: Vec<String> = (0..50)
+        .map(|i| format!("s{i:02}-{}", "q".repeat(59)))
+        .collect();
+    for n in &names {
+        acme.ok(Method::POST, "/seats", Some(json!({ "name": n })))
+            .await;
+    }
+    let node = acme.token("node", None).await;
+    let before = stored(&srv).await;
+    let ops = [
+        "up",
+        "down",
+        "forget",
+        "run",
+        "wake",
+        "sleep",
+        "credentials",
+        "hook",
+    ];
+    let notices: Vec<Value> = (0..6)
+        .map(|k| {
+            json!({
+                "kind": "agent_actions",
+                "seat": names[k],
+                "actions": (0..100)
+                    .map(|i| json!({"op": ops[i % ops.len()], "targets": names, "count": 2}))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let v = node
+        .ok(
+            Method::POST,
+            "/node/notices",
+            Some(json!({"node": "box", "notices": notices})),
+        )
+        .await;
+    assert_eq!(v["sent"], 1, "{v}");
+    let mail = acme.system_mail().await;
+    assert_eq!(mail.len(), 1);
+    let (subject, body) = &mail[0];
+    assert_eq!(subject, "6 notices from the amail node on host \"box\"");
+    let max = amail_proto::limits::MAX_NOTICE_BODY_BYTES;
+    assert!(body.len() <= max, "{} bytes", body.len());
+    assert!(
+        body.starts_with(&format!(
+            "A process of the session of seat {} on host \"box\"",
+            names[0]
+        )),
+        "{body}"
+    );
+    // Seat names, items and notices that do not fit are counted.
+    assert!(body.contains(" more seats) (2 requests)\n"), "{body}");
+    assert!(body.contains(" more not shown)\n"), "{body}");
+    assert!(
+        body.contains(" more notices of this report are not shown.\n"),
+        "{body}"
+    );
+    assert_eq!(stored(&srv).await, before);
+}
+
+/// Notice mail is not charged to the org's storage. Each org may receive
+/// `NOTICE_MAILS_PER_DAY` notice mails (and `NOTICE_BYTES_PER_DAY` bytes)
+/// in 24 hours, counted in the database, so the budget holds on another
+/// instance and after a restart; reports over it are answered as taken (the
+/// node does not retry) and dropped.
+async fn notice_mail_has_a_daily_budget_and_no_charge(b: Backend, t: &str) {
+    use amail_proto::limits::{NOTICE_BYTES_PER_DAY, NOTICE_MAILS_PER_DAY};
+    let srv = start!(b, t);
+    let acme = srv.org("acme").await;
+    let other = srv.org("other").await;
+    let node = acme.token("node", None).await;
+    let store = &srv.db.store;
+    let org = store.org_by_name("acme").await.unwrap().unwrap();
+    let user = store.seat_by_name(org.id, "owner").await.unwrap().unwrap();
+    let system = store.system_seat(org.id).await.unwrap();
+    let notice = |body: String| amail_store::NewMessage {
+        org_id: org.id,
+        sender_seat_id: system.id,
+        thread_id: None,
+        parent_id: None,
+        depth: 0,
+        subject: "earlier notice".into(),
+        body,
+        to_addrs: vec!["owner@acme".into()],
+        cc_addrs: Vec::new(),
+        priority: amail_proto::Priority::Normal,
+        ack_required: false,
+        meta: Default::default(),
+        deliveries: vec![amail_store::NewDelivery {
+            seat_id: user.id,
+            org_id: org.id,
+            class: amail_proto::DeliveryClass::To,
+            mode: amail_proto::DeliveryMode::Immediate,
+        }],
+        ack_due: None,
+        storage_quota: None,
+        notice: true,
+    };
+    for _ in 0..NOTICE_MAILS_PER_DAY - 1 {
+        store.send(&notice("x".repeat(100))).await.unwrap();
+    }
+    // Not charged to anybody.
+    assert!(stored(&srv).await.iter().all(|(_, n)| *n == 0));
+    let post = async |c: &Client| {
+        c.ok(Method::POST, "/node/notices", Some(settings("box")))
+            .await["sent"]
+            .as_i64()
+            .unwrap()
+    };
+    assert_eq!(post(&node).await, 1);
+    assert!(stored(&srv).await.iter().all(|(_, n)| *n == 0));
+    // Over the budget: taken and dropped, on this instance and another.
+    assert_eq!(post(&node).await, 0);
+    let node2 = Client {
+        base: srv.instance(|_| {}).await,
+        ..node.clone()
+    };
+    assert_eq!(post(&node2).await, 0);
+    let count = |n: usize| n as i64 == NOTICE_MAILS_PER_DAY;
+    let all = acme.ok(Method::GET, "/inbox?limit=200", None).await;
+    assert!(
+        count(all["entries"].as_array().unwrap().len()),
+        "{}",
+        all["entries"].as_array().unwrap().len()
+    );
+    // Another org has its own budget.
+    assert_eq!(post(&other.token("node", None).await).await, 1);
+    // A day later the budget is free again.
+    srv.db
+        .exec(&["UPDATE messages SET created_at = created_at - 90000000 WHERE notice".into()])
+        .await;
+    assert_eq!(post(&node).await, 1);
+    // The byte budget: one large notice leaves no room for another.
+    store
+        .send(&notice("y".repeat(NOTICE_BYTES_PER_DAY as usize - 600)))
+        .await
+        .unwrap();
+    assert_eq!(post(&node).await, 0);
+    assert!(stored(&srv).await.iter().all(|(_, n)| *n == 0));
+}
+
+/// Notice mail older than `NOTICE_RETENTION_DAYS` is deleted by the
+/// server's periodic cleanup, whatever its retention setting, with its
+/// deliveries; other mail stays, and replies in its thread too.
+async fn old_notice_mail_is_deleted(b: Backend, t: &str) {
+    let srv = start!(b, t);
+    let acme = srv.org("acme").await;
+    acme.ok(Method::POST, "/seats", Some(json!({ "name": "w1" })))
+        .await;
+    let node = acme.token("node", None).await;
+    for _ in 0..2 {
+        node.ok(Method::POST, "/node/notices", Some(settings("box")))
+            .await;
+    }
+    let ids: Vec<i64> = srv
+        .db
+        .rows_i64("SELECT id FROM messages WHERE notice ORDER BY id")
+        .await
+        .into_iter()
+        .map(|r| r[0])
+        .collect();
+    assert_eq!(ids.len(), 2);
+    // A reply of the user in the first notice's thread, and other mail.
+    let store = &srv.db.store;
+    let org = store.org_by_name("acme").await.unwrap().unwrap();
+    let user = store.seat_by_name(org.id, "owner").await.unwrap().unwrap();
+    let w1 = store.seat_by_name(org.id, "w1").await.unwrap().unwrap();
+    let reply = store
+        .send(&amail_store::NewMessage {
+            org_id: org.id,
+            sender_seat_id: user.id,
+            thread_id: Some(ids[0]),
+            parent_id: Some(ids[0]),
+            depth: 1,
+            subject: "Re: notice".into(),
+            body: "look at this".into(),
+            to_addrs: vec!["w1@acme".into()],
+            cc_addrs: Vec::new(),
+            priority: amail_proto::Priority::Normal,
+            ack_required: false,
+            meta: Default::default(),
+            deliveries: vec![amail_store::NewDelivery {
+                seat_id: w1.id,
+                org_id: org.id,
+                class: amail_proto::DeliveryClass::To,
+                mode: amail_proto::DeliveryMode::Immediate,
+            }],
+            ack_due: None,
+            storage_quota: None,
+            notice: false,
+        })
+        .await
+        .unwrap();
+    let other = acme
+        .ok(
+            Method::POST,
+            "/messages",
+            Some(json!({"to": ["owner@acme"], "subject": "keep", "body": "kept"})),
+        )
+        .await["id"]
+        .as_i64()
+        .unwrap();
+    let before = stored(&srv).await;
+    // Only the first notice is old enough.
+    let days = amail_proto::limits::NOTICE_RETENTION_DAYS;
+    srv.db
+        .exec(&[format!(
+            "UPDATE messages SET created_at = created_at - {} WHERE id = {}",
+            (days * 24 + 1) * 3_600_000,
+            ids[0]
+        )])
+        .await;
+    // A server instance whose cleanup runs often.
+    let base = srv
+        .instance(|st| st.attention.cleanup_every = std::time::Duration::from_millis(100))
+        .await;
+    let acme2 = Client {
+        base,
+        ..acme.clone()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // (Counted from the inbox alone: a message may go between the inbox
+    // and reading it.)
+    let system_count = async || {
+        let inbox = acme2.ok(Method::GET, "/inbox?limit=100", None).await;
+        inbox["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["message"]["source"] == "system")
+            .count()
+    };
+    while system_count().await != 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "old notice not deleted"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let left = srv
+        .db
+        .rows_i64("SELECT id FROM messages WHERE notice ORDER BY id")
+        .await;
+    assert_eq!(left, vec![vec![ids[1]]]);
+    let (s, _) = acme2
+        .call(Method::GET, &format!("/messages/{}?peek=1", ids[0]), None)
+        .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    for id in [reply.message_id, other] {
+        let (s, v) = acme2
+            .call(Method::GET, &format!("/messages/{id}?peek=1"), None)
+            .await;
+        assert!(s.is_success(), "{id}: {s} {v}");
+    }
+    let (s, v) = acme2
+        .call(Method::GET, &format!("/threads/{}", ids[0]), None)
+        .await;
+    assert!(s.is_success(), "{s} {v}");
+    assert_eq!(stored(&srv).await, before);
+    counters_consistent(&srv).await;
 }

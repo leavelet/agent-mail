@@ -99,7 +99,10 @@ the server writes the text from fixed sentences, shows only values a
 setting can have and only names of the org's own seats, and shows the
 node's label escaped on one line. Each org's nodes together can send at
 most 60 such reports per hour (bursts of 10), and a node's reports go only
-to its own org's user.
+to its own org's user. One report becomes one mail of at most 4 KB. An org
+receives at most 50 such mails (128 KB) in 24 hours; further reports are
+dropped. This mail does not count against the org's storage quota and is
+deleted after 7 days.
 
 - When the node starts, and after each `amail up`, it compares its local
   policy, and each supervised seat's permission mode and (for Codex seats)
@@ -526,6 +529,8 @@ Rate and stream limits are counted per server instance.
 | Registration attempts per client address (IPv6: per /64 network) | 10 per hour, bursts of 5, failed ones included (*public*); in addition, all /64 networks of one IPv6 /48 together get 4 times that (40 per hour, bursts of 20), checked first |
 | Link requests per org | 20 per hour, bursts of 5 (*public*) |
 | Node notice reports (`POST /v1/node/notices`) per org | 60 per hour, bursts of 10, all of the org's nodes together; at most 20 notices per report, 100 items per notice and 50 seat names per item |
+| Notice mail (from node notice reports) per org | one mail per report, body at most 4 KB (items and notices that do not fit are left out and counted); 50 mails and 128 KB in any 24 hours, counted in the database (so across restarts and instances; with several instances, reports that arrive at the same moment on different instances can each pass); reports over it are answered as taken and dropped; not counted against the storage quota and never refused at it; deleted after 7 days, whatever the retention setting |
+| Failed authentications per client address (IPv6: per /64 network) | 10 per minute, bursts of 30: unknown, revoked or expired tokens and sessions, at sign-in, on API requests and operator requests (*public*); beyond them, a request from that address with a credential the server instance has not seen valid lately gets 429 without a database lookup. Credentials that were valid on that instance lately keep working from that address; a valid credential not seen yet (after a restart, say) is refused there until the address has room again, and works from other addresses |
 | Pending outgoing link requests per org | 1,000; a request not accepted within 30 days is dropped |
 | `org_exists` answers per invite code | 3; then the invite is spent |
 | Keys tracked by each rate limiter | 100,000; when a new key arrives at that count, the fullest 1/64 of the buckets are dropped to make room, so a new client always gets a bucket of its own; keys whose bucket is full again are dropped on every cleanup pass |

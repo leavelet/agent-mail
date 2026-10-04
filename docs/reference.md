@@ -116,6 +116,9 @@ limits add `retry_after_ms` and a `Retry-After` header). Requests
 authenticate with `Authorization: Bearer <token>` or the web interface's
 session cookie; with the cookie, everything but `GET` needs the header
 `X-Amail-Csrf: 1`, and an `Origin` header must name the server.
+After too many failed authentications from one client address, requests
+from it with a credential the server has not seen valid lately get 429
+`rate_limited` (see [security](security.md#resource-limits)).
 `GET /healthz` (outside `/v1`) answers `ok`.
 
 ### Mail
@@ -163,7 +166,7 @@ session cookie; with the cookie, everything but `GET` needs the header
 | `GET /counts` | user tokens: per seat (or `seat=`), `unread` and `pending` |
 | `GET /attention` | user tokens: what waits for the user ([concepts](concepts.md#the-users-queue-needs-you)), among the user seat's newest 5,000 deliveries |
 | `GET /pending` | node and user tokens: per seat, pending deliveries by class, urgent count, digest counts, `focus_until`, the seat's counter |
-| `POST /node/notices` | node tokens: `{node?, notices: [{kind: "settings", changes: [{seat?, setting, old?, new}]} \| {kind: "agent_actions", seat?, actions: [{op, targets, count}]}]}`; `setting` is `local_policy`, `permission_mode` or `git_access` with one of its values; `op` is `up`, `down`, `forget`, `run`, `wake`, `sleep`, `credentials` or `hook`. Each notice becomes one `system` mail to the org's user seat, written by the server; answers `{sent}`. Limits in [security](security.md#resource-limits) |
+| `POST /node/notices` | node tokens: `{node?, notices: [{kind: "settings", changes: [{seat?, setting, old?, new}]} \| {kind: "agent_actions", seat?, actions: [{op, targets, count}]}]}`; `setting` is `local_policy`, `permission_mode` or `git_access` with one of its values; `op` is `up`, `down`, `forget`, `run`, `wake`, `sleep`, `credentials` or `hook`. Each report becomes one `system` mail to the org's user seat, written by the server (at most 4 KB; what does not fit is counted); answers `{sent}` (1, or 0 when the org is over its daily notice budget and the report was dropped). Limits in [security](security.md#resource-limits) |
 | `POST /presence` | node tokens: `{node?, seats: [{seat, state, wake_failed?, harness?, since?, attention?, attention_hint?, terminal_url?}]}` (at most 5,000 seats); valid for 90 s |
 | `GET /seats/{name}/launch` | node and user tokens: harness, model, role, parent, permission mode (informational; the node does not use it) and a new seat token; the token of the seat's previous launch is revoked |
 | `POST /seats/{name}/sleep`, `POST /seats/{name}/wake` | user tokens: ask the node hosting the seat; 202, or 409 `node_offline` |

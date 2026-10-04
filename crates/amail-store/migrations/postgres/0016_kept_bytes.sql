@@ -12,7 +12,7 @@ UPDATE orgs SET kept_bytes = COALESCE((
                + octet_length(m.to_addrs) + octet_length(m.cc_addrs)
                + 384 * (SELECT COUNT(*) FROM deliveries d WHERE d.message_id = m.id AND d.org_id = orgs.id))
       FROM messages m
-     WHERE m.org_id IN (SELECT o.id FROM orgs o WHERE o.deleted_at IS NOT NULL)
+     WHERE m.org_id IN (SELECT o.id FROM orgs o WHERE o.deleted_at IS NOT NULL) AND NOT m.notice
        AND EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = m.id AND d.org_id = orgs.id)
 ), 0) WHERE deleted_at IS NULL;
 UPDATE orgs SET stored_bytes = stored_bytes - kept_bytes WHERE deleted_at IS NULL;

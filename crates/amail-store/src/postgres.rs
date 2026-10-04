@@ -95,8 +95,13 @@ impl PgStore {
                 let now = now_ms();
                 let meta = meta_to_db(&m.meta);
                 let (to, cc) = (join_addrs(&m.to_addrs), join_addrs(&m.cc_addrs));
-                let bytes = message_bytes(&m.subject, &m.body, &meta, &to, &cc)
-                    + amail_proto::limits::STORED_BYTES_PER_DELIVERY * m.deliveries.len() as i64;
+                // Notice mail is charged to nobody (see `message_bytes`).
+                let bytes = if m.notice {
+                    0
+                } else {
+                    message_bytes(&m.subject, &m.body, &meta, &to, &cc)
+                        + amail_proto::limits::STORED_BYTES_PER_DELIVERY * m.deliveries.len() as i64
+                };
                 let mut seat_ids: Vec<i64> = m.deliveries.iter().map(|d| d.seat_id).collect();
                 seat_ids.sort_unstable();
                 seat_ids.dedup();
@@ -154,8 +159,8 @@ impl PgStore {
                 let thread_id = m.thread_id.unwrap_or(id);
                 sqlx::query(
                     "INSERT INTO messages (id, org_id, sender_seat_id, thread_id, parent_id, depth, subject, body, \
-                     lines, to_addrs, cc_addrs, priority, ack_required, created_at, meta, ack_due) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)",
+                     lines, to_addrs, cc_addrs, priority, ack_required, created_at, meta, ack_due, notice) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
                 )
                 .bind(id)
                 .bind(m.org_id)
@@ -173,6 +178,7 @@ impl PgStore {
                 .bind(now)
                 .bind(&meta)
                 .bind(m.ack_due)
+                .bind(m.notice)
                 .execute(&mut *c)
                 .await?;
 

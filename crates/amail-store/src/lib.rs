@@ -308,6 +308,12 @@ pub trait Store: Send + Sync + 'static {
     /// Drop expired claim keys, watches, server instances, browser sessions
     /// and link requests, and revoked tokens (with their sessions).
     async fn cleanup(&self) -> Result<()>;
+    /// Notice mail the org received since `since` (ms): `(mails, bytes of
+    /// subjects and bodies)`.
+    async fn notice_usage(&self, org_id: i64, since: i64) -> Result<(i64, i64)>;
+    /// Delete up to `limit` notice mails created before `cutoff`, with
+    /// their deliveries; returns how many.
+    async fn delete_old_notices(&self, cutoff: i64, limit: i64) -> Result<u64>;
     /// Which of these token ids are live, and which of these browser
     /// sessions (by hash) are live and belong to a live token.
     async fn live_credentials(
