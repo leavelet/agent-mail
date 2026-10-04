@@ -70,6 +70,130 @@ fn git_dirs(cwd: &str) -> Vec<String> {
     v
 }
 
+/// Entries of a repository's git directory that stay read-only when
+/// sessions may write the directory: git runs `hooks/` and reads `config`
+/// and `config.worktree` as configuration (`core.hooksPath`,
+/// `core.fsmonitor` and others name commands to run); `modules/` holds the
+/// git directories of submodules, with their own hooks and config;
+/// `worktrees/` holds those of linked worktrees, which get their own rules
+/// (see `git_dir_rules`). Codex mounts a path that does not exist as an
+/// empty read-only placeholder, so these entries cannot be created either.
+const GIT_READ_ONLY: &[&str] = &["hooks", "config", "config.worktree", "modules", "worktrees"];
+
+/// Entries of a linked worktree's git directory that stay read-only:
+/// `commondir` names the directory git takes config and hooks from, and
+/// `config.worktree` is configuration.
+const LINKED_GIT_READ_ONLY: &[&str] = &["commondir", "config.worktree"];
+
+/// What kind of git directory `dir` is.
+#[derive(Debug, PartialEq)]
+enum GitDir {
+    /// A repository's git directory (`objects/` and no `commondir`).
+    Main,
+    /// A linked worktree's git directory (`commondir` and no `objects/`).
+    Linked,
+    /// A repository's git directory with a `commondir` file, which git
+    /// never writes there: git run in its main checkout would take config
+    /// and hooks from the directory the file names.
+    Redirected,
+}
+
+fn git_dir_kind(dir: &Path) -> Option<GitDir> {
+    if !dir.join("HEAD").is_file() {
+        return None;
+    }
+    match (dir.join("objects").is_dir(), dir.join("commondir").exists()) {
+        (true, false) => Some(GitDir::Main),
+        (false, true) => Some(GitDir::Linked),
+        (true, true) => Some(GitDir::Redirected),
+        (false, false) => None,
+    }
+}
+
+/// The `filesystem` rules that let sessions write the git directory `dir`
+/// (Codex applies the most specific rule for a path).
+///
+/// Git creates lock and state files (`index.lock`, `packed-refs.lock`,
+/// `ORIG_HEAD`, `rebase-merge/`, ...) next to the files it changes, also in
+/// the common directory when working in a linked worktree, and Codex
+/// accepts only directories as write roots. So the grant is the directory
+/// minus the entries git takes commands from, not a list of files. For a
+/// repository's git directory this also covers each linked worktree's git
+/// directory (`git gc` locks the reflogs of every worktree).
+///
+/// A `commondir` file that does not exist in a repository's git directory
+/// cannot be protected: Codex's placeholder for it would be an empty file,
+/// which git fails to read. `grant_git_rules` refuses to go on if one has
+/// appeared.
+fn git_dir_rules(dir: &Path) -> Vec<(String, &'static str)> {
+    let mut v = Vec::new();
+    let mut add = |d: &Path, ro: &[&str]| {
+        v.push((d.to_string_lossy().into_owned(), "write"));
+        for name in ro {
+            v.push((d.join(name).to_string_lossy().into_owned(), "read"));
+        }
+    };
+    match git_dir_kind(dir) {
+        Some(GitDir::Linked) => add(dir, LINKED_GIT_READ_ONLY),
+        Some(GitDir::Main) => {
+            add(dir, GIT_READ_ONLY);
+            let mut wts: Vec<PathBuf> = std::fs::read_dir(dir.join("worktrees"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .map(|e| e.path())
+                .filter(|p| git_dir_kind(p) == Some(GitDir::Linked))
+                .collect();
+            wts.sort();
+            for w in wts {
+                add(&w, LINKED_GIT_READ_ONLY);
+            }
+        }
+        Some(GitDir::Redirected) | None => {}
+    }
+    v
+}
+
+/// Add the rules of `git_dir_rules` to the profile's `filesystem` table
+/// for `dirs` and for every git directory the table already grants write
+/// on (granted for other seats, possibly by an older amail without the
+/// read-only entries, or a repository that has gained worktrees since).
+/// Returns whether the table changed. Fails if one of these is a
+/// repository's git directory with a `commondir` file.
+fn grant_git_rules(fs: &mut toml::Table, dirs: &[String]) -> Result<bool> {
+    let mut all: Vec<PathBuf> = dirs.iter().map(PathBuf::from).collect();
+    for (k, v) in fs.iter() {
+        if v.as_str() == Some("write") && git_dir_kind(Path::new(k)).is_some() {
+            all.push(PathBuf::from(k));
+        }
+    }
+    all.sort();
+    all.dedup();
+    if let Some(d) = all
+        .iter()
+        .find(|d| git_dir_kind(d) == Some(GitDir::Redirected))
+    {
+        bail!(
+            "{} contains a commondir file, which git does not create in a \
+             repository's git directory; git run in that repository would take \
+             its config and hooks from the directory it names. Check it and \
+             remove it before starting Codex seats",
+            d.display()
+        );
+    }
+    let mut changed = false;
+    for d in &all {
+        for (path, mode) in git_dir_rules(d) {
+            if fs.get(&path).and_then(|v| v.as_str()) != Some(mode) {
+                fs.insert(path, toml::Value::String(mode.into()));
+                changed = true;
+            }
+        }
+    }
+    Ok(changed)
+}
+
 /// Codex caps the timeout of some events at 3 s (and warns about larger ones).
 fn hook_timeout(snake: &str) -> i64 {
     if matches!(snake, "session_end" | "interrupt") {
@@ -201,8 +325,8 @@ impl Codex {
         }
         // Sessions run under the `amail` permissions profile: the workspace
         // profile plus network access (as above) plus write access to the
-        // git directories of the Codex seats' working directories (added at
-        // launch, see `grant_git_dirs`).
+        // git directories of the Codex seats' working directories, except
+        // their hooks and config (added at launch, see `grant_git_dirs`).
         t.insert(
             "default_permissions".into(),
             V::String(PERMISSIONS_PROFILE.into()),
@@ -233,7 +357,11 @@ impl Codex {
     /// added; the rest of the repository and the file system stay as the
     /// workspace profile has them. For a worktree the grant covers the
     /// whole repository's refs and objects (every branch), which is what
-    /// committing and rebasing need.
+    /// committing and rebasing need. Hooks, git config and the other
+    /// entries in `GIT_READ_ONLY` and `LINKED_GIT_READ_ONLY` stay
+    /// read-only, so that a session cannot make git run a command outside
+    /// the sandbox later (except through a new `commondir` file, see
+    /// `git_dir_rules`).
     fn grant_git_dirs(&self, cwd: &str) -> Result<Vec<String>> {
         let dirs = git_dirs(cwd);
         if dirs.is_empty() {
@@ -246,12 +374,7 @@ impl Codex {
             .and_then(|p| p.get_mut(PERMISSIONS_PROFILE))
             .and_then(|p| p.get_mut("filesystem"))
         {
-            for d in &dirs {
-                if fs.get(d).and_then(|v| v.as_str()) != Some("write") {
-                    fs.insert(d.clone(), toml::Value::String("write".into()));
-                    changed = true;
-                }
-            }
+            changed = grant_git_rules(fs, &dirs)?;
         }
         if changed {
             self.write_config(&t)?;
@@ -682,5 +805,91 @@ mod tests {
         ] {
             assert!(Codex::check_extra(&[bad.into()]).is_err(), "{bad}");
         }
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}: {out:?}");
+    }
+
+    #[test]
+    fn git_grant_keeps_hooks_and_config_read_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let repo = root.join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join("a"), "a\n").unwrap();
+        git(&repo, &["add", "a"]);
+        git(&repo, &["commit", "-q", "-m", "init"]);
+        git(&repo, &["worktree", "add", "-q", "-b", "s1", "../wt"]);
+        git(&repo, &["worktree", "add", "-q", "-b", "s2", "../wt2"]);
+        let plain = root.join("plain");
+        std::fs::create_dir(&plain).unwrap();
+        git(&plain, &["init", "-q"]);
+
+        let codex = Codex::new(AdapterEnv {
+            state_dir: root.join("state"),
+            amail_exe: "/bin/amail".into(),
+            node_socket: root.join("node.sock"),
+            server_url: "http://127.0.0.1:1".into(),
+            claude_bin: "claude".into(),
+            codex_bin: "codex".into(),
+            codex_auth: root.join("auth.json"),
+        });
+        std::fs::create_dir_all(codex.home()).unwrap();
+        let mut t = toml::Table::new();
+        codex.apply_managed(&mut t, &BTreeMap::new());
+        // A grant written by an older amail: the whole directory.
+        let pg = plain.join(".git").to_string_lossy().into_owned();
+        if let Some(toml::Value::Table(fs)) = t
+            .get_mut("permissions")
+            .and_then(|p| p.get_mut(PERMISSIONS_PROFILE))
+            .and_then(|p| p.get_mut("filesystem"))
+        {
+            fs.insert(pg.clone(), toml::Value::String("write".into()));
+        }
+        codex.write_config(&t).unwrap();
+
+        codex
+            .grant_git_dirs(&root.join("wt").to_string_lossy())
+            .unwrap();
+        let t = codex.read_config().unwrap();
+        let fs = t["permissions"][PERMISSIONS_PROFILE]["filesystem"]
+            .as_table()
+            .unwrap();
+        let mode = |p: &Path| fs.get(&*p.to_string_lossy()).and_then(|v| v.as_str());
+        let common = repo.join(".git");
+        for d in [&common, &plain.join(".git")] {
+            assert_eq!(mode(d), Some("write"), "{d:?}");
+            for name in GIT_READ_ONLY {
+                assert_eq!(mode(&d.join(name)), Some("read"), "{d:?}/{name}");
+            }
+        }
+        for d in [common.join("worktrees/wt"), common.join("worktrees/wt2")] {
+            assert_eq!(mode(&d), Some("write"), "{d:?}");
+            for name in LINKED_GIT_READ_ONLY {
+                assert_eq!(mode(&d.join(name)), Some("read"), "{d:?}/{name}");
+            }
+        }
+        // Nothing else is granted.
+        let writes = fs.values().filter(|v| v.as_str() == Some("write")).count();
+        assert_eq!(writes, 4);
+
+        // A commondir file in a repository's git directory stops launches.
+        std::fs::write(plain.join(".git/commondir"), "/elsewhere\n").unwrap();
+        let err = codex
+            .grant_git_dirs(&root.join("wt").to_string_lossy())
+            .unwrap_err();
+        assert!(err.to_string().contains("commondir"), "{err:#}");
     }
 }

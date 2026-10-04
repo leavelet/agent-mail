@@ -98,13 +98,29 @@ read-only), network access, and write access to the git directory and the
 repository's common git directory of every Codex seat's working directory,
 so that a seat in a git worktree can commit, rebase and create branches
 (the plain workspace sandbox keeps `.git` read-only, and a worktree's git
-directory lies outside it). Consequences:
+directory lies outside it). The write grant covers each of these
+directories except `hooks/`, `config`, `config.worktree`, `modules/` and
+`worktrees/` of the repository's git directory, and `commondir` and
+`config.worktree` of each linked worktree's git directory (each existing
+linked worktree's git directory is writable, because `git gc` locks every
+worktree's reflog). These entries stay read-only, and those that do not
+exist cannot be created; see [security](security.md) ("Codex seats and
+git") for the reason and the remaining gap (`.git/commondir`). Codex accepts only directories as write
+roots, and git creates lock and state files next to the files it changes,
+so the grant cannot be narrowed to a list of files. Consequences:
 
 - Codex needs network access in its sandbox to reach the amail server:
   with networking disabled, the sandbox refuses both TCP and Unix-socket
   connections. The dedicated home allows it.
 - Permissions are per host, not per seat: every Codex session on a host may
   write the git directories of all Codex seats' repositories on that host.
+- Sessions cannot change git config (`git config`, `git remote add`,
+  `git branch --set-upstream-to`, which prints an error but exits with
+  status 0), add worktrees, or initialise or commit in submodules. Do these
+  outside the session.
+- A Codex seat does not start while a git directory in the profile contains
+  a `commondir` file where git never creates one (a repository's own git
+  directory).
 - Codex's sandbox needs unprivileged user namespaces. Some distributions
   restrict them (for example `kernel.apparmor_restrict_unprivileged_userns
   = 1`); then every sandboxed command fails. `amail doctor` checks this.

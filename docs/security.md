@@ -117,6 +117,36 @@ In our tests, agents of both supported harnesses refused a deletion
 requested by another org's user and carried out the same request from their
 own user. This is model behaviour, not a guarantee.
 
+**Codex seats and git.** The `amail` permissions profile in the node's
+Codex home lets sessions write the git directories of every Codex seat's
+working directory on the host, so that seats can commit, rebase and merge.
+In those directories, the entries that git runs or reads as configuration
+stay read-only: `hooks/`, `config`, `config.worktree`, `modules/` and
+`worktrees/` of a repository's git directory, and `commondir` and
+`config.worktree` of each linked worktree's git directory. Entries that do
+not exist are covered too: Codex puts a read-only placeholder at their path,
+so they cannot be created. A session therefore cannot add a hook or set
+`core.hooksPath`, `core.fsmonitor` or a similar key that git would run
+later, outside the sandbox. What remains:
+
+- Codex cannot protect a file that does not exist without making git fail
+  to read it, so a session can still create `commondir` in a repository's
+  git directory (`.git/commondir`). Git run in that repository's main
+  checkout (not in its linked worktrees) then reads config and hooks from
+  the directory the file names. Git never creates this file there. amail
+  refuses to start a Codex seat while a git directory it grants contains
+  one. If you find one, remove it and look at the directory it names before
+  you run git in that checkout.
+- A seat can leave an unfinished rebase whose todo list contains `exec`
+  lines; `git rebase --continue` runs them. Before you continue a rebase a
+  seat started, read its todo list (`git status` shows it);
+  `git rebase --abort` runs nothing.
+- Files a session writes in its working directory (scripts, build files,
+  editor settings) run when you run them. Review them as code from an
+  untrusted author.
+- With network access enabled, which amail's profile needs, the sandbox
+  allows `connect()` on Unix sockets, including the node's socket.
+
 ## Tokens and their scopes
 
 Tokens are random 256-bit bearer secrets (`amail_` + 64 hex characters).
