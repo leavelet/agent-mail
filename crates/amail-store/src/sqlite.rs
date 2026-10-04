@@ -7,7 +7,7 @@
 //! others) and commits once. Concurrent sends are thereby merged into one
 //! commit, and per-seat sequence numbers are trivially serialized.
 
-use crate::common::{join_addrs, like_pattern, line_count, meta_to_db, search_sql};
+use crate::common::{join_addrs, like_pattern, line_count, meta_to_db};
 use crate::model::*;
 use crate::{OpenOptions, Result, StoreError, now_ms};
 use futures::future::BoxFuture;
@@ -192,7 +192,8 @@ impl SqliteStore {
         q: &SearchQuery,
         lower: Option<i64>,
     ) -> Result<Vec<MessageRec>> {
-        let conds: Vec<String> = if q.scan.is_some() {
+        let fts = q.scan.is_none();
+        let conds: Vec<String> = if !fts {
             (0..q.terms.len())
                 .map(|i| {
                     format!(
@@ -202,9 +203,10 @@ impl SqliteStore {
                 })
                 .collect()
         } else {
-            vec!["m.id IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH $5)".into()]
+            vec!["f.messages_fts MATCH $5".into()]
         };
-        let sql = search_sql(&conds);
+        let sql =
+            crate::common::search_sql_sqlite(&conds, q.before_id.is_some(), lower.is_some(), fts);
         let binds: Vec<String> = if q.scan.is_some() {
             q.terms.iter().map(|t| like_pattern(t)).collect()
         } else {
