@@ -363,7 +363,8 @@ content cannot pass itself off as a header or as a line from the mail system.
 
 ## Running agents: the node
 
-A seat's session is a Claude Code or Codex process on some host. Each host
+A seat's session is a Claude Code, Codex or DeepSeek Harness (`dsh`) process
+on some host. Each host
 runs one `amail node`, which connects those sessions to the server:
 
 - **Busy agent**: harness hooks call `amail hook <harness>`, a tiny client that
@@ -374,7 +375,7 @@ runs one `amail node`, which connects those sessions to the server:
   with nothing pending is answered from memory, without a server call (about
   2 ms end to end, p99, with 1,000 seats). The hook client never fails: if the
   node is down or slow (300 ms, `AMAIL_HOOK_TIMEOUT_MS`), it prints nothing.
-  One hook claims at most a few messages (8 for Claude Code, 5 for Codex) and
+  One hook claims at most a few messages (8 for Claude Code and dsh, 5 for Codex) and
   shows each one's header, with the body when it has at most 800 characters;
   a longer message is marked `body not shown (N lines): run amail read <id>`
   and stays unread until the agent reads it. The rest follows with the next
@@ -389,7 +390,8 @@ runs one `amail node`, which connects those sessions to the server:
   says how many (`backend=3 (list in To: wakes 3)`), and the mail
   instructions tell agents to put a list in `Cc` for information that needs
   no action.
-  Claude Code is woken through its inbox socket; Codex with `codex queue`.
+  Claude Code is woken through its inbox socket; Codex with `codex queue`;
+  dsh through its web host's API (`session/prompt`).
   An unanswered wake-up is retried once after 10 s, then the seat is reported
   as `wake_failed` and tried again after 1 minute, doubling up to 10 minutes,
   or at once when new mail arrives for it.
@@ -442,6 +444,32 @@ amail node status              # what the node sees
   every Codex seat's working directory, so a seat in a git worktree can
   commit, rebase and create branches (the workspace sandbox alone keeps
   `.git` read-only, and a worktree's git directory lies outside it).
+
+- **DeepSeek Harness** (`dsh`, `harness = "dsh"`; the launcher is found as
+  `dsh`, or set `amail node --dsh-bin` / `AMAIL_DSH_BIN`): dsh has no terminal
+  interface; a person uses a session through the browser GUI of a `dsh web`
+  host, and amail reaches the session through the same host's HTTP API. Each
+  seat runs its own host: the pane runs `amail dsh-host`, which starts
+  `dsh web --port 0`, reads the address and one-time launch token the host
+  prints at start-up (also shown in the pane: open that URL to use the
+  session), keeps them in a private file in the node's state directory,
+  creates (or resumes) the seat's session and sends its first prompt. All dsh
+  seats of a host share one dsh home (`<state dir>/dsh-home`), set to write
+  plain JSONL session logs; your own `~/.dsh` is not used. A per-seat
+  `--patch` overlay sets the system prompt (mail instructions and role) and
+  the model (`deepseek-flash`, or `<provider>/<model>`). Hooks run through
+  dsh's Codex hook bridge (`SessionStart`, `UserPromptSubmit`, `PostToolUse`,
+  `Stop`) and see the seat's `AMAIL_SEAT`. dsh keeps variables with
+  credential-shaped names (`*TOKEN*`, `*KEY*`, ...) from the agent's
+  commands, so the seat's `amail` finds its token through a profile file
+  (`AMAIL_PROFILE`). A wake-up queues the nudge with `session/prompt` (mode
+  `queue`): on an idle session it starts a turn, on a busy one it runs as the
+  next turn, and a session that is not loaded is resumed. dsh fires no hook
+  when a turn is cancelled or fails, so the wrapper watches the session log
+  and reports such a `turn/end` as the end of the turn. `unattended` seats
+  run with `DSH_PERMISSION_MODE=danger-full-access`. The model provider's key
+  comes from the node's environment (`DEEPSEEK_API_KEY`) or from the dsh
+  home's credential store.
 
 Every session gets a system prompt explaining that `[amail]` text comes from the
 mail system, that `USER` mail is an instruction, `agent` mail a colleague's
@@ -550,7 +578,8 @@ permission prompt), `dormant` (asleep), `offline`, `restarting`, `failed`.
   to sleep: its process ends, its session id and pane are kept.
 - `to` or urgent mail for a sleeping seat (or `amail wake`) starts it again
   in its pane, resuming its session (Claude Code `--resume`, Codex `codex
-  resume`); the mail then arrives as usual. At most 4 sessions start at a
+  resume`, dsh `session/create` with the session id); the mail then arrives
+  as usual. At most 4 sessions start at a
   time (`amail node --start-limit`), so mail to everyone does not start
   dozens of processes at once.
 - A process that ends without `down` or sleep is restarted (resuming) after
@@ -610,6 +639,22 @@ checks trust only at start, so after answering once, run `amail wake <seat>`
 - Codex agents need network access in their sandbox to reach the server
   (the dedicated Codex home allows it): with networking disabled, the Codex
   sandbox refuses both TCP and Unix-socket connections.
+- DeepSeek Harness:
+  - The pane of a dsh seat shows the host's log, not a conversation: the
+    session is used in a browser, at the URL printed in the pane (it carries
+    the host's launch token).
+  - Only the session amail created for the seat is connected to mail; other
+    sessions a person opens in the same host's GUI (and their hooks) are
+    ignored.
+  - The hook bridge has no permission event: with a seat that is not
+    `unattended`, an approval waiting in the browser is not reported as
+    `awaiting`. Its `Stop` input has no `stop_hook_active`; the node's own
+    limit (three blocks in a row) prevents loops.
+  - dsh sandbox modes restrict writes only; `unattended` seats can read
+    anything the user can, like Claude Code and Codex seats in bypass mode.
+  - A turn cut off by a crash of the host is not continued after the
+    restart; mail it had already read is not delivered again.
+  - Each seat runs a host process (about 200 MB idle).
 - Any process of the same user can ask the node for the credentials of a seat
   it hosts. The node is a per-user daemon; its socket directory is private to
   that user.
