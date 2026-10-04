@@ -14,6 +14,7 @@
 //! server.
 
 mod e2e;
+mod tenants;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -35,7 +36,8 @@ pub struct Opts {
     #[arg(long, default_value = "http://127.0.0.1:8025")]
     url: String,
     /// `server`: sends and periodic claims against the API. `e2e`: one
-    /// real node per org with simulated sessions (see `e2e.rs`).
+    /// real node per org with simulated sessions (see `e2e.rs`). `tenants`:
+    /// one org's load against another org's latency (see `tenants.rs`).
     #[arg(long, default_value = "server")]
     mode: String,
     /// e2e: where nodes keep state and seats' inbox sockets.
@@ -91,6 +93,27 @@ pub struct Opts {
     /// Prefix for org names, so several runs can share a database.
     #[arg(long, default_value = "bench")]
     prefix: String,
+    /// tenants: delivery rows of the attacking org (bulk-inserted).
+    #[arg(long, default_value_t = 2_000_000)]
+    rows: usize,
+    /// tenants: messages in the victim's thread and in the attacker's.
+    #[arg(long, default_value_t = 60_000)]
+    thread_size: usize,
+    /// tenants: user tokens of the attacking org.
+    #[arg(long, default_value_t = 64)]
+    attack_tokens: usize,
+    /// tenants: concurrent request loops of the attacking org.
+    #[arg(long, default_value_t = 128)]
+    attack_conc: usize,
+    /// tenants: requests per second of each victim operation.
+    #[arg(long, default_value_t = 5.0)]
+    victim_rate: f64,
+    /// tenants: comma-separated phases (see `tenants.rs`).
+    #[arg(
+        long,
+        default_value = "pending,counts,overview,attention,thread,own-thread,search,archive,lists,status,changes,inbox,all"
+    )]
+    phases: String,
     /// Write per-rate results as JSON lines to this file.
     #[arg(long)]
     out: Option<String>,
@@ -118,6 +141,9 @@ async fn main() -> Result<()> {
         .tcp_nodelay(true)
         .timeout(Duration::from_secs(120))
         .build()?;
+    if opts.mode == "tenants" {
+        return tenants::run(&opts, &http).await;
+    }
     let t = Instant::now();
     let world = Arc::new(setup(&opts, &http).await?);
     if opts.mode == "e2e" {
