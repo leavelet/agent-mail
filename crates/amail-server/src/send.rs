@@ -354,7 +354,7 @@ async fn notify_users(
             message = st.store.message(sent.message_id).await.ok().flatten();
         }
         let Some(m) = &message else { return };
-        let Some(slot) = st.limiters.webhooks.open(org_id) else {
+        let Some(slot) = webhook_slot(st, org_id, org.id) else {
             tracing::warn!(
                 "webhook of org {}: notice for message {} dropped, too many in flight",
                 target.name,
@@ -376,6 +376,21 @@ async fn notify_users(
             st.config.webhook_private_targets,
         );
     }
+}
+
+/// A place among the webhook notices in flight of the receiving org
+/// `target`: its own mail has the whole cap; mail from other orgs shares one
+/// more cap, of which each sending org may hold a quarter. So a linked org's
+/// burst cannot make the receiving org's own notices, or those of other
+/// orgs, be dropped.
+fn webhook_slot(st: &AppState, target: i64, sender: i64) -> Option<Vec<Box<dyn Send>>> {
+    let l = &st.limiters;
+    if target == sender {
+        return Some(vec![Box::new(l.webhooks.open(target)?)]);
+    }
+    let from = l.webhooks_from.open((target, sender))?;
+    let all = l.webhooks_external.open(target)?;
+    Some(vec![Box::new(from), Box::new(all)])
 }
 
 struct Resolver<'a> {

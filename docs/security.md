@@ -446,7 +446,7 @@ Rate and stream limits are counted per server instance.
 | Conversation mirror, per watched seat | in memory only while someone watches: the last 1,000 events or 4 MiB kept for watchers that join later; at most 8 MiB waiting to be sent to one watcher (a watcher that falls further behind, for example one that stopped reading, is disconnected and its queue freed; it reconnects and starts again from the kept events); 16 MiB for the seat in all (beyond it, the watchers furthest behind are disconnected); 1,000 events per post; 16,000 characters per event; 2,000 characters per status field |
 | Conversation mirrors over all seats | 256 MiB per instance (*public*); beyond it, the watcher furthest behind is disconnected or the largest kept-events buffer shortened, whichever holds more |
 | Browser sessions | 30 days (user), 1 day (operator); at most 20 per token (signing in once more ends the oldest); expired sessions and revoked tokens are deleted by the background cleanup |
-| Webhooks | URL at most 2,000 characters; 3 attempts; 5 s to connect, 10 s per attempt; redirects are not followed; 16 notices in flight per org, further ones are dropped (*public*) |
+| Webhooks | URL at most 2,000 characters; 3 attempts; 5 s to connect, 10 s per attempt; redirects are not followed; per receiving org, 16 notices in flight for its own mail and 16 more for mail from other orgs, of which one sending org may hold 4; further notices are dropped (*public*) |
 
 The node limits what it reads from the server and from its socket, so a
 malicious or broken server cannot make it grow without bound:

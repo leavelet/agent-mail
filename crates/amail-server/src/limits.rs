@@ -145,8 +145,14 @@ pub struct Limiters {
     /// limit (see [`amail_proto::limits::REGISTRATION_NET48_FACTOR`]).
     pub registration_nets: Option<Buckets<String>>,
     pub streams: Arc<StreamCount>,
-    /// Webhook notices in flight per org.
+    /// Webhook notices in flight per receiving org for its own mail.
     pub webhooks: Arc<StreamCount>,
+    /// Webhook notices in flight per receiving org for mail from other
+    /// orgs, all of them together.
+    pub webhooks_external: Arc<StreamCount>,
+    /// Webhook notices in flight per (receiving org, sending org), for mail
+    /// from another org.
+    pub webhooks_from: Arc<StreamCount<(i64, i64)>>,
     /// Search and archive requests in flight per org.
     pub queries: Arc<StreamCount>,
 }
@@ -169,6 +175,10 @@ impl Limiters {
             }),
             streams: Arc::new(StreamCount::new(l.org_streams)),
             webhooks: Arc::new(StreamCount::new(l.org_webhooks_in_flight)),
+            webhooks_external: Arc::new(StreamCount::new(l.org_webhooks_in_flight)),
+            webhooks_from: Arc::new(StreamCount::new(
+                l.org_webhooks_in_flight.map(|n| (n / 4).max(1)),
+            )),
             queries: Arc::new(StreamCount::new(l.org_queries)),
         }
     }
@@ -196,19 +206,19 @@ impl Limiters {
     }
 }
 
-/// Open event streams per org, with an optional cap.
-pub struct StreamCount {
+/// Things in progress per key (an org, usually), with an optional cap.
+pub struct StreamCount<K = i64> {
     max: Option<usize>,
-    open: Mutex<HashMap<i64, usize>>,
+    open: Mutex<HashMap<K, usize>>,
 }
 
-/// One open stream; dropping it ends the count.
-pub struct StreamGuard {
-    count: Arc<StreamCount>,
-    org_id: i64,
+/// One counted thing in progress; dropping it ends the count.
+pub struct StreamGuard<K: Hash + Eq + Clone = i64> {
+    count: Arc<StreamCount<K>>,
+    org_id: K,
 }
 
-impl Drop for StreamGuard {
+impl<K: Hash + Eq + Clone> Drop for StreamGuard<K> {
     fn drop(&mut self) {
         let mut open = self.count.open.lock().unwrap();
         if let Some(n) = open.get_mut(&self.org_id) {
@@ -220,7 +230,7 @@ impl Drop for StreamGuard {
     }
 }
 
-impl StreamCount {
+impl<K: Hash + Eq + Clone> StreamCount<K> {
     pub fn new(max: Option<usize>) -> Self {
         StreamCount {
             max,
@@ -229,9 +239,9 @@ impl StreamCount {
     }
 
     /// Count a new stream of the org, or `None` when the org is at its cap.
-    pub fn open(self: &Arc<Self>, org_id: i64) -> Option<StreamGuard> {
+    pub fn open(self: &Arc<Self>, org_id: K) -> Option<StreamGuard<K>> {
         let mut open = self.open.lock().unwrap();
-        let n = open.entry(org_id).or_default();
+        let n = open.entry(org_id.clone()).or_default();
         if self.max.is_some_and(|m| *n >= m) {
             return None;
         }
@@ -242,9 +252,9 @@ impl StreamCount {
         })
     }
 
-    /// Orgs with open streams.
-    pub fn orgs(&self) -> Vec<i64> {
-        self.open.lock().unwrap().keys().copied().collect()
+    /// Keys (orgs) with something in progress.
+    pub fn orgs(&self) -> Vec<K> {
+        self.open.lock().unwrap().keys().cloned().collect()
     }
 }
 

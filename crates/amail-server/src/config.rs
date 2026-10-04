@@ -35,7 +35,9 @@ pub struct Limits {
     /// client address.
     pub registrations_per_hour: Option<f64>,
     /// Webhook notices of one org being sent at the same time; further
-    /// notices are dropped while that many are in flight.
+    /// notices are dropped while that many are in flight. The cap counts the
+    /// org's own mail; notices of mail from other orgs have a cap of the
+    /// same size, of which each sending org may hold a quarter.
     pub org_webhooks_in_flight: Option<usize>,
     /// Bytes held by all conversation mirrors of the instance (replay
     /// events and what waits to be sent to watchers). Beyond it, the

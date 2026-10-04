@@ -64,6 +64,7 @@ public_tests!(
     cross_org_node_commands_and_presence,
     link_requests_do_not_reveal_org_names,
     webhooks_in_flight_per_org,
+    webhooks_in_flight_fair_between_orgs,
     org_settings_bounded,
 );
 
@@ -2108,6 +2109,67 @@ async fn webhooks_in_flight_per_org(b: Backend, t: &str) {
     a.send(json!({ "to": ["owner"], "subject": "later", "body": "" }))
         .await;
     eventually("the next webhook", async || *hits.lock().unwrap() == 3).await;
+}
+
+/// A linked org's burst of mail cannot use all of the receiving org's
+/// webhook notices in flight: each other org may hold a quarter of them,
+/// and the org's own mail has its own share.
+async fn webhooks_in_flight_fair_between_orgs(b: Backend, t: &str) {
+    use axum::routing::any;
+    let got: Arc<Mutex<Vec<String>>> = Arc::default();
+    let g = got.clone();
+    let app = axum::Router::new().fallback(any(move |body: String| {
+        let g = g.clone();
+        async move {
+            let v: Value = serde_json::from_str(&body).unwrap();
+            g.lock()
+                .unwrap()
+                .push(v["message"]["subject"].as_str().unwrap().to_string());
+            tokio::time::sleep(Duration::from_millis(3000)).await;
+            StatusCode::NO_CONTENT
+        }
+    }));
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    let mut cfg = public();
+    cfg.webhook_private_targets = true;
+    cfg.limits.org_webhooks_in_flight = Some(4);
+    cfg.limits.link_requests_per_hour = None;
+    let srv = start!(b, t, cfg);
+    let acme = srv.org("acme").await;
+    let a = acme.seat("a").await;
+    let beta = srv.org("beta").await;
+    let gamma = srv.org("gamma").await;
+    for (other, name) in [(&beta, "beta"), (&gamma, "gamma")] {
+        other
+            .ok(Method::POST, "/links", Some(json!({ "org": "acme" })))
+            .await;
+        acme.ok(Method::POST, &format!("/links/{name}/accept"), None)
+            .await;
+    }
+    acme.ok(
+        Method::PATCH,
+        "/org",
+        Some(json!({ "webhook_url": format!("http://127.0.0.1:{port}/hook") })),
+    )
+    .await;
+    for i in 0..6 {
+        beta.send(json!({ "to": ["owner@acme"], "subject": format!("beta{i}"), "body": "" }))
+            .await;
+    }
+    gamma
+        .send(json!({ "to": ["owner@acme"], "subject": "gamma", "body": "" }))
+        .await;
+    for i in 0..2 {
+        a.send(json!({ "to": ["owner"], "subject": format!("own{i}"), "body": "" }))
+            .await;
+    }
+    eventually("the notices", async || got.lock().unwrap().len() >= 4).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut got = got.lock().unwrap().clone();
+    got.sort();
+    assert_eq!(got, ["beta0", "gamma", "own0", "own1"]);
 }
 
 /// Org settings have upper bounds: in public mode all of them, on a
