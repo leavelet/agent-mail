@@ -38,7 +38,7 @@
               <span class="steps" aria-label={t(`dlv.${st}`)}>
                 {#each [0, 1, 2, 3] as i}<span class="step" class:on={i <= deliveryStep(st)}></span>{/each}
               </span>
-              <span class="st st-{st}" data-dstate={st}>{t(`dlv.${st}`)}</span>
+              <span class="st st-{st}" data-dstate={st} title={t(`dlv.${st}.long`)}>{t(`dlv.${st}`)}</span>
             </td>
             <td class="faint"><div class="times">
               {#if r.members}<span data-testid="dlv-members">{t('dlv.members', { seats: r.members.seats, read: r.members.read, acked: r.members.acked })}</span>{/if}
@@ -50,6 +50,11 @@
         {/each}
       </tbody>
     </table>
+    <dl class="legend" data-testid="dlv-legend">
+      {#each ['notified', 'read', 'acked'] as const as k}
+        <div><dt>{t(`dlv.${k}`)}</dt><dd>{t(`dlv.${k}.long`)}</dd></div>
+      {/each}
+    </dl>
   {/if}
 </div>
 
@@ -96,5 +101,27 @@
   }
   p {
     margin: 6px 8px;
+  }
+  .legend {
+    margin: 0;
+    padding: 5px 8px;
+    border-top: 1px solid var(--border);
+    background: var(--surface-2);
+    font-size: 11.5px;
+    color: var(--muted);
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+  .legend div {
+    display: flex;
+    gap: 6px;
+  }
+  .legend dt {
+    font-weight: 600;
+    min-width: 58px;
+  }
+  .legend dd {
+    margin: 0;
   }
 </style>

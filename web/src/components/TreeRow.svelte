@@ -3,7 +3,7 @@
   import type { Row } from '../lib/tree';
   import type { Seat, SeatCounts, SeatState } from '../lib/types';
   import { SEAT_STATES } from '../lib/types';
-  import { effectiveState, focusUntil, freshPresence, stateAge } from '../lib/presence';
+  import { KNOWN_ATTENTION, attentionTag, effectiveState, focusUntil, freshPresence, startingAtPrompt, stateAge } from '../lib/presence';
   import { shortTime } from '../lib/time';
   import { t, ui } from '../lib/ui.svelte';
   import StateBadge from './StateBadge.svelte';
@@ -38,14 +38,16 @@
   const isUser = $derived(seat.kind === 'user');
   const focus = $derived(focusUntil(seat, now));
   const hm = $derived([seat.harness ?? p?.harness, seat.model].filter(Boolean).join(' · '));
+  const tag = $derived(attentionTag(p));
   const attnLabel = $derived.by(() => {
-    const a = p?.attention;
-    if (!a) return null;
-    const key = `attn.${a}`;
-    return ['attn.trust-prompt', 'attn.login', 'attn.permission', 'attn.failed', 'attn.wake-failed', 'attn.no-activity'].includes(key)
-      ? t(key as 'attn.login')
-      : a;
+    if (!tag) return null;
+    return KNOWN_ATTENTION.includes(tag) ? t(`attn.${tag}` as 'attn.login') : tag;
   });
+  const attnTitle = $derived(
+    p?.attention_hint ?? (p?.turn_failed ? t('flag.turnFailed.long', { reason: p.turn_failed.reason, n: p.turn_failed.count }) : t('flag.attention')),
+  );
+  const failing = $derived(!!p?.turn_failed);
+  const starting = $derived(startingAtPrompt(p));
 </script>
 
 <div
@@ -53,6 +55,7 @@
   class:selected
   class:context={row.context}
   class:user={isUser}
+  class:failing
   role="treeitem"
   aria-level={row.depth + 1}
   aria-expanded={row.hasChildren ? row.expanded : undefined}
@@ -90,10 +93,11 @@
     {/if}
   </div>
   <div class="hm faint">{isUser ? '' : visible(hm)}</div>
-  <div class="state">{#if !isUser}<StateBadge state={seatState} {age} />{/if}</div>
+  <div class="state">{#if !isUser}<StateBadge state={seatState} {age} {starting} {failing} />{/if}</div>
   <div class="flags">
-    {#if attnLabel}<span class="chip attn" title={visible(p?.attention_hint ?? t('flag.attention'))}>⚠ {attnLabel}</span>{/if}
-    {#if p?.wake_failed && p?.attention !== 'wake-failed'}<span class="chip attn" title={t('flag.wakeFailed.long')}>{t('flag.wakeFailed')}</span>{/if}
+    {#if attnLabel}<span class="chip attn" title={visible(attnTitle)}>⚠ {attnLabel}</span>{/if}
+    {#if p?.turn_failed && tag !== 'turn-failed'}<span class="chip attn" title={visible(t('flag.turnFailed.long', { reason: p.turn_failed.reason, n: p.turn_failed.count }))}>⚠ {t('attn.turn-failed')}</span>{/if}
+    {#if p?.wake_failed && tag !== 'wake-failed'}<span class="chip attn" title={t('flag.wakeFailed.long')}>{t('flag.wakeFailed')}</span>{/if}
     {#if focus}<span class="chip focus" title={t('flag.focus.long')}>◐ {t('flag.focus', { time: shortTime(focus, now, ui.lang) })}</span>{/if}
     {#if waiting}<span class="chip you" title={t('flag.waitingYou.long')}>✉ {t('flag.waitingYou')}</span>{/if}
   </div>
@@ -121,6 +125,9 @@
   .trow.selected {
     background: var(--accent-weak);
     box-shadow: inset 3px 0 0 var(--accent);
+  }
+  .trow.failing {
+    box-shadow: inset 3px 0 0 var(--danger);
   }
   .trow.context {
     opacity: 0.55;

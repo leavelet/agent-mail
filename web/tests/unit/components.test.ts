@@ -50,6 +50,40 @@ describe('TreeRow', () => {
     expect(text).toContain('+2');
     expect(el.querySelector('.below')?.textContent).toContain('2');
   });
+  it('flags a seat whose turns fail, and a seat starting at a prompt', () => {
+    ui.lang = 'en';
+    const failing = render(TreeRow, {
+      row: { name: 'app-2', depth: 0, hasChildren: false, expanded: false, context: false },
+      seat: {
+        name: 'app-2',
+        kind: 'agent',
+        created_at: 'x',
+        presence: {
+          state: 'idle',
+          since: '2026-10-04T11:50:00Z',
+          updated_at: '2026-10-04T11:59:50Z',
+          turn_failed: { reason: 'no API key for provider route', at: '2026-10-04T11:58:00Z', count: 3, retrying: false },
+        },
+      },
+      now,
+    });
+    expect(failing.querySelector('.trow.failing')).not.toBeNull();
+    expect(failing.querySelector('.badge.failing')).not.toBeNull();
+    expect(failing.textContent).toContain('turns failing');
+    expect(failing.querySelector('.chip.attn')?.getAttribute('title')).toContain('no API key');
+    const starting = render(TreeRow, {
+      row: { name: 'root', depth: 0, hasChildren: false, expanded: false, context: false },
+      seat: {
+        name: 'root',
+        kind: 'agent',
+        created_at: 'x',
+        presence: { state: 'offline', since: '2026-10-04T11:50:00Z', updated_at: '2026-10-04T11:59:50Z', attention: 'trust-prompt' },
+      },
+      now,
+    });
+    expect(starting.querySelector('[data-starting]')?.textContent).toContain('starting – waiting for a person');
+    expect(starting.textContent).toContain('trust prompt');
+  });
   it('shows a stale seat as offline', () => {
     const el = render(TreeRow, {
       row: { name: 'w', depth: 0, hasChildren: false, expanded: false, context: false },
@@ -79,6 +113,26 @@ describe('untrusted text', () => {
     expect(el.querySelector('.k-tool_call .tool')?.textContent).toBe('Bash');
     expect(el.querySelector('.k-tool_result.err')).not.toBeNull();
     expect(el.textContent).toContain('cut');
+  });
+  it('labels a failed turn as an error, not as mail', () => {
+    ui.lang = 'en';
+    const el = render(Transcript, {
+      status: { state: 'streaming' },
+      events: [
+        { role: 'system', kind: 'notice', text: '[amail] 1 new message for w' },
+        { role: 'system', kind: 'notice', text: 'turn ended: no API key for provider route "x"', error: true },
+        // As older nodes sent it, without the flag.
+        { role: 'system', kind: 'notice', text: 'turn ended: transport failed' },
+        { role: 'system', kind: 'notice', text: 'turn interrupted' },
+      ],
+    });
+    const labels = [...el.querySelectorAll('.k-notice')].map((e) => [e.getAttribute('data-notice'), e.querySelector('.who')?.textContent?.trim()]);
+    expect(labels).toEqual([
+      ['mail', 'mail'],
+      ['error', 'error'],
+      ['error', 'error'],
+      ['system', 'system'],
+    ]);
   });
   it('explains a missing session instead of showing nothing', () => {
     const el = render(Transcript, { status: { state: 'node_offline' }, events: [] });

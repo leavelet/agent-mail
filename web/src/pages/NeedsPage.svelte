@@ -4,9 +4,9 @@
   import { t, ui } from '../lib/ui.svelte';
   import { href, go } from '../lib/router.svelte';
   import { attentionKey, isUrgent } from '../lib/attention';
-  import { duration } from '../lib/time';
+  import { duration, shortTime } from '../lib/time';
   import { typing, moveIndex } from '../lib/keys';
-  import { parseTime, terminalHref } from '../lib/presence';
+  import { KNOWN_ATTENTION, parseTime, startingAtPrompt, terminalHref } from '../lib/presence';
   import type { AttentionItem } from '../lib/types';
   import MessagePane from '../components/MessagePane.svelte';
   import StateBadge from '../components/StateBadge.svelte';
@@ -29,8 +29,12 @@
 
   function attnLabel(a: string | undefined): string {
     if (!a) return '';
-    const k = `attn.${a}`;
-    return ['attn.trust-prompt', 'attn.login', 'attn.permission', 'attn.failed', 'attn.wake-failed', 'attn.no-activity'].includes(k) ? t(k as 'attn.login') : a;
+    return KNOWN_ATTENTION.includes(a) ? t(`attn.${a}` as 'attn.login') : a;
+  }
+
+  /** A seat item whose session waits at a prompt before it started. */
+  function startingItem(it: AttentionItem): boolean {
+    return !!it.state && startingAtPrompt({ state: it.state, attention: it.attention, since: it.since, updated_at: it.since });
   }
 
   function open(it: AttentionItem) {
@@ -80,7 +84,6 @@
       <div class="items" role="listbox" aria-label={t('needs.title')}>
         {#each items as it (attentionKey(it))}
           {@const key = attentionKey(it)}
-          {@const seat = it.seat ? store.seatMap.get(it.seat) : undefined}
           <div
             class="item k-{it.kind}"
             class:sel={key === selectedKey}
@@ -101,7 +104,7 @@
               <div class="l1">
                 {#if it.seat}<span class="mono who">{it.seat}</span>{/if}
                 {#if it.kind === 'seat'}
-                  {#if it.state}<StateBadge state={it.state} compact />{/if}
+                  {#if it.state}<StateBadge state={it.state} compact starting={startingItem(it)} failing={!!it.turn_failed} />{/if}
                   <span class="chip attn">⚠ {it.attention ? attnLabel(it.attention) : t('flag.wakeFailed')}</span>
                 {:else if it.message}
                   {#if it.message.priority === 'urgent'}<span class="chip urgent">{t('mail.urgent')}</span>{/if}
@@ -110,7 +113,7 @@
                 {/if}
               </div>
               {#if it.kind === 'seat' && it.hint}<div class="l2 muted"><Vis text={it.hint} /></div>{/if}
-              {#if it.kind !== 'seat' && seat}<div class="l2 faint"><Vis text={seat.role?.split('\n', 1)[0] ?? ''} /></div>{/if}
+              {#if it.kind !== 'seat' && it.preview}<div class="l2 muted preview"><Vis text={it.preview} /></div>{/if}
             </div>
             <span class="age faint" title={it.since}>{t('needs.waiting', { d: waited(it) })}</span>
           </div>
@@ -123,9 +126,16 @@
     {#if current?.kind === 'seat' && current.seat}
       {@const seat = store.seatMap.get(current.seat)}
       <div class="seatcard card">
-        <div class="row"><h2 class="mono">{current.seat}</h2>{#if current.state}<StateBadge state={current.state} />{/if}</div>
+        <div class="row"><h2 class="mono">{current.seat}</h2>{#if current.state}<StateBadge state={current.state} starting={startingItem(current)} failing={!!current.turn_failed} />{/if}</div>
         <p class="error"><strong>⚠ {current.attention ? attnLabel(current.attention) : t('flag.wakeFailed')}</strong></p>
-        {#if current.hint}<p><Vis text={current.hint} /></p>{/if}
+        {#if current.turn_failed}
+          {@const tf = current.turn_failed}
+          <p>{t('seat.turnFailed.reason')} <code><Vis text={tf.reason} /></code></p>
+          <p>{t('seat.turnFailed.count', { n: tf.count, time: shortTime(tf.at, ui.now, ui.lang) })} {tf.retrying ? t('seat.turnFailed.retrying') : t('seat.turnFailed.stopped')}</p>
+          <p>{t('seat.turnFailed.todo')}</p>
+        {:else if current.attention === 'trust-prompt'}
+          <p>{terminalHref(seat?.presence?.terminal_url) ? t('seat.trust.web') : t('seat.trust.cli', { cmd: `amail attach ${current.seat}` })}</p>
+        {:else if current.hint}<p><Vis text={current.hint} /></p>{/if}
         {#if terminalHref(seat?.presence?.terminal_url)}
           <p><a href={terminalHref(seat?.presence?.terminal_url)} target="_blank" rel="noopener noreferrer">{t('seat.openTerminal')} ↗</a></p>
         {:else}
@@ -213,6 +223,10 @@
   .k-seat .kind {
     color: var(--danger);
     background: var(--danger-weak);
+  }
+  .k-notice .kind {
+    color: var(--muted);
+    background: var(--surface-2);
   }
   .main {
     min-width: 0;

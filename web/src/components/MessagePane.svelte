@@ -1,13 +1,15 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
   import { get, enc } from '../lib/api';
   import type { Delivery, Message, MessageResponse } from '../lib/types';
   import { t } from '../lib/ui.svelte';
   import { href, go } from '../lib/router.svelte';
-  import { ack, markRead } from '../lib/mailops';
+  import { ack, markRead, markUnread } from '../lib/mailops';
   import MessageCard from './MessageCard.svelte';
 
-  /** One message (peeked: opening does not mark it read) with mail actions. */
-  let { id, onchange }: { id: number; onchange?: () => void } = $props();
+  /** One message with mail actions. It is fetched without marking it read;
+   * with `markOnOpen` it is then marked read (a person opened it). */
+  let { id, onchange, markOnOpen = false }: { id: number; onchange?: () => void; markOnOpen?: boolean } = $props();
 
   let message = $state.raw<Message | null>(null);
   let delivery = $state.raw<Delivery | undefined>(undefined);
@@ -23,6 +25,7 @@
         if (mid !== id) return;
         message = r.message;
         delivery = r.delivery;
+        if (untrack(() => markOnOpen) && r.delivery && !r.delivery.read_at) void run(() => markRead(mid));
       })
       .catch((e) => (error = e instanceof Error ? e.message : String(e)));
   });
@@ -41,6 +44,9 @@
 
   export function doMarkRead() {
     if (message && delivery && !delivery.read_at) void run(() => markRead(id));
+  }
+  export function doMarkUnread() {
+    if (message && delivery?.read_at && !delivery.acked_at) void run(() => markUnread(id));
   }
   export function doAck() {
     if (message?.ack_required && delivery && !delivery.acked_at) void run(() => ack(id));
@@ -66,7 +72,9 @@
           {delivery.acked_at ? t('mail.acked') : t('mail.ack')} <kbd>a</kbd>
         </button>
       {/if}
-      {#if delivery}
+      {#if delivery?.read_at && !delivery.acked_at}
+        <button class="small" disabled={busy} onclick={doMarkUnread}>{t('mail.markUnread')} <kbd>u</kbd></button>
+      {:else if delivery}
         <button class="small" disabled={busy || !!delivery.read_at} onclick={doMarkRead}>{t('mail.markRead')} <kbd>e</kbd></button>
       {/if}
       <a class="small-link" href={href(['thread', message!.thread_id], { m: message!.id })}>{t('mail.thread')} →</a>
