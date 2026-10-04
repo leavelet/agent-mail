@@ -153,6 +153,30 @@ impl Client {
     }
 }
 
+impl Client {
+    /// The ids of every page of `path` (a search or archive request),
+    /// following `next_before_id` to the end, and the number of requests.
+    async fn follow(&self, path: &str) -> (Vec<i64>, usize) {
+        let sep = if path.contains('?') { '&' } else { '?' };
+        let mut out = Vec::new();
+        let mut url = path.to_string();
+        for n in 1..=1000 {
+            let v = self.get(&url).await;
+            out.extend(ids(&v));
+            match v["next_before_id"].as_i64() {
+                Some(next) => {
+                    let base = path.split("before_id=").next().unwrap();
+                    let base = base.trim_end_matches(['&', '?']);
+                    let sep = if base.contains('?') { '&' } else { sep };
+                    url = format!("{base}{sep}before_id={next}");
+                }
+                None => return (out, n),
+            }
+        }
+        panic!("{path}: no end after 1000 requests");
+    }
+}
+
 fn ids(v: &Value) -> Vec<i64> {
     v["messages"]
         .as_array()
@@ -203,12 +227,12 @@ async fn search_looks_at_a_bounded_window(b: Backend, t: &str) {
     );
     assert!(snip.chars().count() <= 162, "{snip}");
     assert!(p1["messages"][0].get("body").is_none());
-    // Following it reaches the oldest message, and the end.
-    let p2 = big
-        .get(&format!("/archive/search?q=needle&before_id={next}"))
+    // Following it reaches the oldest message, and the end (one request
+    // stops after a time limit, so this may take more than one).
+    let (rest, _) = big
+        .follow(&format!("/archive/search?q=needle&before_id={next}"))
         .await;
-    assert_eq!(ids(&p2), vec![first], "{p2}");
-    assert!(p2.get("next_before_id").is_none(), "{p2}");
+    assert_eq!(rest, vec![first]);
     // Short terms look at fewer messages.
     let s = big.get("/archive/search?q=ne").await;
     assert_eq!(ids(&s), vec![last]);
@@ -260,13 +284,12 @@ async fn archive_starts_from_the_org(b: Backend, t: &str) {
     let p1 = big.get("/archive/messages?from=owner@small").await;
     assert!(ids(&p1).is_empty(), "{p1}");
     let next = p1["next_before_id"].as_i64().expect("cursor");
-    let p2 = big
-        .get(&format!(
+    let (rest, _) = big
+        .follow(&format!(
             "/archive/messages?from=owner@small&before_id={next}"
         ))
         .await;
-    assert_eq!(ids(&p2), vec![from_small]);
-    assert!(p2.get("next_before_id").is_none());
+    assert_eq!(rest, vec![from_small]);
     // A seat of the org: its sent mail or mailbox directly.
     let v = big.get("/archive/messages?to=owner&limit=5").await;
     assert_eq!(ids(&v), vec![own, from_small]);

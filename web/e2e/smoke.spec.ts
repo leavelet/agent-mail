@@ -120,3 +120,19 @@ test('a large thread: older bodies are loaded on request', async ({ page }) => {
   await expect(oldest.locator('pre.body')).toContainText('aaaa');
   await expect(oldest.getByTestId('body-omitted')).toHaveCount(0);
 });
+
+test('the user deletes an internal thread', async ({ page }) => {
+  const s = state();
+  await login(page, s.userToken, { lang: 'en' });
+  const root = await api<{ id: number }>(s.userToken, 'POST', '/messages', { to: ['owner'], subject: 'Throwaway', body: 'one' });
+  await api(s.userToken, 'POST', '/messages', { to: ['owner'], subject: 'Re: Throwaway', body: 'two', in_reply_to: root.id });
+  const before = await api<{ stored_bytes: number }>(s.userToken, 'GET', '/org');
+  await page.goto(`${s.base}/#/thread/${root.id}`);
+  await expect(page.locator(`article[data-msg="${root.id}"]`)).toBeVisible();
+  page.once('dialog', (d) => void d.accept());
+  await page.getByRole('button', { name: 'Delete' }).click();
+  await expect(page.getByText('Deleted 2 messages.')).toBeVisible();
+  await expect(page.getByText('Thread not found.', { exact: false })).toBeVisible();
+  const after = await api<{ stored_bytes: number }>(s.userToken, 'GET', '/org');
+  expect(after.stored_bytes).toBeLessThan(before.stored_bytes);
+});

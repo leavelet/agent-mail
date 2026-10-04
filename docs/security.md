@@ -99,7 +99,10 @@ the server writes the text from fixed sentences, shows only values a
 setting can have and only names of the org's own seats, and shows the
 node's label escaped on one line. Each org's nodes together can send at
 most 60 such reports per hour (bursts of 10), and a node's reports go only
-to its own org's user.
+to its own org's user. One report becomes one mail of at most 4 KB. An org
+receives at most 50 such mails (128 KB) in 24 hours; further reports are
+dropped. This mail does not count against the org's storage quota and is
+deleted after 7 days.
 
 - When the node starts, and after each `amail up`, it compares its local
   policy, and each supervised seat's permission mode and (for Codex seats)
@@ -168,6 +171,17 @@ seat with its jail on, the default: amail runs its host in a bwrap jail
 that hides the home directory, the runtime directory and other processes,
 so the points below that need those do not apply to it; it can still read
 the rest of the file system. With `dsh_jail = false` all the points apply.
+The jail mounts `/` read-only, a new `/dev` and `/proc`, and empty `tmpfs`
+mounts over the home directory, `/tmp` and `$XDG_RUNTIME_DIR`; it covers
+the Docker, Podman and containerd sockets with `/dev/null`; it mounts back
+writable the seat's working directory, its dsh home and the git paths its
+`git_access` allows; and it mounts back read-only the `amail`, `dsh` and
+Node.js installations, the repository's other git paths, the seat's
+profile, patch and endpoint directory, the node socket's directory, and
+git's configuration files `~/.gitconfig` and `config`, `ignore` and
+`attributes` in `~/.config/git` (or `$XDG_CONFIG_HOME/git`), each file on its own, never git's
+credential stores. The host has no controlling terminal and reads
+`/dev/null`. The full list is in the harness documentation.
 See [harness support](harnesses.md#deepseek-harness-dsh).) An agent that can run shell commands (Claude Code
 with `--dangerously-skip-permissions`, a Codex seat whose sandbox lets it
 read your home directory, or any agent whose commands you approve without
@@ -471,12 +485,18 @@ mailboxes and archives, shown as from `name@org (deleted org)`: an org
 cannot remove mail it sent to another org, such as a prompt-injection
 attempt, by deleting itself. Of the deleted org, only the names of the
 seats that sent such mail are kept. A new org that takes the name sees none
-of this mail and is never shown as its sender. That mail counts against
-the storage quota of each org that keeps it (in full, with its own
-deliveries), so deleting an org and registering again does not store
-mail beyond the receivers' quotas; a receiving org cannot delete it, and
-only retention or deleting the org frees it. An operator may
-set a retention period after which message bodies are cleared. Backups the
+of this mail and is never shown as its sender. That mail is counted, for
+each org that keeps it (in full, with its own deliveries), as `kept_bytes`,
+which is not held against the org's storage quota: a linked org cannot
+stop another org from sending by filling its quota and deleting itself.
+What it can leave behind is bounded by its own quota. The receiving org's
+user can delete that mail (`amail thread delete`, `amail org
+purge-deleted-orgs`), and retention deletes it once it is older than the
+retention period. The user can also delete the org's internal mail (mail
+no other org received); mail exchanged with orgs that still exist cannot be
+deleted by either side, so neither can remove what it sent to the other.
+An operator may set a retention period after which message bodies are
+cleared. Backups the
 operator made earlier are not affected by either. A public server limits
 the mail each org may store (see [resource limits](#resource-limits)).
 
@@ -501,13 +521,16 @@ Rate and stream limits are counted per server instance.
 | Messages sent per agent seat | 30 per minute, bursts of 30 (org settings; the user seat is exempt) |
 | Org settings | `send_rate_per_min` and `send_burst` at most 600, `max_recipients` and `max_thread_depth` at most 1,000 (*public*); `ack_timeout_min`, `focus_max_min` and `digest_interval_min` at most 10,080 (one week) |
 | Messages per org | 50 per second (*public*) |
-| Mail stored per org | 1 GiB (*public*): every message the org sent counts its subject, body, `meta` and addresses plus 512 bytes, and 384 bytes per delivery (one per recipient seat, so a list counts once per member); mail of deleted orgs counts against the orgs that keep it (so a linked org that sends you much mail and then deletes itself moves its charge to your org, and your sends can be refused until retention removes that mail; received mail cannot be deleted by the receiver yet); retention gives back the bytes of cleared bodies; a send over it is refused with 507 `storage_quota`, and an org at its quota can send nothing, not even an empty message |
+| Mail stored per org | 1 GiB (*public*): every message the org sent counts its subject, body, `meta` and addresses plus 512 bytes, and 384 bytes per delivery (one per recipient seat, so a list counts once per member); mail of deleted orgs is counted for the orgs that keep it as `kept_bytes`, not against their quota (retention deletes it after the retention period, and the user can delete it); retention gives back the bytes of cleared bodies; a send over it is refused with 507 `storage_quota`, and an org at its quota can send nothing, not even an empty message, until it deletes internal mail or retention clears bodies (mail exchanged with orgs that still exist keeps counting its headers and deliveries) |
+| Messages deleted per request | 1,000 (`DELETE /threads/{id}`, `POST /archive/purge-deleted-orgs`); the answer says whether more remain. A purge looks at the org's mail in steps of 5,000 messages and starts no step after 100 ms, then answers with `next_before_id` |
 | Messages over all orgs | 500 per second (*public*) |
 | Requests per token or browser session | 200 per second, bursts of 400 (*public*); sign-ins count too |
 | Requests per org, all its tokens and browser sessions together | 500 per second, bursts of 1,000 (*public*); once the server knows a token's org, a request over the limit is refused before the database is asked, and the refusal (429) is sent after one second, so that a client that retries at once is slowed down |
 | Registration attempts per client address (IPv6: per /64 network) | 10 per hour, bursts of 5, failed ones included (*public*); in addition, all /64 networks of one IPv6 /48 together get 4 times that (40 per hour, bursts of 20), checked first |
 | Link requests per org | 20 per hour, bursts of 5 (*public*) |
 | Node notice reports (`POST /v1/node/notices`) per org | 60 per hour, bursts of 10, all of the org's nodes together; at most 20 notices per report, 100 items per notice and 50 seat names per item |
+| Notice mail (from node notice reports) per org | one mail per report, body at most 4 KB (items and notices that do not fit are left out and counted); 50 mails and 128 KB in any 24 hours, counted in the database (so across restarts and instances; with several instances, reports that arrive at the same moment on different instances can each pass); reports over it are answered as taken and dropped; not counted against the storage quota and never refused at it; deleted after 7 days, whatever the retention setting |
+| Failed authentications per client address (IPv6: per /64 network) | 10 per minute, bursts of 30: unknown, revoked or expired tokens and sessions, at sign-in, on API requests and operator requests (*public*); beyond them, a request from that address with a credential the server instance has not seen valid lately gets 429 without a database lookup. Credentials that were valid on that instance lately keep working from that address; a valid credential not seen yet (after a restart, say) is refused there until the address has room again, and works from other addresses |
 | Pending outgoing link requests per org | 1,000; a request not accepted within 30 days is dropped |
 | `org_exists` answers per invite code | 3; then the invite is spent |
 | Keys tracked by each rate limiter | 100,000; when a new key arrives at that count, the fullest 1/64 of the buckets are dropped to make room, so a new client always gets a bucket of its own; keys whose bucket is full again are dropped on every cleanup pass |
@@ -519,9 +542,9 @@ Rate and stream limits are counted per server instance.
 | `POST /claim` | at most 500 deliveries; `inline_body_max` and `preview_chars` at most 16,384 characters (a longer body is not inlined) |
 | `GET /changes` page | 500 by default, at most 5,000, and at most 2 MiB (`more` says what follows) |
 | `GET /archive/messages`, `GET /sent` page | 50 by default, at most 500, and at most 2 MiB |
-| `GET /archive/search` | 50 results by default, at most 200, and at most 2 MiB; at most 10 terms; each request looks at the org's 50,000 newest messages before its cursor (2,000 when a term is shorter than 3 characters) |
-| Messages one archive request looks at | 50,000 of the org's own, newest first (or of the thread, with `thread=`); then it answers with `next_before_id`. Filters by one of the org's seats (`from=`, `to=`) read that seat's mail directly |
-| Requests whose database cost depends on the data, in progress: search, archive, `GET /threads/{id}`, `/attention`, `/overview`, `/messages/{id}/status`, `/lists`, `/lists/{name}`, `/changes`, and `/inbox` and `/sent` pages of more than 100 | 1 per org and 8 over all orgs (*public*); a request waits up to 1 s for a slot, then gets 429 `too_many_queries`. A slot is held until the database work ends, also when the client gave up |
+| `GET /archive/search` | 50 results by default, at most 200, and at most 2 MiB; at most 10 terms; each request looks at most at the org's 50,000 newest messages before its cursor (2,000 when a term is shorter than 3 characters), in steps of at most 5,000 messages and 4 MiB of body text divided by the number of terms, and starts no step after 100 ms; then it answers with `next_before_id` |
+| Messages one archive request looks at | at most 50,000 of the org's own, newest first (or of the thread, with `thread=`), in steps of 5,000, and no step after 100 ms; then it answers with `next_before_id`. Filters by one of the org's seats (`from=`, `to=`) read that seat's mail directly |
+| Requests whose database cost depends on the data, in progress, in three pools: search (`/archive/search`, `/archive/messages`); other (`GET /threads/{id}`, `/messages/{id}/status`, `/changes`, and `/inbox` and `/sent` pages of more than 100); light (`/overview`, `/attention`, `/lists`, `/lists/{name}`, each with a fixed upper bound on its cost) | in each pool 1 per org (*public*); the search and the other pool also 8 each over all orgs (*public*), the light pool has no limit over all orgs. A request waits up to 1 s for a slot, then gets 429 `too_many_queries`; a freed slot goes to the org holding the fewest slots of the pool, then to the org served least recently. A slot is held until the database work ends, also when the client gave up |
 | One query of those requests | 10 s, then it is cancelled (503 `query_timeout`) |
 | `GET /pending`, `GET /counts` | read per-seat counters, kept in the transactions that change deliveries; their cost does not depend on the number of deliveries |
 | `GET /attention` | looks at the user seat's newest 5,000 deliveries; 500 items and 2 MiB |

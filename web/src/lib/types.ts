@@ -131,6 +131,15 @@ export interface ThreadResponse {
   truncated?: boolean;
 }
 
+/** Response of `DELETE /v1/threads/{id}`. */
+export interface DeleteMailResponse {
+  deleted: number;
+  /** Messages that stay: mail exchanged with orgs that still exist. */
+  kept: number;
+  /** More can be deleted: call again. */
+  more: boolean;
+}
+
 export interface ArchiveResponse {
   messages: MessageHeader[];
   next_before_id?: number;

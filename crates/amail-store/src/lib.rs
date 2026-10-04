@@ -308,6 +308,12 @@ pub trait Store: Send + Sync + 'static {
     /// Drop expired claim keys, watches, server instances, browser sessions
     /// and link requests, and revoked tokens (with their sessions).
     async fn cleanup(&self) -> Result<()>;
+    /// Notice mail the org received since `since` (ms): `(mails, bytes of
+    /// subjects and bodies)`.
+    async fn notice_usage(&self, org_id: i64, since: i64) -> Result<(i64, i64)>;
+    /// Delete up to `limit` notice mails created before `cutoff`, with
+    /// their deliveries; returns how many.
+    async fn delete_old_notices(&self, cutoff: i64, limit: i64) -> Result<u64>;
     /// Which of these token ids are live, and which of these browser
     /// sessions (by hash) are live and belong to a live token.
     async fn live_credentials(
@@ -388,6 +394,30 @@ pub trait Store: Send + Sync + 'static {
     /// Clear the bodies of up to `limit` messages created before `cutoff`;
     /// returns how many were cleared.
     async fn expire_bodies(&self, cutoff: i64, limit: i64) -> Result<u64>;
+    /// Delete, for the org, the messages of the thread it may delete: mail
+    /// of deleted orgs it keeps (its deliveries of it; the message once no
+    /// org keeps a delivery of it), and mail it sent that no other org has
+    /// a delivery of. At most `limit` messages; `None` when the org sees no
+    /// message of the thread.
+    async fn delete_thread(
+        &self,
+        org_id: i64,
+        thread_id: i64,
+        limit: i64,
+    ) -> Result<Option<MailDeleted>>;
+    /// Delete, for the org, up to `limit` messages of deleted orgs it keeps,
+    /// looking below message id `before` and starting no step of the walk
+    /// after `time_limit` (`MailDeleted::next_before_id` continues).
+    async fn purge_deleted_org_mail(
+        &self,
+        org_id: i64,
+        limit: i64,
+        before: Option<i64>,
+        time_limit: Option<std::time::Duration>,
+    ) -> Result<MailDeleted>;
+    /// Retention: delete up to `limit` messages of deleted orgs created
+    /// before `cutoff`, with all their deliveries; returns how many.
+    async fn expire_deleted_org_mail(&self, cutoff: i64, limit: i64) -> Result<u64>;
     /// Load and activity per org, for the operator.
     async fn operator_stats(&self) -> Result<OperatorStats>;
     /// Replace a user token: issue `new`, revoke `old` and end its browser

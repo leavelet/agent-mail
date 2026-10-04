@@ -259,6 +259,19 @@ pub mod limits {
     pub const MAX_NOTICE_ITEMS: usize = 100;
     /// Seat names listed for one action (more are counted, not named).
     pub const MAX_NOTICE_TARGETS: usize = 50;
+    /// Bytes of the body of one notice mail. One report becomes at most one
+    /// mail; items that do not fit are left out and counted.
+    pub const MAX_NOTICE_BODY_BYTES: usize = 4096;
+    /// Notice mails one org may receive in 24 hours (a sliding window,
+    /// counted in the database); reports beyond it are dropped.
+    pub const NOTICE_MAILS_PER_DAY: i64 = 50;
+    /// Bytes of notice mail (subject and body) one org may receive in 24
+    /// hours; reports beyond it are dropped.
+    pub const NOTICE_BYTES_PER_DAY: i64 = 128 * 1024;
+    /// Days after which notice mail is deleted, independent of the server's
+    /// retention setting. Notice mail is not charged to the org's storage
+    /// quota; this and the daily budget bound it instead.
+    pub const NOTICE_RETENTION_DAYS: i64 = 7;
 
     // --- responses ---
 
@@ -273,10 +286,22 @@ pub mod limits {
     pub const MAX_THREAD_BODY_BYTES: usize = 1024 * 1024;
     /// The most messages `GET /threads/{id}` answers (the newest ones).
     pub const MAX_THREAD_MESSAGES: i64 = 500;
+    /// The most messages one `DELETE /threads/{id}` or
+    /// `POST /archive/purge-deleted-orgs` deletes; the answer says whether
+    /// more remain.
+    pub const MAX_DELETE_MESSAGES: i64 = 1_000;
     /// Messages of the org one archive or search request looks at, newest
     /// first, before it answers with what it found and a cursor
     /// (`next_before_id`) to continue.
     pub const MAX_SCAN_MESSAGES: i64 = 50_000;
+    /// Body bytes one step of a search looks at, divided by the number of
+    /// search terms (at least one message per step).
+    pub const SEARCH_STEP_BYTES: i64 = 4 * 1024 * 1024;
+    /// A search or archive request starts no further step of
+    /// [`MAX_SCAN_MESSAGES`] after this many milliseconds; it answers with
+    /// what it found and a cursor (`next_before_id`) to continue. This
+    /// bounds how long one request holds a query slot.
+    pub const SCAN_TIME_LIMIT_MS: u64 = 100;
     /// `GET /inbox` and `GET /sent` pages of up to this many entries are
     /// served without one of the org's query slots; larger pages, and every
     /// `GET /changes` page, take one.
@@ -308,6 +333,11 @@ pub mod limits {
     /// Days after which a link request that was not accepted is dropped,
     /// whether or not an org of that name exists.
     pub const LINK_REQUEST_DAYS: i64 = 30;
+    /// Failed authentications from one client address (IPv6: one /64)
+    /// after which its requests with a credential the server has not seen
+    /// valid lately are refused before the database is asked, as a
+    /// multiple of the per-minute rate (`auth_failures_per_min`).
+    pub const AUTH_FAILURE_BURST_MINUTES: f64 = 3.0;
 
     // --- what the node reads (so a server cannot exhaust its memory) ---
 
@@ -549,6 +579,24 @@ pub struct ThreadResponse {
     /// 500 messages, and headers of at most [`limits::MAX_PAGE_BYTES`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
+}
+
+/// Response of `DELETE /v1/threads/{id}` and
+/// `POST /v1/archive/purge-deleted-orgs`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DeleteMailResponse {
+    /// Messages the org no longer has.
+    pub deleted: i64,
+    /// Messages of the thread that stay: mail exchanged with orgs that
+    /// still exist (neither side can delete it).
+    #[serde(default)]
+    pub kept: i64,
+    /// More can be deleted: call again.
+    #[serde(default)]
+    pub more: bool,
+    /// Purge: pass as `before_id` to the next call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_before_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -814,9 +862,14 @@ pub struct OrgInfo {
     pub webhook_url: Option<String>,
     /// Bytes counted against the storage quota: each message the org sent
     /// (subject, body, meta, addresses and a fixed amount) with a fixed
-    /// amount per delivery, and the same for mail of deleted orgs it keeps.
+    /// amount per delivery.
     #[serde(default)]
     pub stored_bytes: i64,
+    /// Bytes of the mail of deleted orgs the org keeps, counted the same
+    /// way (the message and the org's own deliveries of it). Not counted
+    /// against the quota; retention deletes that mail, and the user can.
+    #[serde(default)]
+    pub kept_bytes: i64,
     /// The server's limit on `stored_bytes`; absent when there is none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_quota_bytes: Option<i64>,
@@ -1056,7 +1109,9 @@ pub struct NodeNotices {
     pub notices: Vec<NodeNotice>,
 }
 
-/// Answer to `POST /v1/node/notices`: the number of mails written.
+/// Answer to `POST /v1/node/notices`: the number of mails written (one
+/// report becomes at most one mail; 0 when the report was empty or the org
+/// is over its daily notice budget, in which case the report is dropped).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeNoticesAccepted {
     pub sent: usize,
@@ -1399,6 +1454,9 @@ pub struct OrgStatInfo {
     /// Bytes of the mail the org sent that the server stores.
     #[serde(default)]
     pub stored_bytes: i64,
+    /// Bytes of the mail of deleted orgs the org keeps.
+    #[serde(default)]
+    pub kept_bytes: i64,
 }
 
 /// Response of `GET /v1/operator/stats`.

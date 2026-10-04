@@ -44,6 +44,7 @@ exit code.
 | `amail ack <id>` | acknowledge |
 | `amail status <id>` | per-recipient delivery state of a message you sent |
 | `amail thread <id>` | a thread, by thread id or the id of any message in it |
+| `amail thread delete <id>` | user token: delete what the org may delete of a thread (mail of deleted orgs, and mail the org sent that no other org received); says how many messages were deleted and how many stay |
 | `amail who` | directory: seats, lists, linked orgs |
 | `amail focus on [--for 30m] [--seat s]` / `amail focus off` | hold all but urgent mail (user tokens: any seat) |
 | `amail claim [--via v] [--classes to,cc,list] [--urgent-only] [--include-digest] [--limit n] [--inline-body-max n]` | take pending notifications (marks them notified) |
@@ -58,7 +59,8 @@ exit code.
 | `amail list ls [name]` / `rm` / `add <list> <members...> [--mode immediate\|digest\|archive]` / `remove` | lists and members |
 | `amail link request <org>` / `accept <org>` / `ls` / `revoke <org>` | links with other orgs |
 | `amail token node` / `user` / `ls` / `revoke <id>` / `rotate [--label l]` | tokens; `rotate` replaces the user token in use and updates saved logins |
-| `amail org show` | org settings |
+| `amail org show` | org settings, the storage count and quota, and the mail of deleted orgs the org keeps |
+| `amail org purge-deleted-orgs` | user token: delete all mail of deleted orgs the org keeps |
 | `amail org set [--send-rate-per-min n] [--send-burst n] [--max-recipients n] [--max-thread-depth n] [--ack-timeout-min n] [--focus-max-min n] [--digest-interval-min n] [--webhook-url url \| --no-webhook]` | change org settings |
 | `amail org delete [--confirm <org>]` | delete the org and all its data; asks for the name unless `--confirm` gives it |
 
@@ -102,7 +104,7 @@ node uses `AMAIL_URL`, then `node.toml`, then the current saved login's URL.
 | `amail admin operator-token create [--label l]` / `ls` / `revoke <id>` | operator tokens |
 | `amail admin org ls` / `suspend <org>` / `resume <org>` / `delete <org> --confirm <org>` | orgs |
 | `amail admin token reset <org>` | revoke all user tokens of an org and print a new one |
-| `amail admin stats [--top 20]` | orgs, seats, mail volume, busiest orgs |
+| `amail admin stats [--top 20]` | orgs, seats, mail volume, stored and kept MiB, busiest orgs |
 
 All `amail admin` commands take `--db` (or `AMAIL_DB`) and work directly on
 the database.
@@ -114,6 +116,9 @@ limits add `retry_after_ms` and a `Retry-After` header). Requests
 authenticate with `Authorization: Bearer <token>` or the web interface's
 session cookie; with the cookie, everything but `GET` needs the header
 `X-Amail-Csrf: 1`, and an `Origin` header must name the server.
+After too many failed authentications from one client address, requests
+from it with a credential the server has not seen valid lately get 429
+`rate_limited` (see [security](security.md#resource-limits)).
 `GET /healthz` (outside `/v1`) answers `ok`.
 
 ### Mail
@@ -126,6 +131,8 @@ session cookie; with the cookie, everything but `GET` needs the header
 | `POST /messages/{id}/ack` | acknowledge |
 | `POST /messages/{id}/read` | mark the caller's delivery read |
 | `GET /messages/{id}/status` | per-recipient state (the sender and the sender org's user only); seats reached through another org's list, including seats of a third org that the list contains, are counted under the list's address (`members`) |
+| `DELETE /threads/{id}` | user tokens: delete, for the org, the messages of the thread it may delete: mail of orgs that no longer exist (the org's deliveries of it; the message goes once no org keeps a delivery of it), and mail the org sent that no other org has a delivery of (its internal mail, including mail from the mail system). Mail exchanged with orgs that still exist stays, for both sides, until retention clears its bodies. Answers `{deleted, kept, more}`: `kept` counts the messages that stay; at most 1,000 messages are deleted per call (among the newest 50,000 of the thread), and `more` says to call again. Replies to a deleted message lose their `in_reply_to`. 404 for a thread the org cannot see, as for a missing one. Takes one of the org's query slots |
+| `POST /archive/purge-deleted-orgs` | `before_id` (user tokens): delete up to 1,000 messages of deleted orgs that the org keeps, looking at the org's mail below `before_id` in steps of 5,000 messages and starting no step after 100 ms; answers `{deleted, more, next_before_id}`, call again with `before_id` set to `next_before_id` while `more` is true. Takes one of the org's query slots |
 | `GET /threads/{id}` | messages of a thread the caller may see, oldest first (404 for a thread the caller cannot see, as for a missing one): at most the newest 500 and 2 MiB of headers, with `"truncated": true` when older ones were left out. Bodies are included newest first up to 1 MiB in total; a message whose body was left out has `"body_omitted": true` and an empty `body`; read it with `GET /messages/{id}?peek=1` |
 | `POST /claim` | `{classes, min_priority?, via, limit?, inline_body_max?, include_digest?, digest_only?, mark_inlined_read?, key?, preview_chars?}`: atomically mark pending deliveries notified and return them; concurrent claims never return the same delivery. `key` (chosen by the caller) makes the claim idempotent: a claim with a key the seat used in the last ten minutes takes nothing new and returns what the first one took. `inline_body_max` and `preview_chars` are capped at 16,384 characters |
 | `GET /changes` | `since` (a sequence number): deliveries created or changed since (`limit` ≤ 5000, at most 2 MiB); continue from `next` while `more` is true. Takes one of the org's query slots |
@@ -142,7 +149,7 @@ session cookie; with the cookie, everything but `GET` needs the header
 | `GET, POST /seats`; `GET, PATCH, DELETE /seats/{name}`; `POST /seats/{name}/tokens` | seats; `GET /seats` cuts each role to its first 1,000 characters and sets `role_truncated`, `GET /seats/{name}` has all of it |
 | `GET, POST /lists`; `GET, DELETE /lists/{name}`; `PUT, DELETE /lists/{name}/members/{address}` | lists (at most 1,000 members each) |
 | `GET, POST /links`; `POST /links/{org}/accept`; `DELETE /links/{org}` | links |
-| `GET, PATCH /org` | org settings (including `webhook_url`; `null` clears it), and `stored_bytes` (the mail the org sent with its deliveries, and the mail of deleted orgs it keeps, as counted for the storage quota) with `storage_quota_bytes` when the server has a quota |
+| `GET, PATCH /org` | org settings (including `webhook_url`; `null` clears it), `stored_bytes` (the mail the org sent with its deliveries, as counted for the storage quota) with `storage_quota_bytes` when the server has a quota, and `kept_bytes` (the mail of deleted orgs the org keeps, counted the same way but not against the quota) |
 | `DELETE /org` | user tokens, `{"confirm": "<org name>"}`: delete the org and all its data; mail other orgs received from it stays with them, from `name@org (deleted org)` |
 | `GET, POST /tokens`; `DELETE /tokens/{id}` | tokens |
 | `POST /tokens/rotate` | user tokens, `{label?}`: a new user token (answered once); the calling token is revoked, its browser sessions end and its open streams close; a browser that rotated gets a new session |
@@ -159,7 +166,7 @@ session cookie; with the cookie, everything but `GET` needs the header
 | `GET /counts` | user tokens: per seat (or `seat=`), `unread` and `pending` |
 | `GET /attention` | user tokens: what waits for the user ([concepts](concepts.md#the-users-queue-needs-you)), among the user seat's newest 5,000 deliveries |
 | `GET /pending` | node and user tokens: per seat, pending deliveries by class, urgent count, digest counts, `focus_until`, the seat's counter |
-| `POST /node/notices` | node tokens: `{node?, notices: [{kind: "settings", changes: [{seat?, setting, old?, new}]} \| {kind: "agent_actions", seat?, actions: [{op, targets, count}]}]}`; `setting` is `local_policy`, `permission_mode` or `git_access` with one of its values; `op` is `up`, `down`, `forget`, `run`, `wake`, `sleep`, `credentials` or `hook`. Each notice becomes one `system` mail to the org's user seat, written by the server; answers `{sent}`. Limits in [security](security.md#resource-limits) |
+| `POST /node/notices` | node tokens: `{node?, notices: [{kind: "settings", changes: [{seat?, setting, old?, new}]} \| {kind: "agent_actions", seat?, actions: [{op, targets, count}]}]}`; `setting` is `local_policy`, `permission_mode` or `git_access` with one of its values; `op` is `up`, `down`, `forget`, `run`, `wake`, `sleep`, `credentials` or `hook`. Each report becomes one `system` mail to the org's user seat, written by the server (at most 4 KB; what does not fit is counted); answers `{sent}` (1, or 0 when the org is over its daily notice budget and the report was dropped). Limits in [security](security.md#resource-limits) |
 | `POST /presence` | node tokens: `{node?, seats: [{seat, state, wake_failed?, harness?, since?, attention?, attention_hint?, terminal_url?}]}` (at most 5,000 seats); valid for 90 s |
 | `GET /seats/{name}/launch` | node and user tokens: harness, model, role, parent, permission mode (informational; the node does not use it) and a new seat token; the token of the seat's previous launch is revoked |
 | `POST /seats/{name}/sleep`, `POST /seats/{name}/wake` | user tokens: ask the node hosting the seat; 202, or 409 `node_offline` |
@@ -170,7 +177,7 @@ session cookie; with the cookie, everything but `GET` needs the header
 
 | | |
 |---|---|
-| `GET /operator/stats` | orgs, suspended orgs, seats, nodes online, mail in the last 5 minutes and hour, and per org: seats, nodes, messages (total, hour, day), `stored_bytes`, creation time, last activity, suspension |
+| `GET /operator/stats` | orgs, suspended orgs, seats, nodes online, mail in the last 5 minutes and hour, and per org: seats, nodes, messages (total, hour, day), `stored_bytes`, `kept_bytes`, creation time, last activity, suspension |
 | `POST /operator/orgs/{name}/suspend`, `/resume` | suspend (tokens and sessions stop working, open streams end, data is kept) / resume |
 | `DELETE /operator/orgs/{name}` | `{"confirm": "<name>"}`: delete the org with all its data |
 
@@ -181,7 +188,8 @@ it), newest first, without bodies, in pages of at most 2 MiB. Pass
 `next_before_id` as `before_id` to continue; when it is absent, nothing
 older matches. A page can be short, or even empty, and still have
 `next_before_id`: each request looks at no more than 50,000 of the org's
-messages, starting below `before_id`, and then stops.
+messages, starting below `before_id`, and starts no further step of
+messages after 100 ms; then it stops.
 
 Archive filters: `from` and `to` take a seat (`name`) or another org's
 address (`name@org`). For a seat of the org, `from` is its sent mail and
@@ -200,20 +208,26 @@ request looks at the 50,000 most recent messages before `before_id` (2,000
 when a term is shorter than three characters; `scan_limit` says which), so
 a search that finds few matches continues with `next_before_id`. Each hit
 has a snippet of the body around the first match. `mode` is always
-`"scan"`. Searches take one of the org's query slots (see
-[below](#limits-on-expensive-requests)).
+`"scan"`. A request also stops after 100 ms of
+looking (in steps of at most 5,000 messages and 4 MiB of body text divided
+by the number of terms) and answers with `next_before_id`, so a search of a
+large org may take several requests. Searches take one of the org's query
+slots (see [below](#limits-on-expensive-requests)).
 
 ### Limits on expensive requests
 
-Requests whose database cost depends on the data take one of the org's
-query slots: search, `GET /archive/messages`, `GET /threads/{id}` (after
-the check that the caller sees the thread), `/attention`, `/overview`,
-`/messages/{id}/status`, `/lists`, `/lists/{name}`, `/changes`, and
-`/inbox` and `/sent` pages of more than 100. On a public server an org has
-1 slot and the server 8 (`--max-org-queries`, `--max-queries`). A request
-that finds no free slot within 1 second gets 429 `too_many_queries` with
-`retry_after_ms`. A query that runs longer than 10 seconds is cancelled
-(503 `query_timeout`).
+Requests whose database cost depends on the data take a query slot of
+one of three pools: search and `GET /archive/messages` (search pool);
+`GET /threads/{id}` (after the check that the caller sees the thread),
+`/messages/{id}/status`, `/changes`, and `/inbox` and `/sent` pages of more
+than 100 (other pool); `/attention`, `/overview`, `/lists` and
+`/lists/{name}` (light pool). On a public server an org has 1 slot in each
+pool, and the search and other pools have 8 slots each over all orgs
+(`--max-org-queries`, `--max-queries`); the light pool has no limit over
+all orgs. A request that finds no free slot within 1 second gets 429
+`too_many_queries` with `retry_after_ms`. A freed slot goes first to an
+org that holds none and was served least recently. A query that runs
+longer than 10 seconds is cancelled (503 `query_timeout`).
 
 ### Webhook
 

@@ -14,6 +14,7 @@
 //! server.
 
 mod e2e;
+mod hostile;
 mod tenants;
 
 use anyhow::{Context, Result, bail};
@@ -114,6 +115,23 @@ pub struct Opts {
         default_value = "pending,counts,overview,attention,thread,own-thread,search,archive,lists,status,changes,inbox,claim,all"
     )]
     phases: String,
+    /// tenants, phase `hostile`: orgs searching their own mail at the same
+    /// time (see `hostile.rs`).
+    #[arg(long, default_value_t = 12)]
+    hostile_orgs: usize,
+    /// tenants, phase `hostile`: messages of each hostile org.
+    #[arg(long, default_value_t = 50_000)]
+    hostile_messages: usize,
+    /// tenants, phase `hostile`: body bytes of each of those messages (with
+    /// the default 50,000 messages, about the public 1 GiB quota).
+    #[arg(long, default_value_t = 20_000)]
+    hostile_body_bytes: usize,
+    /// tenants, phase `hostile`: terms of each hostile search.
+    #[arg(long, default_value_t = 10)]
+    hostile_terms: usize,
+    /// tenants, phase `hostile`: search loops per hostile org.
+    #[arg(long, default_value_t = 4)]
+    hostile_conc: usize,
     /// Write per-rate results as JSON lines to this file.
     #[arg(long)]
     out: Option<String>,

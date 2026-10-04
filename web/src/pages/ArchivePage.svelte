@@ -9,6 +9,7 @@
   let { query }: { query: URLSearchParams } = $props();
 
   const PAGE = 50;
+  const SEARCH_REQUESTS = 10;
   // svelte-ignore state_referenced_locally
   let q = $state(query.get('q') ?? '');
   // svelte-ignore state_referenced_locally
@@ -60,12 +61,21 @@
     error = null;
     try {
       if (query.get('q')) {
-        const r = await get<SearchResponse>(url(beforeId));
-        const got = r.messages.map(fromHit);
+        // One search request looks at the org's mail for a limited time and
+        // answers with a cursor; ask again until the page is full, for a
+        // few requests at most.
+        let got: MailRow[] = [];
+        let cursor = beforeId;
+        for (let i = 0; i < SEARCH_REQUESTS; i++) {
+          const r = await get<SearchResponse>(url(cursor));
+          got = [...got, ...r.messages.map(fromHit)];
+          cursor = r.next_before_id;
+          mode = r.mode;
+          scanLimit = r.scan_limit;
+          if (!cursor || got.length >= PAGE) break;
+        }
         rows = beforeId ? [...rows, ...got] : got;
-        next = r.next_before_id;
-        mode = r.mode;
-        scanLimit = r.scan_limit;
+        next = cursor;
       } else {
         const r = await get<ArchiveResponse>(url(beforeId));
         const got = r.messages.map(fromHeader);

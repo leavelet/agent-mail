@@ -148,7 +148,7 @@ macro_rules! auth_select {
     () => {
         "SELECT t.id AS token_id, t.scope, t.seat_id, o.id, o.name, o.send_rate_per_min, o.send_burst, \
          o.max_recipients, o.max_thread_depth, o.webhook_url, o.ack_timeout_min, o.focus_max_min, \
-         o.digest_interval_min, o.created_at, o.suspended_at, o.stored_bytes, s.id AS s_id, \
+         o.digest_interval_min, o.created_at, o.suspended_at, o.stored_bytes, o.kept_bytes, s.id AS s_id, \
          s.org_id AS s_org_id, s.name AS s_name, \
          s.kind AS s_kind, s.parent_id AS s_parent_id, p.name AS s_parent_name, \
          s.display_name AS s_display_name, s.role AS s_role, s.harness AS s_harness, \
@@ -403,6 +403,7 @@ pub(crate) struct OrgRow {
     created_at: i64,
     suspended_at: Option<i64>,
     stored_bytes: i64,
+    kept_bytes: i64,
 }
 
 impl From<OrgRow> for Org {
@@ -421,6 +422,7 @@ impl From<OrgRow> for Org {
             created_at: r.created_at,
             suspended_at: r.suspended_at,
             stored_bytes: r.stored_bytes,
+            kept_bytes: r.kept_bytes,
         }
     }
 }
@@ -1206,19 +1208,66 @@ macro_rules! impl_store_common {
                 })
             }
 
-            /// Search: steps of [`STEP_MESSAGES`] of the org's window, newest
-            /// first, until the page is full or `q.scan` messages were
-            /// looked at.
+            /// Body sizes of the messages visible to the org in `[lo, before)`,
+            /// newest first (the size is read without the body on both
+            /// backends).
+            async fn window_sizes(c: &mut Conn, org_id: i64, before: i64, lo: i64) -> Result<Vec<(i64, i64)>> {
+                let sql = format!(
+                    "SELECT m.id, CAST(COALESCE(octet_length(m.body), 0) AS BIGINT) FROM messages m \
+                     WHERE m.id IN ({WINDOW_IDS}) ORDER BY m.id DESC"
+                );
+                Ok(sqlx::query_as(&sql)
+                    .bind(org_id)
+                    .bind(before)
+                    .bind(lo)
+                    .fetch_all(&mut *c)
+                    .await?)
+            }
+
+            /// Search: steps over the org's window, newest first, until the
+            /// page is full, `q.scan` messages were looked at, or
+            /// `q.time_limit` has passed. A step looks at up to
+            /// [`STEP_MESSAGES`] messages with up to
+            /// [`amail_proto::limits::SEARCH_STEP_BYTES`] of body text in
+            /// all (divided by the number of terms, at least one message),
+            /// so that one step takes a short, bounded time whatever the
+            /// sizes of the bodies.
             pub async fn search(c: &mut Conn, org_id: i64, q: &SearchQuery) -> Result<SearchResult> {
+                let started = std::time::Instant::now();
                 let sql = search_sql(DIALECT, q.terms.len());
+                let step_bytes = amail_proto::limits::SEARCH_STEP_BYTES / q.terms.len().max(1) as i64;
                 let mut out = SearchResult::default();
                 let mut before = q.before_id.unwrap_or(i64::MAX);
                 let mut seen = 0;
+                // Messages per step: grows back to STEP_MESSAGES while the
+                // bodies are small, shrinks when they are large.
+                let mut step = STEP_MESSAGES;
                 while seen < q.scan {
-                    let w = scan_window(c, org_id, before, STEP_MESSAGES.min(q.scan - seen)).await?;
-                    let Some(lo) = w.lo else {
+                    if seen > 0 && q.time_limit.is_some_and(|t| started.elapsed() >= t) {
+                        break;
+                    }
+                    let mut w = scan_window(c, org_id, before, step.min(q.scan - seen)).await?;
+                    let Some(mut lo) = w.lo else {
                         return Ok(out);
                     };
+                    // Cut the window to the byte budget.
+                    let sizes = window_sizes(c, org_id, before, lo).await?;
+                    let mut total = 0;
+                    let mut kept = 0;
+                    for (_, n) in &sizes {
+                        if kept > 0 && total + n > step_bytes {
+                            break;
+                        }
+                        total += n;
+                        kept += 1;
+                    }
+                    if kept < sizes.len() {
+                        lo = sizes[kept - 1].0;
+                        w = Window { lo: Some(lo), count: kept as i64, exhausted: false };
+                        step = (kept as i64 * 2).clamp(16, STEP_MESSAGES);
+                    } else {
+                        step = (step * 2).min(STEP_MESSAGES);
+                    }
                     let mut query = sqlx::query_as::<_, HitRow>(&sql)
                         .bind(org_id)
                         .bind(before)
@@ -1806,7 +1855,8 @@ macro_rules! impl_store_common {
             /// The archive. Every query starts from the org's own data: one
             /// of its seats' sent mail or mailbox when `from` or `to` names
             /// one, else the org's messages (or a thread's) newest first in
-            /// steps, at most [`MAX_SCAN_MESSAGES`] per request. Built with
+            /// steps, at most [`MAX_SCAN_MESSAGES`] per request and no further
+            /// step once `q.time_limit` has passed. Built with
             /// only the conditions the query has, so that both planners can
             /// use the id order and the indexes (SQLite cannot see through
             /// `$n IS NULL OR ...`).
@@ -1930,7 +1980,11 @@ macro_rules! impl_store_common {
                 let mut out: Vec<MessageRec> = Vec::new();
                 let mut before = upper;
                 let mut seen = 0;
+                let started = std::time::Instant::now();
                 while seen < MAX_SCAN_MESSAGES {
+                    if seen > 0 && q.time_limit.is_some_and(|t| started.elapsed() >= t) {
+                        break;
+                    }
                     let n = STEP_MESSAGES.min(MAX_SCAN_MESSAGES - seen);
                     let w = match q.thread_id {
                         Some(t) => thread_window(c, t, before, n).await?,
@@ -2281,6 +2335,66 @@ macro_rules! impl_store_common {
                     .execute(&mut *c)
                     .await?;
                 Ok(())
+            }
+
+            /// Notice mail the org received since `since`: `(mails, bytes of
+            /// subjects and bodies)`.
+            pub async fn notice_usage(c: &mut Conn, org_id: i64, since: i64) -> Result<(i64, i64)> {
+                Ok(sqlx::query_as(
+                    "SELECT CAST(COUNT(*) AS BIGINT), \
+                     CAST(COALESCE(SUM(octet_length(subject) + octet_length(body)), 0) AS BIGINT) \
+                     FROM messages WHERE org_id = $1 AND notice AND created_at >= $2",
+                )
+                .bind(org_id)
+                .bind(since)
+                .fetch_one(&mut *c)
+                .await?)
+            }
+
+            /// Delete up to `limit` notice mails created before `cutoff`
+            /// (oldest first) with their deliveries; returns how many.
+            /// Notice mail is charged to nobody, so no stored bytes change.
+            pub async fn delete_old_notices(c: &mut Conn, cutoff: i64, limit: i64) -> Result<u64> {
+                let ids: Vec<i64> = sqlx::query_scalar(
+                    "SELECT id FROM messages WHERE notice AND created_at < $1 ORDER BY created_at, id LIMIT $2",
+                )
+                .bind(cutoff)
+                .bind(limit)
+                .fetch_all(&mut *c)
+                .await?;
+                for chunk in ids.chunks(500) {
+                    let list = placeholders(1, chunk.len());
+                    // Deleting deliveries changes their seats' counters
+                    // (triggers): take the seats in id order first, as
+                    // sending does, so that a concurrent send cannot
+                    // deadlock with this.
+                    let mut steps = vec![
+                        format!("UPDATE messages SET parent_id = NULL WHERE parent_id IN ({list})"),
+                        format!("DELETE FROM deliveries WHERE message_id IN ({list})"),
+                        format!("DELETE FROM messages WHERE id IN ({list})"),
+                        format!(
+                            "DELETE FROM thread_seats WHERE thread_id IN ({list}) \
+                             AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = thread_seats.thread_id)"
+                        ),
+                    ];
+                    if DIALECT == Dialect::Postgres {
+                        steps.insert(
+                            0,
+                            format!(
+                                "SELECT id FROM seats WHERE id IN (SELECT seat_id FROM deliveries \
+                                 WHERE message_id IN ({list})) ORDER BY id FOR NO KEY UPDATE"
+                            ),
+                        );
+                    }
+                    for sql in &steps {
+                        let mut q = sqlx::query(sql);
+                        for id in chunk {
+                            q = q.bind(*id);
+                        }
+                        q.execute(&mut *c).await?;
+                    }
+                }
+                Ok(ids.len() as u64)
             }
 
             /// The ids of `tokens` that are live, and the hashes of
@@ -2638,9 +2752,10 @@ macro_rules! impl_store_common {
             ///
             /// Storage counts (see `message_bytes`): each org that keeps
             /// such mail is charged its full bytes and the org's own
-            /// deliveries of it; the senders of mail the org received are no
-            /// longer charged for its deliveries; rewritten addresses change
-            /// the count of whoever is charged for the message.
+            /// deliveries of it in `kept_bytes`; the senders of mail the org
+            /// received are no longer charged for its deliveries; rewritten
+            /// addresses change the count of whoever is charged for the
+            /// message.
             pub async fn delete_org(c: &mut Conn, org_id: i64) -> Result<bool> {
                 let Some(org) = org_by_id(c, org_id).await? else {
                     return Ok(false);
@@ -2673,16 +2788,19 @@ macro_rules! impl_store_common {
                         .collect();
                     join_addrs(&v)
                 };
-                // Changes of the storage counts of other orgs, applied at
-                // the end (in org id order, after all changes to messages).
-                let mut charge: std::collections::BTreeMap<i64, i64> = Default::default();
+                // Changes of the storage counts of other orgs (`stored_bytes`,
+                // `kept_bytes`), applied at the end (in org id order, after
+                // all changes to messages).
+                let mut charge: std::collections::BTreeMap<i64, (i64, i64)> = Default::default();
                 let mut live = Default::default();
                 for (id, sender, to, cc) in addrs {
                     let (to2, cc2) = (mark(&to), mark(&cc));
                     if to2 != to || cc2 != cc {
                         let delta = (to2.len() + cc2.len()) as i64 - (to.len() + cc.len()) as i64;
-                        for payer in payers(c, &mut live, id, sender, org_id).await? {
-                            *charge.entry(payer).or_default() += delta;
+                        let (kept, who) = payers(c, &mut live, id, sender, org_id).await?;
+                        for payer in who {
+                            let e = charge.entry(payer).or_default();
+                            if kept { e.1 += delta } else { e.0 += delta }
                         }
                         sqlx::query("UPDATE messages SET to_addrs = $1, cc_addrs = $2 WHERE id = $3")
                             .bind(to2)
@@ -2733,10 +2851,11 @@ macro_rules! impl_store_common {
                         n
                     }
                 };
-                // Mail of orgs deleted earlier was charged to the orgs that
-                // keep it, this one included; its share goes with it.
+                // (Mail of orgs deleted earlier is counted in the `kept_bytes`
+                // of the orgs that keep it, this one included; its share goes
+                // with it. Updating a deleted sender below changes nothing.)
                 for (sender, n) in gone {
-                    *charge.entry(sender).or_default() -= n * per_delivery;
+                    charge.entry(sender).or_default().0 -= n * per_delivery;
                 }
                 // After its deliveries are gone, the mail it sent that no
                 // other org received has no deliveries left.
@@ -2788,8 +2907,9 @@ macro_rules! impl_store_common {
                 for sql in GONE {
                     sqlx::query(sql).execute(&mut *c).await?;
                 }
-                // The mail it sent that other orgs keep is charged to them:
-                // each its full bytes and its own deliveries of it. On
+                // The mail it sent that other orgs keep is counted in their
+                // `kept_bytes`: each its full bytes and its own deliveries of
+                // it. On
                 // Postgres, a send of this org still in progress commits
                 // first; later ones are refused (the org is marked deleted).
                 if DIALECT == Dialect::Postgres {
@@ -2811,15 +2931,19 @@ macro_rules! impl_store_common {
                 .fetch_all(&mut *c)
                 .await?;
                 for (holder, n) in holders {
-                    *charge.entry(holder).or_default() += n;
+                    charge.entry(holder).or_default().1 += n;
                 }
-                for (payer, n) in charge {
-                    if payer != org_id && n != 0 {
-                        sqlx::query("UPDATE orgs SET stored_bytes = stored_bytes + $1 WHERE id = $2 AND deleted_at IS NULL")
-                            .bind(n)
-                            .bind(payer)
-                            .execute(&mut *c)
-                            .await?;
+                for (payer, (stored, kept)) in charge {
+                    if payer != org_id && (stored, kept) != (0, 0) {
+                        sqlx::query(
+                            "UPDATE orgs SET stored_bytes = stored_bytes + $1, kept_bytes = kept_bytes + $2 \
+                             WHERE id = $3 AND deleted_at IS NULL",
+                        )
+                        .bind(stored)
+                        .bind(kept)
+                        .bind(payer)
+                        .execute(&mut *c)
+                        .await?;
                     }
                 }
                 let kept: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM messages WHERE org_id = $1)")
@@ -2829,7 +2953,7 @@ macro_rules! impl_store_common {
                 if kept {
                     sqlx::query(
                         "UPDATE orgs SET deleted_at = $1, deleted_name = name, name = $2, \
-                         webhook_url = NULL, stored_bytes = 0 WHERE id = $3",
+                         webhook_url = NULL, stored_bytes = 0, kept_bytes = 0 WHERE id = $3",
                     )
                     .bind(now)
                     .bind(format!("deleted:{org_id}"))
@@ -2852,7 +2976,8 @@ macro_rules! impl_store_common {
                 let rows: Vec<(i64, i64, i64)> = sqlx::query_as(
                     "UPDATE messages SET expired_at = $1 WHERE id IN (SELECT id FROM messages \
                      WHERE created_at < $2 AND expired_at IS NULL ORDER BY created_at LIMIT $3) \
-                     AND expired_at IS NULL RETURNING id, org_id, CAST(octet_length(body) AS BIGINT)",
+                     AND expired_at IS NULL \
+                     RETURNING id, org_id, CAST(CASE WHEN notice THEN 0 ELSE octet_length(body) END AS BIGINT)",
                 )
                 .bind(now)
                 .bind(cutoff)
@@ -2874,35 +2999,42 @@ macro_rules! impl_store_common {
                     q.execute(&mut *c).await?;
                 }
                 // Each body's bytes go back to whoever is charged for it
-                // (see `message_bytes`), in org id order.
+                // (see `message_bytes`; notice mail is charged to nobody,
+                // its size is 0 here), in org id order.
                 let mut by_sender: std::collections::BTreeMap<i64, Vec<(i64, i64)>> = Default::default();
-                for (id, org, n) in &rows {
+                for (id, org, n) in rows.iter().filter(|r| r.2 != 0) {
                     by_sender.entry(*org).or_default().push((*id, *n));
                 }
-                let mut freed: std::collections::BTreeMap<i64, i64> = Default::default();
+                // (`stored_bytes`, `kept_bytes`) freed per org.
+                let mut freed: std::collections::BTreeMap<i64, (i64, i64)> = Default::default();
                 let mut live = Default::default();
                 for (sender, msgs) in &by_sender {
                     for (id, n) in msgs {
-                        for payer in payers(c, &mut live, *id, *sender, 0).await? {
-                            *freed.entry(payer).or_default() += n;
+                        let (kept, who) = payers(c, &mut live, *id, *sender, 0).await?;
+                        for payer in who {
+                            let e = freed.entry(payer).or_default();
+                            if kept { e.1 += n } else { e.0 += n }
                         }
                     }
                 }
-                for (org, n) in freed {
+                for (org, (stored, kept)) in freed {
                     let done = sqlx::query(
-                        "UPDATE orgs SET stored_bytes = stored_bytes - $1 WHERE id = $2 AND deleted_at IS NULL",
+                        "UPDATE orgs SET stored_bytes = stored_bytes - $1, kept_bytes = kept_bytes - $2 \
+                         WHERE id = $3 AND deleted_at IS NULL",
                     )
-                    .bind(n)
+                    .bind(stored)
+                    .bind(kept)
                     .bind(org)
                     .execute(&mut *c)
                     .await?
                     .rows_affected();
                     // Postgres: the sender was deleted after `payers` looked;
-                    // its mail is now charged to the orgs that keep it.
-                    if done == 0 && let Some(msgs) = by_sender.get(&org) {
+                    // its mail is now counted in the `kept_bytes` of the orgs
+                    // that keep it.
+                    if done == 0 && stored != 0 && let Some(msgs) = by_sender.get(&org) {
                         for (id, n) in msgs {
                             sqlx::query(
-                                "UPDATE orgs SET stored_bytes = stored_bytes - $1 WHERE deleted_at IS NULL \
+                                "UPDATE orgs SET kept_bytes = kept_bytes - $1 WHERE deleted_at IS NULL \
                                  AND id IN (SELECT org_id FROM deliveries WHERE message_id = $2)",
                             )
                             .bind(n)
@@ -2915,19 +3047,334 @@ macro_rules! impl_store_common {
                 Ok(rows.len() as u64)
             }
 
+            /// Delete, for org `org_id`, the messages of thread `thread_id`
+            /// it may delete (see `delete_mail`), at most `limit` of them,
+            /// oldest first, among the newest `MAX_SCAN_MESSAGES` messages
+            /// of the thread. `None` when the org sees no message of the
+            /// thread.
+            pub async fn delete_thread(c: &mut Conn, org_id: i64, thread_id: i64, limit: i64) -> Result<Option<MailDeleted>> {
+                if !org_sees_thread(c, org_id, thread_id).await? {
+                    return Ok(None);
+                }
+                let w = thread_window(c, thread_id, i64::MAX, MAX_SCAN_MESSAGES).await?;
+                let Some(lo) = w.lo else {
+                    return Ok(None);
+                };
+                // 1: sent by the org, and no other org has a delivery of it;
+                // 2: sent by a deleted org (the org has a delivery of it, or
+                // it would not see it); 0: anything else.
+                let rows: Vec<(i64, i64)> = sqlx::query_as(
+                    "SELECT m.id, CAST(CASE WHEN m.org_id = $2 THEN \
+                       (CASE WHEN EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = m.id AND d.org_id <> $2) \
+                        THEN 0 ELSE 1 END) \
+                     WHEN o.deleted_at IS NOT NULL THEN 2 ELSE 0 END AS BIGINT) \
+                     FROM messages m JOIN orgs o ON o.id = m.org_id \
+                     WHERE m.thread_id = $1 AND m.id >= $3 AND (m.org_id = $2 OR EXISTS \
+                     (SELECT 1 FROM deliveries d WHERE d.message_id = m.id AND d.org_id = $2)) ORDER BY m.id",
+                )
+                .bind(thread_id)
+                .bind(org_id)
+                .bind(lo)
+                .fetch_all(&mut *c)
+                .await?;
+                if rows.is_empty() {
+                    return Ok(None);
+                }
+                let kept = rows.iter().filter(|r| r.1 == 0).count() as i64;
+                let deletable: Vec<&(i64, i64)> = rows.iter().filter(|r| r.1 != 0).collect();
+                let more = deletable.len() as i64 > limit;
+                let (mut own, mut theirs) = (Vec::new(), Vec::new());
+                for (id, kind) in deletable.into_iter().take(limit.max(0) as usize) {
+                    if *kind == 1 { own.push(*id) } else { theirs.push(*id) }
+                }
+                let deleted = delete_mail(c, Some(org_id), &own, &theirs).await?;
+                Ok(Some(MailDeleted { deleted, kept, more, next_before_id: None }))
+            }
+
+            /// Delete, for org `org_id`, up to `limit` messages of deleted
+            /// orgs that it keeps (see `delete_mail`), looking at the org's
+            /// deliveries below message id `before`, newest first, in steps
+            /// of [`STEP_MESSAGES`] messages, and starting no step after
+            /// `time_limit`. `next_before_id` is where to go on.
+            pub async fn purge_deleted_org_mail(
+                c: &mut Conn,
+                org_id: i64,
+                limit: i64,
+                before: Option<i64>,
+                time_limit: Option<std::time::Duration>,
+            ) -> Result<MailDeleted> {
+                let started = std::time::Instant::now();
+                let limit = limit.max(1);
+                let mut before = before.unwrap_or(i64::MAX);
+                let mut ids: Vec<i64> = Vec::new();
+                let mut next = None;
+                let mut first = true;
+                loop {
+                    if !first && time_limit.is_some_and(|t| started.elapsed() >= t) {
+                        next = Some(before);
+                        break;
+                    }
+                    first = false;
+                    let step: Vec<i64> = sqlx::query_scalar(
+                        "SELECT DISTINCT message_id FROM deliveries WHERE org_id = $1 AND message_id < $2 \
+                         ORDER BY message_id DESC LIMIT $3",
+                    )
+                    .bind(org_id)
+                    .bind(before)
+                    .bind(STEP_MESSAGES)
+                    .fetch_all(&mut *c)
+                    .await?;
+                    let Some(lowest) = step.last().copied() else { break };
+                    let sql = format!(
+                        "SELECT m.id FROM messages m JOIN orgs o ON o.id = m.org_id \
+                         WHERE o.deleted_at IS NOT NULL AND m.id IN ({}) ORDER BY m.id DESC",
+                        placeholders(1, step.len())
+                    );
+                    let mut q = sqlx::query_scalar::<_, i64>(&sql);
+                    for id in &step {
+                        q = q.bind(*id);
+                    }
+                    let found = q.fetch_all(&mut *c).await?;
+                    let room = (limit - ids.len() as i64) as usize;
+                    if found.len() > room {
+                        ids.extend(&found[..room]);
+                        next = ids.last().copied();
+                        break;
+                    }
+                    ids.extend(found);
+                    if (step.len() as i64) < STEP_MESSAGES {
+                        break;
+                    }
+                    before = lowest;
+                    if ids.len() as i64 == limit {
+                        next = Some(before);
+                        break;
+                    }
+                }
+                let deleted = delete_mail(c, Some(org_id), &[], &ids).await?;
+                Ok(MailDeleted { deleted, kept: 0, more: next.is_some(), next_before_id: next })
+            }
+
+            /// Retention: delete up to `limit` messages of deleted orgs
+            /// created before `cutoff`, with every org's deliveries of them
+            /// (see `delete_mail`); returns how many.
+            pub async fn expire_deleted_org_mail(c: &mut Conn, cutoff: i64, limit: i64) -> Result<u64> {
+                let ids: Vec<i64> = sqlx::query_scalar(
+                    "SELECT id FROM messages WHERE org_id IN (SELECT id FROM orgs WHERE deleted_at IS NOT NULL) \
+                     AND created_at < $1 ORDER BY id LIMIT $2",
+                )
+                .bind(cutoff)
+                .bind(limit)
+                .fetch_all(&mut *c)
+                .await?;
+                Ok(delete_mail(c, None, &[], &ids).await? as u64)
+            }
+
+            /// Delete mail, with exact storage counts:
+            /// - `own`: messages org `org` (Some) sent that no other org has
+            ///   a delivery of; they go with their deliveries, and the org's
+            ///   `stored_bytes` goes down by what is charged for them now
+            ///   (the current row: bodies cleared by retention were already
+            ///   given back) and their deliveries;
+            /// - `theirs`: messages of deleted orgs; the deliveries of org
+            ///   `org` (or of every org, with `None`) go, and each org's
+            ///   `kept_bytes` goes down by the message's bytes and its
+            ///   deliveries of it. A message nobody keeps a delivery of any
+            ///   more goes too, and then the deleted org's seats and row
+            ///   once nothing of them is left.
+            ///
+            /// Replies to deleted messages lose their parent, `thread_seats`
+            /// rows of seats with no delivery left in the thread go, and the
+            /// seats' counters follow through the deliveries triggers. On
+            /// Postgres, the seats whose deliveries go are locked in id order
+            /// first (as sending and deleting an org do), then the messages
+            /// and their replies in id order, and the orgs' rows last.
+            /// Returns the number of messages the org (with `None`: anyone)
+            /// no longer has.
+            async fn delete_mail(c: &mut Conn, org: Option<i64>, own: &[i64], theirs: &[i64]) -> Result<i64> {
+                if own.is_empty() && theirs.is_empty() {
+                    return Ok(0);
+                }
+                let per_delivery = amail_proto::limits::STORED_BYTES_PER_DELIVERY;
+                let all: Vec<i64> = own.iter().chain(theirs).copied().collect();
+                let ids = |first: usize, list: &[i64]| placeholders(first, list.len());
+                // Deliveries of org `org` ($1) of the messages from $2.
+                let of_org = |list: &[i64]| match org {
+                    Some(_) => format!("org_id = $1 AND message_id IN ({})", ids(2, list)),
+                    None => format!("CAST($1 AS BIGINT) IS NULL AND message_id IN ({})", ids(2, list)),
+                };
+                macro_rules! with_ids {
+                    ($q:expr, $list:expr) => {{
+                        let mut q = $q;
+                        for id in $list {
+                            q = q.bind(*id);
+                        }
+                        q
+                    }};
+                }
+                if DIALECT == Dialect::Postgres {
+                    let sql = format!(
+                        "SELECT id FROM seats WHERE id IN (SELECT seat_id FROM deliveries WHERE {}) \
+                         ORDER BY id FOR NO KEY UPDATE",
+                        of_org(&all)
+                    );
+                    with_ids!(sqlx::query(&sql).bind(org), &all).execute(&mut *c).await?;
+                    let sql = format!(
+                        "SELECT id FROM messages WHERE id IN ({0}) OR parent_id IN ({0}) ORDER BY id FOR UPDATE",
+                        ids(1, &all)
+                    );
+                    with_ids!(sqlx::query(&sql), &all).execute(&mut *c).await?;
+                }
+                // What each message is charged now, without deliveries;
+                // `None` for notice mail, which is charged to nobody.
+                let bytes_sql = message_bytes_sql!().replace("$2", &amail_proto::limits::STORED_BYTES_PER_MESSAGE.to_string());
+                let sql = format!(
+                    "SELECT m.id, m.org_id, m.thread_id, CAST(CASE WHEN m.notice THEN NULL ELSE {bytes_sql} END AS BIGINT) \
+                     FROM messages m WHERE m.id IN ({})",
+                    ids(1, &all)
+                );
+                let rows: Vec<(i64, i64, i64, Option<i64>)> = with_ids!(sqlx::query_as(&sql), &all).fetch_all(&mut *c).await?;
+                let info: std::collections::HashMap<i64, (i64, i64, Option<i64>)> =
+                    rows.into_iter().map(|(id, o, t, b)| (id, (o, t, b))).collect();
+                // The deliveries that go: (message, org, seat).
+                let mut gone: Vec<(i64, i64, i64)> = Vec::new();
+                if !own.is_empty() {
+                    let sql = format!(
+                        "DELETE FROM deliveries WHERE message_id IN ({}) RETURNING message_id, org_id, seat_id",
+                        ids(1, own)
+                    );
+                    gone.extend(with_ids!(sqlx::query_as::<_, (i64, i64, i64)>(&sql), own).fetch_all(&mut *c).await?);
+                }
+                if !theirs.is_empty() {
+                    let sql = format!("DELETE FROM deliveries WHERE {} RETURNING message_id, org_id, seat_id", of_org(theirs));
+                    gone.extend(
+                        with_ids!(sqlx::query_as::<_, (i64, i64, i64)>(&sql).bind(org), theirs)
+                            .fetch_all(&mut *c)
+                            .await?,
+                    );
+                }
+                // The messages that go: the org's own, and the others that
+                // nobody keeps a delivery of any more.
+                let sql = format!(
+                    "SELECT id FROM messages m WHERE m.id IN ({}) \
+                     AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = m.id)",
+                    ids(1, &all)
+                );
+                let empty: Vec<i64> = with_ids!(sqlx::query_scalar(&sql), &all).fetch_all(&mut *c).await?;
+                let mut removed: Vec<(i64, i64)> = Vec::new();
+                if !empty.is_empty() {
+                    let sql = format!("UPDATE messages SET parent_id = NULL WHERE parent_id IN ({})", ids(1, &empty));
+                    with_ids!(sqlx::query(&sql), &empty).execute(&mut *c).await?;
+                    let sql = format!(
+                        "DELETE FROM messages WHERE id IN ({}) \
+                         AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = messages.id) \
+                         RETURNING id, org_id",
+                        ids(1, &empty)
+                    );
+                    removed = with_ids!(sqlx::query_as(&sql), &empty).fetch_all(&mut *c).await?;
+                }
+                // Storage counts: (stored_bytes, kept_bytes) freed per org.
+                let mut freed: std::collections::BTreeMap<i64, (i64, i64)> = Default::default();
+                let own_set: std::collections::HashSet<i64> = own.iter().copied().collect();
+                let mut held: std::collections::BTreeMap<(i64, i64), i64> = Default::default();
+                for (m, o, _) in &gone {
+                    *held.entry((*m, *o)).or_default() += 1;
+                }
+                let mut deleted: std::collections::HashSet<i64> = Default::default();
+                for ((m, o), n) in &held {
+                    if own_set.contains(m) {
+                        continue;
+                    }
+                    let Some((_, _, b)) = info.get(m) else { continue };
+                    if let Some(b) = b {
+                        freed.entry(*o).or_default().1 += b + per_delivery * n;
+                    }
+                    if org.is_some() {
+                        deleted.insert(*m);
+                    }
+                }
+                for (m, sender) in &removed {
+                    if own_set.contains(m) {
+                        let Some((_, _, b)) = info.get(m) else { continue };
+                        if let Some(b) = b {
+                            let n = held.range((*m, i64::MIN)..=(*m, i64::MAX)).map(|(_, n)| n).sum::<i64>();
+                            freed.entry(*sender).or_default().0 += b + per_delivery * n;
+                        }
+                        deleted.insert(*m);
+                    } else if org.is_none() {
+                        deleted.insert(*m);
+                    }
+                }
+                // `thread_seats` rows of seats with no delivery left in the
+                // thread.
+                let mut pairs: Vec<(i64, i64, i64)> = gone
+                    .iter()
+                    .filter_map(|(m, o, s)| info.get(m).map(|(_, t, _)| (*t, *o, *s)))
+                    .collect();
+                pairs.sort_unstable();
+                pairs.dedup();
+                for (t, o, seat) in pairs {
+                    sqlx::query(
+                        "DELETE FROM thread_seats WHERE thread_id = $1 AND org_id = $2 AND seat_id = $3 \
+                         AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.thread_id = $1 \
+                         AND EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = m.id AND d.seat_id = $3))",
+                    )
+                    .bind(t)
+                    .bind(o)
+                    .bind(seat)
+                    .execute(&mut *c)
+                    .await?;
+                }
+                // Deleted orgs with nothing of them left.
+                let mut senders: Vec<i64> = removed
+                    .iter()
+                    .filter(|(m, _)| !own_set.contains(m))
+                    .map(|(_, o)| *o)
+                    .collect();
+                senders.sort_unstable();
+                senders.dedup();
+                if !senders.is_empty() {
+                    let sql = format!(
+                        "DELETE FROM seats WHERE org_id IN ({}) AND deleted_at IS NOT NULL \
+                         AND NOT EXISTS (SELECT 1 FROM messages m WHERE m.sender_seat_id = seats.id)",
+                        ids(1, &senders)
+                    );
+                    with_ids!(sqlx::query(&sql), &senders).execute(&mut *c).await?;
+                    let sql = format!(
+                        "DELETE FROM orgs WHERE id IN ({}) AND deleted_at IS NOT NULL \
+                         AND NOT EXISTS (SELECT 1 FROM seats s WHERE s.org_id = orgs.id)",
+                        ids(1, &senders)
+                    );
+                    with_ids!(sqlx::query(&sql), &senders).execute(&mut *c).await?;
+                }
+                for (o, (stored, kept)) in freed {
+                    sqlx::query(
+                        "UPDATE orgs SET stored_bytes = stored_bytes - $1, kept_bytes = kept_bytes - $2 \
+                         WHERE id = $3 AND deleted_at IS NULL",
+                    )
+                    .bind(stored)
+                    .bind(kept)
+                    .bind(o)
+                    .execute(&mut *c)
+                    .await?;
+                }
+                Ok(deleted.len() as i64)
+            }
+
             /// The orgs charged for message `id` sent by org `sender` (see
             /// `message_bytes`), without org `except`: the sender while it
-            /// exists, else each org that keeps deliveries of the message.
-            /// `live` caches whether each sender exists.
+            /// exists (in `stored_bytes`; the flag is false), else each org
+            /// that keeps deliveries of the message (in `kept_bytes`; the
+            /// flag is true). `live` caches whether each sender exists.
             async fn payers(
                 c: &mut Conn,
                 live: &mut std::collections::HashMap<i64, bool>,
                 id: i64,
                 sender: i64,
                 except: i64,
-            ) -> Result<Vec<i64>> {
+            ) -> Result<(bool, Vec<i64>)> {
                 if sender == except {
-                    return Ok(Vec::new());
+                    return Ok((false, Vec::new()));
                 }
                 let exists = match live.get(&sender) {
                     Some(b) => *b,
@@ -2943,15 +3390,18 @@ macro_rules! impl_store_common {
                     }
                 };
                 if exists {
-                    return Ok(vec![sender]);
+                    return Ok((false, vec![sender]));
                 }
-                Ok(sqlx::query_scalar(
-                    "SELECT DISTINCT org_id FROM deliveries WHERE message_id = $1 AND org_id <> $2",
-                )
-                .bind(id)
-                .bind(except)
-                .fetch_all(&mut *c)
-                .await?)
+                Ok((
+                    true,
+                    sqlx::query_scalar(
+                        "SELECT DISTINCT org_id FROM deliveries WHERE message_id = $1 AND org_id <> $2",
+                    )
+                    .bind(id)
+                    .bind(except)
+                    .fetch_all(&mut *c)
+                    .await?,
+                ))
             }
 
             pub async fn operator_stats(c: &mut Conn, now: i64) -> Result<OperatorStats> {
@@ -2968,14 +3418,14 @@ macro_rules! impl_store_common {
                 let hour_lo = first_id(hour).fetch_optional(&mut *c).await?.unwrap_or(i64::MAX);
                 let day_lo = first_id(day).fetch_optional(&mut *c).await?.unwrap_or(i64::MAX);
                 #[allow(clippy::type_complexity)]
-                let rows: Vec<(i64, String, i64, Option<i64>, i64, i64, i64, i64, Option<i64>, i64)> = sqlx::query_as(
+                let rows: Vec<(i64, String, i64, Option<i64>, i64, i64, i64, i64, Option<i64>, i64, i64)> = sqlx::query_as(
                     "SELECT o.id, o.name, o.created_at, o.suspended_at, \
                      (SELECT COUNT(*) FROM seats s WHERE s.org_id = o.id AND s.kind = 'agent' AND s.deleted_at IS NULL), \
                      (SELECT COUNT(*) FROM messages m WHERE m.org_id = o.id), \
                      (SELECT COUNT(*) FROM messages m WHERE m.org_id = o.id AND m.id >= $1 AND m.created_at >= $2), \
                      (SELECT COUNT(*) FROM messages m WHERE m.org_id = o.id AND m.id >= $3 AND m.created_at >= $4), \
                      (SELECT m.created_at FROM messages m WHERE m.org_id = o.id ORDER BY m.id DESC LIMIT 1), \
-                     o.stored_bytes \
+                     o.stored_bytes, o.kept_bytes \
                      FROM orgs o WHERE o.deleted_at IS NULL",
                 )
                 .bind(hour_lo)
@@ -2986,8 +3436,8 @@ macro_rules! impl_store_common {
                 .await?;
                 let mut orgs: Vec<OrgStat> = rows
                     .into_iter()
-                    .map(|(id, name, created_at, suspended_at, seats, messages, messages_hour, messages_day, last_activity, stored_bytes)| OrgStat {
-                        id, name, created_at, suspended_at, seats, messages, messages_hour, messages_day, last_activity, stored_bytes,
+                    .map(|(id, name, created_at, suspended_at, seats, messages, messages_hour, messages_day, last_activity, stored_bytes, kept_bytes)| OrgStat {
+                        id, name, created_at, suspended_at, seats, messages, messages_hour, messages_day, last_activity, stored_bytes, kept_bytes,
                     })
                     .collect();
                 orgs.sort_by(|a, b| {
@@ -3400,6 +3850,14 @@ macro_rules! impl_store_common {
                 run!(self.write, |c| q::cleanup(c, now).await)
             }
 
+            async fn notice_usage(&self, org_id: i64, since: i64) -> $crate::Result<(i64, i64)> {
+                run!(self.read, |c| q::notice_usage(c, org_id, since).await)
+            }
+
+            async fn delete_old_notices(&self, cutoff: i64, limit: i64) -> $crate::Result<u64> {
+                run!(self.write, |c| q::delete_old_notices(c, cutoff, limit).await)
+            }
+
             async fn set_focus(&self, seat_id: i64, until: Option<i64>) -> $crate::Result<$crate::SeqBump> {
                 run!(self.write, |c| q::set_focus(c, seat_id, until).await)
             }
@@ -3500,6 +3958,24 @@ macro_rules! impl_store_common {
 
             async fn expire_bodies(&self, cutoff: i64, limit: i64) -> $crate::Result<u64> {
                 run!(self.write, |c| q::expire_bodies(c, cutoff, limit).await)
+            }
+
+            async fn delete_thread(&self, org_id: i64, thread_id: i64, limit: i64) -> $crate::Result<Option<$crate::MailDeleted>> {
+                run!(self.write, |c| q::delete_thread(c, org_id, thread_id, limit).await)
+            }
+
+            async fn purge_deleted_org_mail(
+                &self,
+                org_id: i64,
+                limit: i64,
+                before: Option<i64>,
+                time_limit: Option<std::time::Duration>,
+            ) -> $crate::Result<$crate::MailDeleted> {
+                run!(self.write, |c| q::purge_deleted_org_mail(c, org_id, limit, before, time_limit).await)
+            }
+
+            async fn expire_deleted_org_mail(&self, cutoff: i64, limit: i64) -> $crate::Result<u64> {
+                run!(self.write, |c| q::expire_deleted_org_mail(c, cutoff, limit).await)
             }
 
             async fn operator_stats(&self) -> $crate::Result<$crate::OperatorStats> {

@@ -6,6 +6,7 @@ pub mod auth;
 pub mod cluster;
 pub mod commands;
 pub mod config;
+mod deletion;
 mod directory;
 pub mod error;
 pub mod events;
@@ -198,12 +199,19 @@ pub fn router(state: AppState) -> Router {
             "/seats/{name}/transcript",
             get(transcript::watch).post(transcript::post),
         )
-        .route("/threads/{id}", get(mail::thread))
+        .route(
+            "/threads/{id}",
+            get(mail::thread).delete(deletion::delete_thread),
+        )
         .route("/inbox", get(mail::inbox))
         .route("/claim", post(mail::claim))
         .route("/changes", get(mail::changes))
         .route("/events", get(mail::events))
         .route("/archive/messages", get(mail::archive))
+        .route(
+            "/archive/purge-deleted-orgs",
+            post(deletion::purge_deleted_orgs),
+        )
         .route("/whoami", get(public::whoami))
         .route(
             "/org",

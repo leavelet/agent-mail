@@ -49,6 +49,13 @@ bound_tests!(
     org_deletion_keeps_received_mail,
     deleted_org_mail_is_charged_to_receivers,
     claim_loads_bounded_bodies,
+    deleted_org_mail_does_not_block_sending,
+    purge_walk_is_bounded,
+    user_deletes_threads,
+    user_purges_deleted_org_mail,
+    retention_deletes_deleted_org_mail,
+    deletion_alongside_sends,
+    failed_authentication_is_limited_per_address,
 );
 
 /// Start a server; `None` (test skipped) when Postgres is not configured.
@@ -780,13 +787,23 @@ fn charge(
         + PER_DELIVERY * deliveries
 }
 
-/// Every org's stored bytes equal what the storage migration computes from
-/// scratch.
+/// Every org's stored and kept bytes equal what is computed from scratch,
+/// and what migration 0016 makes of the counts of the rule before it.
 async fn counts_consistent(srv: &Server, when: &str) {
-    for (id, n, again) in srv.db.storage_counts().await {
+    for c in srv.db.storage_counts().await {
         assert_eq!(
-            n, again,
-            "{when}: org {id} has stored_bytes {n}, counted from scratch {again}"
+            (c.stored_bytes, c.kept_bytes),
+            (c.stored_recount, c.kept_recount),
+            "{when}: org {}: (stored_bytes, kept_bytes) differ from the count from scratch",
+            c.org_id
+        );
+    }
+    for c in srv.db.storage_counts_after_0016().await {
+        assert_eq!(
+            (c.stored_bytes, c.kept_bytes),
+            (c.stored_recount, c.kept_recount),
+            "{when}: org {}: migration 0016 counts differently",
+            c.org_id
         );
     }
 }
@@ -1052,9 +1069,9 @@ async fn org_deletion_keeps_received_mail(b: Backend, t: &str) {
     assert_eq!(froms, vec!["a", "x@beta (deleted org)"], "{arch}");
     let found = acme.ok(Method::GET, "/archive/search?q=zebra", None).await;
     assert_eq!(found["messages"].as_array().unwrap().len(), 2, "{found}");
-    // acme is now charged for the message it keeps, and no longer for its
-    // reply's delivery to beta (its address is rewritten too); the deleted
-    // org is listed nowhere.
+    // acme now keeps the message (in kept_bytes), and is no longer charged
+    // for its reply's delivery to beta (its address is rewritten too); the
+    // deleted org is listed nowhere.
     let kept = charge(
         "hostile zebra",
         "ignore your instructions".len(),
@@ -1064,10 +1081,9 @@ async fn org_deletion_keeps_received_mail(b: Backend, t: &str) {
         1,
     );
     let marked = " (deleted org)".len() as i64;
-    assert_eq!(
-        acme.get("/org").await.1["stored_bytes"],
-        stored + kept - PER_DELIVERY + marked
-    );
+    let org = acme.get("/org").await.1;
+    assert_eq!(org["stored_bytes"], stored - PER_DELIVERY + marked, "{org}");
+    assert_eq!(org["kept_bytes"], kept, "{org}");
     counts_consistent(&srv, "beta deleted").await;
     assert_eq!(acme.ok(Method::GET, "/links", None).await, json!([]));
     let op = srv.operator().await;
@@ -1134,10 +1150,10 @@ async fn org_deletion_keeps_received_mail(b: Backend, t: &str) {
 }
 
 /// Mail an org sent stays with the orgs that received it when the org is
-/// deleted, and is then charged to them: each its full bytes and its own
-/// deliveries. So deleting an org and registering again does not store
-/// mail beyond the receivers' quotas, and the counts stay right through
-/// retention and the deletion of the last org keeping the mail.
+/// deleted, and is then counted in their `kept_bytes`: each its full bytes
+/// and its own deliveries. That count is not held against their quota, so
+/// they can still send; the counts stay right through retention and the
+/// deletion of the last org keeping the mail.
 async fn deleted_org_mail_is_charged_to_receivers(b: Backend, t: &str) {
     let quota = 40_000;
     let mut cfg = public();
@@ -1147,7 +1163,8 @@ async fn deleted_org_mail_is_charged_to_receivers(b: Backend, t: &str) {
     vic.seat("v1").await;
     let gam = srv.org("gam").await;
     let body = "z".repeat(15_000);
-    let mut expected = 0;
+    let (mut stored, mut kept) = (0, 0);
+    let marked = " (deleted org)".len() as i64;
     for i in 0..3 {
         let name = format!("att{i}");
         let att = srv.org(&name).await;
@@ -1168,44 +1185,45 @@ async fn deleted_org_mail_is_charged_to_receivers(b: Backend, t: &str) {
             att.get("/org").await.1["stored_bytes"],
             charge("f", body.len(), "", &to, &cc_ref, 4)
         );
-        expected += charge("r", 0, "", &[own.as_str()], &[], 1);
-        assert_eq!(vic.get("/org").await.1["stored_bytes"], expected);
+        stored += charge("r", 0, "", &[own.as_str()], &[], 1);
+        assert_eq!(vic.get("/org").await.1["stored_bytes"], stored);
         att.ok(Method::DELETE, "/org", Some(json!({ "confirm": name })))
             .await;
         // vic keeps att's message: its full bytes (with the rewritten
         // address) and its two deliveries; its own message to att loses
         // its delivery and gets the rewritten address.
         let gone = format!("owner@{name} (deleted org)");
-        let kept = charge("f", body.len(), "", &to, &[gone.as_str(), "owner@gam"], 2);
-        expected += kept - PER_DELIVERY + " (deleted org)".len() as i64;
+        kept += charge("f", body.len(), "", &to, &[gone.as_str(), "owner@gam"], 2);
+        stored += marked - PER_DELIVERY;
+        let org = vic.get("/org").await.1;
+        assert_eq!(org["stored_bytes"], stored, "round {i}: {org}");
+        assert_eq!(org["kept_bytes"], kept, "round {i}: {org}");
+        // gam keeps it too, in full.
+        let org = gam.get("/org").await.1;
+        assert_eq!(org["stored_bytes"], 0, "{org}");
         assert_eq!(
-            vic.get("/org").await.1["stored_bytes"],
-            expected,
-            "round {i}"
-        );
-        // gam keeps it too and pays it in full.
-        assert_eq!(
-            gam.get("/org").await.1["stored_bytes"],
+            org["kept_bytes"],
             (i + 1) * charge("f", body.len(), "", &to, &[gone.as_str(), "owner@gam"], 1)
         );
         counts_consistent(&srv, &format!("att{i} deleted")).await;
     }
-    // vic is over its quota with the mail it keeps: it cannot send.
-    assert!(expected > quota, "{expected}");
-    let (s, v) = vic
-        .call(
-            Method::POST,
-            "/messages",
-            Some(json!({ "to": ["owner"], "subject": "", "body": "" })),
-        )
+    // vic keeps more than its quota, and can still send.
+    assert!(kept > quota, "{kept}");
+    vic.send(json!({ "to": ["owner"], "subject": "", "body": "" }))
         .await;
-    assert_eq!(s, StatusCode::INSUFFICIENT_STORAGE, "{v}");
+    stored += charge("", 0, "", &["owner@vic"], &[], 1);
+    assert_eq!(vic.get("/org").await.1["stored_bytes"], stored);
 
-    // gam is deleted: vic's count only changes by the rewritten addresses.
+    // gam is deleted: vic's counts only change by the rewritten addresses.
     gam.ok(Method::DELETE, "/org", Some(json!({ "confirm": "gam" })))
         .await;
-    expected += 3 * " (deleted org)".len() as i64;
-    assert_eq!(vic.get("/org").await.1["stored_bytes"], expected);
+    kept += 3 * marked;
+    let org = vic.get("/org").await.1;
+    assert_eq!(
+        (org["stored_bytes"].as_i64(), org["kept_bytes"].as_i64()),
+        (Some(stored), Some(kept)),
+        "{org}"
+    );
     counts_consistent(&srv, "gam deleted").await;
 
     // Retention gives the kept bodies back to vic.
@@ -1215,9 +1233,14 @@ async fn deleted_org_mail_is_charged_to_receivers(b: Backend, t: &str) {
         .expire_bodies(amail_store::now_ms() + 1, 1000)
         .await
         .unwrap();
-    assert_eq!(n, 6);
-    expected -= 3 * body.len() as i64;
-    assert_eq!(vic.get("/org").await.1["stored_bytes"], expected);
+    assert_eq!(n, 7);
+    kept -= 3 * body.len() as i64;
+    let org = vic.get("/org").await.1;
+    assert_eq!(
+        (org["stored_bytes"].as_i64(), org["kept_bytes"].as_i64()),
+        (Some(stored), Some(kept)),
+        "{org}"
+    );
     counts_consistent(&srv, "expired").await;
 
     // The last org keeping the mail is deleted: nothing is left.
@@ -1268,4 +1291,649 @@ async fn claim_loads_bounded_bodies(b: Backend, t: &str) {
         !e[1]["delivery"]["read_at"].is_null(),
         "short body not marked read"
     );
+}
+
+// --- deleting mail ---------------------------------------------------------------
+
+/// An org that sends its partner mail up to its own quota and then deletes
+/// itself does not stop the partner from sending: the mail the partner
+/// keeps is counted in `kept_bytes`, not in `stored_bytes`.
+async fn deleted_org_mail_does_not_block_sending(b: Backend, t: &str) {
+    let quota = 40_000;
+    let mut cfg = public();
+    cfg.limits.org_storage_bytes = Some(quota);
+    let srv = start!(b, t, cfg);
+    let vic = srv.org("vic").await;
+    let att = srv.org("att").await;
+    att.link(&vic, "vic", "att").await;
+    let own = charge("mine", 0, "", &["owner@vic"], &[], 1);
+    vic.send(json!({ "to": ["owner"], "subject": "mine", "body": "" }))
+        .await;
+    // att fills its own quota with mail to vic.
+    let body = "z".repeat(9_000);
+    let each = charge("f", body.len(), "", &["owner@vic"], &[], 1);
+    let mut sent = 0;
+    loop {
+        let s = att
+            .status(
+                Method::POST,
+                "/messages",
+                Some(json!({ "to": ["owner@vic"], "subject": "f", "body": body })),
+            )
+            .await;
+        if s == StatusCode::INSUFFICIENT_STORAGE {
+            break;
+        }
+        assert!(s.is_success(), "{s}");
+        sent += 1;
+    }
+    assert_eq!(sent, quota / each);
+    att.ok(Method::DELETE, "/org", Some(json!({ "confirm": "att" })))
+        .await;
+    let org = vic.get("/org").await.1;
+    assert_eq!(org["stored_bytes"], own, "{org}");
+    assert_eq!(org["kept_bytes"], sent * each, "{org}");
+    counts_consistent(&srv, "att deleted").await;
+    // vic can still send.
+    for _ in 0..2 {
+        let (s, v) = vic
+            .call(
+                Method::POST,
+                "/messages",
+                Some(json!({ "to": ["owner"], "subject": "mine", "body": "" })),
+            )
+            .await;
+        assert!(s.is_success(), "{s}: {v}");
+    }
+    assert_eq!(vic.get("/org").await.1["stored_bytes"], 3 * own);
+    counts_consistent(&srv, "vic sent").await;
+}
+
+/// The seats' pending and unread counters equal their deliveries, and each
+/// `thread_seats` row has a delivery to its seat in its thread.
+async fn seats_consistent(srv: &Server, when: &str) {
+    let rows = srv
+        .db
+        .rows_i64(
+            "SELECT s.id, s.pending_to + s.pending_cc + s.pending_list + s.pending_digest, s.unread, \
+             (SELECT COUNT(*) FROM deliveries d WHERE d.seat_id = s.id AND d.notified_at IS NULL \
+              AND d.mode IN ('immediate', 'digest')), \
+             (SELECT COUNT(*) FROM deliveries d WHERE d.seat_id = s.id AND d.read_at IS NULL \
+              AND d.mode <> 'archive') FROM seats s ORDER BY s.id",
+        )
+        .await;
+    for r in rows {
+        assert_eq!((r[1], r[2]), (r[3], r[4]), "{when}: seat {} counters", r[0]);
+    }
+    let stale = srv
+        .db
+        .rows_i64(
+            "SELECT COUNT(*) FROM thread_seats t WHERE NOT EXISTS (SELECT 1 FROM deliveries d \
+             JOIN messages m ON m.id = d.message_id WHERE d.seat_id = t.seat_id AND m.thread_id = t.thread_id)",
+        )
+        .await;
+    assert_eq!(
+        stale,
+        vec![vec![0]],
+        "{when}: thread_seats rows without deliveries"
+    );
+}
+
+async fn thread_of(c: &Client, id: i64) -> i64 {
+    c.ok(Method::GET, &format!("/messages/{id}?peek=1"), None)
+        .await["message"]["thread_id"]
+        .as_i64()
+        .unwrap()
+}
+
+async fn unread(c: &Client) -> i64 {
+    let v = c.ok(Method::GET, "/counts", None).await;
+    v["seats"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["unread"].as_i64().unwrap())
+        .sum()
+}
+
+async fn bytes(c: &Client) -> (i64, i64) {
+    let o = c.get("/org").await.1;
+    (
+        o["stored_bytes"].as_i64().unwrap(),
+        o["kept_bytes"].as_i64().unwrap(),
+    )
+}
+
+/// `DELETE /threads/{id}`: the user deletes the mail of deleted orgs and
+/// the org's internal mail of a thread, with exact counts; mail exchanged
+/// with orgs that still exist stays; threads the org cannot see are
+/// `not_found`; only user tokens may delete.
+async fn user_deletes_threads(b: Backend, t: &str) {
+    let srv = start!(b, t, public());
+    let acme = srv.org("acme").await;
+    let beta = srv.org("beta").await;
+    let gam = srv.org("gam").await;
+    acme.link(&beta, "beta", "acme").await;
+    acme.link(&gam, "gam", "acme").await;
+    let a = acme.seat("a").await;
+    let bb = acme.seat("b").await;
+    let x = beta.seat("x").await;
+    let m1 = x
+        .send(json!({ "to": ["a@acme"], "cc": ["owner@acme"], "subject": "from beta", "body": "hello" }))
+        .await;
+    let r1 = a
+        .send(json!({ "to": ["x@beta"], "subject": "Re: from beta", "body": "hi", "in_reply_to": m1 }))
+        .await;
+    let g1 = gam
+        .send(json!({ "to": ["a@acme"], "subject": "from gam", "body": "g" }))
+        .await;
+    a.send(json!({ "to": ["owner@gam"], "subject": "Re", "body": "g", "in_reply_to": g1 }))
+        .await;
+    let i1 = a
+        .send(json!({ "to": ["b"], "cc": ["owner"], "subject": "internal", "body": "one" }))
+        .await;
+    let i2 = bb
+        .send(json!({ "to": ["a"], "subject": "Re: internal", "body": "two", "in_reply_to": i1 }))
+        .await;
+    let (t1, t2, t3) = (
+        thread_of(&a, m1).await,
+        thread_of(&a, g1).await,
+        thread_of(&a, i1).await,
+    );
+    assert_eq!(thread_of(&a, i2).await, t3);
+
+    // Only the user; threads the org cannot see, or that do not exist.
+    let path = |t: i64| format!("/threads/{t}");
+    assert_eq!(
+        a.status(Method::DELETE, &path(t3), None).await,
+        StatusCode::FORBIDDEN
+    );
+    let (s, v) = gam.call(Method::DELETE, &path(t3), None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{v}");
+    assert_eq!(v["error"]["code"], "not_found", "{v}");
+    assert_eq!(
+        acme.status(Method::DELETE, &path(1 << 40), None).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(gam.get(&path(t3)).await.0, StatusCode::NOT_FOUND);
+
+    // While beta exists, neither side deletes the mail they exchanged.
+    let v = acme.ok(Method::DELETE, &path(t1), None).await;
+    assert_eq!(v, json!({ "deleted": 0, "kept": 2, "more": false }));
+    let v = beta.ok(Method::DELETE, &path(t1), None).await;
+    assert_eq!(v, json!({ "deleted": 0, "kept": 2, "more": false }));
+
+    let (stored0, _) = bytes(&acme).await;
+    beta.ok(Method::DELETE, "/org", Some(json!({ "confirm": "beta" })))
+        .await;
+    let marked = " (deleted org)".len() as i64;
+    let kept = charge("from beta", 5, "", &["a@acme"], &["owner@acme"], 2);
+    let stored1 = stored0 - PER_DELIVERY + marked;
+    assert_eq!(bytes(&acme).await, (stored1, kept));
+    counts_consistent(&srv, "beta deleted").await;
+    let unread0 = unread(&acme).await;
+
+    // Now beta's message, and acme's reply (whose only other delivery went
+    // with beta), go.
+    let v = acme.ok(Method::DELETE, &path(t1), None).await;
+    assert_eq!(v, json!({ "deleted": 2, "kept": 0, "more": false }));
+    let reply = charge("Re: from beta", 2, "", &["x@beta (deleted org)"], &[], 0);
+    assert_eq!(bytes(&acme).await, (stored1 - reply, 0));
+    assert_eq!(unread(&acme).await, unread0 - 2);
+    for id in [m1, r1] {
+        assert!(srv.db.store.message(id).await.unwrap().is_none());
+    }
+    assert_eq!(acme.get(&path(t1)).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        acme.status(Method::DELETE, &path(t1), None).await,
+        StatusCode::NOT_FOUND
+    );
+    // Nothing of beta is left.
+    assert_eq!(
+        srv.db.rows_i64("SELECT COUNT(*) FROM orgs").await,
+        vec![vec![2]]
+    );
+    counts_consistent(&srv, "thread of a deleted org deleted").await;
+    seats_consistent(&srv, "thread of a deleted org deleted").await;
+
+    // Mail with gam stays, for both sides.
+    let before = (bytes(&acme).await, bytes(&gam).await);
+    let v = acme.ok(Method::DELETE, &path(t2), None).await;
+    assert_eq!(v, json!({ "deleted": 0, "kept": 2, "more": false }));
+    let v = gam.ok(Method::DELETE, &path(t2), None).await;
+    assert_eq!(v, json!({ "deleted": 0, "kept": 2, "more": false }));
+    assert_eq!((bytes(&acme).await, bytes(&gam).await), before);
+
+    // acme's internal thread goes, with its exact charge.
+    let (stored2, _) = bytes(&acme).await;
+    let unread1 = unread(&acme).await;
+    let v = acme.ok(Method::DELETE, &path(t3), None).await;
+    assert_eq!(v, json!({ "deleted": 2, "kept": 0, "more": false }));
+    let internal = charge("internal", 3, "", &["b@acme"], &["owner@acme"], 2)
+        + charge("Re: internal", 3, "", &["a@acme"], &[], 1);
+    assert_eq!(bytes(&acme).await, (stored2 - internal, 0));
+    assert_eq!(unread(&acme).await, unread1 - 3);
+    assert_eq!(acme.get(&path(t3)).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(bb.get(&path(t3)).await.0, StatusCode::NOT_FOUND);
+    counts_consistent(&srv, "internal thread deleted").await;
+    seats_consistent(&srv, "internal thread deleted").await;
+
+    // Mail from the mail system (an acknowledgement reminder) is internal
+    // mail too; a body cleared by retention was already given back.
+    let ask = a
+        .send(json!({ "to": ["b"], "subject": "ack", "body": "please", "ack_required": true, "ack_timeout_s": 1 }))
+        .await;
+    let t4 = thread_of(&a, ask).await;
+    eventually("acknowledgement reminder", async || {
+        a.ok(Method::GET, "/inbox", None)
+            .await
+            .to_string()
+            .contains("Not acknowledged")
+    })
+    .await;
+    srv.db
+        .store
+        .expire_bodies(amail_store::now_ms() + 1, 1000)
+        .await
+        .unwrap();
+    let v = acme.ok(Method::DELETE, &path(t4), None).await;
+    assert!(v["deleted"].as_i64().unwrap() >= 2, "{v}");
+    assert_eq!(v["kept"], 0, "{v}");
+    assert!(
+        !a.ok(Method::GET, "/inbox", None)
+            .await
+            .to_string()
+            .contains("Not acknowledged")
+    );
+    // Only the mail exchanged with gam is left.
+    let left = charge("Re", 1, "", &["owner@gam"], &[], 1) - 1;
+    assert_eq!(bytes(&acme).await, (left, 0));
+    counts_consistent(&srv, "reminder deleted").await;
+    seats_consistent(&srv, "reminder deleted").await;
+    // Notice mail from a node is charged to nobody: deleting it gives
+    // nothing back.
+    let node = acme.node().await;
+    node.ok(
+        Method::POST,
+        "/node/notices",
+        Some(json!({ "node": "box", "notices": [{ "kind": "settings",
+            "changes": [{ "setting": "local_policy", "old": "restricted", "new": "open" }] }] })),
+    )
+    .await;
+    let inbox = acme.ok(Method::GET, "/inbox?limit=100", None).await;
+    let notice = inbox["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["message"]["source"] == "system")
+        .map(|e| e["message"]["id"].as_i64().unwrap())
+        .expect("notice mail");
+    let tn = thread_of(&acme, notice).await;
+    let v = acme.ok(Method::DELETE, &path(tn), None).await;
+    assert_eq!(v, json!({ "deleted": 1, "kept": 0, "more": false }));
+    assert_eq!(bytes(&acme).await, (left, 0));
+    assert!(srv.db.store.message(notice).await.unwrap().is_none());
+    counts_consistent(&srv, "notice deleted").await;
+    seats_consistent(&srv, "notice deleted").await;
+}
+
+/// `POST /archive/purge-deleted-orgs` deletes the mail of deleted orgs the
+/// org keeps, a bounded number per call; replies to it stay without their
+/// parent; another org keeping the same message keeps it.
+async fn user_purges_deleted_org_mail(b: Backend, t: &str) {
+    let srv = start!(b, t, public());
+    let acme = srv.org("acme").await;
+    let gam = srv.org("gam").await;
+    let att = srv.org("att").await;
+    att.link(&acme, "acme", "att").await;
+    att.link(&gam, "gam", "att").await;
+    let a = acme.seat("a").await;
+    let m1 = att
+        .send(json!({ "to": ["a@acme", "owner@gam"], "subject": "one", "body": "1" }))
+        .await;
+    let m2 = att
+        .send(json!({ "to": ["owner@acme"], "subject": "two", "body": "22" }))
+        .await;
+    let r = a
+        .send(json!({ "to": ["owner"], "subject": "Re: one", "body": "r", "in_reply_to": m1 }))
+        .await;
+    let (stored, _) = bytes(&acme).await;
+    att.ok(Method::DELETE, "/org", Some(json!({ "confirm": "att" })))
+        .await;
+    let to1 = ["a@acme", "owner@gam"];
+    assert_eq!(
+        bytes(&acme).await,
+        (
+            stored,
+            charge("one", 1, "", &to1, &[], 1) + charge("two", 2, "", &["owner@acme"], &[], 1)
+        )
+    );
+    assert_eq!(bytes(&gam).await, (0, charge("one", 1, "", &to1, &[], 1)));
+    assert_eq!(
+        a.status(Method::POST, "/archive/purge-deleted-orgs", None)
+            .await,
+        StatusCode::FORBIDDEN
+    );
+
+    // One at a time from the store; the rest through the API.
+    let id = srv.db.store.org_by_name("acme").await.unwrap().unwrap().id;
+    let d = srv
+        .db
+        .store
+        .purge_deleted_org_mail(id, 1, None, None)
+        .await
+        .unwrap();
+    assert_eq!((d.deleted, d.more, d.next_before_id), (1, true, Some(m2)));
+    // Newest first: the second message went.
+    assert_eq!(
+        bytes(&acme).await,
+        (stored, charge("one", 1, "", &to1, &[], 1))
+    );
+    counts_consistent(&srv, "one purged").await;
+    let v = acme
+        .ok(Method::POST, "/archive/purge-deleted-orgs", None)
+        .await;
+    assert_eq!(v, json!({ "deleted": 1, "kept": 0, "more": false }));
+    assert_eq!(bytes(&acme).await, (stored, 0));
+    let v = acme
+        .ok(Method::POST, "/archive/purge-deleted-orgs", None)
+        .await;
+    assert_eq!(v, json!({ "deleted": 0, "kept": 0, "more": false }));
+    assert!(srv.db.store.message(m2).await.unwrap().is_none());
+    // gam still keeps the first message; acme's reply stays, without its
+    // parent for acme.
+    assert!(srv.db.store.message(m1).await.unwrap().is_some());
+    assert_eq!(bytes(&gam).await, (0, charge("one", 1, "", &to1, &[], 1)));
+    let m = a
+        .ok(Method::GET, &format!("/messages/{r}?peek=1"), None)
+        .await;
+    assert_eq!(m["message"]["in_reply_to"], m1, "{m}");
+    assert_eq!(
+        acme.get(&format!("/messages/{m1}")).await.0,
+        StatusCode::NOT_FOUND
+    );
+    counts_consistent(&srv, "acme purged").await;
+    seats_consistent(&srv, "acme purged").await;
+    // Once gam deletes it too, the message is gone and the reply loses
+    // its parent.
+    let v = gam
+        .ok(Method::POST, "/archive/purge-deleted-orgs", None)
+        .await;
+    assert_eq!(v, json!({ "deleted": 1, "kept": 0, "more": false }));
+    assert!(srv.db.store.message(m1).await.unwrap().is_none());
+    let m = a
+        .ok(Method::GET, &format!("/messages/{r}?peek=1"), None)
+        .await;
+    assert!(m["message"].get("in_reply_to").is_none(), "{m}");
+    assert_eq!(bytes(&gam).await, (0, 0));
+    assert_eq!(
+        srv.db.rows_i64("SELECT COUNT(*) FROM orgs").await,
+        vec![vec![2]]
+    );
+    counts_consistent(&srv, "all purged").await;
+    seats_consistent(&srv, "all purged").await;
+}
+
+/// Retention deletes the mail of deleted orgs older than the retention
+/// period, and the receivers' `kept_bytes` with it.
+async fn retention_deletes_deleted_org_mail(b: Backend, t: &str) {
+    let mut cfg = public();
+    cfg.retention_days = Some(0);
+    cfg.retention_every = Duration::from_millis(100);
+    let srv = start!(b, t, cfg);
+    let vic = srv.org("vic").await;
+    let att = srv.org("att").await;
+    att.link(&vic, "vic", "att").await;
+    let m = att
+        .send(json!({ "to": ["owner@vic"], "subject": "f", "body": "x".repeat(1000) }))
+        .await;
+    let r = vic
+        .send(json!({ "to": ["att@att", "owner"], "subject": "Re", "body": "", "in_reply_to": m }))
+        .await;
+    att.ok(Method::DELETE, "/org", Some(json!({ "confirm": "att" })))
+        .await;
+    eventually("retention", async || bytes(&vic).await.1 == 0).await;
+    assert!(srv.db.store.message(m).await.unwrap().is_none());
+    let v = vic
+        .ok(Method::GET, &format!("/messages/{r}?peek=1"), None)
+        .await;
+    assert!(v["message"].get("in_reply_to").is_none(), "{v}");
+    assert_eq!(
+        srv.db.rows_i64("SELECT COUNT(*) FROM orgs").await,
+        vec![vec![1]]
+    );
+    counts_consistent(&srv, "expired").await;
+    seats_consistent(&srv, "expired").await;
+}
+
+/// Deleting mail while the same seats receive and send mail, and while
+/// another org keeping the same messages deletes them: no deadlock, and
+/// the counts stay right.
+async fn deletion_alongside_sends(b: Backend, t: &str) {
+    let mut cfg = selfhosted();
+    cfg.limits.org_storage_bytes = Some(1 << 30);
+    let srv = start!(b, t, cfg);
+    let acme = srv.org("acme").await;
+    let gam = srv.org("gam").await;
+    let att = srv.org("att").await;
+    att.link(&acme, "acme", "att").await;
+    att.link(&gam, "gam", "att").await;
+    acme.link(&gam, "gam", "acme").await;
+    let a = acme.seat("a").await;
+    let mut ids = Vec::new();
+    for i in 0..40 {
+        ids.push(
+            att.send(json!({ "to": ["a@acme", "owner@acme", "owner@gam"], "subject": format!("m{i}"), "body": "x" }))
+                .await,
+        );
+    }
+    for id in ids.iter().take(10) {
+        a.send(json!({ "to": ["owner"], "subject": "Re", "body": "r", "in_reply_to": id }))
+            .await;
+    }
+    att.ok(Method::DELETE, "/org", Some(json!({ "confirm": "att" })))
+        .await;
+    let acme_id = srv.db.store.org_by_name("acme").await.unwrap().unwrap().id;
+    let gam_id = srv.db.store.org_by_name("gam").await.unwrap().unwrap().id;
+    let store = srv.db.store.clone();
+    let purge = |org: i64| {
+        let store = store.clone();
+        async move {
+            let mut before = None;
+            loop {
+                let d = store
+                    .purge_deleted_org_mail(org, 3, before, None)
+                    .await
+                    .unwrap();
+                if !d.more {
+                    break;
+                }
+                before = d.next_before_id;
+            }
+        }
+    };
+    let sends = |from: Client, to: &'static str| async move {
+        for i in 0..20 {
+            from.send(json!({ "to": [to], "subject": format!("s{i}"), "body": "y" }))
+                .await;
+        }
+    };
+    let mut tids = Vec::new();
+    for id in ids.iter().skip(20).take(10) {
+        tids.push(thread_of(&a, *id).await);
+    }
+    // (The purge may have taken a thread first: then it is not found.)
+    let threads = {
+        let acme = acme.clone();
+        async move {
+            for t in tids {
+                let (s, v) = acme
+                    .call(Method::DELETE, &format!("/threads/{t}"), None)
+                    .await;
+                assert!(s.is_success() || s == StatusCode::NOT_FOUND, "{s}: {v}");
+            }
+        }
+    };
+    tokio::join!(
+        purge(acme_id),
+        purge(gam_id),
+        sends(gam.clone(), "a@acme"),
+        sends(a.clone(), "owner"),
+        sends(acme.clone(), "a"),
+        threads,
+    );
+    assert_eq!(bytes(&acme).await.1, 0);
+    assert_eq!(bytes(&gam).await.1, 0);
+    for id in &ids {
+        assert!(srv.db.store.message(*id).await.unwrap().is_none());
+    }
+    counts_consistent(&srv, "after").await;
+    seats_consistent(&srv, "after").await;
+}
+
+/// After `auth_failures_per_min * AUTH_FAILURE_BURST_MINUTES` failed
+/// authentications from one client address (IPv6: one /64), its requests
+/// with credentials the server has not seen valid lately get 429 without a
+/// database lookup; credentials that were valid keep working from there,
+/// and other addresses are not affected.
+async fn failed_authentication_is_limited_per_address(b: Backend, t: &str) {
+    let mut cfg = public();
+    cfg.trusted_proxies = vec!["127.0.0.1".parse().unwrap()];
+    let limiters = Arc::new(Mutex::new(None));
+    let l2 = limiters.clone();
+    let srv = start!(b, t, cfg, move |st: &mut AppState| {
+        *l2.lock().unwrap() = Some(st.limiters.clone());
+    });
+    let limiters = limiters.lock().unwrap().clone().unwrap();
+    let lookups = || {
+        limiters
+            .auth_lookups
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let burst = (amail_server::config::Limits::public()
+        .auth_failures_per_min
+        .unwrap()
+        * amail_proto::limits::AUTH_FAILURE_BURST_MINUTES) as usize;
+    let acme = srv.org("acme").await;
+    acme.ok(Method::POST, "/seats", Some(json!({ "name": "w1" })))
+        .await;
+    let fresh = acme
+        .ok(Method::POST, "/seats/w1/tokens", Some(json!({})))
+        .await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let from = |token: &str, ip: &str| {
+        let req = srv
+            .http
+            .get(format!("{}/v1/inbox", srv.base))
+            .bearer_auth(token)
+            .header("X-Forwarded-For", ip);
+        async move { req.send().await.unwrap().status() }
+    };
+    let attacker = "198.51.100.7";
+    // The user's token was used from the attacker's address before.
+    assert_eq!(from(&acme.token, attacker).await, StatusCode::OK);
+    let start = lookups();
+    let mut codes = std::collections::BTreeMap::new();
+    for _ in 0..300 {
+        *codes.entry(from(&new_token(), attacker).await).or_insert(0) += 1;
+    }
+    assert_eq!(
+        codes,
+        [
+            (StatusCode::UNAUTHORIZED, burst),
+            (StatusCode::TOO_MANY_REQUESTS, 300 - burst)
+        ]
+        .into(),
+    );
+    // Only the first `burst` reached the database.
+    assert_eq!(lookups() - start, burst as u64);
+    // Valid credentials still work, from another address and from the
+    // limited one; a credential not seen yet works from other addresses.
+    assert_eq!(from(&acme.token, "203.0.113.5").await, StatusCode::OK);
+    assert_eq!(from(&acme.token, attacker).await, StatusCode::OK);
+    assert_eq!(from(&fresh, attacker).await, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(from(&fresh, "203.0.113.5").await, StatusCode::OK);
+    assert_eq!(from(&fresh, attacker).await, StatusCode::OK);
+    // Sign-in and operator requests count as well.
+    let r = srv
+        .http
+        .post(format!("{}/v1/session", srv.base))
+        .header("X-Amail-Csrf", "1")
+        .header("X-Forwarded-For", attacker)
+        .json(&json!({ "token": new_token() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    let r = srv
+        .http
+        .get(format!("{}/v1/operator/stats", srv.base))
+        .bearer_auth(new_token())
+        .header("X-Forwarded-For", attacker)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    // IPv6 clients are limited per /64.
+    for i in 0..burst {
+        let ip = format!("2001:db8:1:2::{:x}", i + 1);
+        assert_eq!(from(&new_token(), &ip).await, StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(
+        from(&new_token(), "2001:db8:1:2:ffff::1").await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        from(&new_token(), "2001:db8:1:3::1").await,
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+/// A purge looks at the org's deliveries in steps and starts no step after
+/// its time limit (as a search does), so that one request holds its query
+/// slot for a bounded time: with a limit of zero, each call looks at one
+/// step of 5,000 delivered messages and answers with a cursor.
+async fn purge_walk_is_bounded(b: Backend, t: &str) {
+    let srv = start!(b, t, public());
+    let vic = srv.org("vic").await;
+    let att = srv.org("att").await;
+    att.link(&vic, "vic", "att").await;
+    att.send(json!({ "to": ["owner@vic"], "subject": "old", "body": "x" }))
+        .await;
+    att.ok(Method::DELETE, "/org", Some(json!({ "confirm": "att" })))
+        .await;
+    // 12,000 newer messages delivered to vic's user.
+    let o = srv.db.store.org_by_name("vic").await.unwrap().unwrap();
+    let user = srv.db.store.user_seat(o.id).await.unwrap().unwrap();
+    srv.db.fill_messages(o.id, user.id, 12_000, "filler").await;
+    srv.db
+        .exec(&[format!(
+            "INSERT INTO deliveries (org_id, message_id, seat_id, class, mode, seq, mod_seq, read_at, notified_at) \
+             SELECT {org}, m.id, {seat}, 'to', 'immediate', 1000 + m.id, 1000 + m.id, 1, 1 \
+             FROM messages m WHERE m.org_id = {org} AND m.subject LIKE 'filler %'",
+            org = o.id,
+            seat = user.id
+        )])
+        .await;
+    let mut before = None;
+    let mut calls = 0;
+    let mut deleted = 0;
+    loop {
+        let d = srv
+            .db
+            .store
+            .purge_deleted_org_mail(o.id, 1000, before, Some(Duration::ZERO))
+            .await
+            .unwrap();
+        calls += 1;
+        deleted += d.deleted;
+        if !d.more {
+            break;
+        }
+        before = d.next_before_id;
+    }
+    assert_eq!((calls, deleted), (3, 1));
+    assert_eq!(vic.get("/org").await.1["kept_bytes"], 0);
 }

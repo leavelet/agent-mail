@@ -54,12 +54,21 @@ pub struct Limits {
     pub org_storage_bytes: Option<i64>,
     /// Requests whose database cost depends on the data (search, archive,
     /// threads, attention, overview, delivery status, lists) of one org in
-    /// progress at the same time; a further one waits briefly for a slot,
+    /// progress at the same time, in each pool of
+    /// [`crate::limits::Pool`]; a further one waits briefly for a slot,
     /// then gets 429.
     pub org_queries: Option<usize>,
-    /// The same over all orgs, so that several orgs together cannot take
-    /// every database connection.
+    /// The same over all orgs, in each of the pools
+    /// [`crate::limits::Pool::Scan`] and [`crate::limits::Pool::Other`],
+    /// so that several orgs together cannot take every database
+    /// connection.
     pub queries: Option<usize>,
+    /// Failed authentications (unknown, revoked or expired tokens and
+    /// sessions) per minute per client address (IPv6: per /64), with bursts
+    /// of [`amail_proto::limits::AUTH_FAILURE_BURST_MINUTES`] minutes'
+    /// worth. A client over it gets 429 for requests with a credential the
+    /// server has not seen valid lately, without a database lookup.
+    pub auth_failures_per_min: Option<f64>,
 }
 
 impl Limits {
@@ -81,6 +90,7 @@ impl Limits {
             org_storage_bytes: Some(1 << 30),
             org_queries: Some(1),
             queries: Some(8),
+            auth_failures_per_min: Some(10.0),
         }
     }
 }

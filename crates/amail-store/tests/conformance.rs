@@ -62,6 +62,7 @@ conformance!(
     ack_steps_taken_once,
     system_seat_hidden,
     focus_and_digest_pending,
+    search_steps_are_bounded,
 );
 
 async fn org(s: &S, name: &str) -> (Org, Seat) {
@@ -107,6 +108,7 @@ fn msg(org_id: i64, from: i64, subject: &str, to: &[(&Seat, C)]) -> NewMessage {
             .collect(),
         ack_due: None,
         storage_quota: None,
+        notice: false,
     }
 }
 
@@ -1727,4 +1729,66 @@ async fn focus_and_digest_pending(s: S) {
     f.digest_only = true;
     assert_eq!(s.claim(a.id, &f).await.unwrap().0.len(), 1);
     assert_eq!(s.pending(o.id, Some(a.id)).await.unwrap()[0].digest, 0);
+}
+
+/// One step of a search looks at a bounded amount of body text: with a
+/// time limit of zero a request does exactly one step, which covers as many
+/// messages as fit in `SEARCH_STEP_BYTES` (divided by the number of terms,
+/// at least one message), and answers with a cursor. Following the cursor
+/// finds every match.
+async fn search_steps_are_bounded(s: S) {
+    use amail_proto::limits::SEARCH_STEP_BYTES;
+    let (o, user) = org(&s, "acme").await;
+    let a = seat(&s, o.id, "a").await;
+    let body_bytes = 256 * 1024;
+    let n = 40;
+    let mut ids = Vec::new();
+    for i in 0..n {
+        let mut m = msg(o.id, user.id, &format!("m{i}"), &[(&a, C::To)]);
+        m.body = format!("{} needle{i} ", "x".repeat(body_bytes - 16));
+        ids.push(s.send(&m).await.unwrap().message_id);
+    }
+    let per_step = (SEARCH_STEP_BYTES / body_bytes as i64) as usize;
+    assert!(per_step >= 2 && per_step < n, "{per_step}");
+    for terms in [vec!["needle"], vec!["needle", "xxx"]] {
+        let per_step = per_step / terms.len();
+        let mut q = SearchQuery {
+            terms: terms.iter().map(|t| t.to_string()).collect(),
+            before_id: None,
+            limit: 100,
+            scan: amail_proto::limits::MAX_SCAN_MESSAGES,
+            time_limit: Some(std::time::Duration::ZERO),
+        };
+        let mut found = Vec::new();
+        let mut requests = 0;
+        loop {
+            let r = s.search(o.id, &q).await.unwrap();
+            requests += 1;
+            assert!(r.hits.len() <= per_step, "{terms:?}: {} hits", r.hits.len());
+            found.extend(r.hits.iter().map(|h| h.message.id));
+            match r.next_before_id {
+                Some(next) => q.before_id = Some(next),
+                None => break,
+            }
+        }
+        found.reverse();
+        assert_eq!(found, ids, "{terms:?}");
+        assert_eq!(requests, n.div_ceil(per_step), "{terms:?}");
+    }
+    // Without a time limit, one request looks at all of them.
+    let r = s
+        .search(
+            o.id,
+            &SearchQuery {
+                terms: vec!["needle".into()],
+                before_id: None,
+                limit: 100,
+                scan: amail_proto::limits::MAX_SCAN_MESSAGES,
+                time_limit: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.hits.len(), n);
+    assert!(r.next_before_id.is_none());
 }

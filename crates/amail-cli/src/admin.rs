@@ -447,6 +447,7 @@ async fn stats(db: &str, top: usize, out: &Out) -> Result<()> {
                 "messages": o.messages, "messages_hour": o.messages_hour,
                 "messages_day": o.messages_day, "last_activity": o.last_activity.map(ts),
                 "suspended": o.suspended_at.is_some(), "stored_bytes": o.stored_bytes,
+                "kept_bytes": o.kept_bytes,
             })
         })
         .collect();
@@ -477,18 +478,19 @@ async fn stats(db: &str, top: usize, out: &Out) -> Result<()> {
             ));
         }
         lines.push(format!(
-            "{:<24} {:>6} {:>8} {:>8} {:>10} {:>10}  last activity",
-            "org", "seats", "mail/h", "mail/d", "mail", "MiB"
+            "{:<24} {:>6} {:>8} {:>8} {:>10} {:>10} {:>10}  last activity",
+            "org", "seats", "mail/h", "mail/d", "mail", "MiB", "kept MiB"
         ));
         for o in s.orgs.iter().take(top) {
             lines.push(format!(
-                "{:<24} {:>6} {:>8} {:>8} {:>10} {:>10.1}  {}{}",
+                "{:<24} {:>6} {:>8} {:>8} {:>10} {:>10.1} {:>10.1}  {}{}",
                 o.name,
                 o.seats,
                 o.messages_hour,
                 o.messages_day,
                 o.messages,
                 o.stored_bytes as f64 / (1024.0 * 1024.0),
+                o.kept_bytes as f64 / (1024.0 * 1024.0),
                 o.last_activity.map(ts).unwrap_or_else(|| "-".into()),
                 if o.suspended_at.is_some() {
                     "  (suspended)"

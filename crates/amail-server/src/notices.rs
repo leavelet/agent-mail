@@ -8,12 +8,21 @@
 //! from the org's hidden system seat, asks for no acknowledgement and wakes
 //! no agent. Reports are limited per org
 //! ([`amail_proto::limits::NODE_NOTICES_PER_HOUR`]).
+//!
+//! One report becomes at most one mail, whose body is at most
+//! [`MAX_NOTICE_BODY_BYTES`]: items that do not fit are left out and
+//! counted. Notice mail is not charged to the org's storage quota and never
+//! refused at it; instead each org may receive [`NOTICE_MAILS_PER_DAY`]
+//! mails and [`NOTICE_BYTES_PER_DAY`] bytes of them in 24 hours (counted in
+//! the database), further reports are dropped, and notice mail is deleted
+//! after [`amail_proto::limits::NOTICE_RETENTION_DAYS`].
 
 use crate::AppState;
 use crate::auth::Auth;
 use crate::error::{ApiError, ApiResult, Json};
 use amail_proto::limits::{
-    MAX_NODE_LABEL_CHARS, MAX_NODE_NOTICES, MAX_NOTICE_ITEMS, MAX_NOTICE_TARGETS,
+    MAX_NODE_LABEL_CHARS, MAX_NODE_NOTICES, MAX_NOTICE_BODY_BYTES, MAX_NOTICE_ITEMS,
+    MAX_NOTICE_TARGETS, NOTICE_BYTES_PER_DAY, NOTICE_MAILS_PER_DAY,
 };
 use amail_proto::{
     AgentAction, DeliveryClass, DeliveryMode, LocalPolicy, NodeNotice, NodeNotices,
@@ -80,7 +89,12 @@ fn setting_text(s: NoticeSetting) -> &'static str {
     }
 }
 
-/// `names` as shown: seats of the org by name; other names are counted.
+/// Bytes of the seat names shown for one action; further names are
+/// counted.
+const MAX_NAMES_BYTES: usize = 400;
+
+/// `names` as shown: seats of the org by name, up to [`MAX_NAMES_BYTES`];
+/// other names are counted.
 fn names_text(names: &[String], seats: &HashSet<String>, count: u32) -> String {
     let known: Vec<&str> = names
         .iter()
@@ -88,11 +102,27 @@ fn names_text(names: &[String], seats: &HashSet<String>, count: u32) -> String {
         .map(String::as_str)
         .collect();
     let unknown = names.len() - known.len();
-    let mut out = if known.is_empty() {
+    let mut shown = Vec::new();
+    let mut len = 0;
+    for n in &known {
+        if len + n.len() + 2 > MAX_NAMES_BYTES {
+            break;
+        }
+        len += n.len() + 2;
+        shown.push(*n);
+    }
+    let mut out = if shown.is_empty() {
         String::new()
     } else {
-        format!(": {}", known.join(", "))
+        format!(": {}", shown.join(", "))
     };
+    let hidden = known.len() - shown.len();
+    if hidden > 0 {
+        out.push_str(&format!(
+            " (and {hidden} more seat{})",
+            if hidden == 1 { "" } else { "s" }
+        ));
+    }
     if unknown > 0 {
         out.push_str(&format!(
             " ({unknown} name{} that {} not a seat of this org)",
@@ -106,11 +136,20 @@ fn names_text(names: &[String], seats: &HashSet<String>, count: u32) -> String {
     out
 }
 
-/// Subject and body of the mail for `n`.
-fn render(n: &NodeNotice, host: &str, seats: &HashSet<String>) -> (String, String) {
+/// One notice as shown: its subject, a first paragraph, list items and
+/// closing paragraphs, all from fixed sentences and typed values.
+struct Section {
+    subject: String,
+    intro: String,
+    items: Vec<String>,
+    outro: String,
+}
+
+/// The parts of the mail for `n`.
+fn render(n: &NodeNotice, host: &str, seats: &HashSet<String>) -> Section {
     match n {
         NodeNotice::Settings { changes } => {
-            let mut lines = Vec::new();
+            let mut items = Vec::new();
             let mut opened = false;
             let mut unjailed = false;
             for c in changes {
@@ -125,18 +164,14 @@ fn render(n: &NodeNotice, host: &str, seats: &HashSet<String>) -> (String, Strin
                     None => setting_text(c.setting).to_string(),
                 };
                 let old = c.old.as_deref().unwrap_or("not reported before");
-                lines.push(format!("- {what}: {old} -> {}", c.new));
+                items.push(format!("- {what}: {old} -> {}", c.new));
                 opened |= c.setting == NoticeSetting::LocalPolicy && c.new == "open";
                 unjailed |= c.setting == NoticeSetting::DshJail && c.new == "off";
             }
-            let mut body = format!(
-                "The amail node on host {host} now runs with settings that differ from the \
-                 ones it reported before:\n\n{}\n",
-                lines.join("\n")
-            );
+            let mut outro = String::new();
             if opened {
-                body.push_str(
-                    "\nWith the local policy open, every process of your OS user on that host, \
+                outro.push_str(
+                    "With the local policy open, every process of your OS user on that host, \
                      including the agents of the sessions the node started, may manage seats \
                      and obtain any seat's credentials through the node. The node reports \
                      such requests from agent sessions to you. Set local_policy = \
@@ -144,13 +179,24 @@ fn render(n: &NodeNotice, host: &str, seats: &HashSet<String>) -> (String, Strin
                 );
             }
             if unjailed {
-                body.push_str(
-                    "\nWith the dsh jail off, an unattended DeepSeek Harness seat runs without \
+                if !outro.is_empty() {
+                    outro.push('\n');
+                }
+                outro.push_str(
+                    "With the dsh jail off, an unattended DeepSeek Harness seat runs without \
                      the bubblewrap jail: its agent can read every file your OS user can read \
                      on that host, saved logins and keys included (see docs/harnesses.md).\n",
                 );
             }
-            (format!("Node settings changed on host {host}"), body)
+            Section {
+                subject: format!("Node settings changed on host {host}"),
+                intro: format!(
+                    "The amail node on host {host} now runs with settings that differ from the \
+                     ones it reported before:"
+                ),
+                items,
+                outro,
+            }
         }
         NodeNotice::AgentActions { seat, actions } => {
             let who = match seat.as_deref() {
@@ -160,7 +206,7 @@ fn render(n: &NodeNotice, host: &str, seats: &HashSet<String>) -> (String, Strin
                          node cannot tell which)"
                     .to_string(),
             };
-            let lines: Vec<String> = actions
+            let items = actions
                 .iter()
                 .map(|a| {
                     format!(
@@ -170,24 +216,87 @@ fn render(n: &NodeNotice, host: &str, seats: &HashSet<String>) -> (String, Strin
                     )
                 })
                 .collect();
-            let body = format!(
-                "A process of the session of {who} on host {host} asked the amail node to:\n\n\
-                 {}\n\nThe node's local policy (open) allowed it. If you did not expect this, \
-                 look at that session. With local_policy = \"restricted\" the node refuses \
-                 such requests from agent sessions (see docs/security.md). This notice is best \
-                 effort: the node recognizes a session's processes by their parent processes, \
-                 and a process that left the session's process tree is not recognized.\n",
-                lines.join("\n")
-            );
             let subject = match seat.as_deref() {
                 Some(s) if seats.contains(s) => {
                     format!("Agent seat {s} used the node on host {host}")
                 }
                 _ => format!("An agent session used the node on host {host}"),
             };
-            (subject, body)
+            Section {
+                subject,
+                intro: format!(
+                    "A process of the session of {who} on host {host} asked the amail node to:"
+                ),
+                items,
+                outro: "The node's local policy (open) allowed it. If you did not expect this, \
+                        look at that session. With local_policy = \"restricted\" the node \
+                        refuses such requests from agent sessions (see docs/security.md). This \
+                        notice is best effort: the node recognizes a session's processes by \
+                        their parent processes, and a process that left the session's process \
+                        tree is not recognized.\n"
+                    .to_string(),
+            }
         }
     }
+}
+
+/// Room kept at the end of the body for the lines that count what was left
+/// out.
+const RESERVE: usize = 200;
+
+/// Subject and body of the one mail for a report: the notices in order,
+/// within [`MAX_NOTICE_BODY_BYTES`]. Items and whole notices that do not
+/// fit are left out and counted.
+fn compose(sections: &[Section], host: &str) -> (String, String) {
+    let subject = match sections {
+        [one] => one.subject.clone(),
+        _ => format!(
+            "{} notices from the amail node on host {host}",
+            sections.len()
+        ),
+    };
+    let mut body = String::new();
+    let mut left = 0;
+    for (i, s) in sections.iter().enumerate() {
+        let sep = if body.is_empty() { "" } else { "\n-----\n\n" };
+        if body.len() + sep.len() + s.intro.len() + s.outro.len() + 3 + RESERVE
+            > MAX_NOTICE_BODY_BYTES
+        {
+            left = sections.len() - i;
+            break;
+        }
+        body.push_str(sep);
+        body.push_str(&s.intro);
+        body.push_str("\n\n");
+        let mut shown = 0;
+        for item in &s.items {
+            if body.len() + item.len() + 1 + s.outro.len() + 1 + RESERVE > MAX_NOTICE_BODY_BYTES {
+                break;
+            }
+            body.push_str(item);
+            body.push('\n');
+            shown += 1;
+        }
+        if shown < s.items.len() {
+            body.push_str(&format!("- ({} more not shown)\n", s.items.len() - shown));
+        }
+        if !s.outro.is_empty() {
+            body.push('\n');
+            body.push_str(&s.outro);
+        }
+    }
+    if left > 0 {
+        body.push_str(&format!(
+            "\n-----\n\n{left} more notice{} of this report {} not shown.\n",
+            if left == 1 { "" } else { "s" },
+            if left == 1 { "is" } else { "are" }
+        ));
+    }
+    let subject = subject
+        .chars()
+        .take(amail_proto::limits::MAX_SUBJECT_CHARS)
+        .collect();
+    (subject, body)
 }
 
 fn check(report: &NodeNotices) -> ApiResult<()> {
@@ -267,53 +376,72 @@ pub async fn post(
         .filter(|s| s.kind != SeatKind::System)
         .map(|s| s.name.clone())
         .collect();
-    let system = st.store.system_seat(org).await?;
     let host = host(report.node.as_deref());
-    let mut sent = 0;
-    for n in &report.notices {
-        let (subject, body) = render(n, &host, &seats);
-        let subject: String = subject
-            .chars()
-            .take(amail_proto::limits::MAX_SUBJECT_CHARS)
-            .collect();
-        let m = st
-            .store
-            .send(&NewMessage {
-                org_id: org,
-                sender_seat_id: system.id,
-                thread_id: None,
-                parent_id: None,
-                depth: 0,
-                subject,
-                body,
-                to_addrs: vec![format!("{}@{}", user.name, auth.org.name)],
-                cc_addrs: Vec::new(),
-                priority: Priority::Normal,
-                ack_required: false,
-                meta: Default::default(),
-                deliveries: vec![NewDelivery {
-                    seat_id: user.id,
-                    org_id: org,
-                    class: DeliveryClass::To,
-                    mode: DeliveryMode::Immediate,
-                }],
-                ack_due: None,
-                // Mail from the mail system is never refused; the rate
-                // limit above bounds it.
-                storage_quota: None,
-            })
-            .await?;
-        let events: Vec<(String, i64)> = m
-            .seqs
-            .iter()
-            .filter(|b| b.seat_id == user.id)
-            .map(|b| (user.name.clone(), b.seq))
-            .collect();
-        st.bus.publish(org, &events);
-        sent += 1;
+    let sections: Vec<Section> = report
+        .notices
+        .iter()
+        .map(|n| render(n, &host, &seats))
+        .collect();
+    let (subject, body) = compose(&sections, &host);
+    // The org's daily budget, counted from the notice mail it holds; one
+    // report at a time per instance, so that the count is not read twice
+    // before a send.
+    let turn = st.limiters.notice_budget.lock().await;
+    let since = amail_store::now_ms() - 86_400_000;
+    let (mails, bytes) = st.store.notice_usage(org, since).await?;
+    if mails >= NOTICE_MAILS_PER_DAY
+        || bytes + (subject.len() + body.len()) as i64 > NOTICE_BYTES_PER_DAY
+    {
+        // Answered as taken, so that the node does not send it again.
+        tracing::warn!(
+            "org {org}: node notice report dropped, over the daily notice budget \
+             ({mails} mails, {bytes} bytes in 24 hours)"
+        );
+        return Ok(Json(NodeNoticesAccepted { sent: 0 }));
     }
-    tracing::info!("org {org}: {sent} node notice(s) sent to the user seat");
-    Ok(Json(NodeNoticesAccepted { sent }))
+    let system = st.store.system_seat(org).await?;
+    let m = st
+        .store
+        .send(&NewMessage {
+            org_id: org,
+            sender_seat_id: system.id,
+            thread_id: None,
+            parent_id: None,
+            depth: 0,
+            subject,
+            body,
+            to_addrs: vec![format!("{}@{}", user.name, auth.org.name)],
+            cc_addrs: Vec::new(),
+            priority: Priority::Normal,
+            ack_required: false,
+            meta: Default::default(),
+            deliveries: vec![NewDelivery {
+                seat_id: user.id,
+                org_id: org,
+                class: DeliveryClass::To,
+                mode: DeliveryMode::Immediate,
+            }],
+            ack_due: None,
+            // Notice mail is never refused at the storage quota and is not
+            // charged to it; the daily budget above and its own retention
+            // bound it.
+            storage_quota: None,
+            notice: true,
+        })
+        .await?;
+    drop(turn);
+    let events: Vec<(String, i64)> = m
+        .seqs
+        .iter()
+        .filter(|b| b.seat_id == user.id)
+        .map(|b| (user.name.clone(), b.seq))
+        .collect();
+    st.bus.publish(org, &events);
+    tracing::info!(
+        "org {org}: {} node notice(s) sent to the user seat in one mail",
+        report.notices.len()
+    );
+    Ok(Json(NodeNoticesAccepted { sent: 1 }))
 }
 
 #[cfg(test)]
