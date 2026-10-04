@@ -5,6 +5,7 @@
 use crate::AppState;
 use crate::auth::Auth;
 use crate::error::{ApiError, ApiResult, Json, Path};
+use crate::limits::Pool;
 use crate::mail::limited;
 use amail_proto::limits::MAX_DELETE_MESSAGES;
 use amail_proto::{self as p};
@@ -33,7 +34,7 @@ pub async fn delete_thread(
     }
     let store = st.store.clone();
     let org_id = auth.org.id;
-    let done = limited(&st, &auth, async move {
+    let done = limited(&st, &auth, Pool::Other, async move {
         Ok(store.delete_thread(org_id, id, MAX_DELETE_MESSAGES).await?)
     })
     .await?
@@ -57,7 +58,7 @@ pub async fn purge_deleted_orgs(
     auth.require_user()?;
     let store = st.store.clone();
     let org_id = auth.org.id;
-    let done = limited(&st, &auth, async move {
+    let done = limited(&st, &auth, Pool::Other, async move {
         Ok(store
             .purge_deleted_org_mail(org_id, MAX_DELETE_MESSAGES)
             .await?)
