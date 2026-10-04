@@ -1787,8 +1787,17 @@ macro_rules! impl_store_common {
                 .await?)
             }
 
-            /// Drop expired claim keys, watches and instances.
+            /// Drop expired claim keys, watches, instances and browser
+            /// sessions, and revoked tokens with their sessions.
             pub async fn cleanup(c: &mut Conn, now: i64) -> Result<()> {
+                sqlx::query("DELETE FROM web_sessions WHERE expires_at <= $1").bind(now).execute(&mut *c).await?;
+                sqlx::query("DELETE FROM operator_sessions WHERE expires_at <= $1").bind(now).execute(&mut *c).await?;
+                sqlx::query(
+                    "DELETE FROM web_sessions WHERE token_id IN (SELECT id FROM tokens WHERE revoked_at IS NOT NULL)",
+                )
+                .execute(&mut *c)
+                .await?;
+                sqlx::query("DELETE FROM tokens WHERE revoked_at IS NOT NULL").execute(&mut *c).await?;
                 sqlx::query("DELETE FROM claim_keys WHERE created_at < $1").bind(now - 600_000).execute(&mut *c).await?;
                 sqlx::query("DELETE FROM mirror_watch WHERE expires_at < $1").bind(now).execute(&mut *c).await?;
                 sqlx::query(
@@ -1800,6 +1809,17 @@ macro_rules! impl_store_common {
                 .await?;
                 sqlx::query("DELETE FROM server_instances WHERE heartbeat_at < $1").bind(now - 300_000).execute(&mut *c).await?;
                 Ok(())
+            }
+
+            pub async fn row_counts(c: &mut Conn) -> Result<RowCounts> {
+                let (tokens, revoked_tokens, web_sessions): (i64, i64, i64) = sqlx::query_as(
+                    "SELECT (SELECT COUNT(*) FROM tokens), \
+                     (SELECT COUNT(*) FROM tokens WHERE revoked_at IS NOT NULL), \
+                     (SELECT COUNT(*) FROM web_sessions)",
+                )
+                .fetch_one(&mut *c)
+                .await?;
+                Ok(RowCounts { tokens, revoked_tokens, web_sessions })
             }
 
             // --- attention ---------------------------------------------------
@@ -2548,6 +2568,10 @@ macro_rules! impl_store_common {
                 let seat = seat.to_string();
                 let now = now_ms();
                 run!(self.read, |c| q::mirror_watchers(c, org_id, &seat, now).await)
+            }
+
+            async fn row_counts(&self) -> $crate::Result<$crate::RowCounts> {
+                run!(self.read, |c| q::row_counts(c).await)
             }
 
             async fn cleanup(&self) -> $crate::Result<()> {

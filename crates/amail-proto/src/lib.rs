@@ -193,8 +193,12 @@ pub struct SendRequest {
 /// Structured message fields (`meta`): a small string map.
 pub type Meta = std::collections::BTreeMap<String, String>;
 
-/// Size limits enforced on every send (HTTP 422 when exceeded).
+/// The fixed bounds of the server, in one place. The configurable limits
+/// (rates, counts per org, the storage quota) are in the server's
+/// `config::Limits`. Both are listed in `docs/security.md`.
 pub mod limits {
+    // --- one message (HTTP 422 when exceeded) ---
+
     /// Maximum subject length in characters.
     pub const MAX_SUBJECT_CHARS: usize = 300;
     /// Maximum body size in bytes.
@@ -205,6 +209,63 @@ pub mod limits {
     pub const MAX_META_KEYS: usize = 16;
     /// Maximum total size of `meta` keys and values in bytes.
     pub const MAX_META_BYTES: usize = 4096;
+
+    // --- other stored text, in characters (HTTP 400 when exceeded) ---
+
+    /// Token labels.
+    pub const MAX_LABEL_CHARS: usize = 200;
+    /// A seat's display name.
+    pub const MAX_DISPLAY_NAME_CHARS: usize = 200;
+    /// A seat's role (part of its agent's system prompt).
+    pub const MAX_ROLE_CHARS: usize = 16_000;
+    /// A seat's model name.
+    pub const MAX_MODEL_CHARS: usize = 200;
+    /// A seat's harness name.
+    pub const MAX_HARNESS_CHARS: usize = 64;
+    /// A list's description.
+    pub const MAX_DESCRIPTION_CHARS: usize = 1_000;
+    /// Presence: the `attention` tag.
+    pub const MAX_ATTENTION_CHARS: usize = 64;
+    /// Presence: the attention hint.
+    pub const MAX_HINT_CHARS: usize = 500;
+    /// URLs (webhook, terminal).
+    pub const MAX_URL_CHARS: usize = 2_000;
+    /// A node's label.
+    pub const MAX_NODE_LABEL_CHARS: usize = 200;
+
+    // --- responses ---
+
+    /// Upper bound of the bytes of message headers (and snippets) in one
+    /// answer of `/inbox`, `/changes`, `/archive/messages`, `/sent` and
+    /// `/archive/search`; a page that would be larger is cut and continues
+    /// with its cursor.
+    pub const MAX_PAGE_BYTES: usize = 2 * 1024 * 1024;
+    /// Upper bound of the message bodies in one answer of
+    /// `GET /threads/{id}`; older messages beyond it come without their
+    /// body (`body_omitted`), to be fetched one at a time.
+    pub const MAX_THREAD_BODY_BYTES: usize = 1024 * 1024;
+    /// The most messages `GET /threads/{id}` answers (the newest ones).
+    pub const MAX_THREAD_MESSAGES: i64 = 500;
+    /// Messages of the org one archive or search request looks at, newest
+    /// first, before it answers with what it found and a cursor
+    /// (`next_before_id`) to continue.
+    pub const MAX_SCAN_MESSAGES: i64 = 50_000;
+    /// Messages a search with a term shorter than three characters looks at.
+    pub const SHORT_TERM_SCAN_MESSAGES: i64 = 2_000;
+
+    // --- browser sessions ---
+
+    /// Browser sessions per token; signing in once more ends the oldest.
+    pub const MAX_SESSIONS_PER_TOKEN: i64 = 20;
+
+    /// Characters of `s`, or an error naming `field` and the limit.
+    pub fn check_chars(field: &str, s: &str, max: usize) -> Result<(), String> {
+        if s.chars().count() > max {
+            Err(format!("{field} is limited to {max} characters"))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

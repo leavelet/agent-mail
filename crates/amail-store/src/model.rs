@@ -423,3 +423,11 @@ pub struct OperatorStats {
     /// instances only; a single instance keeps them in memory).
     pub node_streams: Vec<(i64, i64)>,
 }
+
+/// Row counts of some tables ([`crate::Store::row_counts`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RowCounts {
+    pub tokens: i64,
+    pub revoked_tokens: i64,
+    pub web_sessions: i64,
+}

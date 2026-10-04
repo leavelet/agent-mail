@@ -163,6 +163,8 @@ pub async fn rotate_token(
     OptJson(body): OptJson<p::TokenRequest>,
 ) -> ApiResult<(StatusCode, Json<p::TokenResponse>)> {
     auth.require_user()?;
+    let label = body.and_then(|b| b.label);
+    crate::directory::check_text("label", label.as_deref(), p::limits::MAX_LABEL_CHARS)?;
     let token = new_token();
     st.store
         .rotate_token(
@@ -173,9 +175,7 @@ pub async fn rotate_token(
                 scope: TokenScope::User,
                 seat_id: auth.seat.as_ref().map(|s| s.id),
                 hash: hash_token(&token),
-                label: body
-                    .and_then(|b| b.label)
-                    .or_else(|| Some("rotated".into())),
+                label: label.or_else(|| Some("rotated".into())),
             },
         )
         .await?;

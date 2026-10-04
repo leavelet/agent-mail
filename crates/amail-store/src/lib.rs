@@ -265,8 +265,11 @@ pub trait Store: Send + Sync + 'static {
         org_id: i64,
         seat: &str,
     ) -> Result<Vec<(String, Option<String>)>>;
-    /// Drop expired claim keys, watches and server instances.
+    /// Drop expired claim keys, watches, server instances and browser
+    /// sessions, and revoked tokens (with their sessions).
     async fn cleanup(&self) -> Result<()>;
+    /// Row counts of some tables (tests and diagnostics).
+    async fn row_counts(&self) -> Result<RowCounts>;
 
     // --- attention -------------------------------------------------------------
 

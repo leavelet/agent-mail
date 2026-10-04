@@ -10,6 +10,32 @@ use amail_store::{Member, NewToken};
 use axum::extract::State;
 use axum::http::StatusCode;
 
+/// A free-text field of at most `max` characters (see
+/// [`amail_proto::limits`]).
+pub(crate) fn check_text(field: &str, v: Option<&str>, max: usize) -> ApiResult<()> {
+    match v {
+        Some(s) => p::limits::check_chars(field, s, max).map_err(ApiError::bad_request),
+        None => Ok(()),
+    }
+}
+
+fn check_seat_text(
+    display_name: Option<&str>,
+    role: Option<&str>,
+    harness: Option<&str>,
+    model: Option<&str>,
+) -> ApiResult<()> {
+    use p::limits::*;
+    check_text("display_name", display_name, MAX_DISPLAY_NAME_CHARS)?;
+    check_text("role", role, MAX_ROLE_CHARS)?;
+    check_text("harness", harness, MAX_HARNESS_CHARS)?;
+    check_text("model", model, MAX_MODEL_CHARS)
+}
+
+fn inner(v: &Option<Option<String>>) -> Option<&str> {
+    v.as_ref().and_then(|v| v.as_deref())
+}
+
 fn check_name(name: &str) -> ApiResult<()> {
     if valid_name(name) {
         Ok(())
@@ -89,6 +115,12 @@ pub async fn create_seat(
 ) -> ApiResult<(StatusCode, Json<p::Seat>)> {
     auth.require_user()?;
     crate::public::check_new_name(&st, &seat.name)?;
+    check_seat_text(
+        seat.display_name.as_deref(),
+        seat.role.as_deref(),
+        seat.harness.as_deref(),
+        seat.model.as_deref(),
+    )?;
     if let Some(g) = &seat.group {
         check_name(g)?;
     }
@@ -132,6 +164,12 @@ pub async fn patch_seat(
     Json(patch): Json<p::SeatPatch>,
 ) -> ApiResult<Json<p::Seat>> {
     auth.require_user()?;
+    check_seat_text(
+        inner(&patch.display_name),
+        inner(&patch.role),
+        inner(&patch.harness),
+        inner(&patch.model),
+    )?;
     if let Some(Some(g)) = &patch.group {
         check_name(g)?;
     }
@@ -161,9 +199,10 @@ pub async fn seat_token(
         .seat_by_name(auth.org.id, &name)
         .await?
         .ok_or_else(|| ApiError::not_found(format!("no seat {name:?}")))?;
+    let label = body.and_then(|b| b.label);
+    check_text("label", label.as_deref(), p::limits::MAX_LABEL_CHARS)?;
     check_token_room(&st, auth.org.id).await?;
     let token = new_token();
-    let label = body.and_then(|b| b.label);
     st.store
         .create_token(&NewToken {
             org_id: auth.org.id,
@@ -205,6 +244,7 @@ pub async fn org_token(
             ));
         }
     };
+    check_text("label", req.label.as_deref(), p::limits::MAX_LABEL_CHARS)?;
     check_token_room(&st, auth.org.id).await?;
     let token = new_token();
     st.store
@@ -314,6 +354,11 @@ pub async fn create_list(
 ) -> ApiResult<(StatusCode, Json<p::List>)> {
     auth.require_user()?;
     crate::public::check_new_name(&st, &list.name)?;
+    check_text(
+        "description",
+        list.description.as_deref(),
+        p::limits::MAX_DESCRIPTION_CHARS,
+    )?;
     if let Some(max) = st.config.limits.lists_per_org
         && st.store.lists(auth.org.id).await?.len() as i64 >= max
     {
