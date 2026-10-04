@@ -389,3 +389,13 @@ Rate and stream limits are counted per server instance.
 | Conversation mirrors over all seats | 256 MiB per instance (*public*); beyond it, the watcher furthest behind is disconnected or the largest kept-events buffer shortened, whichever holds more |
 | Browser sessions | 30 days (user), 1 day (operator) |
 | Webhooks | URL at most 2,000 characters; 3 attempts; 5 s to connect, 10 s per attempt; redirects are not followed; 16 notices in flight per org, further ones are dropped (*public*) |
+
+The node limits what it reads from the server and from its socket, so a
+malicious or broken server cannot make it grow without bound:
+
+| What the node reads | Limit |
+|---|---|
+| A response body from the server | 16 MiB |
+| A line or an event of the server's event stream | 1 MiB; a longer one ends the stream and the node connects again |
+| Seats it keeps state for without hosting them (named by the server) | 1,000; names that are not seat names are ignored |
+| A request on its socket | 64 MiB (the hook client sends at most 32 MiB of hook input) |

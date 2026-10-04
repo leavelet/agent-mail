@@ -117,6 +117,14 @@ impl Node {
         if !known && cmd.node.is_none() {
             return;
         }
+        // Named, but unknown here: answered with a status, within bounds.
+        if !known
+            && !st.mirrors.contains_key(&cmd.seat)
+            && (!amail_proto::valid_name(&cmd.seat)
+                || st.mirrors.len() >= amail_proto::limits::NODE_MAX_OTHER_SEATS)
+        {
+            return;
+        }
         let until = Instant::now() + lease;
         let backfill = cmd.backfill.unwrap_or(200).min(2000) as usize;
         match st.mirrors.get_mut(&cmd.seat) {

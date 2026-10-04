@@ -194,9 +194,9 @@ pub struct SendRequest {
 /// Structured message fields (`meta`): a small string map.
 pub type Meta = std::collections::BTreeMap<String, String>;
 
-/// The fixed bounds of the server, in one place. The configurable limits
-/// (rates, counts per org, the storage quota) are in the server's
-/// `config::Limits`. Both are listed in `docs/security.md`.
+/// The fixed bounds of the server and the node, in one place. The
+/// configurable limits (rates, counts per org, the storage quota) are in the
+/// server's `config::Limits`. Both are listed in `docs/security.md`.
 pub mod limits {
     // --- one message (HTTP 422 when exceeded) ---
 
@@ -253,6 +253,20 @@ pub mod limits {
     pub const MAX_SCAN_MESSAGES: i64 = 50_000;
     /// Messages a search with a term shorter than three characters looks at.
     pub const SHORT_TERM_SCAN_MESSAGES: i64 = 2_000;
+
+    // --- what the node reads (so a server cannot exhaust its memory) ---
+
+    /// Largest response body the node reads from the server.
+    pub const NODE_MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+    /// Longest line, and largest event, the node reads from the server's
+    /// event stream; a longer one ends the stream (the node reconnects).
+    pub const NODE_MAX_EVENT_BYTES: usize = 1024 * 1024;
+    /// Largest request (one line) the node reads from its socket. The hook
+    /// client forwards at most 32 MiB of hook input.
+    pub const NODE_MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
+    /// Seats the node keeps state for without hosting them (their pending
+    /// counts, from the server); further names from the server are ignored.
+    pub const NODE_MAX_OTHER_SEATS: usize = 1_000;
 
     // --- browser sessions ---
 

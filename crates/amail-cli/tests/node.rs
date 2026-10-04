@@ -1898,3 +1898,124 @@ async fn transcript_paths_are_checked(b: Backend) {
     );
     assert_eq!(saved["transcripts"]["cx"]["path"], json!(rollout));
 }
+
+/// A server that sends an endless line on the event stream and pending
+/// counts for thousands of seats, some with names that are not seat names:
+/// the node drops the stream and connects again, and keeps state for at
+/// most `NODE_MAX_OTHER_SEATS` seats it does not host.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hostile_server_is_bounded() {
+    use axum::body::{Body, Bytes};
+    use axum::routing::{get, post};
+    use futures::StreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let max = amail_proto::limits::NODE_MAX_OTHER_SEATS;
+    let streams = Arc::new(AtomicUsize::new(0));
+    let n = streams.clone();
+    let mut seats: Vec<Value> = (0..max + 500)
+        .map(|i| json!({"seat": format!("s{i}"), "to": 1, "cc": 0, "list": 0, "urgent": 0, "seq": 1}))
+        .collect();
+    for bad in ["Not A Seat", &"x".repeat(5000), "../x"] {
+        seats.push(json!({"seat": bad, "to": 1, "cc": 0, "list": 0, "urgent": 0, "seq": 1}));
+    }
+    let pending = json!({ "seats": seats });
+    let app = axum::Router::new()
+        .route(
+            "/v1/events",
+            get(move || {
+                let first = n.fetch_add(1, Ordering::SeqCst) == 0;
+                async move {
+                    if first {
+                        // 64 MiB without a newline, and the stream stays
+                        // open.
+                        let chunk = Bytes::from(vec![b'x'; 64 * 1024]);
+                        let s = futures::stream::repeat(chunk)
+                            .take(1024)
+                            .map(Ok::<_, std::io::Error>)
+                            .chain(futures::stream::pending());
+                        Body::from_stream(s)
+                    } else {
+                        // Mailbox events for more unknown seats, then quiet.
+                        let events: String = (0..max + 500)
+                            .map(|i| {
+                                format!("event: mailbox\ndata: {{\"seat\":\"m{i}\",\"seq\":5}}\n\n")
+                            })
+                            .collect();
+                        let s = futures::stream::once(async move {
+                            Ok::<_, std::io::Error>(Bytes::from(events))
+                        })
+                        .chain(futures::stream::pending());
+                        Body::from_stream(s)
+                    }
+                }
+            }),
+        )
+        .route(
+            "/v1/pending",
+            get(move || {
+                let p = pending.clone();
+                async move { axum::Json(p) }
+            }),
+        )
+        .route("/v1/presence", post(|| async { "" }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = amail_node::Config::new(&base, "amail_test");
+    cfg.state_dir = dir.path().join("state");
+    cfg.socket = dir.path().join("run/node.sock");
+    cfg.codex_bin = "/bin/false".into();
+    cfg.claude_bin = "/bin/false".into();
+    cfg.zellij_bin = "/bin/false".into();
+    cfg.codex_auth = dir.path().join("no-auth.json");
+    cfg.claude_config_dir = dir.path().join("claude");
+    let node = amail_node::start(cfg).await.unwrap();
+    let status = || node.node.handle(amail_node::wire::Request::Status);
+    let t0 = Instant::now();
+    loop {
+        let st = status().await;
+        let n = st["seats"].as_array().map_or(0, Vec::len);
+        if streams.load(Ordering::SeqCst) >= 2 && st["connected"] == true && n >= max {
+            break;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(20), "{st}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Let the mailbox events arrive, then count.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let st = status().await;
+    let names: Vec<&str> = st["seats"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["seat"].as_str().unwrap())
+        .collect();
+    assert_eq!(names.len(), max);
+    assert!(names.iter().all(|n| amail_proto::valid_name(n)));
+
+    // A request on the socket longer than the limit is refused.
+    let sock = dir.path().join("run/node.sock");
+    let answer = tokio::task::spawn_blocking(move || {
+        use std::io::{BufRead, Write};
+        let s = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+        let mut w = s.try_clone().unwrap();
+        let writer = std::thread::spawn(move || {
+            let chunk = vec![b'x'; 1024 * 1024];
+            for _ in 0..=amail_proto::limits::NODE_MAX_REQUEST_BYTES / chunk.len() {
+                if w.write_all(&chunk).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut line = String::new();
+        std::io::BufReader::new(s).read_line(&mut line).unwrap();
+        writer.join().unwrap();
+        line
+    })
+    .await
+    .unwrap();
+    assert!(answer.contains("larger than"), "{answer}");
+    node.shutdown();
+}

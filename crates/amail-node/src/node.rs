@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Notify, OnceCell};
 
 mod caller;
@@ -329,6 +329,26 @@ impl State {
         self.seats
             .entry(name.to_string())
             .or_insert_with(|| SeatRt::new(name))
+    }
+
+    /// A seat named by the server: its entry, created only for a valid name
+    /// while the node keeps fewer than [`NODE_MAX_OTHER_SEATS`] seats it
+    /// does not host (so a server cannot make the node grow without bound).
+    ///
+    /// [`NODE_MAX_OTHER_SEATS`]: amail_proto::limits::NODE_MAX_OTHER_SEATS
+    fn server_seat(&mut self, name: &str) -> Option<&mut SeatRt> {
+        if !self.seats.contains_key(name) {
+            let others = self
+                .seats
+                .iter()
+                .filter(|(n, s)| s.harness.is_none() && !self.saved.managed.contains_key(*n))
+                .count();
+            if !amail_proto::valid_name(name) || others >= amail_proto::limits::NODE_MAX_OTHER_SEATS
+            {
+                return None;
+            }
+        }
+        Some(self.seat(name))
     }
 
     /// Change a seat's state; returns true if it changed.
@@ -857,11 +877,17 @@ impl Node {
             .map(|c| (c.pid().unwrap_or(0).max(0) as u32, c.uid()));
         let (r, mut w) = stream.into_split();
         let mut line = String::new();
-        let mut reader = BufReader::new(r);
+        let max = amail_proto::limits::NODE_MAX_REQUEST_BYTES;
+        let mut reader = BufReader::new(r).take(max as u64);
         let read = reader.read_line(&mut line);
         match tokio::time::timeout(Duration::from_secs(10), read).await {
             Ok(Ok(n)) if n > 0 => {}
             _ => return,
+        }
+        if line.len() >= max && !line.ends_with('\n') {
+            let msg = format!("{{\"error\":\"request larger than {max} bytes\"}}\n");
+            let _ = w.write_all(msg.as_bytes()).await;
+            return;
         }
         let started = Instant::now();
         let req = serde_json::from_str::<Request>(&line);
@@ -1648,7 +1674,10 @@ impl Node {
             st.saved.tokens.insert(seat.to_string(), info.token.clone());
             st.seat(seat).harness = Some(h);
             st.save_dirty = true;
+            // Its pending counts, in case the node did not keep them.
+            st.dirty_pending.insert(seat.to_string());
         }
+        self.refresh_kick.notify_one();
         // A supervised seat resumes its last session when it has one;
         // Claude Code sessions get their id up front.
         let resume = managed
@@ -1784,7 +1813,9 @@ impl Node {
         }
         for c in resp.seats {
             let name = c.seat.clone();
-            let seat = st.seat(&name);
+            let Some(seat) = st.server_seat(&name) else {
+                continue;
+            };
             if c.seq < seat.pending.seq {
                 continue;
             }
@@ -1853,7 +1884,10 @@ impl Node {
                             continue;
                         };
                         let mut st = self.lock();
-                        if m.seq > st.seat(&m.seat).pending.seq {
+                        if st
+                            .server_seat(&m.seat)
+                            .is_some_and(|s| m.seq > s.pending.seq)
+                        {
                             st.dirty_pending.insert(m.seat);
                             self.refresh_kick.notify_one();
                         }
