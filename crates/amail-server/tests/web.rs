@@ -619,6 +619,11 @@ async fn webhook_on_user_mail(srv: Server) {
         .await;
     assert_eq!(org["webhook_url"], url);
     assert_eq!(acme.ok(Method::GET, "/org", None).await["webhook_url"], url);
+    // Agents read the org's settings but not the webhook URL, which may
+    // carry credentials.
+    let seen = a.ok(Method::GET, "/org", None).await;
+    assert_eq!(seen["name"], "acme");
+    assert!(seen.get("webhook_url").is_none(), "{seen}");
 
     // Mail between agents: no notice. Mail to the user: one, after a retry.
     a.send(json!({ "to": ["b"], "subject": "between agents", "body": "x" }))

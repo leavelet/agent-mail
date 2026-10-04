@@ -136,7 +136,9 @@ The server stores only their SHA-256 hashes. Each token is shown once.
 The only requests the server makes on a user's behalf are notification
 webhooks (`amail org set --webhook-url`): a `POST` with the header of each
 new message to the user, never its body. Redirects are never followed and
-no proxy is used.
+no proxy is used. Only the user's token and browser sessions
+see the webhook URL; seat tokens read the org's settings without it,
+since such URLs often contain credentials.
 
 In public mode (or with `--webhook-private-targets deny`), webhooks may not
 reach loopback, private, link-local, carrier-grade NAT, multicast or other

@@ -48,7 +48,13 @@ fn check_name(name: &str) -> ApiResult<()> {
 
 pub async fn get_org(auth: Auth) -> ApiResult<Json<p::OrgInfo>> {
     auth.require_directory()?;
-    Ok(Json(render::org(&auth.org)))
+    let mut org = render::org(&auth.org);
+    // Webhook URLs often carry credentials (in the path or as user:password):
+    // only the user sees them, not the agents.
+    if !auth.is_user() {
+        org.webhook_url = None;
+    }
+    Ok(Json(org))
 }
 
 pub async fn patch_org(
