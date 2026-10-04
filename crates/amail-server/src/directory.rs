@@ -527,14 +527,20 @@ pub async fn list_links(State(st): State<AppState>, auth: Auth) -> ApiResult<Jso
 }
 
 /// Another org by name; a suspended org counts as absent.
-async fn peer_org(st: &AppState, name: &str) -> ApiResult<amail_store::Org> {
-    st.store
+async fn find_peer(st: &AppState, name: &str) -> ApiResult<Option<amail_store::Org>> {
+    Ok(st
+        .store
         .org_by_name(name)
         .await?
-        .filter(|o| o.suspended_at.is_none())
-        .ok_or_else(|| ApiError::not_found(format!("no org {name:?}")))
+        .filter(|o| o.suspended_at.is_none()))
 }
 
+/// Most pending outgoing link requests an org may have.
+pub const MAX_PENDING_LINK_REQUESTS: usize = 1000;
+
+/// Link requests are answered the same whether or not an org of that name
+/// exists: a request to an unknown name is recorded and listed as
+/// `requested`, like a request the other org has not accepted yet.
 pub async fn request_link(
     State(st): State<AppState>,
     auth: Auth,
@@ -551,10 +557,41 @@ pub async fn request_link(
             ms,
         ));
     }
-    let peer = peer_org(&st, &req.org).await?;
-    let state = st.store.request_link(auth.org.id, peer.id).await?;
+    let name = req.org.trim();
+    check_name(name)?;
+    if name == auth.org.name {
+        return Err(ApiError::bad_request("an org cannot link to itself"));
+    }
+    let links = st.store.links(auth.org.id).await?;
+    if let Some(l) = links.iter().find(|l| l.peer_name == name) {
+        if l.state != p::LinkState::Invited {
+            return Ok(Json(p::Link {
+                org: name.to_string(),
+                state: l.state,
+            }));
+        }
+    } else if links
+        .iter()
+        .filter(|l| l.state == p::LinkState::Requested)
+        .count()
+        >= MAX_PENDING_LINK_REQUESTS
+    {
+        return Err(ApiError::unprocessable(
+            "too_many_link_requests",
+            format!(
+                "this org has {MAX_PENDING_LINK_REQUESTS} pending link requests; withdraw some first"
+            ),
+        ));
+    }
+    let state = match find_peer(&st, name).await? {
+        Some(peer) => st.store.request_link(auth.org.id, peer.id).await?,
+        None => {
+            st.store.request_unknown_link(auth.org.id, name).await?;
+            p::LinkState::Requested
+        }
+    };
     Ok(Json(p::Link {
-        org: peer.name,
+        org: name.to_string(),
         state,
     }))
 }
@@ -565,7 +602,9 @@ pub async fn accept_link(
     Path(org): Path<String>,
 ) -> ApiResult<Json<p::Link>> {
     auth.require_user()?;
-    let peer = peer_org(&st, &org).await?;
+    let peer = find_peer(&st, &org)
+        .await?
+        .ok_or_else(|| ApiError::not_found("no pending link request from that org"))?;
     st.store.accept_link(auth.org.id, peer.id).await?;
     Ok(Json(p::Link {
         org: peer.name,
@@ -579,8 +618,12 @@ pub async fn revoke_link(
     Path(org): Path<String>,
 ) -> ApiResult<StatusCode> {
     auth.require_user()?;
-    let peer = peer_org(&st, &org).await?;
-    if st.store.revoke_link(auth.org.id, peer.id).await? {
+    let removed = match find_peer(&st, &org).await? {
+        Some(peer) => st.store.revoke_link(auth.org.id, peer.id).await?,
+        None => false,
+    };
+    // A request made to the name while no (active) org had it.
+    if removed || st.store.revoke_unknown_link(auth.org.id, &org).await? {
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found(format!("no link with {org:?}")))

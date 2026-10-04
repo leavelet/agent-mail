@@ -59,6 +59,7 @@ public_tests!(
     cross_org_links,
     cross_org_mirrors,
     cross_org_node_commands_and_presence,
+    link_requests_do_not_reveal_org_names,
 );
 
 /// Start a server; `None` (test skipped) when Postgres is not configured.
@@ -386,6 +387,13 @@ async fn registration_with_invites(b: Backend, t: &str) {
     assert_eq!(s, StatusCode::FORBIDDEN);
     assert_eq!(v["error"]["code"], "invalid_invite");
 
+    // Without a valid invite, a taken name looks like any other name.
+    let (s, v) = srv
+        .register(json!({ "invite": "amail_inv_bogus", "org": "acme" }))
+        .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{v}");
+    assert_eq!(v["error"]["code"], "invalid_invite");
+
     // A taken name does not use up the invite.
     let code2 = srv.invite(None).await;
     let (s, v) = srv
@@ -674,7 +682,7 @@ async fn stream_request_and_link_limits(b: Backend, t: &str) {
     let (s, _) = beta
         .call(Method::POST, "/links", Some(json!({ "org": "nowhere" })))
         .await;
-    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert_eq!(s, StatusCode::OK);
     let (s, v) = beta
         .call(Method::POST, "/links", Some(json!({ "org": "acme" })))
         .await;
@@ -1833,4 +1841,58 @@ async fn cross_org_node_commands_and_presence(b: Backend, t: &str) {
         StatusCode::FORBIDDEN
     );
     let _ = &o.srv;
+}
+
+/// A link request, its listing, withdrawing it and accepting look the same
+/// whether or not an org of that name exists.
+async fn link_requests_do_not_reveal_org_names(b: Backend, t: &str) {
+    let srv = start!(b, t, public());
+    let acme = srv.org("acme").await;
+    let _beta = srv.org("beta").await;
+    for name in ["beta", "nosuchorg"] {
+        let (s, v) = acme
+            .call(Method::POST, "/links", Some(json!({ "org": name })))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v, json!({ "org": name, "state": "requested" }));
+        // Asking again answers the same.
+        let (_, v2) = acme
+            .call(Method::POST, "/links", Some(json!({ "org": name })))
+            .await;
+        assert_eq!(v, v2);
+    }
+    assert_eq!(
+        acme.ok(Method::GET, "/links", None).await,
+        json!([
+            { "org": "beta", "state": "requested" },
+            { "org": "nosuchorg", "state": "requested" },
+        ])
+    );
+    // Accepting where nothing was asked: one answer for both.
+    let (s1, v1) = acme.call(Method::POST, "/links/beta/accept", None).await;
+    let (s2, v2) = acme
+        .call(Method::POST, "/links/nosuchorg/accept", None)
+        .await;
+    assert_eq!((s1, &v1["error"]), (s2, &v2["error"]));
+    // Withdrawing works for both, then neither is known.
+    for name in ["beta", "nosuchorg"] {
+        assert_eq!(
+            acme.call(Method::DELETE, &format!("/links/{name}"), None)
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+        let (s, v) = acme
+            .call(Method::DELETE, &format!("/links/{name}"), None)
+            .await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        assert_eq!(v["error"]["message"], format!("no link with {name:?}"));
+    }
+    assert_eq!(acme.ok(Method::GET, "/links", None).await, json!([]));
+    // A request to a name that is registered later does not carry over.
+    acme.ok(Method::POST, "/links", Some(json!({ "org": "later" })))
+        .await;
+    let later = srv.org("later").await;
+    assert_eq!(later.ok(Method::GET, "/links", None).await, json!([]));
+    assert_eq!(acme.ok(Method::GET, "/links", None).await, json!([]));
 }

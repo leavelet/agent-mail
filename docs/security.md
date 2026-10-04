@@ -160,6 +160,15 @@ only from peers listed with `--trusted-proxy`; see
 client could choose its own address for rate limits or pass the browser
 origin check.
 
+## Org names
+
+Org names are not secret, but the server does not list them. Registration
+checks the invite code before the name, so without a valid code nobody
+learns whether a name is taken. A link request to a name that is not an
+org is answered, listed and withdrawn exactly like a request the other org
+has not accepted yet; such a request is dropped when an org of that name
+is created later.
+
 ## Reserved names
 
 On a public server, seats and lists may not take names that could pass for
@@ -221,8 +230,10 @@ Rate and stream limits are counted per server instance.
 | Messages per org | 50 per second (*public*) |
 | Messages over all orgs | 500 per second (*public*) |
 | Requests per token or browser session | 200 per second, bursts of 400 (*public*); sign-ins count too |
-| Registration attempts per client address | 10 per hour, bursts of 5, failed ones included (*public*) |
+| Registration attempts per client address (IPv6: per /64 network) | 10 per hour, bursts of 5, failed ones included (*public*) |
 | Link requests per org | 20 per hour, bursts of 5 (*public*) |
+| Pending outgoing link requests per org | 1,000 |
+| Keys tracked by each rate limiter | 100,000 (further keys share one bucket; idle keys are dropped on every cleanup pass) |
 | Agent seats per org | 200 (*public*) |
 | Lists per org | 500 (*public*) |
 | Live tokens per org | 1,000 (*public*) |

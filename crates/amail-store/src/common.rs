@@ -825,6 +825,11 @@ macro_rules! impl_store_common {
                         StoreError::Conflict(_) => StoreError::Conflict(format!("org {name:?} already exists")),
                         other => other,
                     })?;
+                // Requests made while no org had this name do not carry over.
+                sqlx::query("DELETE FROM link_requests WHERE peer_name = $1")
+                    .bind(name)
+                    .execute(&mut *c)
+                    .await?;
                 let seat = NewSeat { name: user_seat.to_string(), ..Default::default() };
                 let seat = insert_seat(c, id, SeatKind::User, None, &seat).await?;
                 let token = NewToken {
@@ -1268,12 +1273,37 @@ macro_rules! impl_store_common {
             pub async fn links(c: &mut Conn, org_id: i64) -> Result<Vec<Link>> {
                 let rows: Vec<LinkRow> = sqlx::query_as(
                     "SELECT l.peer_org_id, o.name AS peer_name, l.state FROM links l \
-                     JOIN orgs o ON o.id = l.peer_org_id WHERE l.org_id = $1 ORDER BY o.name",
+                     JOIN orgs o ON o.id = l.peer_org_id WHERE l.org_id = $1 \
+                     UNION ALL SELECT CAST(0 AS BIGINT), r.peer_name, 'requested' \
+                     FROM link_requests r WHERE r.org_id = $1 ORDER BY 2",
                 )
                 .bind(org_id)
                 .fetch_all(&mut *c)
                 .await?;
                 collect(rows, LinkRow::into_link)
+            }
+
+            pub async fn request_unknown_link(c: &mut Conn, org_id: i64, name: &str) -> Result<()> {
+                sqlx::query(
+                    "INSERT INTO link_requests (org_id, peer_name, created_at) VALUES ($1, $2, $3) \
+                     ON CONFLICT (org_id, peer_name) DO NOTHING",
+                )
+                .bind(org_id)
+                .bind(name)
+                .bind(now_ms())
+                .execute(&mut *c)
+                .await?;
+                Ok(())
+            }
+
+            pub async fn revoke_unknown_link(c: &mut Conn, org_id: i64, name: &str) -> Result<bool> {
+                let n = sqlx::query("DELETE FROM link_requests WHERE org_id = $1 AND peer_name = $2")
+                    .bind(org_id)
+                    .bind(name)
+                    .execute(&mut *c)
+                    .await?
+                    .rows_affected();
+                Ok(n > 0)
             }
 
             pub async fn message(c: &mut Conn, id: i64) -> Result<Option<MessageRec>> {
@@ -2027,10 +2057,23 @@ macro_rules! impl_store_common {
                 user_seat: &str,
                 token_hash: &str,
             ) -> Result<std::result::Result<(Org, Seat), InviteError>> {
+                let now = now_ms();
+                // The invite is checked first, so that without a valid one
+                // nobody learns which org names are taken.
+                let valid: Option<i64> = sqlx::query_scalar(
+                    "SELECT id FROM invites WHERE hash = $1 AND used_at IS NULL \
+                     AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > $2)",
+                )
+                .bind(invite_hash)
+                .bind(now)
+                .fetch_optional(&mut *c)
+                .await?;
+                if valid.is_none() {
+                    return Ok(Err(InviteError::Invalid));
+                }
                 if org_by_name(c, org).await?.is_some() {
                     return Ok(Err(InviteError::OrgExists));
                 }
-                let now = now_ms();
                 let used: Option<i64> = sqlx::query_scalar(
                     "UPDATE invites SET used_at = $1, used_by = $2 WHERE hash = $3 AND used_at IS NULL \
                      AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > $1) RETURNING id",
@@ -2167,6 +2210,7 @@ macro_rules! impl_store_common {
                     "DELETE FROM list_members WHERE org_id = $1",
                     "DELETE FROM lists WHERE org_id = $1",
                     "DELETE FROM links WHERE org_id = $1 OR peer_org_id = $1",
+                    "DELETE FROM link_requests WHERE org_id = $1",
                     "UPDATE seats SET parent_id = NULL WHERE org_id = $1",
                     "DELETE FROM seats WHERE org_id = $1",
                     "DELETE FROM orgs WHERE id = $1",
@@ -2415,6 +2459,16 @@ macro_rules! impl_store_common {
 
             async fn links(&self, org_id: i64) -> $crate::Result<Vec<$crate::Link>> {
                 run!(self.read, |c| q::links(c, org_id).await)
+            }
+
+            async fn request_unknown_link(&self, org_id: i64, name: &str) -> $crate::Result<()> {
+                let name = name.to_string();
+                run!(self.write, |c| q::request_unknown_link(c, org_id, &name).await)
+            }
+
+            async fn revoke_unknown_link(&self, org_id: i64, name: &str) -> $crate::Result<bool> {
+                let name = name.to_string();
+                run!(self.write, |c| q::revoke_unknown_link(c, org_id, &name).await)
             }
 
             async fn link_active(&self, org_id: i64, peer_id: i64) -> $crate::Result<bool> {

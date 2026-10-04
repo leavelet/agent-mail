@@ -7,23 +7,42 @@ use std::hash::Hash;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-/// Token buckets, one per key.
+/// Token buckets, one per key. At most [`MAX_KEYS`] keys are tracked; while
+/// that many are, new keys share one overflow bucket, so that many distinct
+/// keys (client addresses, say) cannot grow the map without bound. Buckets
+/// that are full again carry no information and are dropped by
+/// [`Buckets::prune`], which the server calls on a timer.
 pub struct Buckets<K> {
     rate: f64,
     burst: f64,
-    map: Mutex<HashMap<K, (f64, Instant)>>,
+    max_keys: usize,
+    inner: Mutex<Inner<K>>,
 }
 
-/// Keys whose bucket is full again are forgotten once this many exist.
-const PRUNE_OVER: usize = 10_000;
+struct Inner<K> {
+    map: HashMap<K, (f64, Instant)>,
+    overflow: (f64, Instant),
+}
+
+/// Keys tracked per limiter.
+pub const MAX_KEYS: usize = 100_000;
 
 impl<K: Hash + Eq + Clone> Buckets<K> {
     /// `rate` tokens per second, at most `burst` saved up.
     pub fn new(rate: f64, burst: f64) -> Self {
+        Self::with_max_keys(rate, burst, MAX_KEYS)
+    }
+
+    pub fn with_max_keys(rate: f64, burst: f64, max_keys: usize) -> Self {
+        let burst = burst.max(1.0);
         Buckets {
             rate,
-            burst: burst.max(1.0),
-            map: Mutex::new(HashMap::new()),
+            burst,
+            max_keys,
+            inner: Mutex::new(Inner {
+                map: HashMap::new(),
+                overflow: (burst, Instant::now()),
+            }),
         }
     }
 
@@ -33,20 +52,25 @@ impl<K: Hash + Eq + Clone> Buckets<K> {
 
     /// Give back a token taken for something that then did not happen.
     pub fn refund(&self, key: &K) {
-        if let Some((t, _)) = self.map.lock().unwrap().get_mut(key) {
-            *t = (*t + 1.0).min(self.burst);
-        }
+        let mut inner = self.inner.lock().unwrap();
+        let burst = self.burst;
+        let slot = match inner.map.get_mut(key) {
+            Some(slot) => slot,
+            None => &mut inner.overflow,
+        };
+        slot.0 = (slot.0 + 1.0).min(burst);
     }
 
     /// Take a token, or say in how many milliseconds one is available.
     pub fn take(&self, key: &K) -> Result<(), u64> {
         let now = Instant::now();
-        let mut map = self.map.lock().unwrap();
-        if map.len() > PRUNE_OVER {
-            let (rate, burst) = (self.rate, self.burst);
-            map.retain(|_, (t, at)| *t + now.duration_since(*at).as_secs_f64() * rate < burst);
-        }
-        let (tokens, at) = map.entry(key.clone()).or_insert((self.burst, now));
+        let mut inner = self.inner.lock().unwrap();
+        let inner = &mut *inner;
+        let (tokens, at) = if inner.map.contains_key(key) || inner.map.len() < self.max_keys {
+            inner.map.entry(key.clone()).or_insert((self.burst, now))
+        } else {
+            &mut inner.overflow
+        };
         let have = (*tokens + now.duration_since(*at).as_secs_f64() * self.rate).min(self.burst);
         *at = now;
         if have >= 1.0 {
@@ -61,6 +85,26 @@ impl<K: Hash + Eq + Clone> Buckets<K> {
             };
             Err((wait * 1000.0).ceil().max(1.0) as u64)
         }
+    }
+
+    /// Forget keys whose bucket is full again.
+    pub fn prune(&self) {
+        let now = Instant::now();
+        let (rate, burst) = (self.rate, self.burst);
+        self.inner
+            .lock()
+            .unwrap()
+            .map
+            .retain(|_, (t, at)| *t + now.duration_since(*at).as_secs_f64() * rate < burst);
+    }
+
+    /// Keys tracked.
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }
 
@@ -88,6 +132,25 @@ impl Limiters {
                 .registrations_per_hour
                 .map(|n| Buckets::per_hour(n, (n / 2.0).max(1.0))),
             streams: Arc::new(StreamCount::new(l.org_streams)),
+        }
+    }
+
+    /// Drop the state of keys that are not limited at the moment.
+    pub fn prune(&self) {
+        if let Some(b) = &self.global_send {
+            b.prune();
+        }
+        if let Some(b) = &self.org_send {
+            b.prune();
+        }
+        if let Some(b) = &self.token_requests {
+            b.prune();
+        }
+        if let Some(b) = &self.link_requests {
+            b.prune();
+        }
+        if let Some(b) = &self.registrations {
+            b.prune();
         }
     }
 }
@@ -158,6 +221,30 @@ mod tests {
         assert!(b.take(&2).is_ok());
         std::thread::sleep(std::time::Duration::from_millis(120));
         assert!(b.take(&1).is_ok());
+    }
+
+    /// Many keys cannot grow the map without bound: past the cap they share
+    /// one bucket, and keys whose bucket is full again are pruned.
+    #[test]
+    fn bounded_keys() {
+        let b = Buckets::with_max_keys(0.0, 1.0, 3);
+        for k in 0..3 {
+            assert!(b.take(&k).is_ok());
+        }
+        assert_eq!(b.len(), 3);
+        // New keys share the overflow bucket (one token here).
+        assert!(b.take(&10).is_ok());
+        assert!(b.take(&11).is_err());
+        assert_eq!(b.len(), 3);
+        // Known keys keep their own bucket.
+        assert!(b.take(&0).is_err());
+        let r = Buckets::with_max_keys(1000.0, 1.0, 3);
+        for k in 0..3 {
+            assert!(r.take(&k).is_ok());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        r.prune();
+        assert!(r.is_empty());
     }
 
     #[test]

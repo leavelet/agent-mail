@@ -24,11 +24,18 @@ pub struct Peer {
 }
 
 impl Peer {
-    /// The client address as a rate-limit key.
+    /// The client address as a rate-limit key. IPv6 clients are keyed by
+    /// their /64 network: one host usually holds a whole /64, so keying by
+    /// the full address would give it billions of separate limits.
     pub fn key(&self) -> String {
-        self.ip
-            .map(|i| crate::config::canonical(i).to_string())
-            .unwrap_or_else(|| "unknown".into())
+        match self.ip.map(crate::config::canonical) {
+            Some(IpAddr::V6(v6)) => {
+                let net = u128::from(v6) & (u128::MAX << 64);
+                format!("{}/64", std::net::Ipv6Addr::from(net))
+            }
+            Some(ip) => ip.to_string(),
+            None => "unknown".into(),
+        }
     }
 }
 
@@ -89,6 +96,22 @@ impl<S: Send + Sync> FromRequestParts<S> for Peer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keys_group_ipv6_by_64() {
+        let key = |s: &str| {
+            Peer {
+                ip: Some(s.parse().unwrap()),
+                proxied: false,
+            }
+            .key()
+        };
+        assert_eq!(key("2001:db8:1:2::1"), "2001:db8:1:2::/64");
+        assert_eq!(key("2001:db8:1:2:ffff::9"), key("2001:db8:1:2::1"));
+        assert_ne!(key("2001:db8:1:3::1"), key("2001:db8:1:2::1"));
+        assert_eq!(key("192.0.2.7"), "192.0.2.7");
+        assert_eq!(key("::ffff:192.0.2.7"), "192.0.2.7");
+    }
     use crate::config::Config;
     use axum::http::HeaderMap;
 

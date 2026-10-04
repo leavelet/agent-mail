@@ -262,6 +262,7 @@ pub fn close_org(st: &AppState, org_id: i64) {
 pub async fn sweep(st: AppState) {
     loop {
         tokio::time::sleep(st.config.sweep_every).await;
+        st.limiters.prune();
         if let Err(e) = st.revocations.sweep(&*st.store).await {
             tracing::warn!("checking the credentials of open streams: {e}");
         }

@@ -142,7 +142,14 @@ pub trait Store: Send + Sync + 'static {
     async fn accept_link(&self, org_id: i64, peer_id: i64) -> Result<()>;
     /// Remove the link in both directions. Returns false if there was none.
     async fn revoke_link(&self, org_id: i64, peer_id: i64) -> Result<bool>;
+    /// Links and pending requests, including requests to names that are
+    /// not an org (`peer_org_id` 0, state `requested`).
     async fn links(&self, org_id: i64) -> Result<Vec<Link>>;
+    /// Record a request to a name that is not an (active) org, so that it
+    /// is listed like any other request.
+    async fn request_unknown_link(&self, org_id: i64, name: &str) -> Result<()>;
+    /// Remove such a request. Returns false if there was none.
+    async fn revoke_unknown_link(&self, org_id: i64, name: &str) -> Result<bool>;
     async fn link_active(&self, org_id: i64, peer_id: i64) -> Result<bool>;
 
     // --- mail ----------------------------------------------------------------
