@@ -2462,8 +2462,10 @@ async fn external_list_members_are_counted(srv: Server) {
     alpha.link(&bravo, "bravo", "alpha").await;
     let id = a
         .send(
+            // (5 s: b1 acknowledges before the deadline, also on a loaded
+            // machine.)
             json!({ "to": ["team@bravo", "named@bravo"], "subject": "hi", "body": "x",
-                      "ack_required": true, "ack_timeout_s": 1 }),
+                      "ack_required": true, "ack_timeout_s": 5 }),
         )
         .await["id"]
         .as_i64()

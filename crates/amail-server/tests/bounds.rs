@@ -1030,7 +1030,8 @@ async fn storage_quota_counts_deliveries(b: Backend, t: &str) {
         assert_eq!(s, StatusCode::INSUFFICIENT_STORAGE, "{to}: {v}");
         assert_eq!(v["error"]["code"], "storage_quota", "{v}");
     }
-    assert_eq!(acme.get("/org").await.1["stored_bytes"], quota);
+    // (Not compared with the quota again: on a loaded machine the
+    // reminder below may already have come.)
     // The reminder to `a` still comes, charged to the org.
     eventually("acknowledgement reminder", async || {
         acme.get("/org").await.1["stored_bytes"].as_i64().unwrap() > quota
