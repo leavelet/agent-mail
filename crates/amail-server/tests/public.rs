@@ -948,7 +948,11 @@ async fn webhook_redirects_not_followed(b: Backend, t: &str) {
     // A redirect is a failure: retried (three attempts), never followed.
     eventually("three attempts", async || hits.lock().unwrap().len() == 3).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(target_hits.lock().unwrap().is_empty());
+    // Only the redirect's URL counts: another test's request to a port
+    // that the system gave to this test's target is not a followed
+    // redirect.
+    let hits = target_hits.lock().unwrap().clone();
+    assert!(!hits.iter().any(|u| u.starts_with("/stolen")), "{hits:?}");
 }
 
 async fn forwarded_headers_need_trusted_proxy(b: Backend, t: &str) {
