@@ -303,7 +303,7 @@ impl Dsh {
     /// Writable: the working directory, its git directories (a worktree's
     /// git directory and the repository's common one lie outside it) and
     /// the dsh home (session logs). Read-only: the `amail` and `dsh`
-    /// installations, the seat's profile and the endpoint files, and the
+    /// installations, the seat's profile and patch, the endpoint files, and the
     /// node socket's directory. Everything else under the home directory is
     /// hidden; the rest of the system is read-only.
     pub fn jail_paths(&self, cwd: &str, seat: &str) -> (Vec<String>, Vec<String>) {
@@ -315,6 +315,7 @@ impl Dsh {
         ro.extend(self.env.amail_dir());
         ro.extend(dsh_install_root(&self.env.dsh_bin).map(s));
         ro.push(s(self.seat_profile_path(seat)));
+        ro.push(s(self.seat_patch_path(seat)));
         ro.push(s(self.run_dir()));
         ro.extend(self.env.node_socket.parent().map(|p| s(p.to_path_buf())));
         rw.sort();

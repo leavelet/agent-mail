@@ -466,8 +466,19 @@ amail node status              # what the node sees
   `queue`): on an idle session it starts a turn, on a busy one it runs as the
   next turn, and a session that is not loaded is resumed. dsh fires no hook
   when a turn is cancelled or fails, so the wrapper watches the session log
-  and reports such a `turn/end` as the end of the turn. `unattended` seats
-  run with `DSH_PERMISSION_MODE=danger-full-access`. The model provider's key
+  and reports such a `turn/end` as the end of the turn.
+  `unattended` dsh seats run their whole host in a bubblewrap jail, because
+  dsh's own sandbox modes limit writes only and its file tools read files
+  inside the host process without any sandbox. In the jail the system is
+  read-only; the home directory, `/tmp` and `$XDG_RUNTIME_DIR` are empty;
+  container engine sockets (Docker, Podman, containerd) are replaced by
+  `/dev/null`; and only these are mounted back: the working directory, its
+  git directories and the dsh home (writable), and the `amail` and `dsh`
+  installations, the Node.js runtime, `~/.gitconfig`, the seat's profile and
+  patch, the endpoint files and the node socket's directory (read-only). The
+  network is shared. dsh runs with `DSH_PERMISSION_MODE=danger-full-access`
+  inside the jail. `bwrap` is required (unprivileged user namespaces must
+  be allowed); if it cannot run, the seat does not start. The model provider's key
   comes from the node's environment (`DEEPSEEK_API_KEY`) or from the dsh
   home's credential store.
 
@@ -650,8 +661,11 @@ checks trust only at start, so after answering once, run `amail wake <seat>`
     `unattended`, an approval waiting in the browser is not reported as
     `awaiting`. Its `Stop` input has no `stop_hook_active`; the node's own
     limit (three blocks in a row) prevents loops.
-  - dsh sandbox modes restrict writes only; `unattended` seats can read
-    anything the user can, like Claude Code and Codex seats in bypass mode.
+  - The jail of an `unattended` seat hides the home directory, but the rest
+    of the file system stays readable (read-only), and the dsh home is shared
+    by all dsh seats of the host (each can read the others' session logs).
+    A seat that is not `unattended` has no jail: it asks for approvals in the
+    browser, and its file tools can read any file the user can read.
   - A turn cut off by a crash of the host is not continued after the
     restart; mail it had already read is not delivered again.
   - Each seat runs a host process (about 200 MB idle).

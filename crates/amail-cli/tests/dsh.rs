@@ -187,6 +187,7 @@ async fn dsh_hooks_and_wake(b: Backend) {
             .any(|p| p.ends_with("state/dsh-home"))
     );
     assert!(flagged("--ro").iter().any(|p| p.ends_with("state/dsh/run")));
+    assert!(flagged("--ro").iter().any(|p| p.ends_with("ds.patch.yml")));
     let prompt = &args[args.iter().position(|a| a == "--prompt").unwrap() + 1];
     assert!(prompt.starts_with("[amail]"), "{prompt}");
     let env = &plan["env"];

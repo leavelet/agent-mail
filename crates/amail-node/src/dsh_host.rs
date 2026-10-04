@@ -42,12 +42,15 @@ pub struct HostArgs {
 
 /// The `bwrap` arguments of a seat's jail, before `--` and the command.
 ///
-/// The system is mounted read-only, `/tmp` and the home directory are empty
-/// (so nothing under the home directory is visible unless listed), and the
-/// listed paths are mounted back, read-only or writable. Paths that do not
-/// exist are skipped. The network is shared (the model API, the amail
-/// server).
-pub fn jail_args(home: &str, rw: &[String], ro: &[String]) -> Vec<String> {
+/// The system is mounted read-only; `/tmp`, the home directory and the
+/// user's runtime directory (`$XDG_RUNTIME_DIR`, which holds other
+/// programs' sockets) are empty, so nothing in them is visible unless
+/// listed; container engine sockets are replaced by `/dev/null` (a Unix
+/// socket can be connected to on a read-only mount, and the Docker socket
+/// would give root). The listed paths are mounted back, read-only or
+/// writable; paths that do not exist are skipped. The network is shared
+/// (the model API, the amail server).
+pub fn jail_args(home: &str, runtime_dir: &str, rw: &[String], ro: &[String]) -> Vec<String> {
     let mut args: Vec<String> = [
         "--ro-bind",
         "/",
@@ -62,8 +65,23 @@ pub fn jail_args(home: &str, rw: &[String], ro: &[String]) -> Vec<String> {
     ]
     .map(String::from)
     .to_vec();
-    if !home.is_empty() && home != "/" {
-        args.extend(["--tmpfs".into(), home.to_string()]);
+    for dir in [home, runtime_dir] {
+        if !dir.is_empty() && dir != "/" && std::path::Path::new(dir).is_dir() {
+            args.extend(["--tmpfs".into(), dir.to_string()]);
+        }
+    }
+    let mut masked = Vec::new();
+    for sock in SOCKETS {
+        if let Ok(real) = std::fs::canonicalize(sock)
+            && !masked.contains(&real)
+        {
+            args.extend([
+                "--ro-bind".into(),
+                "/dev/null".into(),
+                real.to_string_lossy().into_owned(),
+            ]);
+            masked.push(real);
+        }
     }
     let mut mounts: Vec<(&str, &String)> = ro
         .iter()
@@ -78,6 +96,14 @@ pub fn jail_args(home: &str, rw: &[String], ro: &[String]) -> Vec<String> {
     }
     args
 }
+
+/// Sockets that would let a jailed process act outside the jail.
+const SOCKETS: &[&str] = &[
+    "/run/docker.sock",
+    "/var/run/docker.sock",
+    "/run/podman/podman.sock",
+    "/run/containerd/containerd.sock",
+];
 
 /// Paths a jailed host needs besides those amail lists: the Node.js
 /// runtime that runs `dsh` and the user's git configuration.
@@ -149,7 +175,8 @@ async fn run_inner(a: HostArgs) -> Result<i32> {
         let mut ro = a.ro.clone();
         ro.extend(runtime_paths(&home));
         let mut c = tokio::process::Command::new("bwrap");
-        c.args(jail_args(&home, &a.rw, &ro))
+        let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_default();
+        c.args(jail_args(&home, &runtime, &a.rw, &ro))
             .arg("--")
             .arg(program)
             .args(args);
@@ -403,13 +430,18 @@ mod tests {
         let deep = format!("{d}/work/.git");
         std::fs::create_dir_all(&deep).unwrap();
         let args = jail_args(
-            "/home/u",
+            &d,
+            "/nonexistent-runtime-dir",
             &[deep.clone(), work.clone(), format!("{d}/missing")],
             std::slice::from_ref(&d),
         );
         let s = args.join(" ");
         assert!(s.starts_with("--ro-bind / / --dev /dev --proc /proc --tmpfs /tmp"));
-        assert!(s.contains("--tmpfs /home/u"));
+        assert!(s.contains(&format!("--tmpfs {d} ")));
+        assert!(!s.contains("nonexistent-runtime-dir"));
+        if std::path::Path::new("/run/docker.sock").exists() {
+            assert!(s.contains("--ro-bind /dev/null /run/docker.sock"), "{s}");
+        }
         let pos = |x: &str| s.find(x).unwrap();
         assert!(pos(&format!("--ro-bind {d} {d}")) < pos(&format!("--bind {work} {work}")));
         assert!(pos(&format!("--bind {work} {work}")) < pos(&format!("--bind {deep} {deep}")));
