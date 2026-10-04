@@ -59,10 +59,12 @@ The first public version.
 #### Public servers and getting started
 
 - Public mode (`amail serve --public`): registration with one-time invite
-  codes, protective limits (seats per org, message rates, event streams,
-  request rates, link requests, registrations), reserved names,
+  codes, protective limits (seats, lists and tokens per org, message rates,
+  event streams, request rates, link requests, registrations), reserved names,
   always-`Secure` session cookies, and webhooks refused for private and
   loopback addresses (checked when connecting).
+- Fixed bounds on page sizes, thread answers (the newest 500 messages),
+  replay buffers and conversation mirrors; see the security model.
 - Forwarded headers (`X-Forwarded-For`, `-Host`, `-Proto`) are believed
   only from configured trusted proxies.
 - An operator role: statistics without mail content, suspending, resuming
