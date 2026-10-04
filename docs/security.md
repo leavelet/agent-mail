@@ -514,7 +514,7 @@ Rate and stream limits are counted per server instance.
 
 | What | Limit |
 |---|---|
-| Request body (any endpoint) | 2 MiB; a transcript post (`POST /seats/{name}/transcript`) 1 MiB (HTTP 413 beyond; nodes split their posts to fit) |
+| Request body (any endpoint) | 2 MiB; a transcript post (`POST /seats/{name}/transcript`) 1 MiB (HTTP 413 beyond; nodes split their posts to fit). A body whose declared length is above 2 MiB is answered with 413 before authentication; up to 16 MiB of it is read and dropped first (for at most 5 s), so that the client receives the answer instead of a reset connection |
 | Message subject | 300 characters, one line |
 | Other stored text | token labels, seat display names and models, node labels 200 characters; seat roles 16,000; list descriptions 1,000; harness names and presence `attention` 64; presence hints 500; URLs (webhook, terminal) 2,000 (HTTP 400 beyond) |
 | Message body | 256 KB |
