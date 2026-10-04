@@ -74,6 +74,36 @@ impl Endpoint {
     }
 }
 
+/// Read `NAME=value` lines (blank lines, `#` comments and a leading
+/// `export ` are allowed; one pair of surrounding quotes is removed).
+pub fn read_env_file(path: &Path) -> Result<BTreeMap<String, String>> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut out = BTreeMap::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((k, v)) = line.split_once('=') else {
+            bail!("{}:{}: expected NAME=value", path.display(), i + 1);
+        };
+        let k = k.trim();
+        if k.is_empty() || !k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            bail!("{}:{}: bad variable name", path.display(), i + 1);
+        }
+        let v = v.trim();
+        let v = v
+            .strip_prefix('"')
+            .and_then(|x| x.strip_suffix('"'))
+            .or_else(|| v.strip_prefix('\'').and_then(|x| x.strip_suffix('\'')))
+            .unwrap_or(v);
+        out.insert(k.to_string(), v.to_string());
+    }
+    Ok(out)
+}
+
 /// The directory that holds the `dsh` installation (the parent of the
 /// `node_modules` that contains it), found from the launcher's real path.
 pub fn dsh_install_root(dsh_bin: &str) -> Option<PathBuf> {
@@ -628,6 +658,10 @@ impl Adapter for Dsh {
                 endpoint.to_string_lossy().into_owned(),
             ),
         ]);
+        // The model provider's credentials, for this host only.
+        for (k, v) in &self.env.dsh_env {
+            env.insert(k.clone(), v.clone());
+        }
         if unattended {
             // Inside the jail; dsh's own sandbox would only repeat it, and
             // without the repository's git directories (a worktree commits
@@ -662,6 +696,7 @@ mod tests {
             claude_bin: "claude".into(),
             codex_bin: "codex".into(),
             dsh_bin: "dsh".into(),
+            dsh_env: BTreeMap::from([("DEEPSEEK_API_KEY".to_string(), "k".to_string())]),
             codex_auth: dir.join("auth.json"),
         })
     }
@@ -774,6 +809,19 @@ mod tests {
         assert_eq!(d.resolve("session-x").unwrap().1, "session-x");
         assert!(d.resolve("session-y").is_none());
         assert!(d.target_alive("session-x"));
+    }
+
+    #[test]
+    fn env_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("e");
+        std::fs::write(&p, "# c\n\nexport A_KEY=\"x y\"\nB=plain\nC='q'\n").unwrap();
+        let m = read_env_file(&p).unwrap();
+        assert_eq!(m["A_KEY"], "x y");
+        assert_eq!(m["B"], "plain");
+        assert_eq!(m["C"], "q");
+        std::fs::write(&p, "not a pair\n").unwrap();
+        assert!(read_env_file(&p).is_err());
     }
 
     #[test]

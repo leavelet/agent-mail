@@ -98,6 +98,8 @@ pub struct AdapterEnv {
     pub claude_bin: String,
     pub codex_bin: String,
     pub dsh_bin: String,
+    /// Environment given only to dsh hosts.
+    pub dsh_env: BTreeMap<String, String>,
     /// The `auth.json` the dedicated Codex home links to.
     pub codex_auth: PathBuf,
 }

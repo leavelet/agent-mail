@@ -157,7 +157,13 @@ async fn launch(h: &Harness, seat: &str, cwd: &Path) -> Value {
 /// Launch plan, hook state machine, injection, wake-up through the host API,
 /// the wrapper's `Interrupt`, and hooks of other sessions.
 async fn dsh_hooks_and_wake(b: Backend) {
-    let Some(h) = Harness::start(b, "dsh_hooks_and_wake", Opts::default()).await else {
+    let opts = Opts {
+        tweak: Some(|c| {
+            c.dsh_env = [("DEEPSEEK_API_KEY".to_string(), "test-key".to_string())].into();
+        }),
+        ..Opts::default()
+    };
+    let Some(h) = Harness::start(b, "dsh_hooks_and_wake", opts).await else {
         return;
     };
     h.seat("ds", "dsh").await;
@@ -193,6 +199,8 @@ async fn dsh_hooks_and_wake(b: Backend) {
     let env = &plan["env"];
     assert_eq!(env["AMAIL_SEAT"], "ds");
     assert_eq!(env["DSH_PERMISSION_MODE"], "danger-full-access");
+    // The provider's key goes to the dsh host only (from `--dsh-env-file`).
+    assert_eq!(env["DEEPSEEK_API_KEY"], "test-key");
     assert!(
         env["DSH_HOME"]
             .as_str()

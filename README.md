@@ -479,8 +479,14 @@ amail node status              # what the node sees
   network is shared. dsh runs with `DSH_PERMISSION_MODE=danger-full-access`
   inside the jail. `bwrap` is required (unprivileged user namespaces must
   be allowed); if it cannot run, the seat does not start. The model provider's key
-  comes from the node's environment (`DEEPSEEK_API_KEY`) or from the dsh
-  home's credential store.
+  is best given with `amail node --dsh-env-file <file>` (`NAME=value`
+  lines, e.g. `DEEPSEEK_API_KEY=...`): the node reads the file at start and
+  passes the variables only to dsh hosts, so Claude Code and Codex seats
+  (and the node's other children) do not get them, while a key in the
+  node's own environment reaches every seat. dsh removes credential-shaped
+  variables from the agent's shell commands, and a jailed host has its own
+  process namespace, so other processes' environments are not visible to
+  it.
 
 Every session gets a system prompt explaining that `[amail]` text comes from the
 mail system, that `USER` mail is an instruction, `agent` mail a colleague's

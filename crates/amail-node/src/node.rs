@@ -52,6 +52,8 @@ pub struct Config {
     pub codex_bin: String,
     /// The `dsh` launcher (DeepSeek Harness).
     pub dsh_bin: String,
+    /// Environment given only to dsh hosts (e.g. the model provider's key).
+    pub dsh_env: BTreeMap<String, String>,
     pub codex_auth: PathBuf,
     /// Coalescing window for wake-ups caused by normal `to` mail.
     pub wake_window: Duration,
@@ -125,6 +127,7 @@ impl Config {
             claude_bin: "claude".into(),
             codex_bin: "codex".into(),
             dsh_bin: "dsh".into(),
+            dsh_env: BTreeMap::new(),
             codex_auth: crate::paths::home().join(".codex").join("auth.json"),
             wake_window: Duration::from_secs(3),
             wake_confirm: Duration::from_secs(10),
@@ -574,6 +577,7 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
         claude_bin: cfg.claude_bin.clone(),
         codex_bin: cfg.codex_bin.clone(),
         dsh_bin: cfg.dsh_bin.clone(),
+        dsh_env: cfg.dsh_env.clone(),
         codex_auth: cfg.codex_auth.clone(),
     };
     let claude: Arc<dyn Adapter> = Arc::new(crate::adapter::claude::Claude::new(env.clone()));

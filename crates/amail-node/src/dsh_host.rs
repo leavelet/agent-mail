@@ -57,6 +57,9 @@ pub fn jail_args(home: &str, runtime_dir: &str, rw: &[String], ro: &[String]) ->
         "/",
         "--dev",
         "/dev",
+        // Its own process namespace: other processes (and their
+        // environments) are not visible.
+        "--unshare-pid",
         "--proc",
         "/proc",
         "--tmpfs",
@@ -436,7 +439,7 @@ mod tests {
             std::slice::from_ref(&d),
         );
         let s = args.join(" ");
-        assert!(s.starts_with("--ro-bind / / --dev /dev --proc /proc --tmpfs /tmp"));
+        assert!(s.starts_with("--ro-bind / / --dev /dev --unshare-pid --proc /proc --tmpfs /tmp"));
         assert!(s.contains(&format!("--tmpfs {d} ")));
         assert!(!s.contains("nonexistent-runtime-dir"));
         if std::path::Path::new("/run/docker.sock").exists() {

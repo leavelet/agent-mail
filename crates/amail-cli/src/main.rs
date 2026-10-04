@@ -274,6 +274,10 @@ struct NodeArgs {
     /// The DeepSeek Harness launcher.
     #[arg(long, env = "AMAIL_DSH_BIN", default_value = "dsh")]
     dsh_bin: String,
+    /// A file of `NAME=value` lines (e.g. `DEEPSEEK_API_KEY=...`) given only
+    /// to DeepSeek Harness hosts, not to the node's other children.
+    #[arg(long, env = "AMAIL_DSH_ENV_FILE")]
+    dsh_env_file: Option<PathBuf>,
     #[arg(long, env = "AMAIL_ZELLIJ_BIN", default_value = "zellij")]
     zellij_bin: String,
     /// Most supervised sessions starting at once.
@@ -1364,6 +1368,9 @@ async fn node_daemon(a: NodeArgs) -> Result<()> {
     cfg.claude_bin = a.claude_bin;
     cfg.codex_bin = a.codex_bin;
     cfg.dsh_bin = a.dsh_bin;
+    if let Some(f) = &a.dsh_env_file {
+        cfg.dsh_env = amail_node::adapter::dsh::read_env_file(f)?;
+    }
     cfg.zellij_bin = a.zellij_bin;
     cfg.start_limit = a.start_limit;
     if let Some(p) = a.codex_auth {
