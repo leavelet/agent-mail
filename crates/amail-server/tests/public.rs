@@ -55,6 +55,7 @@ public_tests!(
     cross_org_seats,
     cross_org_lists,
     cross_org_tokens,
+    cross_org_links,
     cross_org_mirrors,
     cross_org_node_commands_and_presence,
 );
@@ -1610,6 +1611,69 @@ async fn cross_org_tokens(b: Backend, t: &str) {
     // Rotation revokes the caller's own token only.
     o.acme.ok(Method::POST, "/tokens/rotate", None).await;
     assert_eq!(o.beta.get("/whoami").await.0, StatusCode::OK);
+}
+
+async fn cross_org_links(b: Backend, t: &str) {
+    let o = two_orgs!(b, t);
+    let gamma = o.srv.org("gamma").await;
+    // Acme asks beta; neither acme itself nor a third org can accept it.
+    o.acme
+        .ok(Method::POST, "/links", Some(json!({ "org": "beta" })))
+        .await;
+    assert_eq!(
+        o.acme
+            .status(Method::POST, "/links/beta/accept", None)
+            .await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        gamma.status(Method::POST, "/links/acme/accept", None).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        gamma.status(Method::POST, "/links/beta/accept", None).await,
+        StatusCode::NOT_FOUND
+    );
+    // Still pending: mail across is refused.
+    let (s, v) =
+        o.a.call(
+            Method::POST,
+            "/messages",
+            Some(json!({ "to": ["x@beta"], "subject": "x", "body": "" })),
+        )
+        .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+    // Seat tokens cannot accept for their org.
+    assert_eq!(
+        o.x.status(Method::POST, "/links/acme/accept", None).await,
+        StatusCode::FORBIDDEN
+    );
+    o.beta.ok(Method::POST, "/links/acme/accept", None).await;
+    // A third org sees nothing of the link and cannot end it.
+    assert_eq!(gamma.ok(Method::GET, "/links", None).await, json!([]));
+    assert_eq!(
+        gamma.status(Method::DELETE, "/links/beta", None).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        gamma.status(Method::DELETE, "/links/acme", None).await,
+        StatusCode::NOT_FOUND
+    );
+    o.a.send(json!({ "to": ["x@beta"], "subject": "still linked", "body": "" }))
+        .await;
+    // Mail from gamma to either is refused.
+    let g = gamma.seat("g").await;
+    for to in ["x@beta", "a@acme"] {
+        let (s, v) = g
+            .call(
+                Method::POST,
+                "/messages",
+                Some(json!({ "to": [to], "subject": "x", "body": "" })),
+            )
+            .await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{to}: {v}");
+        assert_eq!(v["error"]["rejected"][0]["reason"], "not_linked");
+    }
 }
 
 async fn cross_org_mirrors(b: Backend, t: &str) {
