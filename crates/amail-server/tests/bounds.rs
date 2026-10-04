@@ -1026,11 +1026,17 @@ async fn claim_loads_bounded_bodies(b: Backend, t: &str) {
     let e = v["entries"].as_array().unwrap();
     assert_eq!(e.len(), 2, "{v}");
     assert!(e[0]["body"].is_null(), "long body inlined");
-    assert!(e[0]["delivery"]["read_at"].is_null(), "long body marked read");
+    assert!(
+        e[0]["delivery"]["read_at"].is_null(),
+        "long body marked read"
+    );
     assert!(
         e[0]["preview"].as_str().unwrap().chars().count() <= MAX_CLAIM_BODY_CHARS + 1,
         "preview too long"
     );
     assert_eq!(e[1]["body"].as_str().unwrap().len(), MAX_CLAIM_BODY_CHARS);
-    assert!(!e[1]["delivery"]["read_at"].is_null(), "short body not marked read");
+    assert!(
+        !e[1]["delivery"]["read_at"].is_null(),
+        "short body not marked read"
+    );
 }
