@@ -53,6 +53,8 @@ The first public version.
   archive and search, composing mail, a read-only mirror of each seat's
   conversation, and administration of seats, lists, links, tokens and org
   settings. English and Chinese, light and dark.
+- Browser notifications for new items in the "needs you" queue (opt-in in
+  the settings).
 
 #### Public servers and getting started
 
@@ -64,14 +66,17 @@ The first public version.
 - Forwarded headers (`X-Forwarded-For`, `-Host`, `-Proto`) are believed
   only from configured trusted proxies.
 - An operator role: statistics without mail content, suspending, resuming
-  and deleting orgs (`amail admin`, and `/admin` in the web interface).
+  and deleting orgs, invite codes and resetting an org's lost user token
+  (`amail admin`, and `/admin` in the web interface).
 - Users can rotate their token and delete their org with all its data;
   an optional retention period clears old message bodies.
 - `amail register`, `amail login` with saved profiles, `amail init` (a
   sample team file), `amail doctor` (checks with hints), and
   `amail node start` / `stop`.
 - A Dockerfile, a Compose file with Postgres, and an install script for
-  release binaries (Linux x86_64 and aarch64).
+  release binaries (Linux x86_64 and aarch64) that verifies checksums.
+- `THIRD_PARTY_LICENSES.md` with the licenses of the bundled Rust crates
+  and npm packages.
 
 #### Platforms
 

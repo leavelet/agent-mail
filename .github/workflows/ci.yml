@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Format and clippy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    name: Tests (SQLite and Postgres)
+    runs-on: ubuntu-24.04
+    env:
+      AMAIL_TEST_PG_URL: postgres://postgres:amail@127.0.0.1:5432/postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start Postgres
+        # Each Postgres test creates its own database; allow enough
+        # connections for the tests running in parallel.
+        run: |
+          docker run -d --name pg -e POSTGRES_PASSWORD=amail -p 127.0.0.1:5432:5432 \
+            postgres:17 -c max_connections=500
+          for _ in $(seq 1 60); do
+            docker exec pg pg_isready -U postgres && exit 0
+            sleep 1
+          done
+          exit 1
+      - name: Git identity for the team tests
+        run: |
+          git config --global user.name "amail CI"
+          git config --global user.email "ci@example.invalid"
+      # With AMAIL_TEST_PG_URL set, every backend test runs on SQLite and on
+      # Postgres.
+      - run: cargo test --workspace --locked
+
+  web:
+    name: Web interface (lint, types, unit, end-to-end)
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: web
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/web/.e2e/browsers
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+      - run: npm run check
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build
+      - name: Build amail with the interface embedded
+        run: cargo build --locked -p amail-cli
+        working-directory: .
+      - name: Git identity
+        run: |
+          git config --global user.name "amail CI"
+          git config --global user.email "ci@example.invalid"
+      - run: npx playwright install --with-deps chromium
+      - run: npm run e2e
+        env:
+          AMAIL_SCREENSHOTS: ${{ github.workspace }}/web/.e2e/screenshots
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-screenshots-and-traces
+          path: |
+            web/.e2e/screenshots
+            web/.e2e/test-results
+          if-no-files-found: ignore
+
+  macos:
+    name: macOS build (server and mail commands)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked -p amail-cli
+      - name: Linux-only commands refuse with a clear error
+        run: |
+          ./target/debug/amail --version
+          if ./target/debug/amail node 2> err.txt; then exit 1; fi
+          grep -q "Linux only" err.txt

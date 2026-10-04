@@ -46,6 +46,30 @@ PLAYWRIGHT_BROWSERS_PATH=.e2e/browsers npx playwright install chromium
 PLAYWRIGHT_BROWSERS_PATH=.e2e/browsers npm run e2e
 ```
 
+Continuous integration (`.github/workflows/ci.yml`) runs all of the above,
+the tests on both backends, and a macOS build of the binary. Check workflow
+changes locally with [actionlint](https://github.com/rhysd/actionlint).
+
+## Dependencies and licenses
+
+New dependencies must have licenses compatible with distributing amail
+under Apache-2.0 (the accepted list is in `about.toml`). After changing
+Rust dependencies or the npm packages bundled into the web interface,
+regenerate the notices shipped with the binary:
+
+```sh
+cargo install --locked cargo-about --features cli
+./scripts/third-party-licenses.sh            # writes THIRD_PARTY_LICENSES.md
+```
+
+## Releases
+
+Bump the version in `Cargo.toml` (and `web/package.json`), move the
+`Unreleased` entries in `CHANGELOG.md` under the new version, then push a
+tag `v<version>`: `.github/workflows/release.yml` builds the Linux binaries
+with the web interface and attaches them with `SHA256SUMS` to a draft
+release.
+
 ## Conventions
 
 - Code, identifiers, comments, commit messages and documentation are in

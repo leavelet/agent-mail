@@ -1,0 +1,106 @@
+name: Release
+
+# Push a tag v<version> (matching the version in Cargo.toml) to build the
+# Linux binaries with the web interface embedded and attach them, with
+# SHA256SUMS, to a draft release. Publish the draft by hand after checking it.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  web:
+    name: Build the web interface
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches the crate version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match version $version in Cargo.toml" >&2
+            exit 1
+          fi
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci && npm run build
+        working-directory: web
+      - uses: actions/upload-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+          if-no-files-found: error
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: web
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # Built on Ubuntu 22.04 so that the binaries run on distributions
+          # with glibc 2.35 or later.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+      - name: Build
+        run: cargo build --release --locked -p amail-cli
+      - name: Check the binary
+        run: |
+          ./target/release/amail --version
+          # The interface is embedded, not the placeholder page.
+          ./target/release/amail serve --db "sqlite://$RUNNER_TEMP/check.db" --listen 127.0.0.1:18025 &
+          for _ in $(seq 1 30); do curl -fsS http://127.0.0.1:18025/healthz && break; sleep 1; done
+          curl -fsS http://127.0.0.1:18025/ | grep -q /assets/
+          kill %1
+      - name: Package
+        run: |
+          name="amail-${GITHUB_REF_NAME#v}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp target/release/amail LICENSE THIRD_PARTY_LICENSES.md README.md "dist/$name/"
+          tar -C dist -czf "$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.target }}
+          path: amail-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Draft release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-*
+          merge-multiple: true
+      - name: Checksums
+        run: sha256sum amail-*.tar.gz > SHA256SUMS && cat SHA256SUMS
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            --draft --title "amail ${GITHUB_REF_NAME#v}" \
+            --notes "See CHANGELOG.md for what changed. Verify downloads with SHA256SUMS." \
+            amail-*.tar.gz SHA256SUMS
