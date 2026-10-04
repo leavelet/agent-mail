@@ -61,6 +61,7 @@ public_tests!(
     cross_org_node_commands_and_presence,
     link_requests_do_not_reveal_org_names,
     webhooks_in_flight_per_org,
+    org_settings_bounded,
 );
 
 /// Start a server; `None` (test skipped) when Postgres is not configured.
@@ -1940,4 +1941,45 @@ async fn webhooks_in_flight_per_org(b: Backend, t: &str) {
     a.send(json!({ "to": ["owner"], "subject": "later", "body": "" }))
         .await;
     eventually("the next webhook", async || *hits.lock().unwrap() == 3).await;
+}
+
+/// Org settings have upper bounds: in public mode all of them, on a
+/// self-hosted server the times.
+async fn org_settings_bounded(b: Backend, t: &str) {
+    let srv = start!(b, t, public());
+    let acme = srv.org("acme").await;
+    for (k, too_big, ok) in [
+        ("send_rate_per_min", 601, 600),
+        ("send_burst", 1_000_000, 600),
+        ("max_recipients", 1_000_000, 1000),
+        ("max_thread_depth", i64::MAX, 1000),
+        ("ack_timeout_min", i64::MAX, 10_080),
+        ("focus_max_min", 10_081, 10_080),
+        ("digest_interval_min", 1_000_000, 60),
+    ] {
+        let (s, v) = acme
+            .call(Method::PATCH, "/org", Some(json!({ k: too_big })))
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{k}: {v}");
+        let v = acme.ok(Method::PATCH, "/org", Some(json!({ k: ok }))).await;
+        assert_eq!(v[k], ok);
+    }
+    let srv = start!(b, &format!("{t}_self"), selfhosted());
+    let acme = srv.org("acme").await;
+    acme.ok(
+        Method::PATCH,
+        "/org",
+        Some(json!({ "send_burst": 1_000_000 })),
+    )
+    .await;
+    assert_eq!(
+        acme.call(
+            Method::PATCH,
+            "/org",
+            Some(json!({ "ack_timeout_min": i64::MAX }))
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
 }

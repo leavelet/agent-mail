@@ -63,11 +63,22 @@ pub async fn patch_org(
     Json(patch): Json<p::OrgPatch>,
 ) -> ApiResult<Json<p::OrgInfo>> {
     auth.require_user()?;
-    let check = |v: Option<i64>, min: i64, name: &str| match v {
-        Some(x) if x < min => Err(ApiError::bad_request(format!(
-            "{name} must be at least {min}"
-        ))),
-        _ => Ok(()),
+    let public = st.config.public;
+    let check = |v: Option<i64>, min: i64, name: &str| {
+        let max = crate::config::ORG_SETTING_MAX
+            .iter()
+            .find(|m| m.name == name && (public || !m.public_only))
+            .map(|m| m.max);
+        match v {
+            Some(x) if x < min => Err(ApiError::bad_request(format!(
+                "{name} must be at least {min}"
+            ))),
+            Some(x) if max.is_some_and(|m| x > m) => Err(ApiError::bad_request(format!(
+                "{name} must be at most {}",
+                max.unwrap_or_default()
+            ))),
+            _ => Ok(()),
+        }
     };
     check(patch.send_rate_per_min, 0, "send_rate_per_min")?;
     check(patch.send_burst, 1, "send_burst")?;

@@ -176,6 +176,53 @@ impl Config {
     }
 }
 
+/// Largest values of the org settings. `public` bounds apply in public
+/// mode only; the others always (they are times, and keep arithmetic on
+/// them in range).
+pub struct SettingMax {
+    pub name: &'static str,
+    pub max: i64,
+    pub public_only: bool,
+}
+
+pub const ORG_SETTING_MAX: &[SettingMax] = &[
+    SettingMax {
+        name: "send_rate_per_min",
+        max: 600,
+        public_only: true,
+    },
+    SettingMax {
+        name: "send_burst",
+        max: 600,
+        public_only: true,
+    },
+    SettingMax {
+        name: "max_recipients",
+        max: 1000,
+        public_only: true,
+    },
+    SettingMax {
+        name: "max_thread_depth",
+        max: 1000,
+        public_only: true,
+    },
+    SettingMax {
+        name: "ack_timeout_min",
+        max: 10_080,
+        public_only: false,
+    },
+    SettingMax {
+        name: "focus_max_min",
+        max: 10_080,
+        public_only: false,
+    },
+    SettingMax {
+        name: "digest_interval_min",
+        max: 10_080,
+        public_only: false,
+    },
+];
+
 /// Names a seat or list may not take in public mode: they could pass for
 /// the mail system, the server's operator or the org's user.
 pub const RESERVED_SEAT_NAMES: &[&str] = &[

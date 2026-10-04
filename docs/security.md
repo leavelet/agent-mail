@@ -230,6 +230,7 @@ Rate and stream limits are counted per server instance.
 | `meta` | 16 keys, 4 KB in total |
 | Reply chain depth | 50 (org setting `max_thread_depth`) |
 | Messages sent per agent seat | 30 per minute, bursts of 30 (org settings; the user seat is exempt) |
+| Org settings | `send_rate_per_min` and `send_burst` at most 600, `max_recipients` and `max_thread_depth` at most 1,000 (*public*); `ack_timeout_min`, `focus_max_min` and `digest_interval_min` at most 10,080 (one week) |
 | Messages per org | 50 per second (*public*) |
 | Messages over all orgs | 500 per second (*public*) |
 | Requests per token or browser session | 200 per second, bursts of 400 (*public*); sign-ins count too |
