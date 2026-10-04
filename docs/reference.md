@@ -182,7 +182,7 @@ it), newest first, without bodies, in pages of at most 2 MiB. Pass
 older matches. A page can be short, or even empty, and still have
 `next_before_id`: each request looks at no more than 50,000 of the org's
 messages, starting below `before_id`, and starts no further step of
-messages after 300 ms; then it stops.
+messages after 100 ms; then it stops.
 
 Archive filters: `from` and `to` take a seat (`name`) or another org's
 address (`name@org`). For a seat of the org, `from` is its sent mail and
@@ -201,7 +201,7 @@ request looks at the 50,000 most recent messages before `before_id` (2,000
 when a term is shorter than three characters; `scan_limit` says which), so
 a search that finds few matches continues with `next_before_id`. Each hit
 has a snippet of the body around the first match. `mode` is always
-`"scan"`. A request also stops after 300 ms of
+`"scan"`. A request also stops after 100 ms of
 looking (in steps of at most 5,000 messages and 4 MiB of body text divided
 by the number of terms) and answers with `next_before_id`, so a search of a
 large org may take several requests. Searches take one of the org's query

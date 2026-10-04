@@ -269,10 +269,12 @@ pub enum Pool {
 /// [`Pool::Light`]) `total` of all orgs run at a time. A request waits up
 /// to [`QUERY_SLOT_WAIT`] for a slot.
 /// When a slot frees, it goes to the waiting request of the org that holds
-/// the fewest slots of the pool at that moment, then of the org that was
-/// given a slot least recently, then the longest waiting: an org with one
-/// request waiting is served before another org's next one, however many
-/// requests that org has waiting.
+/// the fewest slots of the pool at that moment, then of the org that held
+/// slots of the pool for the least time lately (decaying by half every
+/// 10 s), then the longest waiting: an org with one request waiting is
+/// served before another org's next one, however many requests that org
+/// has waiting, and an org whose requests are short is not kept waiting by
+/// orgs whose requests use their slots for long.
 pub struct QuerySlots {
     scan: FairSlots,
     other: FairSlots,
@@ -323,18 +325,32 @@ struct FairSlots {
 
 #[derive(Default)]
 struct FairState {
-    /// Per org: slots held, and when it was last given one. Orgs holding
-    /// none are dropped after [`FAIR_MEMORY`].
-    orgs: HashMap<i64, (usize, Instant)>,
+    /// Per org: slots held and recent use. Orgs holding none whose recent
+    /// use has decayed below a millisecond are dropped.
+    orgs: HashMap<i64, OrgUse>,
     in_use: usize,
     /// Requests waiting, in arrival order.
     waiters: Vec<Waiter>,
     next_id: u64,
 }
 
-/// How long a pool remembers when an org holding no slot was last given
-/// one.
-const FAIR_MEMORY: std::time::Duration = std::time::Duration::from_secs(10);
+struct OrgUse {
+    held: usize,
+    /// Seconds the org held slots of the pool, decayed by half every
+    /// [`USE_HALF_LIFE_S`], as of `at`.
+    used: f64,
+    at: Instant,
+}
+
+/// Half-life of an org's recorded slot time, in seconds.
+const USE_HALF_LIFE_S: f64 = 10.0;
+
+impl OrgUse {
+    fn used_now(&self, now: Instant) -> f64 {
+        let dt = now.saturating_duration_since(self.at).as_secs_f64();
+        self.used * 0.5f64.powf(dt / USE_HALF_LIFE_S)
+    }
+}
 
 struct Waiter {
     id: u64,
@@ -344,45 +360,59 @@ struct Waiter {
 
 impl FairState {
     fn held(&self, org: i64) -> usize {
-        self.orgs.get(&org).map_or(0, |o| o.0)
+        self.orgs.get(&org).map_or(0, |o| o.held)
     }
 
     /// Give free slots to waiting requests: each to the waiter of the org
-    /// that holds the fewest slots, then of the org that was given one
-    /// least recently, then the oldest.
+    /// that holds the fewest slots, then of the org that held slots of the
+    /// pool for the least time lately, then the oldest.
     fn dispatch(&mut self, per_org: usize, total: usize) {
+        let now = Instant::now();
         while self.in_use < total {
             let best = self
                 .waiters
                 .iter()
                 .enumerate()
                 .filter_map(|(i, w)| {
-                    let (held, last) = match self.orgs.get(&w.org) {
-                        Some((n, t)) => (*n, Some(*t)),
-                        None => (0, None),
+                    let (held, used) = match self.orgs.get(&w.org) {
+                        Some(o) => (o.held, o.used_now(now)),
+                        None => (0, 0.0),
                     };
-                    (held < per_org).then_some((held, last, w.id, i))
+                    (held < per_org).then_some((held, used, w.id, i))
                 })
-                .min();
+                .min_by(|a, b| {
+                    (a.0, a.1, a.2)
+                        .partial_cmp(&(b.0, b.1, b.2))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
             let Some((_, _, _, i)) = best else { return };
             let w = self.waiters.remove(i);
             if w.grant.send(()).is_ok() {
-                let o = self.orgs.entry(w.org).or_insert((0, Instant::now()));
-                o.0 += 1;
-                o.1 = Instant::now();
+                self.orgs
+                    .entry(w.org)
+                    .or_insert(OrgUse {
+                        held: 0,
+                        used: 0.0,
+                        at: now,
+                    })
+                    .held += 1;
                 self.in_use += 1;
             }
         }
     }
 
-    fn release(&mut self, org: i64) {
+    /// An org gives back a slot it held for `held_for`.
+    fn release(&mut self, org: i64, held_for: std::time::Duration) {
+        let now = Instant::now();
         if let Some(o) = self.orgs.get_mut(&org) {
-            o.0 = o.0.saturating_sub(1);
+            o.held = o.held.saturating_sub(1);
+            o.used = o.used_now(now) + held_for.as_secs_f64();
+            o.at = now;
         }
         self.in_use -= 1;
         if self.orgs.len() > 1024 {
             self.orgs
-                .retain(|_, (n, t)| *n > 0 || t.elapsed() < FAIR_MEMORY);
+                .retain(|_, o| o.held > 0 || o.used_now(now) >= 0.001);
         }
     }
 }
@@ -445,6 +475,7 @@ impl FairSlots {
             org: org_id,
             per_org: self.per_org,
             total: self.total,
+            since: Instant::now(),
         })
     }
 }
@@ -470,7 +501,7 @@ impl Drop for Pending<'_> {
                 st.waiters.remove(i);
             }
             None => {
-                st.release(self.org);
+                st.release(self.org, std::time::Duration::ZERO);
                 st.dispatch(self.slots.per_org, self.slots.total);
             }
         }
@@ -484,12 +515,13 @@ pub struct QuerySlot {
     org: i64,
     per_org: usize,
     total: usize,
+    since: Instant,
 }
 
 impl Drop for QuerySlot {
     fn drop(&mut self) {
         let mut st = self.state.lock().unwrap();
-        st.release(self.org);
+        st.release(self.org, self.since.elapsed());
         st.dispatch(self.per_org, self.total);
     }
 }
@@ -681,6 +713,31 @@ mod tests {
                 let s = q.acquire(Pool::Scan, org).await.unwrap();
                 order.lock().unwrap().push(org);
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                drop(s);
+            }));
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        drop(held);
+        for t in tasks {
+            t.await.unwrap();
+        }
+        assert_eq!(order.lock().unwrap().as_slice(), &[2, 1]);
+
+        // Org 1 held its slots for long, org 2 briefly: org 2 goes first,
+        // although org 1 has waited longer.
+        let q = Arc::new(QuerySlots::new(Some(1), Some(1)));
+        drop(q.acquire(Pool::Scan, 2).await.unwrap());
+        let s = q.acquire(Pool::Scan, 1).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(s);
+        let held = q.acquire(Pool::Scan, 3).await.unwrap();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let mut tasks = Vec::new();
+        for org in [1, 2] {
+            let (q, order) = (q.clone(), order.clone());
+            tasks.push(tokio::spawn(async move {
+                let s = q.acquire(Pool::Scan, org).await.unwrap();
+                order.lock().unwrap().push(org);
                 drop(s);
             }));
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;

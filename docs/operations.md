@@ -326,10 +326,10 @@ A search is a bounded scan in steps. Each request looks at the org's newest
 messages before its cursor, at most 50,000 of them (2,000 when a term is
 shorter than three characters), in steps of at most 5,000 messages and
 4 MiB of body text divided by the number of terms, and starts no further
-step after 300 ms. It then answers with what it found and
+step after 100 ms. It then answers with what it found and
 `next_before_id`. An archive request (headers only) walks the same way in
-steps of 5,000 messages and also stops after 300 ms. So one request holds
-its slot for about 300 ms plus one step, whatever the size of the org's
+steps of 5,000 messages and also stops after 100 ms. So one request holds
+its slot for about 100 ms plus one step, whatever the size of the org's
 mail. Older mail is reached by following the cursor: in a large org a
 search for a rare term takes several requests. The web interface's archive
 page repeats a search request up to ten times until it has a page of
@@ -345,6 +345,21 @@ other org's median latencies stayed within 1.7 times their idle values for
 every endpoint (two runs: at most 1.6 and 1.7 times, at most 20 ms); before these limits they reached 10 to 60 seconds. Run
 once; on SQLite, where the database works on the server's cores, a flood
 of `GET /pending` (200 seats) still raised them three to ten times.
+
+`amail-bench --mode tenants --phases hostile` measures many orgs against
+one: it gives each of `--hostile-orgs` orgs (12 by default) 50,000
+messages of 20,000 bytes of text that does not compress (about the 1 GiB
+quota each) and lets each run 4 loops of searches for 10 terms that match
+nothing, following the cursor through all of its mail, while another org
+calls every endpoint the web interface reads, 5 times per second each. On
+Postgres 17 with the public-mode defaults (server and database on one host
+with 20 cores), 30 seconds measured:
+
+| | before this change | after |
+|---|---|---|
+| the other org's answers refused with 429 | all requests of `/overview`, `/attention`, `/lists`, `/lists/{name}`, `/threads/{id}`, `/messages/{id}/status`, `/archive/messages` and `/archive/search` (150 each) | none |
+| its median latency, as a multiple of its idle median | 190 to 330 times for those endpoints (each refused after the one-second wait) | at most 1.4 times for every endpoint except search and archive; 3.7 and 4.1 times (19 and 17 ms) for those two |
+| the searching orgs | 2 searches answered, 16 cancelled after 10 s, 1,231 refused | 2,271 searches answered, none refused (75 per second over the 8 slots: about 100 ms per request) |
 
 Search and the archive start from the org's own messages, so their cost
 does not grow with other orgs' mail. Measured on the same host with 500,000

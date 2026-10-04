@@ -284,7 +284,7 @@ pub mod limits {
     /// [`MAX_SCAN_MESSAGES`] after this many milliseconds; it answers with
     /// what it found and a cursor (`next_before_id`) to continue. This
     /// bounds how long one request holds a query slot.
-    pub const SCAN_TIME_LIMIT_MS: u64 = 300;
+    pub const SCAN_TIME_LIMIT_MS: u64 = 100;
     /// `GET /inbox` and `GET /sent` pages of up to this many entries are
     /// served without one of the org's query slots; larger pages, and every
     /// `GET /changes` page, take one.
