@@ -20,7 +20,8 @@ It is idempotent: run it again after editing the file and only the
 differences are applied. Changed seats keep running (the output names those
 that need a restart); seats that left the file are reported and deleted
 only with `--prune`. Changed `[team]` settings (`idle_sleep`, `max_live`,
-`restart`) apply at once. `--only g,s` starts just some groups or seats;
+`restart`, `local_policy`) apply at once. The output ends with the node's
+local policy (see below). `--only g,s` starts just some groups or seats;
 `--no-start` starts nothing.
 
 Generated lists: one per group (its lead and workers), `leads` (every seat
@@ -41,6 +42,7 @@ workroot = "/path/to/worktrees"  # seats' working directories go here
 idle_sleep = "30m"               # put idle seats to sleep; "off" (default)
 max_live = 40                    # seats with a process on this host
 restart = "on-failure"           # or "never"
+# local_policy = "restricted"    # see "Agents that manage seats" below
 
 [defaults]
 harness = "claude"               # or "codex"
@@ -108,6 +110,19 @@ staged-merge template gives the root seat `"full"` when it has
 subordinates, unless the file sets `git_access` for it; `amail up` names
 every Codex seat with `"full"`. See [harness support](harnesses.md) for the
 exact rules.
+
+### Agents that manage seats
+
+Whether an agent may run `amail up`, `amail ps`, `amail sleep`, `amail wake`
+and the other seat commands depends on the node's local policy
+(`amail node --local-policy`, see
+[security](security.md#trust-boundaries)). Under `open`, agents of the
+sessions the node launched may use these commands, and the user gets a
+system mail that lists what each session did (at most one per session
+every five minutes). Under `restricted`, the node refuses these commands
+to sessions. `local_policy = "restricted"` under `[team]` makes the node
+use the restricted policy while the team is up; the team file cannot make
+the policy open. `amail up` and `amail ps` print the policy in effect.
 
 ## Templates
 

@@ -13,6 +13,7 @@ pub mod limits;
 mod mail;
 pub mod netguard;
 mod nodes;
+mod notices;
 mod operator;
 pub mod peer;
 pub mod presence;
@@ -214,6 +215,7 @@ pub fn router(state: AppState) -> Router {
         .route("/tokens/{id}", axum::routing::delete(d::revoke_token))
         .route("/pending", get(nodes::pending))
         .route("/presence", post(nodes::presence))
+        .route("/node/notices", post(notices::post))
         .route("/seats/{name}/launch", get(nodes::launch))
         .route("/seats", get(d::list_seats).post(d::create_seat))
         .route(

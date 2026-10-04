@@ -10,6 +10,7 @@
 //! idle_sleep = "30m"            # or "off" (default)
 //! max_live = 40
 //! restart = "on-failure"        # or "never"
+//! local_policy = "restricted"   # can only make the node's policy stricter
 //!
 //! [defaults]
 //! harness = "claude"
@@ -61,6 +62,7 @@ struct TeamRaw {
     idle_sleep: Option<String>,
     max_live: Option<u32>,
     restart: Option<String>,
+    local_policy: Option<String>,
 }
 
 /// Settings a seat inherits from `[defaults]` (or a group's `workers`).
@@ -134,6 +136,11 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_live: Option<u32>,
     pub restart: Restart,
+    /// `[team] local_policy`: `restricted` makes the node use the
+    /// restricted policy whatever its own setting; `open` does not loosen
+    /// the node's setting (see [`amail_proto::LocalPolicy`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_policy: Option<amail_proto::LocalPolicy>,
 }
 
 impl Default for Settings {
@@ -142,6 +149,7 @@ impl Default for Settings {
             idle_sleep_ms: None,
             max_live: None,
             restart: Restart::OnFailure,
+            local_policy: None,
         }
     }
 }
@@ -343,10 +351,19 @@ pub fn parse(text: &str, base: &Path) -> Result<Team, TeamError> {
     if t.max_live == Some(0) {
         return err("[team] max_live must be at least 1");
     }
+    let local_policy = match t.local_policy.as_deref().map(str::trim) {
+        None => None,
+        Some(s) => Some(s.parse::<amail_proto::LocalPolicy>().map_err(|_| {
+            TeamError(format!(
+                "[team] local_policy {s:?}: expected \"open\" or \"restricted\""
+            ))
+        })?),
+    };
     let settings = Settings {
         idle_sleep_ms: idle_sleep.map(|d| d.as_millis() as u64),
         max_live: t.max_live,
         restart,
+        local_policy,
     };
 
     let defaults = &raw.defaults;
@@ -1002,6 +1019,21 @@ cwd = "docs"
         assert!(p.contains(&("docs".into(), "main".into(), "docs".into())));
         assert!(p.contains(&("be-3".into(), "backend".into(), "be-3".into())));
         assert!(p.contains(&("db-1".into(), "db".into(), "db-1".into())));
+    }
+
+    #[test]
+    fn local_policy_setting() {
+        let base = "[team]\nworkroot = \"/w\"\n";
+        let seat = "[defaults]\nharness = \"claude\"\n[[seat]]\nname = \"a\"\n";
+        let t = team(&format!("{base}{seat}")).unwrap();
+        assert_eq!(t.settings.local_policy, None);
+        let t = team(&format!("{base}local_policy = \"restricted\"\n{seat}")).unwrap();
+        assert_eq!(
+            t.settings.local_policy,
+            Some(amail_proto::LocalPolicy::Restricted)
+        );
+        let e = team(&format!("{base}local_policy = \"loose\"\n{seat}")).unwrap_err();
+        assert!(e.to_string().contains("local_policy"), "{e}");
     }
 
     #[test]

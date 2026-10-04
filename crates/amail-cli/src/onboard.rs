@@ -452,26 +452,31 @@ pub async fn doctor(profile: Option<&Path>, team_file: &Path, out: &Out) -> Resu
         &amail_node::wire::Request::Status,
         Duration::from_secs(3),
     ) {
-        Ok(v) => r.add(
-            if v["connected"] == true {
-                Level::Ok
-            } else {
-                Level::Warn
-            },
-            "node",
-            format!(
-                "running ({}), {} to {}",
-                sock.display(),
+        Ok(v) => {
+            if let Some(l) = crate::team_cmd::policy_line(&v) {
+                r.add(Level::Info, "local policy", l, None);
+            }
+            r.add(
                 if v["connected"] == true {
-                    "connected"
+                    Level::Ok
                 } else {
-                    "NOT connected"
+                    Level::Warn
                 },
-                v["server"].as_str().unwrap_or("?")
-            ),
-            (v["connected"] != true)
-                .then(|| "see the node's log; is the server reachable from it?".into()),
-        ),
+                "node",
+                format!(
+                    "running ({}), {} to {}",
+                    sock.display(),
+                    if v["connected"] == true {
+                        "connected"
+                    } else {
+                        "NOT connected"
+                    },
+                    v["server"].as_str().unwrap_or("?")
+                ),
+                (v["connected"] != true)
+                    .then(|| "see the node's log; is the server reachable from it?".into()),
+            );
+        }
         Err(_) => r.add(
             Level::Info,
             "node",

@@ -499,6 +499,13 @@ struct NodeArgs {
     /// http://127.0.0.1:PORT), e.g. behind an HTTPS reverse proxy.
     #[arg(long, value_name = "URL", requires = "web_terminal_port")]
     web_terminal_url: Option<String>,
+    /// Which processes of your OS user may use the node: `open` (all of
+    /// them, including agent sessions, which may then manage seats; the
+    /// node reports their requests to you) or `restricted` (agent sessions
+    /// get only their own seat's credentials). Default: <state
+    /// dir>/node.toml, else the built-in default (see docs/security.md).
+    #[arg(long, env = "AMAIL_LOCAL_POLICY", value_name = "POLICY")]
+    local_policy: Option<amail_proto::LocalPolicy>,
 }
 
 #[derive(Subcommand)]
@@ -999,10 +1006,16 @@ async fn run(cli: Cli) -> Result<()> {
                 let dir = state_dir.unwrap_or_else(amail_node::paths::state_dir);
                 std::fs::create_dir_all(&dir)?;
                 let path = dir.join("node.toml");
+                // Settings the person set in the file stay.
+                let old: NodeFile = std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|t| toml::from_str(&t).ok())
+                    .unwrap_or_default();
                 let text = toml::to_string(&NodeFile {
                     url: Some(c.base().to_string()),
                     token: Some(token.clone()),
-                    label: None,
+                    label: old.label,
+                    local_policy: old.local_policy,
                 })?;
                 amail_node::persist::write_atomic(&path, text.as_bytes(), 0o600)?;
                 eprintln!("saved to {}", path.display());
@@ -1688,6 +1701,8 @@ struct NodeFile {
     token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    local_policy: Option<amail_proto::LocalPolicy>,
 }
 
 /// A database URL without its password, for messages and logs.
@@ -1746,6 +1761,10 @@ fn node_args(a: &NodeArgs) -> (Vec<String>, Option<String>) {
         a.web_terminal_port.map(|p| p.to_string()),
     );
     opt("--web-terminal-url", a.web_terminal_url.clone());
+    opt(
+        "--local-policy",
+        a.local_policy.map(|p| p.as_str().to_string()),
+    );
     (v, a.token.clone())
 }
 
@@ -1794,6 +1813,7 @@ async fn node_daemon(a: NodeArgs) -> Result<()> {
         cfg.socket = s;
     }
     cfg.label = a.label.or(file.label).or_else(hostname);
+    cfg.local_policy = a.local_policy.or(file.local_policy);
     cfg.claude_bin = a.claude_bin;
     cfg.codex_bin = a.codex_bin;
     cfg.zellij_bin = a.zellij_bin;

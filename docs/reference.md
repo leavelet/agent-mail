@@ -81,8 +81,12 @@ Node options: `--url`, `--token` (`AMAIL_NODE_TOKEN`), `--state-dir`
 `<state dir>/run/node.sock` without `XDG_RUNTIME_DIR`), `--label`,
 `--claude-bin`, `--codex-bin`, `--zellij-bin`, `--start-limit` (4),
 `--codex-auth`, `--wake-window-ms` (3000), `--wake-confirm-ms` (10000),
-`--web-terminal-port`, `--web-terminal-url`. Without `--url`/`--token` the
+`--web-terminal-port`, `--web-terminal-url`, `--local-policy open|restricted`
+(`AMAIL_LOCAL_POLICY`; see
+[security](security.md#trust-boundaries)). Without `--url`/`--token` the
 node uses `AMAIL_URL`, then `node.toml`, then the current saved login's URL.
+`node.toml` may also set `label` and `local_policy`; `amail node token
+--save` keeps them.
 
 ### Server and operator
 
@@ -151,6 +155,7 @@ session cookie; with the cookie, everything but `GET` needs the header
 | `GET /counts` | user tokens: per seat (or `seat=`), `unread` and `pending` |
 | `GET /attention` | user tokens: what waits for the user ([concepts](concepts.md#the-users-queue-needs-you)), among the user seat's newest 5,000 deliveries |
 | `GET /pending` | node and user tokens: per seat, pending deliveries by class, urgent count, digest counts, `focus_until`, the seat's counter |
+| `POST /node/notices` | node tokens: `{node?, notices: [{kind: "settings", changes: [{seat?, setting, old?, new}]} \| {kind: "agent_actions", seat?, actions: [{op, targets, count}]}]}`; `setting` is `local_policy`, `permission_mode` or `git_access` with one of its values; `op` is `up`, `down`, `forget`, `run`, `wake`, `sleep`, `credentials` or `hook`. Each notice becomes one `system` mail to the org's user seat, written by the server; answers `{sent}`. Limits in [security](security.md#resource-limits) |
 | `POST /presence` | node tokens: `{node?, seats: [{seat, state, wake_failed?, harness?, since?, attention?, attention_hint?, terminal_url?}]}` (at most 5,000 seats); valid for 90 s |
 | `GET /seats/{name}/launch` | node and user tokens: harness, model, role, parent, permission mode (informational; the node does not use it) and a new seat token; the token of the seat's previous launch is revoked |
 | `POST /seats/{name}/sleep`, `POST /seats/{name}/wake` | user tokens: ask the node hosting the seat; 202, or 409 `node_offline` |

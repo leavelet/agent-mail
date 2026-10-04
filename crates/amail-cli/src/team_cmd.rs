@@ -27,6 +27,28 @@ fn node(req: &Request, timeout: Duration) -> Result<Value> {
     amail_node::request(&sock, req, timeout)
 }
 
+/// The node's local policy as `ps`, `up` and `doctor` show it, from a
+/// `Ps`, `Up` or `Status` answer.
+pub fn policy_line(v: &Value) -> Option<String> {
+    let p = v["local_policy"].as_str()?;
+    let source = v["local_policy_source"]
+        .as_str()
+        .map(|s| format!(" ({s})"))
+        .unwrap_or_default();
+    let what = match p {
+        "open" => {
+            "agent sessions on this host may manage seats and obtain any seat's credentials; \
+             the node reports such requests to you by system mail"
+        }
+        "restricted" => {
+            "agent sessions on this host get only their own seat's credentials and cannot \
+             manage seats (best effort)"
+        }
+        _ => "",
+    };
+    Some(format!("local policy: {p}{source}: {what}"))
+}
+
 fn ps_rows() -> Result<Vec<PsRow>> {
     let v = node(&Request::Ps, Duration::from_secs(10))?;
     Ok(serde_json::from_value(v["seats"].clone())?)
@@ -406,6 +428,9 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
             report.push(format!("settings changed (in effect now): {c}"));
         }
     }
+    if let Some(l) = policy_line(&v) {
+        report.push(l);
+    }
     let mut by_action: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for s in v["seats"].as_array().into_iter().flatten() {
         by_action
@@ -484,7 +509,9 @@ pub fn ps(out: &Out) -> Result<()> {
     let rows: Vec<PsRow> = serde_json::from_value(v["seats"].clone())?;
     out.show(&v, || {
         if rows.is_empty() {
-            return Ok("no supervised seats (start a team with amail up)".into());
+            let mut lines = vec!["no supervised seats (start a team with amail up)".to_string()];
+            lines.extend(policy_line(&v));
+            return Ok(lines.join("\n"));
         }
         let mut table = vec![[
             "SEAT".to_string(),
@@ -539,6 +566,7 @@ pub fn ps(out: &Out) -> Result<()> {
         if v["connected"].as_bool() == Some(false) {
             lines.push("(the node is not connected to the server)".into());
         }
+        lines.extend(policy_line(&v));
         Ok(lines.join("\n"))
     })
 }

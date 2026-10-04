@@ -81,7 +81,8 @@ pub enum Request {
         budget_ms: Option<u64>,
     },
     /// `amail run`: prepare a session for `seat` and say how to start it.
-    /// Refused from processes of the sessions the node launched.
+    /// Under the restricted local policy, refused from processes of the
+    /// sessions the node launched.
     Launch {
         seat: String,
         cwd: String,
@@ -116,8 +117,8 @@ pub enum Request {
         pass: Option<String>,
     },
     /// Node state, for people and tests. This and the requests below are
-    /// for the person: the node refuses them from processes of the
-    /// sessions it launched.
+    /// for the person: under the restricted local policy, the node refuses
+    /// them from processes of the sessions it launched.
     Status,
     /// `amail up`: supervise these seats (replacing earlier placements of
     /// the same seats) and, with `start`, start the ones not running (only

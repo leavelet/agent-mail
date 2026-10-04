@@ -922,6 +922,13 @@ impl Node {
                 show(settings.max_live)
             ));
         }
+        let (was, now) = (
+            self.policy_with(old.local_policy),
+            self.policy_with(settings.local_policy),
+        );
+        if was != now {
+            changed.push(format!("local_policy {was} -> {now}"));
+        }
         if !first && old.restart != settings.restart {
             changed.push(format!(
                 "restart {:?} -> {:?}",
@@ -1006,10 +1013,17 @@ impl Node {
             self.begin_stop(&mut st, seat, Intent::Restart);
         }
         st.save_dirty = true;
+        st.settings_due = true;
         drop(st);
         self.save_now();
         self.sup_kick.notify_one();
-        json!({"seats": out, "settings_changed": changed})
+        let (policy, source) = (self.local_policy(), self.policy_source());
+        json!({
+            "seats": out,
+            "settings_changed": changed,
+            "local_policy": policy,
+            "local_policy_source": source,
+        })
     }
 
     fn targets(&self, seats: &[String]) -> Result<Vec<String>, String> {
@@ -1194,6 +1208,7 @@ impl Node {
     }
 
     pub(super) fn sup_ps(&self) -> Value {
+        let (policy, source) = (self.local_policy(), self.policy_source());
         let st = self.lock();
         let now = Instant::now();
         let mut rows: Vec<PsRow> = st
@@ -1243,7 +1258,12 @@ impl Node {
             })
             .collect();
         rows.sort_by(|a, b| (&a.mux_session, &a.seat).cmp(&(&b.mux_session, &b.seat)));
-        json!({"connected": st.connected, "seats": rows})
+        json!({
+            "connected": st.connected,
+            "seats": rows,
+            "local_policy": policy,
+            "local_policy_source": source,
+        })
     }
 
     pub(super) fn sup_locate(&self, target: &str) -> Value {

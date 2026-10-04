@@ -162,6 +162,8 @@ pub struct Limiters {
     /// Requests whose database cost depends on the data (search, archive,
     /// threads, ...) in flight, per org and in all.
     pub queries: QuerySlots,
+    /// Node notice reports per org (always on).
+    pub node_notices: Buckets<i64>,
 }
 
 impl Limiters {
@@ -189,6 +191,10 @@ impl Limiters {
                 l.org_webhooks_in_flight.map(|n| (n / 4).max(1)),
             )),
             queries: QuerySlots::new(l.org_queries, l.queries),
+            node_notices: Buckets::per_hour(
+                amail_proto::limits::NODE_NOTICES_PER_HOUR,
+                amail_proto::limits::NODE_NOTICE_BURST,
+            ),
         }
     }
 
@@ -216,6 +222,7 @@ impl Limiters {
             b.prune();
         }
         self.queries.prune();
+        self.node_notices.prune();
     }
 }
 

@@ -60,11 +60,70 @@ user's machine beyond what such mail and role text can talk an agent into:
 Use a server you trust with these powers. Seats with `permission_mode =
 "unattended"` act on such mail without asking anyone.
 
-**The node gives each session only its own seat's credentials and mail.**
-The node holds a node token and the seat tokens of the sessions it runs.
-For every connection to its socket it takes the connecting process's id
-from the kernel (`SO_PEERCRED`) and follows that process's parents in
-`/proc`:
+**Which local processes may use the node: `local_policy`.** The node
+holds a node token and the seat tokens of the sessions it runs, and serves
+requests on a Unix socket that only processes of the person's
+operating-system user can reach (see the end of this section). The setting
+`local_policy` decides what those processes may ask:
+
+- `open`: every process of the user may use the socket fully. This
+  includes the agents of the sessions the node launched: they can run
+  `amail up`, `down`, `ps`, `sleep`, `wake` and `amail run` for any seat,
+  which gives them any agent seat's credentials and mail. This lets an
+  agent manage a team of seats.
+- `restricted`: the node tells a session's processes apart from the
+  person's (described below). A session gets only its own seat's
+  credentials and mail, and requests meant for the person are refused to
+  it.
+
+The node takes the setting from `amail node --local-policy`
+(`AMAIL_LOCAL_POLICY`, or `local_policy` in `<state dir>/node.toml`). A
+team file can set `local_policy = "restricted"` under `[team]`, which makes
+the node use the restricted policy while that team is up; a team file
+cannot make the policy open, because team files usually lie in the
+project, where agents can write. Without either setting the node uses
+`restricted`. `amail up`, `amail ps`, `amail node status` and `amail
+doctor` print the policy in effect and where it comes from.
+
+Neither policy is a security boundary between the agents and the person:
+all of them run as the same user (see below). The restricted policy stops
+an agent from taking another seat's credentials or managing seats through
+amail itself; it does not stop an agent that sets out to get around it.
+
+**What the node tells the person.** The node reports two kinds of events to
+the server, which writes a `system` mail to the org's user seat. The mail
+appears in the user's inbox and in the web interface's list of what needs
+the user. It asks for no acknowledgement and wakes no agent. The node sends
+only typed fields (setting names and values, seat names, request kinds);
+the server writes the text from fixed sentences, shows only values a
+setting can have and only names of the org's own seats, and shows the
+node's label escaped on one line. Each org's nodes together can send at
+most 60 such reports per hour (bursts of 10), and a node's reports go only
+to its own org's user.
+
+- When the node starts, and after each `amail up`, it compares its local
+  policy, and each supervised seat's permission mode and (for Codex seats)
+  `git_access`, with what it last reported, and reports the differences in
+  one mail: the setting, the old and the new value, and the host. The
+  first report of a node names its policy. A node whose state was written
+  by an earlier version, which always used the restricted policy, reports
+  a change from `restricted`.
+- Under the open policy, when a process of an agent session runs `up`,
+  `down`, `forget`, `run`, `sleep` or `wake`, obtains a seat's
+  credentials, or sends a hook in the name of a seat other than its own,
+  the node reports which seat's session did what to which seats. The first
+  such request of a session is reported within seconds; further requests
+  of the same session within the next five minutes are reported together
+  at the end of those five minutes. The node recognizes a session's
+  processes by their parent processes, as the restricted policy does, so
+  these notices are best effort: a process that left the session's process
+  tree is taken for one of the person's and is not reported. Codex runs the
+  commands of all Codex seats of a node in one shared process, so a notice
+  about a Codex session cannot name the seat.
+
+**How the restricted policy tells sessions apart.** For every connection to
+its socket the node takes the connecting process's id from the kernel
+(`SO_PEERCRED`) and follows that process's parents in `/proc`:
 
 - A Claude Code session is the process of `amail run`, which the node
   records when it hands out the launch plan and which then becomes the
@@ -83,10 +142,12 @@ from the kernel (`SO_PEERCRED`) and follows that process's parents in
 - Requests meant for the person (`amail run`, `up`, `down`, `ps`,
   `attach`, `sleep`, `wake`, `amail node status`) are refused to processes
   that run below a session the node launched or with the node's Codex
-  home. `amail node status` does not show session or thread ids.
-- The node relays a seat's conversation only from a transcript file in the
-  directory where the harness writes transcripts, whatever path a hook
-  reports (see [conversation mirrors](architecture.md#conversation-mirrors)).
+  home.
+
+Under both policies, `amail node status` does not show session or thread
+ids, and the node relays a seat's conversation only from a transcript file
+in the directory where the harness writes transcripts, whatever path a hook
+reports (see [conversation mirrors](architecture.md#conversation-mirrors)).
 
 **On the host, agents and the person are not separated from each other.**
 All sessions run as the same operating-system user as the person who
@@ -115,9 +176,9 @@ reading them) can:
   from any process of the user (`crossSessionInbound: "accept"`, which the
   node's wake-ups need), and so put a prompt into another seat's session.
 
-The node's checks stop an agent from taking another seat's token or mail
-through amail itself; they do not stop an agent that sets out to read files
-or other processes. If that matters for your agents (for example because
+The restricted policy stops an agent from taking another seat's token or
+mail through amail itself; it does not stop an agent that sets out to read
+files or other processes. If that matters for your agents (for example because
 your org is linked to others and they read external mail):
 
 - run the node and its agents under an operating-system user of their own,
@@ -427,6 +488,7 @@ Rate and stream limits are counted per server instance.
 | Requests per org, all its tokens and browser sessions together | 500 per second, bursts of 1,000 (*public*); once the server knows a token's org, a request over the limit is refused before the database is asked, and the refusal (429) is sent after one second, so that a client that retries at once is slowed down |
 | Registration attempts per client address (IPv6: per /64 network) | 10 per hour, bursts of 5, failed ones included (*public*); in addition, all /64 networks of one IPv6 /48 together get 4 times that (40 per hour, bursts of 20), checked first |
 | Link requests per org | 20 per hour, bursts of 5 (*public*) |
+| Node notice reports (`POST /v1/node/notices`) per org | 60 per hour, bursts of 10, all of the org's nodes together; at most 20 notices per report, 100 items per notice and 50 seat names per item |
 | Pending outgoing link requests per org | 1,000; a request not accepted within 30 days is dropped |
 | `org_exists` answers per invite code | 3; then the invite is spent |
 | Keys tracked by each rate limiter | 100,000; when a new key arrives at that count, the fullest 1/64 of the buckets are dropped to make room, so a new client always gets a bucket of its own; keys whose bucket is full again are dropped on every cleanup pass |

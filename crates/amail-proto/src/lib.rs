@@ -247,6 +247,19 @@ pub mod limits {
     /// A node's label.
     pub const MAX_NODE_LABEL_CHARS: usize = 200;
 
+    // --- node notices (`POST /v1/node/notices`) ---
+
+    /// Notice reports one org's nodes may send per hour, all together
+    /// (bursts of [`NODE_NOTICE_BURST`]); further ones get 429.
+    pub const NODE_NOTICES_PER_HOUR: f64 = 60.0;
+    pub const NODE_NOTICE_BURST: f64 = 10.0;
+    /// Notices in one report.
+    pub const MAX_NODE_NOTICES: usize = 20;
+    /// Setting changes or actions in one notice.
+    pub const MAX_NOTICE_ITEMS: usize = 100;
+    /// Seat names listed for one action (more are counted, not named).
+    pub const MAX_NOTICE_TARGETS: usize = 50;
+
     // --- responses ---
 
     /// Upper bound of the bytes of message headers (and snippets) in one
@@ -966,6 +979,87 @@ pub struct PresenceReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
     pub seats: Vec<PresenceUpdate>,
+}
+
+string_enum!(
+    /// Which processes of the person's OS user may use a node's socket.
+    /// `open`: every such process, including the agents of the sessions
+    /// the node launched (they can manage seats and obtain any seat's
+    /// credentials; the node tells the person when they do). `restricted`:
+    /// the node tells sessions apart from other processes by their parent
+    /// processes and gives a session only its own seat's credentials and
+    /// no seat management. Both are best effort; see docs/security.md.
+    LocalPolicy { Open => "open", Restricted => "restricted" }
+);
+
+impl LocalPolicy {
+    /// The policy of a node, and of a team file, that set none.
+    pub const DEFAULT: LocalPolicy = LocalPolicy::Restricted;
+}
+
+string_enum!(
+    /// A node setting named in a settings notice.
+    NoticeSetting { LocalPolicy => "local_policy", PermissionMode => "permission_mode", GitAccess => "git_access" }
+);
+
+string_enum!(
+    /// What a process of an agent session asked the node to do (see
+    /// [`NodeNotice::AgentActions`]). `hook`: it sent a hook in the name of
+    /// another seat; `credentials`: it obtained a seat's credentials.
+    NoticeOp { Up => "up", Down => "down", Forget => "forget", Run => "run", Wake => "wake", Sleep => "sleep", Credentials => "credentials", Hook => "hook" }
+);
+
+/// One changed setting: of the node (`seat` absent) or of one seat.
+/// `old` is absent when the node never reported the setting before.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettingChange {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat: Option<String>,
+    pub setting: NoticeSetting,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old: Option<String>,
+    pub new: String,
+}
+
+/// Requests of one kind from one session, to these seats (at most
+/// [`limits::MAX_NOTICE_TARGETS`] named), `count` times in all.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentAction {
+    pub op: NoticeOp,
+    #[serde(default)]
+    pub targets: Vec<String>,
+    pub count: u32,
+}
+
+/// An event a node reports so that the server tells the org's person, by
+/// system mail written from fixed texts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NodeNotice {
+    /// The node runs with settings other than those it reported last.
+    Settings { changes: Vec<SettingChange> },
+    /// A process of an agent session managed seats or obtained another
+    /// seat's credentials. `seat` is the session's seat; absent for Codex,
+    /// whose seats on one node share one process.
+    AgentActions {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seat: Option<String>,
+        actions: Vec<AgentAction>,
+    },
+}
+
+/// Body of `POST /v1/node/notices` (node tokens).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeNotices {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    pub notices: Vec<NodeNotice>,
+}
+
+/// Answer to `POST /v1/node/notices`: the number of mails written.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeNoticesAccepted {
+    pub sent: usize,
 }
 
 /// Payload of a server-sent `presence` event.

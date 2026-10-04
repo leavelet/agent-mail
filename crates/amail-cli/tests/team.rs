@@ -50,6 +50,7 @@ team_tests!(
     staged_merge_worktrees_and_validation,
     paste_fallback_types_only_when_safe,
     server_permission_mode_is_informational,
+    agent_up_is_reported,
 );
 
 async fn setup(
@@ -1323,4 +1324,124 @@ paste_fallback = false
     assert!(typed(pq).is_empty() && typed(pr).is_empty());
     let st = h.api.get(&format!("/messages/{}/status", ids[1])).await;
     assert_eq!(st["recipients"][0]["state"], "queued");
+}
+
+/// Under the open policy an agent session can run `amail up`, `wake` and
+/// `sleep`; the person gets one system mail per session and window that
+/// lists them. With the team file's `local_policy = "restricted"` the same
+/// commands are refused.
+async fn agent_up_is_reported(b: Backend) {
+    let Some(h) = Harness::start(
+        b,
+        "agent_up_is_reported",
+        Opts {
+            supervise: true,
+            local_policy: Some(amail_proto::LocalPolicy::Open),
+            notices: true,
+            ..Default::default()
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    let _i: Vec<FakeInbox> = ["a", "b"].iter().map(|s| inbox(&h, s)).collect();
+    let team = "[team]\nworkroot = \"@DIR@/work\"\n@POLICY@[defaults]\nharness = \"claude\"\n\
+                [[seat]]\nname = \"a\"\n[[seat]]\nname = \"b\"\n";
+    write_team(&h, &team.replace("@POLICY@", ""));
+    let out = up(&h, &[]).await;
+    assert!(out.contains("local policy: open (node setting)"), "{out}");
+    for s in ["a", "b"] {
+        wait_state(&h, s, "idle").await;
+    }
+    let system = || async {
+        let inbox = h.api.get("/inbox?limit=100").await;
+        inbox["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["message"]["source"] == "system")
+            .map(|e| e["message"]["id"].as_i64().unwrap())
+            .collect::<Vec<i64>>()
+    };
+    // The node's first report.
+    h.wait("the settings notice", || async {
+        system().await.len() == 1
+    })
+    .await;
+
+    let script = format!(
+        "export AMAIL_URL='{url}' AMAIL_TOKEN='{token}'\n\
+         cd '{dir}'\n\
+         \"$FAKE_AMAIL\" up -f amail.toml --only b; echo \"up-exit=$?\"\n\
+         \"$FAKE_AMAIL\" sleep b; echo \"sleep-exit=$?\"\n\
+         \"$FAKE_AMAIL\" wake b; echo \"wake-exit=$?\"\n",
+        url = h.api.base,
+        token = h.api.token,
+        dir = h.dir.path().display(),
+    );
+    let ran = h.fake.join("a.ran");
+    std::fs::write(h.fake.join("a.run"), &script).unwrap();
+    h.wait("a ran the commands", || async { ran.exists() })
+        .await;
+    let text = std::fs::read_to_string(&ran).unwrap();
+    for want in ["up-exit=0", "sleep-exit=0", "wake-exit=0"] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
+    }
+    // The first notice goes out at once; requests made after it come in
+    // one more at the end of the window.
+    let notices = || async {
+        let mut out = Vec::new();
+        for id in system().await.into_iter().skip(1) {
+            let m = h.api.get(&format!("/messages/{id}?peek=1")).await;
+            let subject = m["message"]["subject"].as_str().unwrap().to_string();
+            assert!(
+                subject.starts_with("Agent seat a used the node"),
+                "{subject}"
+            );
+            out.push(m["message"]["body"].as_str().unwrap().to_string());
+        }
+        out
+    };
+    let wants = [
+        "- start or update seats (amail up): b\n",
+        "- put seats to sleep (amail sleep): b\n",
+        "- wake seats (amail wake): b\n",
+    ];
+    h.wait("the agent notices", || async {
+        let all = notices().await.concat();
+        wants.iter().all(|w| all.contains(w))
+    })
+    .await;
+    let n = notices().await.len();
+    assert!(
+        (1..=2).contains(&n),
+        "{n} notices for one window's requests"
+    );
+
+    // The team file makes the policy restricted: the same commands from
+    // the session are refused, and the person is told about the change.
+    write_team(
+        &h,
+        &team.replace("@POLICY@", "local_policy = \"restricted\"\n"),
+    );
+    let out = up(&h, &[]).await;
+    assert!(out.contains("local_policy open -> restricted"), "{out}");
+    assert!(
+        out.contains("local policy: restricted (team file)"),
+        "{out}"
+    );
+    h.wait("the policy notice", || async {
+        system().await.len() == 2 + n
+    })
+    .await;
+    std::fs::remove_file(&ran).unwrap();
+    std::fs::write(h.fake.join("a.run"), &script).unwrap();
+    h.wait("a ran the commands again", || async { ran.exists() })
+        .await;
+    let text = std::fs::read_to_string(&ran).unwrap();
+    for want in ["up-exit=1", "sleep-exit=1", "wake-exit=1"] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
+    }
+    cli(&h, &["down"]).await;
 }

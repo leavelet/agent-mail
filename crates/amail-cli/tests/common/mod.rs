@@ -164,6 +164,11 @@ pub struct Opts {
     /// where sessions are launched as they are in use; other tests send
     /// hooks from the test process).
     pub check_callers: Option<bool>,
+    /// The node's local policy (default: none set, so the built-in default).
+    pub local_policy: Option<amail_proto::LocalPolicy>,
+    /// Send node notices (off by default: they would add system mail to the
+    /// user's inbox in tests about other things).
+    pub notices: bool,
 }
 
 impl Default for Opts {
@@ -178,6 +183,8 @@ impl Default for Opts {
             server_tweak: None,
             slow_claims: None,
             check_callers: None,
+            local_policy: None,
+            notices: false,
         }
     }
 }
@@ -285,6 +292,10 @@ impl Harness {
         cfg.restart_backoff = Duration::from_millis(200);
         cfg.resume_grace = Duration::from_secs(3);
         cfg.check_callers = opts.check_callers.unwrap_or(opts.supervise);
+        cfg.local_policy = opts.local_policy;
+        cfg.notices = opts.notices;
+        cfg.notice_window = Duration::from_secs(3);
+        cfg.notice_tick = Duration::from_millis(100);
         // Claude Code transcripts are followed only under `projects` here.
         cfg.claude_config_dir = dir.path().join("claude");
         let fake_dir = dir.path().join("fake");
