@@ -98,7 +98,7 @@ pub async fn headers(req: Request, next: Next) -> Response {
 /// Whether the session cookie gets `Secure`: always in public mode,
 /// otherwise when the request came over HTTPS (through a trusted proxy that
 /// says so, or as seen from the page's origin).
-fn https(st: &AppState, peer: Peer, headers: &HeaderMap) -> bool {
+pub(crate) fn https(st: &AppState, peer: Peer, headers: &HeaderMap) -> bool {
     if st.config.secure_cookies {
         return true;
     }
@@ -114,7 +114,7 @@ fn https(st: &AppState, peer: Peer, headers: &HeaderMap) -> bool {
     fwd || origin
 }
 
-fn session_cookie(value: &str, max_age: i64, secure: bool) -> HeaderValue {
+pub(crate) fn session_cookie(value: &str, max_age: i64, secure: bool) -> HeaderValue {
     let mut c =
         format!("{SESSION_COOKIE}={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}");
     if secure {
@@ -226,7 +226,9 @@ pub async fn logout(
     if let Some(secret) = cookie(&headers, SESSION_COOKIE) {
         check_csrf(&method, &headers, peer.proxied)?;
         let hash = hash_token(secret);
-        if !st.store.delete_session(&hash).await? {
+        if st.store.delete_session(&hash).await? {
+            st.credentials_ended(Vec::new(), vec![hash]);
+        } else {
             st.store.delete_operator_session(&hash).await?;
         }
     }

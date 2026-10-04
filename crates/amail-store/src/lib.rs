@@ -192,8 +192,8 @@ pub trait Store: Send + Sync + 'static {
     async fn seat_seqs(&self, org_id: i64) -> Result<Vec<(i64, String, i64)>>;
     /// Live (unrevoked) tokens of the org.
     async fn tokens(&self, org_id: i64) -> Result<Vec<TokenRec>>;
-    /// Revoke a token of the org. Returns false if there was no live token
-    /// with that id.
+    /// Revoke a token of the org and end its browser sessions. Returns
+    /// false if there was no live token with that id.
     async fn revoke_token(&self, org_id: i64, id: i64) -> Result<bool>;
     /// Pending-notification counts of every live seat of the org (or only
     /// `seat_id`), including seats with nothing pending.
@@ -204,7 +204,8 @@ pub trait Store: Send + Sync + 'static {
     /// The token behind a live (unexpired) browser session, if its token is
     /// still live.
     async fn session_auth(&self, hash: &str) -> Result<Option<TokenAuth>>;
-    /// Store a browser session (and drop expired ones).
+    /// Store a browser session; the token's oldest sessions beyond
+    /// `amail_proto::limits::MAX_SESSIONS_PER_TOKEN` end.
     async fn create_session(&self, hash: &str, token_id: i64, expires_at: i64) -> Result<()>;
     async fn delete_session(&self, hash: &str) -> Result<bool>;
     /// The org's user seat.
@@ -268,6 +269,13 @@ pub trait Store: Send + Sync + 'static {
     /// Drop expired claim keys, watches, server instances and browser
     /// sessions, and revoked tokens (with their sessions).
     async fn cleanup(&self) -> Result<()>;
+    /// Which of these token ids are live, and which of these browser
+    /// sessions (by hash) are live and belong to a live token.
+    async fn live_credentials(
+        &self,
+        tokens: &[i64],
+        sessions: &[String],
+    ) -> Result<(Vec<i64>, Vec<String>)>;
     /// Row counts of some tables (tests and diagnostics).
     async fn row_counts(&self) -> Result<RowCounts>;
 
@@ -343,8 +351,8 @@ pub trait Store: Send + Sync + 'static {
     async fn expire_bodies(&self, cutoff: i64, limit: i64) -> Result<u64>;
     /// Load and activity per org, for the operator.
     async fn operator_stats(&self) -> Result<OperatorStats>;
-    /// Replace a user token: issue `new`, move `old`'s browser sessions to
-    /// it, revoke `old`. Returns the new token's id.
+    /// Replace a user token: issue `new`, revoke `old` and end its browser
+    /// sessions. Returns the new token's id.
     async fn rotate_token(&self, org_id: i64, old: i64, new: &NewToken) -> Result<i64>;
     /// Revoke all user tokens of the org and issue one with this hash.
     async fn reset_user_tokens(&self, org_id: i64, hash: &str) -> Result<()>;

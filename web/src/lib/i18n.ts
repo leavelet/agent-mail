@@ -347,7 +347,7 @@ const en = {
 
   'settings.token': 'Your token',
   'settings.rotate': 'Rotate my token',
-  'settings.rotateHint': 'Issues a new user token and revokes the one this browser signed in with. This browser stays signed in; run amail login again on your machines.',
+  'settings.rotateHint': 'Issues a new user token and revokes the one this browser signed in with. Every other browser signed in with it is signed out; this browser stays signed in. Run amail login again on your machines.',
   'settings.rotated': 'Your new user token (shown once):',
   'settings.notify': 'Notifications in this browser',
   'settings.notifyHint': 'A system notification when something new needs you while this tab is in the background.',
@@ -746,7 +746,7 @@ const zh: Record<Key, string> = {
 
   'settings.token': '你的令牌',
   'settings.rotate': '轮换我的令牌',
-  'settings.rotateHint': '签发一个新的用户令牌，并撤销本浏览器登录时用的那个。本浏览器保持登录；请在你的机器上重新执行 amail login。',
+  'settings.rotateHint': '签发一个新的用户令牌，并撤销本浏览器登录时用的那个。用旧令牌登录的其他浏览器都会退出，本浏览器保持登录。请在你的机器上重新执行 amail login。',
   'settings.rotated': '你的新用户令牌（只显示这一次）：',
   'settings.notify': '本浏览器的通知',
   'settings.notifyHint': '本标签页在后台时，有新的事项需要你处理就发一条系统通知。',

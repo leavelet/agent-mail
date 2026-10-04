@@ -296,6 +296,8 @@ pub async fn watch(
             5000,
         )
     })?;
+    // The mirror ends when its token (or browser session) is revoked.
+    let (cred, ended) = st.revocations.open(&auth);
     let key = (auth.org.id, seat.name.clone());
     let (initial, rx, guard) = {
         let mut seats = st.mirror.seats.lock().unwrap();
@@ -331,8 +333,9 @@ pub async fn watch(
     let live = BroadcastStream::new(rx).take_while(|r| std::future::ready(r.is_ok()));
     let stream = stream::iter(initial.into_iter().map(Ok))
         .chain(live)
+        .take_until(ended)
         .filter_map(move |m| {
-            let _keep = (&guard, &open);
+            let _keep = (&guard, &open, &cred);
             std::future::ready(m.ok().map(|m| Ok(sse(m))))
         });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))

@@ -35,7 +35,13 @@ macro_rules! bound_tests {
     };
 }
 
-bound_tests!(text_field_limits, revoked_tokens_are_pruned,);
+bound_tests!(
+    text_field_limits,
+    revoked_tokens_are_pruned,
+    revocation_ends_streams,
+    rotation_ends_sessions,
+    sessions_per_token_are_capped,
+);
 
 /// Start a server; `None` (test skipped) when Postgres is not configured.
 macro_rules! start {
@@ -402,4 +408,155 @@ async fn revoked_tokens_are_pruned(b: Backend, t: &str) {
     let rows = srv.db.store.row_counts().await.unwrap();
     assert_eq!((rows.tokens, rows.revoked_tokens), (1, 0));
     assert_eq!(acme.get("/whoami").await.0, StatusCode::OK);
+}
+
+// --- revocation -----------------------------------------------------------------
+
+fn closed(lines: &Arc<Mutex<Vec<String>>>) -> bool {
+    lines.lock().unwrap().iter().any(|l| l == "<closed>")
+}
+
+/// Streams opened with a token end when the token is revoked, rotated or
+/// reset on the database.
+async fn revocation_ends_streams(b: Backend, t: &str) {
+    let srv = start!(b, t, public());
+    let acme = srv.org("acme").await;
+    acme.seat("w").await;
+    // A second user token (the leaked one) and a node token.
+    let leaked = srv.client(
+        acme.ok(Method::POST, "/tokens", Some(json!({ "scope": "user" })))
+            .await["token"]
+            .as_str()
+            .unwrap(),
+    );
+    let node = acme.node().await;
+    let (s, mirror) = leaked.stream("/seats/w/transcript").await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, events) = node.stream("/events").await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, own) = acme.stream("/events").await;
+    assert_eq!(s, StatusCode::OK);
+    let ids: Vec<(i64, String)> = acme
+        .get("/tokens")
+        .await
+        .1
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| {
+            (
+                t["id"].as_i64().unwrap(),
+                t["scope"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    for (id, scope) in &ids {
+        if scope == "node" || (scope == "user" && *id != ids[0].0) {
+            acme.ok(Method::DELETE, &format!("/tokens/{id}"), None)
+                .await;
+        }
+    }
+    eventually("streams of revoked tokens end", async || {
+        closed(&mirror) && closed(&events)
+    })
+    .await;
+    assert!(!closed(&own), "{}", joined(&own));
+    // Rotation ends the streams of the rotated token.
+    let v = acme.ok(Method::POST, "/tokens/rotate", None).await;
+    let new = srv.client(v["token"].as_str().unwrap());
+    eventually("streams of a rotated token end", async || closed(&own)).await;
+    // A reset on the database ends them at the next sweep.
+    let (_, mirror) = new.stream("/seats/w/transcript").await;
+    let org = srv.db.store.org_by_name("acme").await.unwrap().unwrap();
+    srv.db
+        .store
+        .reset_user_tokens(org.id, &hash_token(&new_token()))
+        .await
+        .unwrap();
+    eventually("streams of reset tokens end", async || closed(&mirror)).await;
+}
+
+/// Rotating a token ends every browser session made with it; a browser
+/// that rotated gets a new session for the new token.
+async fn rotation_ends_sessions(b: Backend, t: &str) {
+    let srv = start!(b, t, public());
+    let acme = srv.org("acme").await;
+    let (_, attacker) = srv.login(&acme.token, &[]).await;
+    let (_, owner) = srv.login(&acme.token, &[]).await;
+    let ok = |c: &str| {
+        let c = c.to_string();
+        let srv = &srv;
+        async move { srv.with_cookie(Method::GET, "/whoami", &c).await.0 }
+    };
+    assert_eq!(ok(&attacker).await, StatusCode::OK);
+    // Rotation through the owner's browser session.
+    let cookie = owner.split(';').next().unwrap().to_string();
+    let r = srv
+        .http
+        .post(format!("{}/v1/tokens/rotate", srv.base))
+        .header("Cookie", &cookie)
+        .header("X-Amail-Csrf", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+    let fresh = r
+        .headers()
+        .get("set-cookie")
+        .expect("a new session cookie")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let v: Value = r.json().await.unwrap();
+    assert_eq!(ok(&attacker).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(ok(&owner).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(ok(&fresh).await, StatusCode::OK);
+    // Rotation with the bearer token ends the sessions too and sets no
+    // cookie.
+    let new = srv.client(v["token"].as_str().unwrap());
+    let (_, other) = srv.login(&new.token, &[]).await;
+    let r = srv
+        .http
+        .post(format!("{}/v1/tokens/rotate", srv.base))
+        .bearer_auth(&new.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::CREATED);
+    assert!(r.headers().get("set-cookie").is_none());
+    assert_eq!(ok(&other).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(ok(&fresh).await, StatusCode::UNAUTHORIZED);
+}
+
+/// A token keeps at most a fixed number of browser sessions; signing in
+/// again ends the oldest.
+async fn sessions_per_token_are_capped(b: Backend, t: &str) {
+    let mut cfg = public();
+    cfg.limits.token_requests_per_sec = None;
+    let srv = start!(b, t, cfg);
+    let acme = srv.org("acme").await;
+    let max = amail_proto::limits::MAX_SESSIONS_PER_TOKEN as usize;
+    let mut cookies = Vec::new();
+    for _ in 0..max + 5 {
+        let (s, c) = srv.login(&acme.token, &[]).await;
+        assert_eq!(s, StatusCode::OK);
+        cookies.push(c);
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert_eq!(
+        srv.db.store.row_counts().await.unwrap().web_sessions,
+        max as i64
+    );
+    for (i, c) in cookies.iter().enumerate() {
+        let want = if i < 5 {
+            StatusCode::UNAUTHORIZED
+        } else {
+            StatusCode::OK
+        };
+        assert_eq!(
+            srv.with_cookie(Method::GET, "/whoami", c).await.0,
+            want,
+            "session {i}"
+        );
+    }
 }

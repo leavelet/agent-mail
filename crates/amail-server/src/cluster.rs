@@ -57,6 +57,10 @@ pub enum Wire {
     /// A command for the org's nodes.
     #[serde(rename = "c")]
     Command { o: i64, c: NodeCommand },
+    /// These tokens (ids) and browser sessions (hashes) were revoked: end
+    /// their streams.
+    #[serde(rename = "r")]
+    Ended { k: Vec<i64>, s: Vec<String> },
     /// The sender's own liveness ping (others ignore it).
     #[serde(rename = "h")]
     Ping,
@@ -274,6 +278,11 @@ impl Cluster {
             Wire::Command { o, c } => {
                 st.nodes.deliver(o, c);
             }
+            Wire::Ended { k, s } => st.revocations.end(
+                k.into_iter()
+                    .map(crate::revoke::Cred::Token)
+                    .chain(s.into_iter().map(crate::revoke::Cred::Session)),
+            ),
             Wire::Ping => {}
         }
     }

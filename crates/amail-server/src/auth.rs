@@ -32,6 +32,9 @@ pub struct Auth {
     pub org: Org,
     /// The token's seat (`seat` tokens) or the org's user seat (`user` tokens).
     pub seat: Option<Seat>,
+    /// The hash of the browser session the request was made with, if it
+    /// was authenticated by the session cookie.
+    pub session: Option<String>,
 }
 
 /// A new random token (`amail_` + 64 hex chars).
@@ -113,6 +116,7 @@ impl FromRequestParts<AppState> for Auth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        let mut session = None;
         let auth = match parts.headers.get(header::AUTHORIZATION) {
             Some(value) => {
                 let value = value
@@ -136,11 +140,14 @@ impl FromRequestParts<AppState> for Auth {
                     .ok_or_else(|| ApiError::unauthorized("missing bearer token"))?;
                 let peer = parts.extensions.get::<Peer>().copied().unwrap_or_default();
                 check_csrf(&parts.method, &parts.headers, peer.proxied)?;
-                state
+                let hash = hash_token(secret);
+                let a = state
                     .store
-                    .session_auth(&hash_token(secret))
+                    .session_auth(&hash)
                     .await?
-                    .ok_or_else(|| ApiError::unauthorized("session expired or signed out"))?
+                    .ok_or_else(|| ApiError::unauthorized("session expired or signed out"))?;
+                session = Some(hash);
+                a
             }
         };
         if auth.org.suspended_at.is_some() {
@@ -160,6 +167,7 @@ impl FromRequestParts<AppState> for Auth {
             scope: auth.scope,
             org: auth.org,
             seat: auth.seat,
+            session,
         })
     }
 }

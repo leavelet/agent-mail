@@ -534,12 +534,13 @@ async fn token_rotation_and_reset(b: Backend, t: &str) {
     let new = srv.client(v["token"].as_str().unwrap());
     assert_eq!(acme.get("/whoami").await.0, StatusCode::UNAUTHORIZED);
     assert_eq!(new.get("/whoami").await.0, StatusCode::OK);
-    // The browser session made with the old token moved to the new one.
+    // The browser session made with the old token ended.
     assert_eq!(
         srv.with_cookie(Method::GET, "/whoami", &cookie).await.0,
-        StatusCode::OK
+        StatusCode::UNAUTHORIZED
     );
-    // Rotating through the session works the same way.
+    // Rotating through a session works the same way.
+    let (_, cookie) = srv.login(&new.token, &[]).await;
     let (s, v) = srv
         .with_cookie(Method::POST, "/tokens/rotate", &cookie)
         .await;
@@ -547,10 +548,7 @@ async fn token_rotation_and_reset(b: Backend, t: &str) {
     let newer = srv.client(v["token"].as_str().unwrap());
     assert_eq!(new.get("/whoami").await.0, StatusCode::UNAUTHORIZED);
     assert_eq!(newer.get("/whoami").await.0, StatusCode::OK);
-    assert_eq!(
-        srv.with_cookie(Method::GET, "/whoami", &cookie).await.0,
-        StatusCode::OK
-    );
+    let (_, cookie) = srv.login(&newer.token, &[]).await;
     // Seat and node tokens cannot rotate into user tokens.
     let a = newer.seat("a").await;
     assert_eq!(

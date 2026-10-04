@@ -888,12 +888,11 @@ macro_rules! impl_store_common {
                 row.map(AuthRow::into_auth).transpose().map(Option::flatten)
             }
 
+            /// Store a browser session; the token's oldest sessions beyond
+            /// [`amail_proto::limits::MAX_SESSIONS_PER_TOKEN`] end. (Expired sessions are
+            /// dropped by [`cleanup`].)
             pub async fn create_session(c: &mut Conn, hash: &str, token_id: i64, expires_at: i64) -> Result<()> {
                 let now = now_ms();
-                sqlx::query("DELETE FROM web_sessions WHERE expires_at <= $1")
-                    .bind(now)
-                    .execute(&mut *c)
-                    .await?;
                 sqlx::query(
                     "INSERT INTO web_sessions (hash, token_id, created_at, expires_at) VALUES ($1, $2, $3, $4)",
                 )
@@ -901,6 +900,15 @@ macro_rules! impl_store_common {
                 .bind(token_id)
                 .bind(now)
                 .bind(expires_at)
+                .execute(&mut *c)
+                .await?;
+                sqlx::query(
+                    "DELETE FROM web_sessions WHERE token_id = $1 AND hash <> $3 AND hash NOT IN \
+                     (SELECT hash FROM web_sessions WHERE token_id = $1 AND hash <> $3 ORDER BY created_at DESC, hash LIMIT $2)",
+                )
+                .bind(token_id)
+                .bind(amail_proto::limits::MAX_SESSIONS_PER_TOKEN - 1)
+                .bind(hash)
                 .execute(&mut *c)
                 .await?;
                 Ok(())
@@ -1538,6 +1546,11 @@ macro_rules! impl_store_common {
             }
 
             pub async fn revoke_token(c: &mut Conn, org_id: i64, id: i64) -> Result<bool> {
+                sqlx::query("DELETE FROM web_sessions WHERE token_id = (SELECT id FROM tokens WHERE id = $1 AND org_id = $2)")
+                    .bind(id)
+                    .bind(org_id)
+                    .execute(&mut *c)
+                    .await?;
                 let n = sqlx::query(
                     "UPDATE tokens SET revoked_at = $1 WHERE org_id = $2 AND id = $3 AND revoked_at IS NULL",
                 )
@@ -1811,6 +1824,37 @@ macro_rules! impl_store_common {
                 Ok(())
             }
 
+            /// The ids of `tokens` that are live, and the hashes of
+            /// `sessions` that are live (unexpired, with a live token).
+            pub async fn live_credentials(c: &mut Conn, tokens: &[i64], sessions: &[String], now: i64) -> Result<(Vec<i64>, Vec<String>)> {
+                let mut live_tokens = Vec::new();
+                for chunk in tokens.chunks(500) {
+                    let sql = format!(
+                        "SELECT id FROM tokens WHERE revoked_at IS NULL AND id IN ({})",
+                        placeholders(1, chunk.len())
+                    );
+                    let mut q = sqlx::query_scalar::<_, i64>(&sql);
+                    for id in chunk {
+                        q = q.bind(*id);
+                    }
+                    live_tokens.extend(q.fetch_all(&mut *c).await?);
+                }
+                let mut live_sessions = Vec::new();
+                for chunk in sessions.chunks(500) {
+                    let sql = format!(
+                        "SELECT w.hash FROM web_sessions w JOIN tokens t ON t.id = w.token_id \
+                         WHERE t.revoked_at IS NULL AND w.expires_at > $1 AND w.hash IN ({})",
+                        placeholders(2, chunk.len())
+                    );
+                    let mut q = sqlx::query_scalar::<_, String>(&sql).bind(now);
+                    for h in chunk {
+                        q = q.bind(h.clone());
+                    }
+                    live_sessions.extend(q.fetch_all(&mut *c).await?);
+                }
+                Ok((live_tokens, live_sessions))
+            }
+
             pub async fn row_counts(c: &mut Conn) -> Result<RowCounts> {
                 let (tokens, revoked_tokens, web_sessions): (i64, i64, i64) = sqlx::query_as(
                     "SELECT (SELECT COUNT(*) FROM tokens), \
@@ -2050,16 +2094,24 @@ macro_rules! impl_store_common {
                 .await?)
             }
 
+            /// Like [`create_session`], for operator sessions.
             pub async fn create_operator_session(c: &mut Conn, hash: &str, token_id: i64, expires_at: i64) -> Result<()> {
-                let now = now_ms();
-                sqlx::query("DELETE FROM operator_sessions WHERE expires_at <= $1").bind(now).execute(&mut *c).await?;
                 sqlx::query(
                     "INSERT INTO operator_sessions (hash, token_id, created_at, expires_at) VALUES ($1, $2, $3, $4)",
                 )
                 .bind(hash)
                 .bind(token_id)
-                .bind(now)
+                .bind(now_ms())
                 .bind(expires_at)
+                .execute(&mut *c)
+                .await?;
+                sqlx::query(
+                    "DELETE FROM operator_sessions WHERE token_id = $1 AND hash <> $3 AND hash NOT IN \
+                     (SELECT hash FROM operator_sessions WHERE token_id = $1 AND hash <> $3 ORDER BY created_at DESC, hash LIMIT $2)",
+                )
+                .bind(token_id)
+                .bind(amail_proto::limits::MAX_SESSIONS_PER_TOKEN - 1)
+                .bind(hash)
                 .execute(&mut *c)
                 .await?;
                 Ok(())
@@ -2196,7 +2248,7 @@ macro_rules! impl_store_common {
             }
 
             /// Issue `new` (a user token of the org) and revoke `old`, whose
-            /// browser sessions move to the new token. Returns the new id.
+            /// browser sessions end. Returns the new id.
             pub async fn rotate_token(c: &mut Conn, org_id: i64, old: i64, new: &NewToken) -> Result<i64> {
                 let id: i64 = sqlx::query_scalar(
                     "INSERT INTO tokens (org_id, scope, seat_id, hash, label, created_at) \
@@ -2210,8 +2262,7 @@ macro_rules! impl_store_common {
                 .bind(now_ms())
                 .fetch_one(&mut *c)
                 .await?;
-                sqlx::query("UPDATE web_sessions SET token_id = $1 WHERE token_id = $2")
-                    .bind(id)
+                sqlx::query("DELETE FROM web_sessions WHERE token_id = $1")
                     .bind(old)
                     .execute(&mut *c)
                     .await?;
@@ -2568,6 +2619,12 @@ macro_rules! impl_store_common {
                 let seat = seat.to_string();
                 let now = now_ms();
                 run!(self.read, |c| q::mirror_watchers(c, org_id, &seat, now).await)
+            }
+
+            async fn live_credentials(&self, tokens: &[i64], sessions: &[String]) -> $crate::Result<(Vec<i64>, Vec<String>)> {
+                let (tokens, sessions) = (tokens.to_vec(), sessions.to_vec());
+                let now = now_ms();
+                run!(self.read, |c| q::live_credentials(c, &tokens, &sessions, now).await)
             }
 
             async fn row_counts(&self) -> $crate::Result<$crate::RowCounts> {

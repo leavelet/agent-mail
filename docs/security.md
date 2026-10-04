@@ -76,9 +76,15 @@ The server stores only their SHA-256 hashes. Each token is shown once.
   `amail token revoke <id>` revokes one. The last user token of an org
   cannot be revoked.
 - `amail token rotate` (or Admin → Settings → rotate in the web interface)
-  issues a new user token and revokes the one in use; browser sessions
-  made with the old token move to the new one, and saved logins holding it
-  are updated.
+  issues a new user token and revokes the one in use. Every browser
+  session made with the old token ends (the browser that rotated gets a
+  new session), and saved logins holding it are updated. Use it when a
+  user token may have leaked: it also signs out every browser that signed
+  in with it.
+- Revoking or rotating a token, or signing out, also ends the event
+  streams and conversation mirrors opened with that token or session: at
+  once on the instance where it happened and at the other instances
+  within the sweep interval (15 seconds).
 - A user who lost every user token asks the operator:
   `amail admin token reset <org>` revokes all user tokens and their browser
   sessions and prints a new one.
@@ -91,7 +97,8 @@ The server stores only their SHA-256 hashes. Each token is shown once.
   in exchanges the token for a session cookie: `HttpOnly`,
   `SameSite=Strict`, valid for 30 days (operator sessions: one day),
   `Secure` when the request came over HTTPS and always in public mode.
-  Revoking the token ends its sessions.
+  Revoking or rotating the token ends its sessions. A token has at most 20
+  sessions; signing in once more ends the oldest.
 - Signing in counts against the token's request rate in public mode, like
   any other request made with the token.
 - Requests authenticated by the cookie must send `X-Amail-Csrf: 1` for

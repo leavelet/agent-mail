@@ -17,6 +17,7 @@ pub mod peer;
 pub mod presence;
 pub mod public;
 mod render;
+mod revoke;
 mod send;
 pub mod transcript;
 mod ui;
@@ -51,6 +52,8 @@ pub struct AppState {
     /// Public mode, limits, proxies, retention (see [`config`]).
     pub config: Arc<config::Config>,
     pub limiters: Arc<limits::Limiters>,
+    /// Open streams by credential, to end them on revocation.
+    pub revocations: Arc<revoke::Revocations>,
 }
 
 impl AppState {
@@ -69,6 +72,7 @@ impl AppState {
             attention: attention::Config::default(),
             config: Arc::new(config::Config::default()),
             limiters: Arc::new(limits::Limiters::new(&config::Limits::default())),
+            revocations: Arc::new(revoke::Revocations::default()),
         }
     }
 
@@ -92,6 +96,31 @@ impl AppState {
         });
         st.cluster = Some(c);
         st
+    }
+
+    /// A token was revoked: end its streams here and on the other
+    /// instances. (Every instance also checks the credentials of its open
+    /// streams at each sweep.)
+    pub(crate) fn token_revoked(&self, _org_id: i64, token_id: i64) {
+        self.credentials_ended(vec![token_id], Vec::new());
+    }
+
+    /// End the streams of these tokens and browser sessions (by hash) here
+    /// and on the other instances.
+    pub(crate) fn credentials_ended(&self, tokens: Vec<i64>, sessions: Vec<String>) {
+        self.revocations.end(
+            tokens
+                .iter()
+                .copied()
+                .map(revoke::Cred::Token)
+                .chain(sessions.iter().cloned().map(revoke::Cred::Session)),
+        );
+        if let Some(c) = &self.cluster {
+            c.notify(cluster::Wire::Ended {
+                k: tokens,
+                s: sessions,
+            });
+        }
     }
 
     /// Tell other instances that the presence of these seats changed.

@@ -313,6 +313,8 @@ pub async fn events(
             5000,
         )
     })?;
+    // The stream ends when its token (or browser session) is revoked.
+    let (cred, ended) = st.revocations.open(&auth);
     let last = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
@@ -406,8 +408,9 @@ pub async fn events(
     let stream = stream::select(mailbox, others)
         .take_while(|e| std::future::ready(e.is_some()))
         .filter_map(std::future::ready)
+        .take_until(ended)
         .map(move |e| {
-            let _open = &guard;
+            let _open = (&guard, &cred);
             Ok(e)
         });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()))

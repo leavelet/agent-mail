@@ -327,6 +327,7 @@ pub async fn revoke_token(
         ));
     }
     if st.store.revoke_token(auth.org.id, id).await? {
+        st.token_revoked(auth.org.id, id);
         Ok(StatusCode::NO_CONTENT)
     } else {
         Err(ApiError::not_found(format!("no token {id}")))

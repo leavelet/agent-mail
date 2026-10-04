@@ -155,18 +155,23 @@ pub async fn register(
 }
 
 /// `POST /v1/tokens/rotate` (user tokens): issue a new user token and
-/// revoke the one making the request; browser sessions made with it move
-/// to the new one. The new token is answered once.
+/// revoke the one making the request. Every browser session made with the
+/// old token ends, and its open streams close; a browser that rotated gets
+/// a new session (cookie) for the new token. The new token is answered
+/// once.
 pub async fn rotate_token(
     State(st): State<AppState>,
     auth: Auth,
+    peer: Peer,
+    headers: axum::http::HeaderMap,
     OptJson(body): OptJson<p::TokenRequest>,
-) -> ApiResult<(StatusCode, Json<p::TokenResponse>)> {
+) -> ApiResult<Response> {
     auth.require_user()?;
     let label = body.and_then(|b| b.label);
     crate::directory::check_text("label", label.as_deref(), p::limits::MAX_LABEL_CHARS)?;
     let token = new_token();
-    st.store
+    let new_id = st
+        .store
         .rotate_token(
             auth.org.id,
             auth.token_id,
@@ -179,14 +184,32 @@ pub async fn rotate_token(
             },
         )
         .await?;
-    Ok((
+    st.token_revoked(auth.org.id, auth.token_id);
+    let mut resp = (
         StatusCode::CREATED,
         Json(p::TokenResponse {
             token,
             scope: TokenScope::User,
             seat: auth.seat.map(|s| s.name),
         }),
-    ))
+    )
+        .into_response();
+    if auth.session.is_some() {
+        let secret = new_token();
+        let max_age = crate::web::SESSION_DAYS * 86_400;
+        st.store
+            .create_session(
+                &hash_token(&secret),
+                new_id,
+                amail_store::now_ms() + max_age * 1000,
+            )
+            .await?;
+        resp.headers_mut().insert(
+            header::SET_COOKIE,
+            crate::web::session_cookie(&secret, max_age, crate::web::https(&st, peer, &headers)),
+        );
+    }
+    Ok(resp)
 }
 
 /// `DELETE /v1/org` (user tokens) with `{"confirm": "<org name>"}`: delete
@@ -234,10 +257,14 @@ pub fn close_org(st: &AppState, org_id: i64) {
 }
 
 /// Background: end the streams of orgs that were suspended or deleted
-/// (by another instance, or on the database with `amail admin`).
+/// (by another instance, or on the database with `amail admin`), and the
+/// streams whose token or browser session is no longer valid.
 pub async fn sweep(st: AppState) {
     loop {
         tokio::time::sleep(st.config.sweep_every).await;
+        if let Err(e) = st.revocations.sweep(&*st.store).await {
+            tracing::warn!("checking the credentials of open streams: {e}");
+        }
         let open = st.limiters.streams.orgs();
         if open.is_empty() {
             continue;
