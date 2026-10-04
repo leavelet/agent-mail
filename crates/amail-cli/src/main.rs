@@ -685,8 +685,42 @@ enum OrgCmd {
     },
 }
 
+/// Whether the environment variable `name` is a server limit or the
+/// retention period and is set to the empty string.
+fn empty_limit_env(name: &std::ffi::OsStr) -> bool {
+    let n = name.to_string_lossy();
+    (n.starts_with("AMAIL_MAX_") || n == "AMAIL_RETENTION_DAYS")
+        && std::env::var_os(name).is_some_and(|v| v.is_empty())
+}
+
+/// Treat `AMAIL_MAX_*=` and `AMAIL_RETENTION_DAYS=` (set, but empty) as
+/// not set, so that an empty line in an `.env` file means "the default"
+/// instead of stopping the server.
+fn unset_empty_limit_env(mut cmd: clap::Command) -> clap::Command {
+    let ids: Vec<clap::Id> = cmd
+        .get_arguments()
+        .filter(|a| a.get_env().is_some_and(empty_limit_env))
+        .map(|a| a.get_id().clone())
+        .collect();
+    for id in ids {
+        cmd = cmd.mut_arg(id, |a| a.env(None::<&'static str>));
+    }
+    let subs: Vec<String> = cmd
+        .get_subcommands()
+        .map(|s| s.get_name().to_string())
+        .collect();
+    for name in subs {
+        cmd = cmd.mut_subcommand(name, unset_empty_limit_env);
+    }
+    cmd
+}
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = {
+        use clap::{CommandFactory, FromArgMatches};
+        let matches = unset_empty_limit_env(Cli::command()).get_matches();
+        Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())
+    };
     // The hook client runs on every harness hook: no runtime, no failures.
     if let Cmd::Hook { harness } = &cli.cmd {
         let out = amail_node::hook_client::run(harness);

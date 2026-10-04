@@ -454,6 +454,34 @@ async fn webhook_secrets_stay_out_of_logs() {
     }
 }
 
+/// An empty `AMAIL_MAX_*=` or `AMAIL_RETENTION_DAYS=` (as an `.env` file
+/// may set) means "not set"; a value that is not a number still fails.
+#[test]
+fn empty_limit_env_values_are_unset() {
+    let mut env = Env::new();
+    let db = format!(
+        "sqlite://{}?mode=rwc",
+        env.dir.path().join("db.sqlite").display()
+    );
+    for k in [
+        "AMAIL_MAX_ORG_QUERIES",
+        "AMAIL_MAX_SEATS_PER_ORG",
+        "AMAIL_MAX_SENDS_PER_SEC",
+        "AMAIL_RETENTION_DAYS",
+    ] {
+        env.extra.push((k.into(), String::new()));
+    }
+    let log = env.dir.path().join("serve.log");
+    // `serve` waits until the server answers.
+    let (server, _url) = serve(&env, &db, &["--public"], &log);
+    drop(server);
+    let err = env.fails(
+        &["serve", "--db", &db, "--listen", "127.0.0.1:1"],
+        &[("AMAIL_MAX_ORG_QUERIES", "x")],
+    );
+    assert!(err.contains("--max-org-queries"), "{err}");
+}
+
 #[test]
 fn init_and_doctor() {
     let env = Env::new();

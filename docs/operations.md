@@ -94,7 +94,8 @@ docker compose exec amail amail admin create-org acme
 
 The server is published on `127.0.0.1:${AMAIL_PORT:-8025}` only. Every
 setting of the table above can be set in `.env` (see `.env.example`), for
-example `AMAIL_PUBLIC=true`. For the single-container image with SQLite:
+example `AMAIL_PUBLIC=true`. An empty `AMAIL_MAX_*=` or
+`AMAIL_RETENTION_DAYS=` counts as not set (the default applies). For the single-container image with SQLite:
 
 ```sh
 docker build -t amail .
