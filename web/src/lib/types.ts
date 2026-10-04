@@ -7,7 +7,7 @@ export type Source = 'user' | 'agent' | 'external' | 'system';
 export type DeliveryClass = 'to' | 'cc' | 'list';
 export type DeliveryMode = 'immediate' | 'digest' | 'archive';
 export type Priority = 'normal' | 'urgent';
-export type TokenScope = 'user' | 'seat' | 'node';
+export type TokenScope = 'user' | 'seat' | 'node' | 'operator';
 export type PostPolicy = 'anyone' | 'members' | 'user_only';
 export type LinkState = 'requested' | 'invited' | 'active';
 export type PermissionMode = 'default' | 'unattended';
@@ -71,6 +71,8 @@ export interface MessageHeader {
   lines: number;
   created_at: string;
   meta?: Meta;
+  /** The server's retention period removed the body. */
+  expired?: boolean;
 }
 
 export interface Message extends MessageHeader {
@@ -263,4 +265,43 @@ export interface TranscriptStatus {
 
 export interface ApiErrorBody {
   error: { code: string; message: string; rejected?: { address: string; reason: string }[] };
+}
+
+/** `GET /v1/info` (no sign-in needed). */
+export interface ServerInfo {
+  version: string;
+  public: boolean;
+  registration: boolean;
+  retention_days?: number;
+}
+
+/** `POST /v1/register`: the user token is shown only here. */
+export interface RegisterResponse {
+  org: string;
+  user_seat: string;
+  token: string;
+}
+
+/** One org as the operator sees it (no mail content). */
+export interface OrgStat {
+  name: string;
+  created_at: string;
+  suspended_at?: string;
+  seats: number;
+  nodes: number;
+  messages: number;
+  messages_hour: number;
+  messages_day: number;
+  last_activity?: string;
+}
+
+/** `GET /v1/operator/stats`. */
+export interface OperatorStats {
+  orgs: number;
+  suspended: number;
+  seats: number;
+  nodes_online: number;
+  mail_last_5min: number;
+  mail_last_hour: number;
+  list: OrgStat[];
 }

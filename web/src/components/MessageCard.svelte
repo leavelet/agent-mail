@@ -45,7 +45,11 @@
       <MetaView meta={message.meta} />
     {/if}
   </header>
-  <pre class="body">{message.body}</pre>
+  {#if message.expired && !message.body}
+    <p class="expired faint">{t('msg.expired')}</p>
+  {:else}
+    <pre class="body">{message.body}</pre>
+  {/if}
   <footer class="row wrap">
     {@render actions?.()}
     {#if own}
@@ -124,6 +128,10 @@
   .src-external {
     color: var(--src-external);
     background: color-mix(in srgb, var(--src-external) 12%, transparent);
+  }
+  .expired {
+    margin: 6px 0;
+    font-style: italic;
   }
   .body {
     font-family: var(--font);

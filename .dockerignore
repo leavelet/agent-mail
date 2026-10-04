@@ -1,0 +1,11 @@
+target/
+.git/
+web/node_modules/
+web/.e2e/
+web/dist/
+web/test-results/
+web/playwright-report/
+*.db
+*.db-*
+*.sqlite*
+.env

@@ -92,6 +92,9 @@ pub fn message(m: &Message) -> String {
         out.push_str(&format!("Meta: {k}={v}\n"));
     }
     out.push('\n');
+    if h.expired && m.body.is_empty() {
+        out.push_str("(body removed: older than the server's retention period)");
+    }
     out.push_str(&m.body);
     if !m.body.ends_with('\n') {
         out.push('\n');

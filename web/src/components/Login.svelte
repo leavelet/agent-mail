@@ -1,6 +1,7 @@
 <script lang="ts">
   import { ApiError } from '../lib/api';
   import { store } from '../lib/store.svelte';
+  const operator = globalThis.location?.pathname === '/admin';
   import { t, ui } from '../lib/ui.svelte';
   import LangTheme from './LangTheme.svelte';
 
@@ -33,7 +34,7 @@
       <div class="logo" aria-hidden="true">✉</div>
       <h1>amail · {t('login.title')}</h1>
     </div>
-    <p class="muted">{t('login.intro')}</p>
+    <p class="muted">{operator ? t('login.operator') : t('login.intro')}</p>
     <label for="token">{t('login.token')}</label>
     <input
       id="token"
@@ -52,6 +53,9 @@
         {busy ? t('login.busy') : t('login.submit')}
       </button>
     </div>
+    {#if store.info?.registration && !operator}
+      <a class="reg" href="/register">{t('login.register')}</a>
+    {/if}
   </form>
   <div class="prefs"><LangTheme /></div>
 </main>
@@ -94,5 +98,9 @@
   }
   .hint {
     font-size: 12px;
+  }
+  .reg {
+    font-size: 13px;
+    align-self: flex-start;
   }
 </style>
