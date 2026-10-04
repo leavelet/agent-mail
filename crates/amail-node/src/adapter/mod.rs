@@ -6,7 +6,7 @@
 pub mod claude;
 pub mod codex;
 
-use crate::wire::LaunchPlan;
+use crate::wire::{GitAccess, LaunchPlan};
 use amail_proto::{LaunchInfo, PermissionMode, SeatState};
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -124,6 +124,9 @@ pub struct LaunchCtx<'a> {
     /// The permission mode chosen on this machine (team file or `amail run`
     /// flag). Only `Unattended` turns off the harness's permission prompts.
     pub permission_mode: PermissionMode,
+    /// The git access chosen on this machine (team file or `amail run`
+    /// flag). Used by the Codex adapter's sandbox profile.
+    pub git_access: GitAccess,
     pub cwd: &'a str,
     pub extra: &'a [String],
     /// One-time registration nonce, for adapters that register sessions.

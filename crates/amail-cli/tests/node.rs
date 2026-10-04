@@ -393,6 +393,7 @@ async fn codex_registration_and_rows(b: Backend) {
             pane: None,
             mux_session: None,
             permission_mode: Some(amail_proto::PermissionMode::Unattended),
+            git_access: None,
         })
         .await;
     assert!(plan.get("error").is_none(), "{plan}");
@@ -440,6 +441,7 @@ async fn codex_registration_and_rows(b: Backend) {
             pane: None,
             mux_session: None,
             permission_mode: None,
+            git_access: None,
         })
         .await;
     assert!(
@@ -462,6 +464,7 @@ async fn codex_registration_and_rows(b: Backend) {
             pane: None,
             mux_session: None,
             permission_mode: None,
+            git_access: None,
         })
         .await;
     assert!(prompting.get("error").is_none(), "{prompting}");
@@ -1651,6 +1654,7 @@ async fn socket_checks_callers(b: Backend) {
             pane: None,
             mux_session: None,
             permission_mode: None,
+            git_access: None,
         })
         .await;
     let pass = plan["env"]["AMAIL_CODEX_PASS"]
@@ -1783,6 +1787,7 @@ env -u AMAIL_TOKEN CODEX_THREAD_ID={tid} AMAIL_CODEX_PASS={pass} timeout 10 "$B"
             pane: None,
             mux_session: None,
             permission_mode: None,
+            git_access: None,
         },
     )
     .await;
@@ -1861,6 +1866,7 @@ async fn transcript_paths_are_checked(b: Backend) {
             pane: None,
             mux_session: None,
             permission_mode: None,
+            git_access: None,
         })
         .await;
     let prompt = plan["args"].as_array().unwrap().last().unwrap().clone();

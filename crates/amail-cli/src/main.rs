@@ -210,6 +210,15 @@ enum Cmd {
         /// The server's seat setting is never used.
         #[arg(long, value_parser = parse_permission_mode)]
         permission_mode: Option<p::PermissionMode>,
+        /// Codex seats: what the session's sandbox may write in the git
+        /// repository. `worktree` (commit, rebase and merge in a linked
+        /// worktree; git config and hooks stay read-only), `full` (the
+        /// whole git directory and the main checkout; the session can then
+        /// make git run commands outside its sandbox) or `off`. Without it,
+        /// a supervised seat uses its team file's `git_access`, any other
+        /// seat `worktree`.
+        #[arg(long, value_parser = parse_git_access)]
+        git_access: Option<amail_node::wire::GitAccess>,
         /// The node socket (default: AMAIL_NODE_SOCK, then the standard path).
         #[arg(long)]
         socket: Option<PathBuf>,
@@ -693,6 +702,7 @@ fn main() -> ExitCode {
         seat,
         harness,
         permission_mode,
+        git_access,
         socket,
         extra,
     } = &cli.cmd
@@ -702,6 +712,7 @@ fn main() -> ExitCode {
                 seat,
                 harness.clone(),
                 *permission_mode,
+                *git_access,
                 socket.clone(),
                 extra.clone(),
             )
@@ -1603,6 +1614,10 @@ fn parse_permission_mode(s: &str) -> Result<p::PermissionMode, String> {
         .map_err(|_| format!("{s:?}: expected \"default\" or \"unattended\""))
 }
 
+fn parse_git_access(s: &str) -> Result<amail_node::wire::GitAccess, String> {
+    s.parse()
+}
+
 fn parse_meta(items: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
     let mut m = std::collections::BTreeMap::new();
     for it in items {
@@ -1821,6 +1836,7 @@ fn run_seat(
     seat: &str,
     harness: Option<String>,
     permission_mode: Option<p::PermissionMode>,
+    git_access: Option<amail_node::wire::GitAccess>,
     socket: Option<PathBuf>,
     extra: Vec<String>,
 ) -> Result<()> {
@@ -1845,6 +1861,7 @@ fn run_seat(
             pane,
             mux_session,
             permission_mode,
+            git_access,
         },
         std::time::Duration::from_secs(180),
     )?;

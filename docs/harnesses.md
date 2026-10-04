@@ -100,35 +100,72 @@ keep the session on the shared daemon are allowed (`-m`, `-a`, `-s`, `-C`,
 
 **Sandbox and permissions.** `unattended` Codex seats (chosen in the team
 file or with `amail run --permission-mode`, as for Claude Code) run with `-a never`
-under the home's `amail` permissions profile: the workspace sandbox (the
-working directory, `/tmp` and `$TMPDIR` writable, everything else
-read-only), network access, and write access to the git directory and the
-repository's common git directory of every Codex seat's working directory,
-so that a seat in a git worktree can commit, rebase and create branches
-(the plain workspace sandbox keeps `.git` read-only, and a worktree's git
-directory lies outside it). The write grant covers each of these
-directories except `hooks/`, `config`, `config.worktree`, `modules/` and
-`worktrees/` of the repository's git directory, and `commondir` and
-`config.worktree` of each linked worktree's git directory (each existing
-linked worktree's git directory is writable, because `git gc` locks every
-worktree's reflog). These entries stay read-only, and those that do not
-exist cannot be created; see [security](security.md) ("Codex seats and
-git") for the reason and the remaining gap (`.git/commondir`). Codex accepts only directories as write
-roots, and git creates lock and state files next to the files it changes,
-so the grant cannot be narrowed to a list of files. Consequences:
+under a permissions profile in the dedicated home: the workspace sandbox
+(the working directory, `/tmp` and `$TMPDIR` writable, everything else
+read-only), network access, and the git grants of the seat's `git_access`.
+The plain workspace sandbox keeps `.git` read-only, and a linked worktree's
+git directory lies outside the worktree, so without a grant a session
+cannot commit. `git_access` is set per seat in the team file (or with
+`amail run --git-access`):
+
+| `git_access` | profile | what sessions may write |
+|---|---|---|
+| `worktree` (default) | `amail` | In a linked worktree: the repository's `objects/`, `refs/`, branch reflogs (`logs/refs/`) and `amail/` (see below), and the worktree's own git directory except its `commondir`, `gitdir` and `config.worktree`. Nothing else in the root of the repository's git directory: `config`, `hooks/`, `info/`, `commondir` and the main checkout's `HEAD`, `index` and `logs/HEAD` stay read-only, and so does the reflog of the branch checked out in the main checkout. In a main checkout: nothing (the session cannot commit; `amail run` says so). |
+| `full` | `amail-full` | The whole git directory of the repository and its main checkout, except `hooks/`, `config`, `config.worktree`, `modules/` and `worktrees/` (and `commondir`, `gitdir` and `config.worktree` in each linked worktree's git directory). For a seat that merges in the main checkout. |
+| `off` | `amail-off` | No git grant. |
+
+The staged-merge template gives its root seat `full` when the team has
+other seats (the root merges into the main branch in the main checkout);
+`amail up` names such seats in its output. Everyone else gets `worktree`
+unless the team file says otherwise. With `full`, a session can make git
+run commands outside its sandbox (see [security](security.md), "Codex seats
+and git"); give it only to seats that need it.
+
+How it is set up:
+
+- All Codex seats of a host share one Codex home, and with it one
+  `default_permissions` (`amail`). The `amail` profile holds the
+  `worktree` grants of every such seat on the host: a session can also write
+  the git directories of the other seats' worktrees. A seat with `full` or
+  `off` gets its own profile through a project config amail writes into
+  its working directory, `.codex/config.toml` (with a `.codex/.gitignore`
+  so git ignores both); Codex reads `default_permissions` from there, and
+  keeps `.codex/` read-only inside the sandbox. amail removes the file when
+  the seat goes back to `worktree`. A seat does not start when a
+  `.codex/config.toml` amail did not write sets `default_permissions` in
+  its working directory or a directory above it in the checkout, or when
+  another seat with another `git_access` uses the same directory.
+- Git takes the lock `packed-refs.lock` in the directory of `packed-refs`
+  whenever it deletes a ref, which a rebase does. So that `worktree`
+  sessions can take it without write access to the root of the git
+  directory, the node moves `packed-refs` into `.git/amail/` and leaves a
+  symbolic link `.git/packed-refs -> amail/packed-refs` (git follows it when
+  it reads, locks and rewrites the file). The file itself stays read-only
+  in the sandbox. To undo, move `.git/amail/packed-refs` back over the link.
+- Codex accepts only directories as write roots (a file as a write root
+  stops the sandbox from starting), and a missing file can only be made
+  read-only as an empty placeholder, so the grants are directories minus
+  read-only entries, not a list of files.
+
+Consequences:
 
 - Codex needs network access in its sandbox to reach the amail server:
   with networking disabled, the sandbox refuses both TCP and Unix-socket
   connections. The dedicated home allows it.
-- Permissions are per host, not per seat: every Codex session on a host may
-  write the git directories of all Codex seats' repositories on that host.
-- Sessions cannot change git config (`git config`, `git remote add`,
-  `git branch --set-upstream-to`, which prints an error but exits with
-  status 0), add worktrees, or initialise or commit in submodules. Do these
-  outside the session.
-- A Codex seat does not start while a git directory in the profile contains
-  a `commondir` file where git never creates one (a repository's own git
-  directory).
+- With `worktree`, sessions commit, amend, rebase, merge, cherry-pick,
+  stash, reset, tag and create branches in a linked worktree. They cannot
+  delete branches or tags (`git branch -d` rewrites `packed-refs`), change
+  git config (`git config`, `git remote add`, `git branch
+  --set-upstream-to`, which prints an error but exits with status 0), add
+  worktrees, or initialise or commit in submodules. Do these outside the
+  session. A Codex seat whose working directory is a main checkout needs a
+  linked worktree (`amail up` creates them for the staged-merge template)
+  or `full` to commit.
+- A Codex seat does not start while a repository it may write contains a
+  `commondir` file in its git directory (git never creates one there), or a
+  symbolic link in `refs/`, `logs/`, `amail/` or a linked worktree's git
+  directory (git never creates those either). `amail up` checks the same
+  before it runs git in the repository.
 - Codex's sandbox needs unprivileged user namespaces. Some distributions
   restrict them (for example `kernel.apparmor_restrict_unprivileged_userns
   = 1`); then every sandboxed command fails. `amail doctor` checks this.

@@ -134,6 +134,9 @@ pub struct Managed {
     /// The permission mode from the team file (see `SeatPlacement`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<amail_proto::PermissionMode>,
+    /// The git access from the team file (see `SeatPlacement`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_access: Option<crate::wire::GitAccess>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

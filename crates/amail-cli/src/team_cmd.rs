@@ -5,7 +5,7 @@
 use crate::Out;
 use crate::client::{Client, enc};
 use amail_node::team::{self, Team};
-use amail_node::wire::{PsRow, Request, SeatPlacement};
+use amail_node::wire::{GitAccess, PsRow, Request, SeatPlacement};
 use amail_proto::{self as p, PostPolicy, SeatKind, TokenScope};
 use anyhow::{Context, Result, bail};
 use reqwest::Method;
@@ -373,9 +373,25 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
                 tab,
                 paste_fallback: plan.paste_fallback,
                 permission_mode: plan.permission_mode,
+                git_access: Some(t.git_access(&s)),
             }
         })
         .collect();
+    for p in &placements {
+        if p.harness == "codex" && p.git_access == Some(GitAccess::Full) {
+            let why = if t.seat(&p.seat).is_some_and(|s| s.git_access.is_some()) {
+                "set in the team file"
+            } else {
+                "the staged-merge root merges in the main checkout"
+            };
+            report.push(format!(
+                "seat {}: git_access full ({why}): its Codex sessions can write the whole \
+                 git directory and the main checkout, including git hooks and config, so \
+                 they can make git run commands outside their sandbox",
+                p.seat
+            ));
+        }
+    }
     let v = node(
         &Request::Up {
             seats: placements,

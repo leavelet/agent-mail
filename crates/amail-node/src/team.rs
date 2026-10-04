@@ -27,6 +27,7 @@
 //! workers = { count = 3, prefix = "be" }   # be-1 .. be-3, reporting to be-lead
 //! ```
 
+use crate::wire::GitAccess;
 use amail_proto::{PermissionMode, valid_name};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
@@ -69,6 +70,7 @@ struct SeatOpts {
     harness: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
+    git_access: Option<String>,
     /// Allow the guarded terminal-paste wake-up (see the node).
     paste_fallback: Option<bool>,
 }
@@ -81,6 +83,7 @@ struct SeatRaw {
     harness: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
+    git_access: Option<String>,
     role: Option<String>,
     role_file: Option<PathBuf>,
     cwd: Option<PathBuf>,
@@ -109,6 +112,7 @@ struct WorkersRaw {
     harness: Option<String>,
     model: Option<String>,
     permission_mode: Option<String>,
+    git_access: Option<String>,
     role: Option<String>,
     role_file: Option<PathBuf>,
 }
@@ -182,6 +186,8 @@ pub struct SeatPlan {
     pub harness: String,
     pub model: Option<String>,
     pub permission_mode: Option<PermissionMode>,
+    /// `git_access` as written in the file (see [`Team::git_access`]).
+    pub git_access: Option<GitAccess>,
     /// The seat's own role text (`role` or the contents of `role_file`).
     pub role: Option<String>,
     /// Explicit working directory (absolute).
@@ -402,6 +408,18 @@ pub fn parse(text: &str, base: &Path) -> Result<Team, TeamError> {
                 ))
             })?),
         };
+        let git_access = match s
+            .git_access
+            .clone()
+            .or_else(|| inherit.git_access.clone())
+            .or_else(|| defaults.git_access.clone())
+        {
+            None => None,
+            Some(g) => Some(
+                g.parse::<GitAccess>()
+                    .map_err(|e| TeamError(format!("{what}: {e}")))?,
+            ),
+        };
         if s.role.is_some() && s.role_file.is_some() {
             return err(format!("{what}: give role or role_file, not both"));
         }
@@ -428,6 +446,7 @@ pub fn parse(text: &str, base: &Path) -> Result<Team, TeamError> {
                 .or_else(|| inherit.model.clone())
                 .or_else(|| defaults.model.clone()),
             permission_mode: pm,
+            git_access,
             role,
             cwd: s.cwd.as_deref().map(|p| abs(base, p)),
             display_name: s.display_name.clone(),
@@ -511,6 +530,7 @@ pub fn parse(text: &str, base: &Path) -> Result<Team, TeamError> {
                     harness: w.harness.clone(),
                     model: w.model.clone(),
                     permission_mode: w.permission_mode.clone(),
+                    git_access: w.git_access.clone(),
                     paste_fallback: None,
                 };
                 for n in 1..=w.count {
@@ -683,6 +703,22 @@ impl Team {
             Template::Custom(dir) => crate::template::custom_workdir(dir) == "worktree",
             Template::None => false,
         }
+    }
+
+    /// The seat's git access: the file's `git_access`, else `full` for the
+    /// root of a staged-merge team that has subordinates (it merges into
+    /// the main branch in the main checkout), else `worktree`.
+    pub fn git_access(&self, name: &str) -> GitAccess {
+        if let Some(g) = self.seat(name).and_then(|s| s.git_access) {
+            return g;
+        }
+        if self.template == Template::StagedMerge
+            && self.position(name) == Position::Root
+            && !self.children(name).is_empty()
+        {
+            return GitAccess::Full;
+        }
+        GitAccess::Worktree
     }
 
     /// The seat's working directory.
@@ -1117,6 +1153,69 @@ harness = "codex"
             let e = team(text).expect_err(text).0;
             assert!(e.contains(want), "{text:?}: got {e:?}, want {want:?}");
         }
+    }
+
+    #[test]
+    fn git_access_defaults_and_overrides() {
+        let t = team(EXAMPLE).unwrap();
+        // No staged-merge template: everyone gets the default.
+        assert!(
+            t.seats
+                .iter()
+                .all(|s| t.git_access(&s.name) == GitAccess::Worktree)
+        );
+        let t = team(
+            r#"
+[team]
+template = "staged-merge"
+repo = "/repo"
+workroot = "/wt"
+
+[defaults]
+harness = "codex"
+
+[[seat]]
+name = "root"
+
+[[group]]
+name = "g"
+parent = "root"
+lead = { name = "lead" }
+workers = [{ name = "w1" }, { name = "w2", git_access = "off" }]
+"#,
+        )
+        .unwrap();
+        // The staged-merge root merges in the main checkout.
+        assert_eq!(t.git_access("root"), GitAccess::Full);
+        assert_eq!(t.git_access("lead"), GitAccess::Worktree);
+        assert_eq!(t.git_access("w1"), GitAccess::Worktree);
+        assert_eq!(t.git_access("w2"), GitAccess::Off);
+        let t = team(
+            r#"
+[team]
+template = "staged-merge"
+repo = "/repo"
+workroot = "/wt"
+
+[defaults]
+harness = "codex"
+git_access = "worktree"
+
+[[seat]]
+name = "root"
+
+[[seat]]
+name = "w"
+parent = "root"
+"#,
+        )
+        .unwrap();
+        // An explicit setting (here from [defaults]) wins.
+        assert_eq!(t.git_access("root"), GitAccess::Worktree);
+        let e =
+            team("[defaults]\nharness = \"codex\"\ngit_access = \"all\"\n[[seat]]\nname = \"a\"\n")
+                .unwrap_err();
+        assert!(e.0.contains("git_access"), "{e:?}");
     }
 
     #[test]

@@ -70,7 +70,7 @@ exit code.
 | `amail node token [--save]` | issue a node token (user token needed); `--save` writes it with the URL to `<state dir>/node.toml` |
 | `amail node status` | the node's view of its seats |
 | `amail node web-token` | a login token for the node's browser terminal |
-| `amail run <seat> [--harness claude\|codex] [--permission-mode default\|unattended] [-- args]` | start the seat's harness session in this terminal. `--permission-mode unattended` runs it without permission prompts; without the flag a seat placed by `amail up` uses its team file's `permission_mode` and any other seat keeps the prompts. The server's seat setting is not used |
+| `amail run <seat> [--harness claude\|codex] [--permission-mode default\|unattended] [--git-access worktree\|full\|off] [-- args]` | start the seat's harness session in this terminal. `--permission-mode unattended` runs it without permission prompts; without the flag a seat placed by `amail up` uses its team file's `permission_mode` and any other seat keeps the prompts. The server's seat setting is not used. `--git-access` (Codex seats) sets what the sandbox may write in the git repository (see [harness support](harnesses.md)); without it a seat placed by `amail up` uses its team file's `git_access`, any other seat `worktree` |
 | `amail up [-f amail.toml] [--only g,s] [--no-start] [--prune]` | bring a team up from a team file ([team files](teams.md)) |
 | `amail down [--only g,s]` / `amail ps` | stop the team's sessions / one line per seat |
 | `amail attach <group or seat>` / `amail sleep <seat>` / `amail wake <seat>` | attach to a group's zellij session / put a seat to sleep / start it now |

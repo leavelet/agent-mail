@@ -26,7 +26,7 @@
 use crate::adapter::{Adapter, AdapterEnv, Event, Harness, Hook, LaunchCtx, Output};
 use crate::persist::{self, LiveSession, Reservation, Saved, SessionReg};
 use crate::server::{ClaimSpec, ServerClient};
-use crate::wire::{Credentials, LaunchPlan, Request};
+use crate::wire::{Credentials, GitAccess, LaunchPlan, Request};
 use amail_proto::{
     DeliveryClass, InboxEntry, MailboxEvent, PendingCounts, PermissionMode, PresenceReport,
     PresenceUpdate, Priority, SeatState,
@@ -981,6 +981,7 @@ impl Node {
                 pane,
                 mux_session,
                 permission_mode,
+                git_access,
             } => match self
                 .launch(
                     &seat,
@@ -991,6 +992,7 @@ impl Node {
                     pane,
                     mux_session,
                     permission_mode,
+                    git_access,
                 )
                 .await
             {
@@ -1041,6 +1043,7 @@ impl Node {
                 pane,
                 mux_session,
                 permission_mode,
+                git_access,
                 ..
             } => Ok(Request::Launch {
                 seat,
@@ -1052,6 +1055,7 @@ impl Node {
                 pane,
                 mux_session,
                 permission_mode,
+                git_access,
             }),
             req => Ok(req),
         }
@@ -1621,6 +1625,7 @@ impl Node {
         pane: Option<u32>,
         mux_session: Option<String>,
         permission_mode: Option<PermissionMode>,
+        git_access: Option<GitAccess>,
     ) -> Result<LaunchPlan> {
         let managed = self.lock().saved.managed.get(seat).cloned();
         let harness = harness.or(managed.as_ref().map(|m| m.harness.as_str()));
@@ -1649,6 +1654,10 @@ impl Node {
             tracing::warn!("{n}");
         }
         info.permission_mode = Some(mode);
+        // Git access, like the permission mode, is decided on this machine.
+        let git_access = git_access
+            .or(managed.as_ref().and_then(|m| m.git_access))
+            .unwrap_or_default();
         if let Some(m) = info.model.take_if(|m| !valid_model(m)) {
             tracing::warn!("seat {seat}: ignoring the server's model {m:?}");
         }
@@ -1694,6 +1703,7 @@ impl Node {
             .launch(&LaunchCtx {
                 info: &info,
                 permission_mode: mode,
+                git_access,
                 cwd,
                 extra,
                 nonce: &nonce,
@@ -1716,6 +1726,11 @@ impl Node {
             );
             st.save_dirty = true;
         }
+        // The adapter's notice (if any) follows the node's.
+        let notice = match (notice, plan.notice.clone()) {
+            (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
+            (a, b) => a.or(b),
+        };
         let plan = LaunchPlan { notice, ..plan };
         if managed.is_some() {
             let lazy = self.adapter(h).resume_is_lazy();

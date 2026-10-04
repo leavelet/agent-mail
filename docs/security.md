@@ -186,27 +186,48 @@ In our tests, agents of both supported harnesses refused a deletion
 requested by another org's user and carried out the same request from their
 own user. This is model behaviour, not a guarantee.
 
-**Codex seats and git.** The `amail` permissions profile in the node's
-Codex home lets sessions write the git directories of every Codex seat's
-working directory on the host, so that seats can commit, rebase and merge.
-In those directories, the entries that git runs or reads as configuration
-stay read-only: `hooks/`, `config`, `config.worktree`, `modules/` and
-`worktrees/` of a repository's git directory, and `commondir` and
-`config.worktree` of each linked worktree's git directory. Entries that do
-not exist are covered too: Codex puts a read-only placeholder at their path,
-so they cannot be created. A session therefore cannot add a hook or set
-`core.hooksPath`, `core.fsmonitor` or a similar key that git would run
-later, outside the sandbox. What remains:
+**Codex seats and git.** Codex seats can commit only where their sandbox
+profile lets them write git directories. What they may write is set per
+seat with `git_access` (see [harness support](harnesses.md) for the exact
+rules):
 
-- Codex cannot protect a file that does not exist without making git fail
-  to read it, so a session can still create `commondir` in a repository's
-  git directory (`.git/commondir`). Git run in that repository's main
-  checkout (not in its linked worktrees) then reads config and hooks from
-  the directory the file names. Git never creates this file there. amail
-  refuses to start a Codex seat while a git directory it grants contains
-  one, and `amail up` refuses to prepare worktrees in such a repository.
-  Git commands you run yourself do not check for it. If you find one, remove it and look at the directory it names before
-  you run git in that checkout.
+- `worktree` (the default): in a linked worktree, the repository's objects,
+  refs and branch reflogs, and the worktree's own git directory. The root
+  of the repository's git directory stays read-only, so a session cannot
+  create or change `config`, `hooks/`, `info/`, `modules/` or `commondir`
+  there (a `commondir` file would make git run in the main checkout take its
+  config, and so commands such as `core.fsmonitor`, from a directory the
+  session chose). In the worktree's git directory, `commondir`, `gitdir`
+  and `config.worktree` stay read-only. A session therefore cannot make git
+  run a command outside the sandbox through hooks or configuration.
+- `full`: the whole git directory and the main checkout, minus `hooks/`,
+  `config`, `config.worktree`, `modules/` and `worktrees/`. A session with
+  `full` can still create `.git/commondir` (Codex cannot keep a missing
+  file from being created without making git fail to read it), and git run
+  in the main checkout then takes config and hooks from the directory the
+  file names: **a `full` session can make git run commands outside its
+  sandbox, as you**. The staged-merge template gives `full` to its root
+  seat, which merges in the main checkout; `amail up` names such seats. Set
+  `git_access = "worktree"` for that seat and merge yourself if you do not
+  want this.
+- `off`: no git grant.
+
+What remains with `worktree`:
+
+- Git appends reflog lines through symbolic links. A session can replace a
+  branch's reflog in `logs/refs/` (or a file in its worktree's git
+  directory) with a symbolic link to a file of yours, for example a shell
+  start-up file; the next time you or a `full` seat change that branch
+  outside the sandbox, git appends a line that ends with a commit subject
+  the session chose. This needs you to run git on that branch (the reflog
+  of the branch checked out in the main checkout, and `logs/HEAD`, stay
+  read-only). amail refuses to start a Codex seat, and `amail up` refuses to
+  run git, while a repository's `refs/`, `logs/`, `amail/` or a linked
+  worktree's git directory contains a symbolic link; git never creates
+  one there. Git commands you run yourself do not check for this. If amail
+  reports one, look at where it points and remove it.
+- A session can write any branch and tag of the repository, not only its
+  own.
 - A seat can leave an unfinished rebase whose todo list contains `exec`
   lines; `git rebase --continue` runs them. Before you continue a rebase a
   seat started, read its todo list (`git status` shows it);

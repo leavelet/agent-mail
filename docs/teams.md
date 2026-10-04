@@ -46,6 +46,7 @@ restart = "on-failure"           # or "never"
 harness = "claude"               # or "codex"
 model = "sonnet"                 # any model name the harness accepts
 permission_mode = "unattended"   # or "default" (keep the harness's prompts)
+# git_access = "worktree"        # Codex seats: "worktree" (default), "full" or "off"
 # paste_fallback = true          # see docs/harnesses.md; off by default
 
 [[seat]]
@@ -95,6 +96,18 @@ the server says `unattended` and the team file does not, the node keeps
 the prompts and logs a notice. After upgrading from a version where the
 server's setting decided, run `amail up` once so that the node learns each
 seat's mode from the team file.
+
+`git_access` (Codex seats; in `[defaults]`, a `workers` table or a seat)
+sets what a session's sandbox may write in the git repository. The default,
+`"worktree"`, lets a seat commit, rebase and merge in its own linked
+worktree while the repository's git config and hooks stay read-only.
+`"full"` also lets it write the whole git directory and the main checkout,
+which a seat needs to merge in the main checkout; such a session can make
+git run commands outside its sandbox. `"off"` grants nothing. The
+staged-merge template gives the root seat `"full"` when it has
+subordinates, unless the file sets `git_access` for it; `amail up` names
+every Codex seat with `"full"`. See [harness support](harnesses.md) for the
+exact rules.
 
 ## Templates
 
