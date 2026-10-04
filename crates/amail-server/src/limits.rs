@@ -164,6 +164,19 @@ pub struct Limiters {
     pub queries: QuerySlots,
     /// Node notice reports per org (always on).
     pub node_notices: Buckets<i64>,
+    /// Held while one node notice report checks and uses its org's daily
+    /// notice budget, so that two reports do not both pass one count.
+    pub notice_budget: tokio::sync::Mutex<()>,
+    /// Failed authentications per client address (IPv6: per /64). When a
+    /// client's bucket is empty, its requests with a credential that is not
+    /// in [`Limiters::known_credentials`] are refused before the database
+    /// is asked.
+    pub auth_failures: Option<Buckets<String>>,
+    /// Credentials (by hash) that were valid lately.
+    pub known_credentials: KnownCredentials,
+    /// Credential lookups in the database by the authentication extractors
+    /// (diagnostics and tests).
+    pub auth_lookups: std::sync::atomic::AtomicU64,
 }
 
 impl Limiters {
@@ -195,6 +208,15 @@ impl Limiters {
                 amail_proto::limits::NODE_NOTICES_PER_HOUR,
                 amail_proto::limits::NODE_NOTICE_BURST,
             ),
+            notice_budget: tokio::sync::Mutex::new(()),
+            auth_failures: l.auth_failures_per_min.map(|n| {
+                Buckets::new(
+                    n / 60.0,
+                    n * amail_proto::limits::AUTH_FAILURE_BURST_MINUTES,
+                )
+            }),
+            known_credentials: KnownCredentials::default(),
+            auth_lookups: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -223,6 +245,43 @@ impl Limiters {
         }
         self.queries.prune();
         self.node_notices.prune();
+        if let Some(b) = &self.auth_failures {
+            b.prune();
+        }
+    }
+}
+
+/// Credentials (by the first 8 bytes of their hash) that were valid lately,
+/// for at most [`MAX_KEYS`] credentials (when full, it starts over). A
+/// credential in it is not refused by the failed-authentication limit; it
+/// is still checked by the database like any other. A guessed credential
+/// gets in only by matching the prefix of a valid credential's hash, which
+/// the client does not know.
+#[derive(Default)]
+pub struct KnownCredentials {
+    set: Mutex<std::collections::HashSet<u64>>,
+}
+
+impl KnownCredentials {
+    fn key(hash: &str) -> u64 {
+        u64::from_str_radix(hash.get(..16).unwrap_or(hash), 16).unwrap_or(0)
+    }
+
+    pub fn contains(&self, hash: &str) -> bool {
+        self.set.lock().unwrap().contains(&Self::key(hash))
+    }
+
+    pub fn insert(&self, hash: &str) {
+        let mut s = self.set.lock().unwrap();
+        let k = Self::key(hash);
+        if s.len() >= MAX_KEYS && !s.contains(&k) {
+            s.clear();
+        }
+        s.insert(k);
+    }
+
+    pub fn remove(&self, hash: &str) {
+        self.set.lock().unwrap().remove(&Self::key(hash));
     }
 }
 

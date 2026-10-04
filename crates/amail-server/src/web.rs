@@ -140,12 +140,16 @@ pub async fn login(
     }
     check_csrf(&Method::POST, &headers, peer.proxied)?;
     let hash = hash_token(req.token.trim());
+    let ticket = crate::auth::auth_gate(&st, &peer, &hash)?;
     let Some(auth) = st.store.token_auth(&hash).await? else {
         if let Some(op) = st.store.operator_auth(&hash).await? {
+            crate::auth::auth_outcome(&st, &peer, &hash, ticket, true);
             return operator_login(&st, peer, &headers, op).await;
         }
+        crate::auth::auth_outcome(&st, &peer, &hash, ticket, false);
         return Err(ApiError::unauthorized("invalid or revoked token"));
     };
+    crate::auth::auth_outcome(&st, &peer, &hash, ticket, true);
     if auth.org.suspended_at.is_some() {
         return Err(crate::auth::suspended());
     }

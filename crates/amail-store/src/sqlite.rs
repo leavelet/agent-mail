@@ -167,7 +167,15 @@ impl SqliteStore {
         let now = now_ms();
         let meta = meta_to_db(&m.meta);
         let (to, cc) = (join_addrs(&m.to_addrs), join_addrs(&m.cc_addrs));
-        let bytes = message_bytes(&m.subject, &m.body, &meta, &to, &cc);
+        // Notice mail is charged to nobody (see `message_bytes`).
+        let (bytes, per_delivery) = if m.notice {
+            (0, 0)
+        } else {
+            (
+                message_bytes(&m.subject, &m.body, &meta, &to, &cc),
+                amail_proto::limits::STORED_BYTES_PER_DELIVERY,
+            )
+        };
         let rows: Vec<(i64, i64, i64, i64, i64)> = self
             .write(move |c| {
                 Box::pin(async move {
@@ -190,7 +198,8 @@ impl SqliteStore {
                         .bind(m.ack_due)
                         .bind(bytes)
                         .bind(m.storage_quota)
-                        .bind(amail_proto::limits::STORED_BYTES_PER_DELIVERY)
+                        .bind(per_delivery)
+                        .bind(m.notice)
                         .fetch_all(&mut *c)
                         .await;
                     match rows {
@@ -279,7 +288,8 @@ impl SqliteStore {
 /// $5 depth, $6 subject, $7 body, $8 lines, $9 to, $10 cc, $11 priority,
 /// $12 ack_required, $13 now, $14 deliveries JSON, $15 meta, $16 ack_due,
 /// $17 the message's bytes without its deliveries (see `message_bytes`),
-/// $18 the org's storage quota (NULL: none), $19 the bytes per delivery.
+/// $18 the org's storage quota (NULL: none), $19 the bytes per delivery,
+/// $20 whether it is notice mail.
 /// The org's `stored_bytes` grows by $17 plus $19 per delivery created; the
 /// message is refused when that would exceed $18, and also when the org was
 /// deleted meanwhile.
@@ -288,8 +298,8 @@ const SEND_SQL: &str = "
 UPDATE temp.send_quota SET fits = COALESCE((SELECT deleted_at IS NULL
        AND ($18 IS NULL OR stored_bytes + $17 + $19 * json_array_length($14) <= $18) FROM orgs WHERE id = $1), FALSE);
 INSERT INTO messages (org_id, sender_seat_id, thread_id, parent_id, depth, subject, body, lines,
-                      to_addrs, cc_addrs, priority, ack_required, created_at, meta, ack_due)
-VALUES ($1, $2, COALESCE($3, 0), $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $15, $16);
+                      to_addrs, cc_addrs, priority, ack_required, created_at, meta, ack_due, notice)
+VALUES ($1, $2, COALESCE($3, 0), $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $15, $16, $20);
 UPDATE messages SET thread_id = id WHERE id = last_insert_rowid() AND $3 IS NULL;
 UPDATE seats SET last_seq = last_seq + 1
  WHERE id IN (SELECT json_extract(value, '$.s') FROM json_each($14));

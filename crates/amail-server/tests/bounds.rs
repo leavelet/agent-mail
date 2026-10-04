@@ -49,6 +49,7 @@ bound_tests!(
     org_deletion_keeps_received_mail,
     deleted_org_mail_is_charged_to_receivers,
     claim_loads_bounded_bodies,
+    failed_authentication_is_limited_per_address,
 );
 
 /// Start a server; `None` (test skipped) when Postgres is not configured.
@@ -1267,5 +1268,105 @@ async fn claim_loads_bounded_bodies(b: Backend, t: &str) {
     assert!(
         !e[1]["delivery"]["read_at"].is_null(),
         "short body not marked read"
+    );
+}
+
+/// After `auth_failures_per_min * AUTH_FAILURE_BURST_MINUTES` failed
+/// authentications from one client address (IPv6: one /64), its requests
+/// with credentials the server has not seen valid lately get 429 without a
+/// database lookup; credentials that were valid keep working from there,
+/// and other addresses are not affected.
+async fn failed_authentication_is_limited_per_address(b: Backend, t: &str) {
+    let mut cfg = public();
+    cfg.trusted_proxies = vec!["127.0.0.1".parse().unwrap()];
+    let limiters = Arc::new(Mutex::new(None));
+    let l2 = limiters.clone();
+    let srv = start!(b, t, cfg, move |st: &mut AppState| {
+        *l2.lock().unwrap() = Some(st.limiters.clone());
+    });
+    let limiters = limiters.lock().unwrap().clone().unwrap();
+    let lookups = || {
+        limiters
+            .auth_lookups
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    let burst = (amail_server::config::Limits::public()
+        .auth_failures_per_min
+        .unwrap()
+        * amail_proto::limits::AUTH_FAILURE_BURST_MINUTES) as usize;
+    let acme = srv.org("acme").await;
+    acme.ok(Method::POST, "/seats", Some(json!({ "name": "w1" })))
+        .await;
+    let fresh = acme
+        .ok(Method::POST, "/seats/w1/tokens", Some(json!({})))
+        .await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let from = |token: &str, ip: &str| {
+        let req = srv
+            .http
+            .get(format!("{}/v1/inbox", srv.base))
+            .bearer_auth(token)
+            .header("X-Forwarded-For", ip);
+        async move { req.send().await.unwrap().status() }
+    };
+    let attacker = "198.51.100.7";
+    // The user's token was used from the attacker's address before.
+    assert_eq!(from(&acme.token, attacker).await, StatusCode::OK);
+    let start = lookups();
+    let mut codes = std::collections::BTreeMap::new();
+    for _ in 0..300 {
+        *codes.entry(from(&new_token(), attacker).await).or_insert(0) += 1;
+    }
+    assert_eq!(
+        codes,
+        [
+            (StatusCode::UNAUTHORIZED, burst),
+            (StatusCode::TOO_MANY_REQUESTS, 300 - burst)
+        ]
+        .into(),
+    );
+    // Only the first `burst` reached the database.
+    assert_eq!(lookups() - start, burst as u64);
+    // Valid credentials still work, from another address and from the
+    // limited one; a credential not seen yet works from other addresses.
+    assert_eq!(from(&acme.token, "203.0.113.5").await, StatusCode::OK);
+    assert_eq!(from(&acme.token, attacker).await, StatusCode::OK);
+    assert_eq!(from(&fresh, attacker).await, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(from(&fresh, "203.0.113.5").await, StatusCode::OK);
+    assert_eq!(from(&fresh, attacker).await, StatusCode::OK);
+    // Sign-in and operator requests count as well.
+    let r = srv
+        .http
+        .post(format!("{}/v1/session", srv.base))
+        .header("X-Amail-Csrf", "1")
+        .header("X-Forwarded-For", attacker)
+        .json(&json!({ "token": new_token() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    let r = srv
+        .http
+        .get(format!("{}/v1/operator/stats", srv.base))
+        .bearer_auth(new_token())
+        .header("X-Forwarded-For", attacker)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+    // IPv6 clients are limited per /64.
+    for i in 0..burst {
+        let ip = format!("2001:db8:1:2::{:x}", i + 1);
+        assert_eq!(from(&new_token(), &ip).await, StatusCode::UNAUTHORIZED);
+    }
+    assert_eq!(
+        from(&new_token(), "2001:db8:1:2:ffff::1").await,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        from(&new_token(), "2001:db8:1:3::1").await,
+        StatusCode::UNAUTHORIZED
     );
 }
