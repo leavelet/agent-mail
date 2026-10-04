@@ -454,8 +454,10 @@ async fn webhook_secrets_stay_out_of_logs() {
     }
 }
 
-/// An empty `AMAIL_MAX_*=` or `AMAIL_RETENTION_DAYS=` (as an `.env` file
-/// may set) means "not set"; a value that is not a number still fails.
+/// An empty `AMAIL_MAX_*=`, `AMAIL_RETENTION_DAYS=` or
+/// `AMAIL_WEBHOOK_PRIVATE_TARGETS=` (as an `.env` file may set; the compose
+/// file passes all three) means "not set"; a value that is not valid still
+/// fails.
 #[test]
 fn empty_limit_env_values_are_unset() {
     let mut env = Env::new();
@@ -468,6 +470,7 @@ fn empty_limit_env_values_are_unset() {
         "AMAIL_MAX_SEATS_PER_ORG",
         "AMAIL_MAX_SENDS_PER_SEC",
         "AMAIL_RETENTION_DAYS",
+        "AMAIL_WEBHOOK_PRIVATE_TARGETS",
     ] {
         env.extra.push((k.into(), String::new()));
     }
@@ -480,6 +483,11 @@ fn empty_limit_env_values_are_unset() {
         &[("AMAIL_MAX_ORG_QUERIES", "x")],
     );
     assert!(err.contains("--max-org-queries"), "{err}");
+    let err = env.fails(
+        &["serve", "--db", &db, "--listen", "127.0.0.1:1"],
+        &[("AMAIL_WEBHOOK_PRIVATE_TARGETS", "maybe")],
+    );
+    assert!(err.contains("--webhook-private-targets"), "{err}");
 }
 
 #[test]

@@ -708,16 +708,19 @@ enum OrgCmd {
     },
 }
 
-/// Whether the environment variable `name` is a server limit or the
-/// retention period and is set to the empty string.
+/// Whether the environment variable `name` is a server limit, the
+/// retention period or the webhook target setting, and is set to the empty
+/// string.
 fn empty_limit_env(name: &std::ffi::OsStr) -> bool {
     let n = name.to_string_lossy();
-    (n.starts_with("AMAIL_MAX_") || n == "AMAIL_RETENTION_DAYS")
+    (n.starts_with("AMAIL_MAX_")
+        || n == "AMAIL_RETENTION_DAYS"
+        || n == "AMAIL_WEBHOOK_PRIVATE_TARGETS")
         && std::env::var_os(name).is_some_and(|v| v.is_empty())
 }
 
-/// Treat `AMAIL_MAX_*=` and `AMAIL_RETENTION_DAYS=` (set, but empty) as
-/// not set, so that an empty line in an `.env` file means "the default"
+/// Treat `AMAIL_MAX_*=`, `AMAIL_RETENTION_DAYS=` and
+/// `AMAIL_WEBHOOK_PRIVATE_TARGETS=` (set, but empty) as not set, so that an empty line in an `.env` file means "the default"
 /// instead of stopping the server.
 fn unset_empty_limit_env(mut cmd: clap::Command) -> clap::Command {
     let ids: Vec<clap::Id> = cmd
