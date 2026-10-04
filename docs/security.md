@@ -106,7 +106,11 @@ to its own org's user.
   `git_access` (and for dsh seats whether the jail is on), with what it
   last reported, and reports the differences in
   one mail: the setting, the old and the new value, and the host. The
-  first report of a node names its policy. A node whose state was written
+  first report of a node names its policy. A seat reported for the first
+  time is listed when one of its settings is not the default (for example
+  `permission_mode = "unattended"`), and then with all of them: an
+  unattended Codex seat with its `git_access`, an unattended dsh seat with
+  its jail, even when these are the defaults. A node whose state was written
   by an earlier version, which always used the restricted policy, reports
   a change from `restricted`.
 - Under the open policy, when a process of an agent session runs `up`,

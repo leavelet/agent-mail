@@ -198,7 +198,7 @@ async fn onboarding(backend: Backend) {
             "invite",
             "create",
             "--count",
-            "2",
+            "4",
             "--note",
             "first users",
             "--expires",
@@ -214,10 +214,10 @@ async fn onboarding(backend: Backend) {
         .iter()
         .map(|i| i["code"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(codes.len(), 2);
+    assert_eq!(codes.len(), 4);
     assert!(codes.iter().all(|c| c.starts_with("inv_")));
     let ls = env.ok(&["admin", "invite", "ls", "--db", &db], &[], None);
-    assert_eq!(ls.matches(" open ").count(), 2, "{ls}");
+    assert_eq!(ls.matches(" open ").count(), 4, "{ls}");
     let op = env.json(
         &[
             "admin",
@@ -288,18 +288,28 @@ async fn onboarding(backend: Backend) {
     let mine = env.ok(&["inbox"], &[], None);
     assert!(mine.contains("w1 (agent): Re: Kickoff"), "{mine}");
 
-    // A second login (another org) and switching between them.
-    let reg2 = env.json(
+    // A second login (another org) and switching between them. register
+    // says that it changed the current login and how to switch back.
+    let acme_profile = format!("acme@127.0.0.1:{}", url.rsplit(':').next().unwrap());
+    let o = env.run_with(
         &[
-            "register", &url, "--invite", &codes[1], "--org", "beta", "--name", "b",
+            "--json", "register", &url, "--invite", &codes[1], "--org", "beta", "--name", "b",
         ],
         &[],
+        None,
     );
+    assert!(o.status.success());
+    let reg2: Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(reg2["org"], "beta");
+    assert_eq!(reg2["profile"], "b");
+    assert_eq!(
+        reg2["previous_profile"].as_str(),
+        Some(acme_profile.as_str())
+    );
+
     assert_eq!(env.json(&["org", "show"], &[])["name"], "beta");
     let profiles = env.ok(&["profile", "ls"], &[], None);
     assert!(profiles.contains("* b "), "{profiles}");
-    let acme_profile = format!("acme@127.0.0.1:{}", url.rsplit(':').next().unwrap());
     env.ok(&["profile", "use", &acme_profile], &[], None);
     assert_eq!(env.json(&["org", "show"], &[])["name"], "acme");
     assert_eq!(
@@ -360,6 +370,45 @@ async fn onboarding(backend: Backend) {
     assert_eq!(env.json(&["org", "show"], &by_reset)["name"], "acme");
     // The agent's seat token is not affected.
     env.ok(&["inbox"], &as_w1, None);
+
+    // register in text form says what it saved and how to switch back;
+    // with --no-save it saves nothing.
+    let before = std::fs::read_to_string(&cfg_file).unwrap();
+    let o = env.run_with(
+        &[
+            "register",
+            &url,
+            "--invite",
+            &codes[3],
+            "--org",
+            "delta",
+            "--no-save",
+        ],
+        &[],
+        None,
+    );
+    assert!(o.status.success());
+    let token_d = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    assert!(token_d.starts_with("amail_"), "{token_d}");
+    let msg = String::from_utf8_lossy(&o.stderr);
+    assert!(msg.contains("Nothing was saved"), "{msg}");
+    assert_eq!(std::fs::read_to_string(&cfg_file).unwrap(), before);
+    let o = env.run_with(
+        &["register", &url, "--invite", &codes[2], "--org", "gamma"],
+        &[],
+        None,
+    );
+    assert!(o.status.success());
+    let msg = String::from_utf8_lossy(&o.stderr);
+    for want in [
+        "registered org gamma",
+        "made it the current login",
+        "switch back with: amail profile use acme-again",
+    ] {
+        assert!(msg.contains(want), "missing {want:?} in:\n{msg}");
+    }
+    assert_eq!(env.json(&["org", "show"], &[])["name"], "gamma");
+    env.ok(&["profile", "use", "acme-again"], &[], None);
 
     // The user deletes the org (confirmed with its name).
     let err = env.fails(&["org", "delete", "--confirm", "acm"], &by_reset);
@@ -524,6 +573,14 @@ fn init_and_doctor() {
     assert!(out.contains("wrote amail.toml"), "{out}");
     let team = std::fs::read_to_string(env.dir.path().join("amail.toml")).unwrap();
     assert!(team.contains("template = \"staged-merge\""));
+    for want in [
+        "\"dsh\"",
+        "# git_access = ",
+        "# dsh_jail = ",
+        "--dsh-env-file",
+    ] {
+        assert!(team.contains(want), "missing {want:?} in:\n{team}");
+    }
     env.fails(&["init"], &[]);
     env.ok(&["init", "--force"], &[], None);
 
@@ -548,6 +605,16 @@ fn init_and_doctor() {
     ] {
         assert!(text.contains(want), "missing {want:?} in:\n{text}");
     }
+    // A harness the team file uses and that is missing is a warning.
+    let empty = env.dir.path().join("empty-bin");
+    std::fs::create_dir_all(&empty).unwrap();
+    let o = env.run_with(&["doctor"], &[("PATH", empty.to_str().unwrap())], None);
+    let text = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(
+        text.contains("warn claude: claude not found (on this PATH); used by root (team file)"),
+        "{text}"
+    );
+    assert!(text.contains("info codex: codex not found"), "{text}");
     // A server that is down is an error.
     let down = format!("http://127.0.0.1:{}", free_port());
     let o = env.run_with(
@@ -584,11 +651,37 @@ fn node_start_and_stop() {
         .to_string();
     // The node takes the server from the saved login.
     env.ok(&["login", &url], &[], Some(&format!("{token}\n")));
-    let saved = env.ok(&["node", "token", "--save"], &[], None);
-    assert!(saved.starts_with("amail_"));
+    // --save writes the token and does not print it.
+    let o = env.run_with(&["node", "token", "--save"], &[], None);
+    assert!(o.status.success());
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr),
+    );
+    assert!(
+        !stdout.contains("amail_") && !stderr.contains("amail_"),
+        "{stdout}{stderr}"
+    );
+    assert!(stdout.contains("node.toml"), "{stdout}");
     let fake = env.dir.path().join("fake-harness");
     std::fs::write(&fake, "#!/bin/sh\nexit 0\n").unwrap();
     let fake = fake.to_str().unwrap();
+    // dsh off PATH, given as a relative path, with an env file (relative too).
+    let dsh_dir = env.dir.path().join("dsh-pkg");
+    std::fs::create_dir_all(&dsh_dir).unwrap();
+    let dsh = dsh_dir.join("dsh");
+    std::fs::write(&dsh, "#!/bin/sh\necho 'dsh 0.2.0-rc.2'\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for f in [&dsh, &env.dir.path().join("fake-harness")] {
+            std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    std::fs::write(
+        env.dir.path().join("dsh.env"),
+        "DEEPSEEK_API_KEY=k-test-1\n",
+    )
+    .unwrap();
     let out = env.ok(
         &[
             "node",
@@ -597,6 +690,10 @@ fn node_start_and_stop() {
             fake,
             "--codex-bin",
             fake,
+            "--dsh-bin",
+            "./dsh-pkg/dsh",
+            "--dsh-env-file",
+            "dsh.env",
             "--label",
             "test-host",
         ],
@@ -604,6 +701,23 @@ fn node_start_and_stop() {
         None,
     );
     assert!(out.contains("node started"), "{out}");
+    // Every option reached the background node, with absolute paths.
+    let pid = std::fs::read_to_string(env.dir.path().join("state/node.pid")).unwrap();
+    let cmdline = std::fs::read(format!("/proc/{}/cmdline", pid.trim())).unwrap();
+    let argv: Vec<String> = cmdline
+        .split(|b| *b == 0)
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect();
+    let root = env.dir.path().to_string_lossy().into_owned();
+    for want in [
+        format!("--dsh-bin={root}/./dsh-pkg/dsh"),
+        format!("--dsh-env-file={root}/dsh.env"),
+        "--label=test-host".to_string(),
+        format!("--claude-bin={fake}"),
+    ] {
+        assert!(argv.contains(&want), "{want} not in {argv:?}");
+    }
+    assert!(!argv.iter().any(|a| a.contains("amail_")), "{argv:?}");
     // The node answers on its socket before its first connection to the
     // server is made.
     let want = format!("node connected to server {url}");
@@ -619,6 +733,35 @@ fn node_start_and_stop() {
         );
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    // The status names the policy and the programs the node starts.
+    let status = env.ok(&["node", "status"], &[], None);
+    for want in [
+        "local policy: open (default):".to_string(),
+        format!("claude: {fake}"),
+        format!("dsh: {root}/./dsh-pkg/dsh, --dsh-env-file sets DEEPSEEK_API_KEY"),
+    ] {
+        assert!(status.contains(&want), "missing {want:?} in:\n{status}");
+    }
+    assert!(!status.contains("k-test-1"), "{status}");
+    // doctor asks the node which dsh it runs; a dsh seat in the team file
+    // makes a missing harness a warning.
+    std::fs::write(
+        env.dir.path().join("amail.toml"),
+        "[team]\nworkroot = \"work\"\n\n[defaults]\nharness = \"dsh\"\n\n[[seat]]\nname = \"d1\"\n\n[[seat]]\nname = \"c1\"\nharness = \"codex\"\n",
+    )
+    .unwrap();
+    let o = env.run_with(&["doctor"], &[("PATH", "/usr/bin:/bin")], None);
+    let text = String::from_utf8_lossy(&o.stdout).into_owned();
+    for want in [
+        "info local policy: open (default):",
+        "ok   dsh: 0.2.0-rc.2 (verified",
+        "ok   dsh key: --dsh-env-file sets DEEPSEEK_API_KEY",
+        "info codex: ",
+        "did not print a version",
+    ] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
+    }
+    assert!(!text.contains("local policy: local policy"), "{text}");
     let err = env.fails(&["node", "start"], &[]);
     assert!(err.contains("already running"), "{err}");
     let out = env.ok(&["node", "stop"], &[], None);
@@ -626,4 +769,9 @@ fn node_start_and_stop() {
     env.fails(&["node", "status"], &[]);
     let nlog = std::fs::read_to_string(env.dir.path().join("state/node.log")).unwrap();
     assert!(!nlog.contains(&token), "the node log contains the token");
+    assert!(nlog.contains("amail node listening"), "{nlog}");
+    assert!(
+        !nlog.contains('\x1b'),
+        "colour codes in the node log:\n{nlog}"
+    );
 }

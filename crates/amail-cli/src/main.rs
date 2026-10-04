@@ -69,8 +69,9 @@ enum Cmd {
         #[arg(long)]
         name: Option<String>,
     },
-    /// Register an org on a public server with an invite code; the new
-    /// user token is saved as a login (and printed once).
+    /// Register an org on a public server with an invite code. The new
+    /// user token is printed once and saved as a login that becomes the
+    /// current one (unless --no-save).
     Register {
         /// The server, e.g. https://mail.example.com
         url: String,
@@ -83,8 +84,11 @@ enum Cmd {
         #[arg(long)]
         user_name: Option<String>,
         /// Profile name (default: <org>@<host>).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "no_save")]
         name: Option<String>,
+        /// Only print the token; save no login and keep the current one.
+        #[arg(long)]
+        no_save: bool,
     },
     /// Saved logins: list, switch, forget.
     #[command(subcommand)]
@@ -465,8 +469,9 @@ enum NodeCmd {
         #[arg(long, env = "AMAIL_STATE_DIR")]
         state_dir: Option<PathBuf>,
     },
-    /// Issue a node token (needs a user token). With --save, also write it
-    /// with the server URL to <state dir>/node.toml for `amail node`.
+    /// Issue a node token (needs a user token) and print it. With --save,
+    /// write it with the server URL to <state dir>/node.toml for `amail
+    /// node` instead of printing it.
     Token {
         #[arg(long)]
         label: Option<String>,
@@ -945,7 +950,11 @@ async fn run(cli: Cli) -> Result<()> {
             org,
             user_name,
             name,
-        } => return onboard::register(&url, &invite, &org, user_name, name, &out).await,
+            no_save,
+        } => {
+            let save = (!no_save).then_some(name);
+            return onboard::register(&url, &invite, &org, user_name, save, &out).await;
+        }
         Cmd::Profile(cmd) => return onboard::profile(cmd, &out),
         Cmd::Init { file, force } => return onboard::init(&file, force, &out),
         Cmd::Doctor { file } => {
@@ -1109,7 +1118,19 @@ async fn run(cli: Cli) -> Result<()> {
                     local_policy: old.local_policy,
                 })?;
                 amail_node::persist::write_atomic(&path, text.as_bytes(), 0o600)?;
-                eprintln!("saved to {}", path.display());
+                // Not printed: it is in the file, for `amail node`.
+                let mut v = v;
+                if let Some(o) = v.as_object_mut() {
+                    o.remove("token");
+                    o.insert("saved".into(), json!(path));
+                }
+                return out.show(&v, || {
+                    Ok(format!(
+                        "node token saved with the server URL in {} (mode 0600); \
+                         amail node and amail node start read it from there",
+                        path.display()
+                    ))
+                });
             }
             out.show(&v, || Ok(token))
         }
@@ -1207,7 +1228,11 @@ async fn run(cli: Cli) -> Result<()> {
                 .await?;
             out.show(&v, || {
                 let r: p::StatusResponse = parse(&v)?;
-                Ok(lines(&r.recipients, output::status_line))
+                Ok(format!(
+                    "{}\n{}",
+                    lines(&r.recipients, output::status_line),
+                    output::STATE_LEGEND
+                ))
             })
         }
         Cmd::Thread { id } => {
@@ -2033,6 +2058,33 @@ fn node_status_text(v: &Value) -> Result<String> {
         v["server"].as_str().unwrap_or("?"),
         v["registered_sessions"]
     )];
+    out.extend(team_cmd::policy_line(v));
+    for h in v["harnesses"].as_array().into_iter().flatten() {
+        let bin = h["bin"].as_str().unwrap_or("?");
+        let mut line = format!(
+            "{}: {}",
+            h["harness"].as_str().unwrap_or("?"),
+            match h["path"].as_str() {
+                Some(p) if p == bin => p.to_string(),
+                Some(p) => format!("{bin} ({p})"),
+                None => format!("{bin} (not found)"),
+            }
+        );
+        if h["harness"] == "dsh" {
+            let names: Vec<&str> = v["dsh_env"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            line.push_str(&if names.is_empty() {
+                ", no --dsh-env-file".to_string()
+            } else {
+                format!(", --dsh-env-file sets {}", names.join(" "))
+            });
+        }
+        out.push(line);
+    }
     for s in v["seats"].as_array().into_iter().flatten() {
         let p = &s["pending"];
         let mut line = format!(
