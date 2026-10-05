@@ -429,9 +429,10 @@ origin check.
 
 ## What another org can learn
 
-What org B can learn about org A is built in one place on the server
-(from A's openings and from the threads B took part in), and every
-endpoint and every message header that B is shown goes through it.
+What org B can see of org A's seats and teams is built in one place on
+the server, from A's openings; whether a message may go from one org to
+the other is decided in one other place, from the openings and the stored
+threads.
 
 **B can learn:**
 
@@ -440,32 +441,33 @@ endpoint and every message header that B is shown goes through it.
 - with an active link: the cards (name, kind, description) of the seats
   and teams A opened to B or to every linked org, and the link's state and
   since when;
-- the card of a seat of A that wrote into a thread in mail that reached B,
-  in that thread;
-- in messages that reached B: their senders, and the addresses of A that
-  B may see; other addresses of A (closed seats, lists) only as a count;
-- for mail B sent: the delivery state of each recipient of A it may still
-  see.
+- everything about the messages that reached B: their senders and every
+  address on them, and the cards of the seats on a thread's cross-org
+  messages. A message that crosses orgs carries a contact of each org and
+  no list, so the seats of A that B learns this way are A's contacts and
+  the seats A's side put on such a message (by writing or by naming them);
+  A's user is told by system mail when a seat that is not a contact joins
+  such a thread;
+- for mail B sent: the delivery state of each recipient.
 
-**B cannot learn:** the names of seats, teams or lists A did not open; how
-A's org is structured (parents, teams, list members); role texts,
-harnesses, models, presence, hosts or terminals; A's internal mail; whether
-a name is a closed seat, a list or nothing at all. Mail to any of these is
-refused with `unreachable` after the same lookups, a list member of A that
-is not open cannot be added to B's lists (the same answer as for a name
-that does not exist), and the archive's `to=` filter finds nothing for an
-address B may not see. The test suite checks that these answers do not
-differ in status, body or time (beyond noise) between a closed seat and a
-missing name.
+**B cannot learn:** the names of seats, teams or lists A did not open and
+did not put on mail to B; how A's org is structured (parents, teams, list
+members); role texts, harnesses, models, presence, hosts or terminals; A's
+internal mail, also in threads that crossed orgs; whether a name is a
+closed seat, a list or nothing at all. Mail to any of these is refused
+with `unreachable` after the same lookups. The test suite checks that
+these answers do not differ in status, body or time (beyond noise)
+between a closed seat and a missing name.
 
-**Agents cannot change what the org shows.** Openings, the org's
-visibility and outbound setting, team contacts and links change only with
-the user token (the command line, the web interface, or a team file
-applied by the user's `amail up`). Every change is reported to the user by
-system mail, naming which orgs gain or lose sight of which cards. A seat
-that writes into a thread of another org does make its own name and
-description visible to that org in that thread; with `outbound =
-"open-seats-only"` only the user and open seats may write outside.
+**Agents cannot change what the org shows.** Openings, primary contacts,
+the org's visibility and outbound setting, team contacts and links change
+only with the user token (the command line, the web interface, or a team
+file applied by the user's `amail up`). Every change is reported to the
+user by system mail, naming which orgs gain or lose sight of which cards.
+An agent can still write to an open seat of a linked org: its own card
+then becomes visible to that org in that thread, and the org's primary
+contact is added in Cc; with `outbound = "contacts-only"` only the user
+and the contacts may write outside.
 
 **Hidden orgs.** An org with visibility `hidden` does not exist for orgs
 without an active link with it: a card lookup answers `not_found`, a link

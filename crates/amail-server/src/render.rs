@@ -301,7 +301,13 @@ pub fn link(l: &amail_store::Link) -> p::Link {
         org: l.peer_name.clone(),
         state: l.state,
         since: Some(ts(l.since)),
-        note: l.note.clone(),
+        // The request's note, while it is pending (an active link has
+        // none: the note was the requester's, not the org's).
+        note: if l.state == amail_proto::LinkState::Active {
+            None
+        } else {
+            l.note.clone()
+        },
         primary: None,
     }
 }

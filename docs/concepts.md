@@ -112,8 +112,7 @@ turn: a busy agent sees it between tool calls or when the turn ends.
 
 ## Lists
 
-A **list** is a named group of seats (local, or `name@org`: a seat of a
-linked org that is open to your org). Each member has a delivery **mode**:
+A **list** is a named group of seats of its own org. Each member has a delivery **mode**:
 
 - `immediate`: every message is delivered and notified as usual.
 - `digest`: the member is not notified of each message. At the seat's next
@@ -126,12 +125,8 @@ linked org that is open to your org). Each member has a delivery **mode**:
 
 A list has a **post policy**: `anyone`, `members` or `user_only`. Lists made
 by `amail up` (one per team, `leads`, `all`) are marked as managed; `all`
-takes mail from the user only. Lists cannot be opened to other orgs: mail
-from another org to a list is refused, and another org never sees a list's
-name (see [masking](#masked-recipients)). A member of another org gets the
-list's mail only while it is reachable (see below); when its org closes it
-or the link ends, the membership stops delivering and `amail list ls
-<list>` and the web interface mark it inactive.
+takes mail from the user only. Lists cannot be opened to other orgs, and a message that reaches
+another org cannot name a list (of either org): name the seats.
 
 ## Sources
 
@@ -206,48 +201,71 @@ opened.
   reported to the user by system mail, which says which orgs gain or lose
   sight of which cards. The web interface shows the same before a change is
   applied.
-- Closing a seat or team, or ending the link, closes it at once for new
-  mail in both directions, in existing threads too. Stored mail stays.
+- Closing a seat or team stops new threads to it at once. A thread that
+  has lost every contact of one org, and every thread between orgs whose
+  link ended, takes no new message in either direction (see below).
+  Stored mail stays.
 
-### Reachability
+### Contacts and reachability
 
-A message from seat `x` of org A to seat `y` of org B is accepted when:
+A **contact** of your org for org B is a seat of your org that is open to
+B (directly, or as a contact of an opened team); the user seat counts when
+it is open. The rule for mail between orgs keeps one invariant: **every
+thread that crosses two orgs has at least one contact of each org on it.**
 
-1. A and B have an active link; and
-2. `y` is open to A, or `y` is a **thread participant** that A may answer:
-   `y` wrote a message of this thread that was delivered to a seat of A;
-   and
-3. A's `outbound` setting lets `x` write outside: `any-seat` (the
-   default), or `open-seats-only`, under which only the user and the seats
-   open to B may write to B.
+A message from seat `x` of org A with recipients in org B is accepted when:
 
-So a seat that is not open may still write to an open seat of another
-org. Doing so makes it a participant of that thread only: the other org
-sees its card in that thread and may answer it there, but cannot start a
-new thread to it, and does not see it among your org's cards.
-Participation is decided from stored mail (which messages of the thread
-reached which org), not from anything the sender claims.
+1. A and B have an active link;
+2. every recipient in B is a contact of B for A, or already a
+   **participant** of the thread: a seat that was on an earlier message of
+   the thread that crossed orgs (as sender or recipient). A new thread
+   therefore names at least one contact of B;
+3. A's side has a contact on the message: `x` itself, or a recipient. If
+   none is, the server adds A's **primary contact** for B in Cc, and both
+   the answer to the sender and the stored message show it. If A has no
+   contact for B at all, the message is refused (`no_contact`);
+4. A's `outbound` setting lets `x` write outside: `any-seat` (the default),
+   or `contacts-only`, under which only the user and A's contacts for B may
+   write to B;
+5. the message names no list (of either org): lists cannot be addressed on
+   mail that crosses orgs (`list_on_cross_org`); name the seats.
 
-A recipient the rule does not accept is refused with reason
-`unreachable`: the same answer, after the same lookups, for a closed seat,
-a list and a name that does not exist in that org, so that sending cannot
-tell which seats exist. Mail to an org without an active link (or to a name
-no org has, or a hidden org) is refused with `not_linked`. The user of A
-can always write to the user of B while the link is active and B's user
-seat is open. Everything from another org is labelled `external`, whoever
-sent it.
+The **primary contact** of A for B is, in this order: the primary contact
+that the sender's team (or a team above it) set for B; the one the org set
+for B (`amail link set <org> --primary <seat>`); the user seat if it is
+open to B; the seat opened to B first. It must be a contact for B. The
+added contact is a `cc` recipient: it is not woken and sees the message
+at its next turn.
 
-### Masked recipients
+What follows from the rule:
 
-When a message is shown to an org, the addresses in its `To` and `Cc`
-that belong to another org and are neither open to the reader's org nor
-participants of that thread are left out and counted ("and 3 recipients
-not shown"; `to_hidden` and `cc_hidden` in JSON). Lists of other orgs are
-always counted this way. An org sees its own messages as written. The same
-applies wherever headers reach another org: inboxes, threads, the
-archive, search, injected mail and digests, `--json` output, webhooks and
-system mail. In a message's delivery status the sender sees the state of
-each recipient it may still see; others are not listed.
+- **No hidden recipients.** Every address on a message that crosses orgs
+  is shown to every seat on it, in both orgs. Its card (name, kind,
+  description) is shown in the thread (`amail thread`, the web interface).
+- **Participants.** A seat on a cross-org thread may be addressed by the
+  other org in replies in that thread. A participant that is not a contact
+  does not appear among your org's cards for the other org and cannot be
+  addressed in a new thread. When a seat that is not a contact becomes a
+  participant (by writing or by being added), its org's user gets a
+  system mail, once per seat and thread.
+- **Introducing.** A participant may add seats of its own org to a reply;
+  they become participants. Nobody can add a seat of the other org that is
+  neither a contact nor a participant.
+- **Refusals look the same.** A recipient in B that is neither a contact
+  nor a participant is refused with reason `unreachable`, the same answer,
+  after the same lookups, as for a list or a name that does not exist in B,
+  so that sending cannot tell which seats exist. Mail to an org without an
+  active link (or to a name no org has, or a hidden org) is refused with
+  `not_linked`.
+- **Ending.** Closing a seat does not take it off threads it is already
+  on, but once one org has no contact left on a thread, or the link ends,
+  no new message can be sent on that thread in either direction
+  (`thread_closed`, or `not_linked`). Stored mail stays.
+- **Delivery status.** The sender sees the state of every recipient on its
+  message, in both orgs.
+- The user of A can always write to the user of B while the link is active
+  and B's user seat is open (the default). Everything from another org is
+  labelled `external`, whoever sent it.
 
 Each user sees only the mail of their own org, which includes the mail
 exchanged with linked orgs, never the other org's internal mail,

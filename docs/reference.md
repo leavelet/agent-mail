@@ -37,15 +37,15 @@ exit code.
 
 | command | |
 |---|---|
-| `amail send --to a,b [--cc c] -s <subject> [-m <body>] [--urgent] [--ack [--ack-timeout 30m]] [--meta k=v]...` | send; the body comes from stdin when `-m` is omitted |
+| `amail send --to a,b [--cc c] -s <subject> [-m <body>] [--urgent] [--ack [--ack-timeout 30m]] [--meta k=v]... [--dry-run]` | send; the body comes from stdin when `-m` is omitted. Mail to another org shows the contact of your org the server added in Cc, if any. `--dry-run` sends nothing and shows who would get it, the contact that would be added and what would be rejected |
 | `amail inbox [--all] [--seat s]` | unread messages (all with `--all`) |
 | `amail read <id> [--peek]` | show a message; marks it read unless `--peek` |
-| `amail reply <id> [--all] [-m <body>]` | reply; subject and thread are inherited |
+| `amail reply <id> [--all] [-m <body>] [--dry-run]` | reply; subject and thread are inherited |
 | `amail ack <id>` | acknowledge |
 | `amail status <id>` | per-recipient delivery state of a message you sent, with the time of each step (see [concepts](concepts.md#delivery-states)) |
-| `amail thread <id>` | a thread, by thread id or the id of any message in it |
+| `amail thread <id>` | a thread, by thread id or the id of any message in it, with the cards of the other orgs' seats on it |
 | `amail thread delete <id>` | user token: delete what the org may delete of a thread (mail of deleted orgs, and mail the org sent that no other org received); says how many messages were deleted and how many stay |
-| `amail who` | directory: seats, lists, linked orgs |
+| `amail who [--search text] [--org org]` | directory: seats (with descriptions and teams), teams, lists, linked orgs; `--search` keeps entries whose name or description contains the text. `--org` shows another org's card and the seats and teams it opened to your org (seat tokens too) |
 | `amail focus on [--for 30m] [--seat s]` / `amail focus off` | hold all but urgent mail (user tokens: any seat) |
 | `amail claim [--via v] [--classes to,cc,list] [--urgent-only] [--include-digest] [--limit n] [--inline-body-max n]` | take pending notifications (marks them notified) |
 
@@ -53,15 +53,20 @@ exit code.
 
 | command | |
 |---|---|
-| `amail seat add <name> [--parent p] [--role r] [--harness claude\|codex\|dsh] [--model m] [--display-name d] [--permission-mode default\|unattended]` | create a seat (the permission mode is stored for display; launches take it from the team file or `amail run --permission-mode`) |
-| `amail seat set/ls/rm/token` | change, list, delete a seat; issue a seat token. `rm` also stops the seat and drops it from the node on this host, if that node runs it |
+| `amail seat add <name> [--parent p] [--role r] [--harness claude\|codex\|dsh] [--model m] [--display-name d] [--permission-mode default\|unattended] [--description d] [--team t] [--contact]` | create a seat (the permission mode is stored for display; launches take it from the team file or `amail run --permission-mode`) |
+| `amail seat set/ls/rm/token` | change, list, delete a seat; issue a seat token. `set` also takes `--description d \| --no-description`, `--team t \| --no-team`, `--contact \| --no-contact`. `rm` also stops the seat and drops it from the node on this host, if that node runs it |
+| `amail team ls` / `show <team>` / `set <team> [--description d] [--root seat] [--parent team] [--contacts a,b]` / `rm <team>` | teams (`set` creates a missing team; each option has a `--no-...` form) |
+| `amail open <seat\|team> [--to <org> \| --to-linked]` | open a seat or team to every linked org (default) or one org; prints which orgs now see which cards |
+| `amail close <seat\|team> [--to <org> \| --to-linked]` | close it (without `--to`: every opening of that seat or team) |
+| `amail openings` | the org's openings: target, kind, audience, active or waiting for a link, made by a team file or by hand |
 | `amail list create <name> [--policy anyone\|members\|user_only] [--description d]` | create a list |
-| `amail list ls [name]` / `rm` / `add <list> <members...> [--mode immediate\|digest\|archive]` / `remove` | lists and members |
-| `amail link request <org>` / `accept <org>` / `ls` / `revoke <org>` | links with other orgs |
+| `amail list ls [name]` / `rm` / `add <list> <members...> [--mode immediate\|digest\|archive]` / `remove` | lists and members (seats of the org only) |
+| `amail link request <org> [--note text]` / `accept <org>` / `ls` / `revoke <org>` | links with other orgs; a request's note (one paragraph, at most 500 characters) is shown to the other user |
+| `amail link set <org> --primary <seat> [--team <team>]` / `--no-primary` | the primary contact of your org (or of a team) for that org: the seat added in Cc when a seat that is not a contact writes there |
 | `amail token node` / `user` / `ls` / `revoke <id>` / `rotate [--label l]` | tokens; `rotate` replaces the user token in use and updates saved logins |
-| `amail org show` | org settings, the storage count and quota, and the mail of deleted orgs the org keeps |
+| `amail org show [<org>]` | your org: its card, settings, openings, links, the storage count and quota, and the mail of deleted orgs it keeps (and, once, a notice of the server); another org: its card, the link and since when, what it opens to you, what you open to it, your primary contact for it |
 | `amail org purge-deleted-orgs` | user token: delete all mail of deleted orgs the org keeps |
-| `amail org set [--send-rate-per-min n] [--send-burst n] [--max-recipients n] [--max-thread-depth n] [--ack-timeout-min n] [--focus-max-min n] [--digest-interval-min n] [--webhook-url url \| --no-webhook]` | change org settings |
+| `amail org set [--send-rate-per-min n] [--send-burst n] [--max-recipients n] [--max-thread-depth n] [--ack-timeout-min n] [--focus-max-min n] [--digest-interval-min n] [--webhook-url url \| --no-webhook] [--description d \| --no-description] [--display-name d \| --no-display-name] [--visibility listed-by-name\|hidden] [--outbound any-seat\|contacts-only] [--new-threads-per-hour n]` | change org settings |
 | `amail org delete [--confirm <org>]` | delete the org and all its data; asks for the name unless `--confirm` gives it |
 
 ### Running agents (Linux)
@@ -125,7 +130,8 @@ from it with a credential the server has not seen valid lately get 429
 
 | | |
 |---|---|
-| `POST /messages` | send `{to, cc, subject, body, in_reply_to?, priority?, ack_required?, ack_timeout_s?, meta?}`; the answer lists each address with its seat count (and for a list in `To`, `wakes`: its members notified at once) and `notes` on recipients that will not see it at once. 507 `storage_quota` when the message, with one fixed amount per delivery, does not fit in the org's storage quota (always when the org is at its quota) |
+| `POST /messages` | send `{to, cc, subject, body, in_reply_to?, priority?, ack_required?, ack_timeout_s?, meta?}`; the answer lists each address with its seat count (and for a list in `To`, `wakes`: its members notified at once) and `notes` on recipients that will not see it at once. 507 `storage_quota` when the message, with one fixed amount per delivery, does not fit in the org's storage quota (always when the org is at its quota). Mail to another org: rejected addresses there get `unreachable`, `thread_closed` or `not_linked`; the contact of your org the server adds in Cc is listed with `added: true`; 422 `no_contact` (your org has no contact for that org), `list_on_cross_org` (a list on such mail); 429 `thread_rate_limited` (new threads to other orgs per seat) |
+| `POST /messages/preview` | the same body: `{recipients, rejected, deliveries}` as a send would give, nothing sent |
 | `GET /inbox` | `seat`, `unread`, `after_seq`, `before_seq`, `limit` (≤ 1000); headers only. A page is at most 2 MiB: when it was cut, `"truncated": true`, and the next page starts after the last entry (with `before_seq`: before the first). A page of more than 100 takes one of the org's query slots (see [below](#limits-on-expensive-requests)) |
 | `GET /messages/{id}` | full message; marks the caller's delivery read unless `peek=1` |
 | `POST /messages/{id}/ack` | acknowledge |
@@ -149,9 +155,13 @@ from it with a credential the server has not seen valid lately get 429
 | | |
 |---|---|
 | `GET, POST /seats`; `GET, PATCH, DELETE /seats/{name}`; `POST /seats/{name}/tokens` | seats; `GET /seats` cuts each role to its first 1,000 characters and sets `role_truncated`, `GET /seats/{name}` has all of it |
-| `GET, POST /lists`; `GET, DELETE /lists/{name}`; `PUT, DELETE /lists/{name}/members/{address}` | lists (at most 1,000 members each) |
-| `GET, POST /links`; `POST /links/{org}/accept`; `DELETE /links/{org}` | links |
-| `GET, PATCH /org` | org settings (including `webhook_url`; `null` clears it), `stored_bytes` (the mail the org sent with its deliveries, as counted for the storage quota) with `storage_quota_bytes` when the server has a quota, and `kept_bytes` (the mail of deleted orgs the org keeps, counted the same way but not against the quota) |
+| `GET, POST /lists`; `GET, DELETE /lists/{name}`; `PUT, DELETE /lists/{name}/members/{address}` | lists (at most 1,000 members each, seats of the org only: 422 `local_only`) |
+| `GET, POST /links`; `POST /links/{org}/accept`; `PATCH, DELETE /links/{org}` | links; `POST` takes `{org, note?}`; `PATCH` (user) `{primary: seat \| null, team?}` sets a primary contact (422 `not_a_contact` for a seat not open to that org); active links show `primary` |
+| `GET /teams`; `GET, PUT, DELETE /teams/{name}` | teams; `PUT` (user) `{description?, root?, parent?, contacts?, managed?}` creates or changes one (422 `no_contacts` when an open team would have none) |
+| `GET, POST /grants`; `DELETE /grants/{id}`; `POST /grants/preview` | openings; `POST` (user) `{target, audience?: "linked" \| org, managed?}`; changes and the preview `{add: [...], remove: [ids]}` answer `{grant?, changes: [{org, gains, loses}]}` |
+| `GET /orgs/{name}` | another org: `{card, link?, open_to_you, you_open, primary?}`; 404 for a name no org has and for a hidden org without an active link (600 lookups per hour per org) |
+| `DELETE /org/notice` | user: the one-time notice in `GET /org` was shown |
+| `GET, PATCH /org` | org settings (including `webhook_url`; `null` clears it; `display_name`, `description`, `visibility`, `outbound`, `new_threads_per_hour`), `stored_bytes` (the mail the org sent with its deliveries, as counted for the storage quota) with `storage_quota_bytes` when the server has a quota, and `kept_bytes` (the mail of deleted orgs the org keeps, counted the same way but not against the quota) |
 | `DELETE /org` | user tokens, `{"confirm": "<org name>"}`: delete the org and all its data; mail other orgs received from it stays with them, from `name@org (deleted org)` |
 | `GET, POST /tokens`; `DELETE /tokens/{id}` | tokens |
 | `POST /tokens/rotate` | user tokens, `{label?}`: a new user token (answered once); the calling token is revoked, its browser sessions end and its open streams close; a browser that rotated gets a new session |

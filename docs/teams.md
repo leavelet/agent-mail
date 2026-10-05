@@ -12,8 +12,9 @@ one worker with the staged-merge template).
 1. checks the file; errors name the entry, and nothing is changed;
 2. prepares working directories (for staged-merge: git worktrees and
    branches);
-3. creates or updates the seats (tree, harness, model, role, group) and the
-   generated lists;
+3. creates or updates the teams, the seats (tree, harness, model, role,
+   description, team, contact mark), the openings the file declares, and
+   the generated lists;
 4. asks the node to start the sessions.
 
 It is idempotent: run it again after editing the file and only the
@@ -27,9 +28,49 @@ them. Changed `[team]` settings (`idle_sleep`, `max_live`,
 local policy (see below). `--only g,s` starts just some groups or seats;
 `--no-start` starts nothing.
 
-Generated lists: one per group (its lead and workers), `leads` (every seat
-with subordinates) and `all` (every seat; only the user may post). They are
-marked as managed; lists you made yourself are never touched.
+Generated lists: one per team (its members), `leads` (every seat with
+subordinates) and `all` (every agent seat of the org; only the user may
+post). `leads` and `all` are computed from the seats on the server, so they
+stay right when several team files are up in one org. They are marked as
+managed; lists you made yourself are never touched.
+
+### Teams
+
+A team is an object on the server (see
+[concepts](concepts.md#orgs-the-user-and-seats)): a name, a description, a
+root seat, a parent team, its members and its contacts. A team file
+creates its teams:
+
+- With `[team] name = "..."`, the file is one team: its `[[group]]`s are
+  sub-teams of it (nested as their parent seats are), and seats outside any
+  group are members of the file's team.
+- Without a name, each `[[group]]` is a team. A group whose parent seat is
+  in another group is a sub-team of that group's team; seats outside any
+  group are in no team.
+
+Several team files can be up in one org (run `amail up -f` with each).
+`--prune` only removes seats of the teams the file owns (for a file
+without teams: seats in no team that are in one of its trees), never the
+seats of another file. The `[team]` settings (`idle_sleep`, `max_live`,
+`restart`, `local_policy`) are the node's: the last `amail up` sets them.
+`amail team ls`, `amail team show <team>` and `amail team set <team>
+[--description d] [--root seat] [--parent team] [--contacts a,b]` show and
+change teams by hand.
+
+### Openings in a team file
+
+`open = "linked"` (every org with an active link) or `open = ["org", ...]`
+on a seat, on a lead or worker, on a `[[group]]` or under `[team]` opens
+that seat or team to other orgs (see
+[concepts](concepts.md#openings)). An open group or team opens its
+contacts: `contacts = ["seat", ...]` on the group or `[team]`; without it,
+an open group's contact is its lead and an open named team's is its root
+seat. `amail up` adds the openings the file declares and removes the ones
+it added earlier that the file no longer declares; openings the user made
+by hand (`amail open`) are left alone. The output says which orgs gain or
+lose sight of which cards, and the user gets a system mail for each
+change. Agents cannot change openings; only the user token used by `amail
+up` can.
 
 Related commands: `amail ps` (one line per seat: state, pane, pending mail,
 activity, and whether a person is needed), `amail attach <group or seat>`,
@@ -58,12 +99,17 @@ permission_mode = "unattended"   # or "default" (keep the harness's prompts)
 [[seat]]
 name = "root"
 role = "Overall technical lead."
+description = "Leads the project; answers questions about its plan."  # shown to other orgs when open
+open = "linked"                  # or ["org", ...]: open this seat to other orgs
 
 [[group]]
 name = "backend"
 parent = "root"                  # any seat, e.g. another group's lead
 lead = { name = "be-lead", harness = "codex", model = "<a Codex model>" }
 workers = { count = 3, prefix = "be", role = "..." }   # be-1..be-3, under be-lead
+description = "The backend: API and storage."          # the team's description
+# open = ["partner-org"]         # open the team; its contacts (default: the lead)
+# contacts = ["be-lead"]
 
 [[group]]
 name = "core"

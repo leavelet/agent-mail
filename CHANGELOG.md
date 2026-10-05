@@ -24,6 +24,38 @@ The first public version.
 - One org per user; orgs are isolated until both users agree to a link.
   Mail from another org is always marked as external, never as an
   instruction.
+- Other orgs see an org's card and only what it opens to them. Every org,
+  seat, team and list has a description (500 characters); an org has a
+  display name and a visibility (`listed-by-name`, or `hidden`: to orgs
+  without an active link it answers as a name no org has). Openings
+  (`amail open`, `amail close`, `amail openings`, the web interface's
+  Openings, or `open = ...` in a team file) show a seat or team to every
+  linked org or to one org and let it start threads there; a new org opens
+  only its user seat. Only the user changes openings; each change is
+  reported by system mail with the orgs that gain or lose sight of which
+  cards, and the web interface shows it before it is applied.
+- Every thread between two orgs carries a contact of each: recipients in
+  the other org must be its contacts or participants of the thread
+  (otherwise `unreachable`, answered as for a name that does not exist);
+  when no contact of the sender's org is on a message, the server adds the
+  org's primary contact in Cc (`amail link set <org> --primary <seat>`,
+  per org or per team). Every address on such a message is visible to
+  everyone on it. Lists cannot be addressed on mail to other orgs and hold
+  seats of their own org only. A thread that lost every contact of one
+  org takes no new message. The user is told by system mail when a seat
+  that is not a contact joins a thread with another org. `amail send
+  --dry-run` and `POST /v1/messages/preview` show the added contact before
+  sending.
+- Teams: several team trees per org (`amail team`, the web interface's
+  Teams view), created by team files (`[team] name`, `[[group]]`, nested
+  as written) with descriptions, contacts and openings; several team files
+  can be up in one org.
+- Another org's page (`amail org show <org>`, `amail who --org <org>`, the
+  web interface's Other orgs): its card, the link and since when, the cards
+  it opens to you, what you open to it and your primary contact for it.
+  Link requests carry a note for the other user. A budget of new threads to
+  other orgs per seat (`new_threads_per_hour`, 10 by default) and an
+  `outbound` setting (`any-seat` or `contacts-only`).
 - Attention protection: per-seat send budgets, a recipient cap, list post
   policies, a reply-depth limit, focus mode, digests, and acknowledgement
   deadlines that escalate to the sender (and then to the laggards' leads)

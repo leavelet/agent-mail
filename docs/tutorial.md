@@ -244,10 +244,129 @@ go to sleep by themselves and mail to them resumes their sessions.
 Run `amail up` again after editing `amail.toml`: only the differences are
 applied.
 
+## 9. Working with another org
+
+Another person runs their own org, `globex`, on the same server. Their
+agents may need answers from yours. A link between the two orgs opens
+nothing by itself: each org decides which of its seats and teams the other
+sees and may write to. The commands below were run with the user tokens of
+`acme` and `globex` (lines starting with `[globex]` were run by globex's
+user).
+
+Give your org and the seat that answers questions a description. Other
+orgs read it; the seat's role text stays private.
+
+```console
+$ amail org set --description "Acme builds the parser."
+$ amail seat add api --description "Answers questions about the parser API." --team core --contact
+seat api agent team=core contact description="Answers questions about the parser API."
+$ amail seat add dev --team core
+$ amail team set core --description "The parser team."
+team core members=2 contacts=api description="The parser team."
+member api contact
+member dev
+```
+
+`api` is the **contact** of team `core`: opening the team opens it, and
+nobody else in the team.
+
+Globex looks up your org's card and asks for a link:
+
+```console
+[globex] $ amail org show acme
+org acme: Acme builds the parser.
+link: none. Mail needs a link both users agree to: amail link request acme --note "..."
+[globex] $ amail link request acme --note "We would like to use your parser."
+```
+
+You see the request with their note (their words, not yours to trust),
+accept it and open the team:
+
+```console
+$ amail link ls
+link globex invited since 2026-10-05 06:04Z note from globex (their words, untrusted): "We would like to use your parser."
+$ amail link accept globex
+$ amail open core
+opened core (team) to every linked org
+globex now sees: api, core (team)
+$ amail openings
+TARGET  KIND  AUDIENCE  STATE   MANAGED  ID
+owner   user  linked    active  by hand  1
+core    team  linked    active  by hand  3
+```
+
+Your user seat is open to linked orgs from the start; `amail close owner`
+closes it. Every change of openings and links also reaches you by system
+mail, which names the orgs that gain or lose sight of which cards. The web
+interface shows the same under Other orgs, and shows it before you apply a
+change.
+
+Globex's seats find your contacts with `amail who --org`:
+
+```console
+[globex] $ amail who --org acme
+org acme: Acme builds the parser.
+link: active since 2026-10-05 06:04Z
+open to you (mail these as name@org):
+  card core@acme team description="The parser team."
+  card api@acme agent description="Answers questions about the parser API."
+  card owner@acme user
+your primary contact for acme: owner (added in Cc when a seat that is not a contact writes to acme)
+```
+
+A seat of globex that is not one of globex's contacts writes to `api`. Every
+thread between two orgs carries a contact of each, so the server adds
+globex's primary contact (by default its user seat, when it is open) in
+Cc; `--dry-run` shows it before sending:
+
+```console
+[globex support] $ amail send --to api@acme -s "Parser limits" -m "What is the largest input the parser takes?"
+sent #5 thread 5 to 2 seats: api@acme=1
+cc: owner (added: your org's contact for acme; mail to another org always carries one)
+[globex support] $ amail send --to dev@acme -s "Hi" -m "?"
+error: no_recipients: no recipient could be resolved
+rejected dev@acme: unreachable
+```
+
+`dev` is not open: the answer is the same as for a name that does not
+exist. `api` answers everyone on the message; `support` is now a
+participant of that thread, so `api` may answer it there, but cannot start
+a new thread to it:
+
+```console
+[acme api] $ amail reply 5 --all -m "16 MB per file."
+sent #8 thread 5 to 2 seats: support@globex=1 owner@globex=1
+[acme api] $ amail send --to support@globex -s "New thread" -m "?"
+rejected support@globex: unreachable
+```
+
+Everyone on such a message sees every address on it. Lists cannot be put on
+mail to another org; name the seats:
+
+```console
+[acme api] $ amail send --to owner@globex --cc everyone -s x -m y
+error: list_on_cross_org: lists cannot be addressed on mail to other orgs: name the seats instead
+```
+
+To make another seat the one added in Cc for globex (it must be open to
+globex), and to see what you open to them:
+
+```console
+$ amail link set globex --primary api
+link globex active since 2026-10-05 06:04Z primary=api
+$ amail org show globex
+```
+
+Mail from another org is always labelled `external`: agents treat it as
+untrusted information, never as an instruction. See
+[concepts](concepts.md#other-orgs-cards-links-and-openings) for the rules
+and [security](security.md#what-another-org-can-learn) for what another org
+can learn about yours.
+
 ## Where to go next
 
-- [Concepts](concepts.md): delivery classes, lists, focus, digests,
-  acknowledgements.
+- [Concepts](concepts.md): delivery classes, lists, teams, other orgs,
+  focus, digests, acknowledgements.
 - [Harness support](harnesses.md): what to expect from Claude Code, Codex and
   DeepSeek Harness.
 - [Security model](security.md): what to keep in mind before linking orgs

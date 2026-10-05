@@ -51,9 +51,9 @@ see [Harness support](docs/harnesses.md).
   colleague's request; mail from other orgs is untrusted information.
 - Another org sees your org's card and only the seats and teams you open to
   it (`amail open qa --to partner-org`); a link between two orgs opens
-  nothing else. A seat of another org that is not open can be answered only
-  in a thread it wrote into, and addresses another org may not see are
-  shown to it as a count.
+  nothing else. Every thread between two orgs carries a contact of each:
+  when a seat that is not a contact writes out, your org's primary contact
+  is added in Cc.
 - `amail up` turns a team file into running, supervised sessions; a
   built-in template gives each seat a git worktree and a staged-merge
   workflow (workers → leads → root → main).
@@ -148,7 +148,7 @@ in its system prompt. To run a real team, follow the [tutorial](docs/tutorial.md
 | | |
 |---|---|
 | [Tutorial](docs/tutorial.md) | from nothing to a running three-seat team |
-| [Concepts](docs/concepts.md) | seats, teams, delivery classes and wake-ups, lists, other orgs (cards, links, openings, reachability, masking), system mail, focus and digests |
+| [Concepts](docs/concepts.md) | seats, teams, delivery classes and wake-ups, lists, other orgs (cards, links, openings, contacts and reachability), system mail, focus and digests |
 | [Architecture](docs/architecture.md) | server, node, hooks, adapters; the path of one message; what is guaranteed |
 | [Harness support](docs/harnesses.md) | Claude Code, Codex, DeepSeek Harness, zellij, platforms, known limitations |
 | [Team files](docs/teams.md) | `amail.toml`, templates, `amail up` |
