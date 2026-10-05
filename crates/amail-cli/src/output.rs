@@ -77,6 +77,25 @@ fn header_tags(m: &MessageHeader) -> Vec<&'static str> {
     tags
 }
 
+/// `n recipient(s) not shown`: addresses of another org that the reader's
+/// org may not see (neither open to it nor in the thread).
+pub fn not_shown(n: u32) -> String {
+    format!("{n} recipient{} not shown", if n == 1 { "" } else { "s" })
+}
+
+/// A `To` or `Cc` value: the addresses, then how many are not shown;
+/// `None` when there is nothing.
+pub fn addresses(shown: &[String], hidden: u32) -> Option<String> {
+    let mut out = shown.iter().map(|a| l(a)).collect::<Vec<_>>().join(", ");
+    match (out.is_empty(), hidden) {
+        (true, 0) => return None,
+        (_, 0) => {}
+        (true, n) => out = not_shown(n),
+        (false, n) => out.push_str(&format!(" and {}", not_shown(n))),
+    }
+    Some(out)
+}
+
 /// Mail-style headers, a blank line, then the body with every line behind
 /// `  > `. The headers, including the source label (`USER`, `agent`,
 /// `external`, `system`) computed by the server, are written here; nothing
@@ -91,12 +110,11 @@ pub fn message(m: &Message) -> String {
         source(h.source),
         short_time(&h.created_at)
     );
-    let addrs = |v: &[String]| v.iter().map(|a| l(a)).collect::<Vec<_>>().join(", ");
-    if !h.to.is_empty() {
-        out.push_str(&format!("To: {}\n", addrs(&h.to)));
+    if let Some(to) = addresses(&h.to, h.to_hidden) {
+        out.push_str(&format!("To: {to}\n"));
     }
-    if !h.cc.is_empty() {
-        out.push_str(&format!("Cc: {}\n", addrs(&h.cc)));
+    if let Some(cc) = addresses(&h.cc, h.cc_hidden) {
+        out.push_str(&format!("Cc: {cc}\n"));
     }
     out.push_str(&format!("Subject: {}\n", l(&h.subject)));
     if let Some(p) = h.in_reply_to {
@@ -195,7 +213,13 @@ pub fn seat_line(s: &p::Seat) -> String {
         out.push_str(&format!(" permissions={p}"));
     }
     if let Some(g) = &s.group {
-        out.push_str(&format!(" group={}", l(g)));
+        out.push_str(&format!(" team={}", l(g)));
+    }
+    if s.contact {
+        out.push_str(" contact");
+    }
+    if !s.open_to.is_empty() {
+        out.push_str(&format!(" open_to={}", names(&s.open_to)));
     }
     if let Some(p) = &s.presence {
         out.push_str(&format!(" state={}", l(&p.state.to_string())));
@@ -211,8 +235,139 @@ pub fn seat_line(s: &p::Seat) -> String {
         out.push_str(&format!(" focus_until={}", short_time(t)));
     }
     out.push_str(&quoted("name", &s.display_name));
+    out.push_str(&quoted("description", &s.description));
     out.push_str(&quoted("role", &s.role));
     out
+}
+
+/// Names joined with commas, each made safe for one line.
+fn names(v: &[String]) -> String {
+    v.iter().map(|x| l(x)).collect::<Vec<_>>().join(",")
+}
+
+/// `team backend members=4 root=be-lead parent=platform contacts=be-lead open_to=linked managed description="..."`
+pub fn team_line(t: &p::Team) -> String {
+    let mut out = format!("team {} members={}", l(&t.name), t.members.len());
+    if let Some(r) = &t.root {
+        out.push_str(&format!(" root={}", l(r)));
+    }
+    if let Some(p) = &t.parent {
+        out.push_str(&format!(" parent={}", l(p)));
+    }
+    if !t.contacts.is_empty() {
+        out.push_str(&format!(" contacts={}", names(&t.contacts)));
+    }
+    if !t.open_to.is_empty() {
+        out.push_str(&format!(" open_to={}", names(&t.open_to)));
+    }
+    if t.managed {
+        out.push_str(" managed");
+    }
+    out.push_str(&quoted("description", &t.description));
+    out
+}
+
+/// `card api@beta agent description="..."`: what another org shows.
+pub fn card_line(c: &p::Card) -> String {
+    format!(
+        "card {} {}{}",
+        l(&c.address),
+        c.kind,
+        quoted("description", &c.description)
+    )
+}
+
+/// `beta now sees: a, b` / `beta no longer sees: c`, one line each.
+pub fn sight_lines(changes: &[p::SightChange]) -> Vec<String> {
+    let mut out = Vec::new();
+    for c in changes {
+        if !c.gains.is_empty() {
+            out.push(format!(
+                "{} now sees: {}",
+                l(&c.org),
+                names(&c.gains).replace(',', ", ")
+            ));
+        }
+        if !c.loses.is_empty() {
+            out.push(format!(
+                "{} no longer sees: {}",
+                l(&c.org),
+                names(&c.loses).replace(',', ", ")
+            ));
+        }
+    }
+    out
+}
+
+/// What an opening's audience is, in words.
+fn audience(a: &str) -> String {
+    if a == "linked" {
+        "every linked org".to_string()
+    } else {
+        l(a).into_owned()
+    }
+}
+
+/// `g-lead (agent) to every linked org`.
+pub fn grant_what(g: &p::Grant) -> String {
+    format!("{} ({}) to {}", l(&g.target), g.kind, audience(&g.audience))
+}
+
+/// [`grant_what`] with its state and origin.
+pub fn grant_text(g: &p::Grant) -> String {
+    let mut out = grant_what(g);
+    if !g.active {
+        out.push_str(&format!(
+            " (waits for an active link with {})",
+            l(&g.audience)
+        ));
+    }
+    if g.managed {
+        out.push_str(" [team file]");
+    }
+    out
+}
+
+/// A table of grants: target, kind, audience, state, managed, id.
+pub fn grant_table(grants: &[p::Grant]) -> String {
+    let mut rows = vec![[
+        "TARGET".to_string(),
+        "KIND".into(),
+        "AUDIENCE".into(),
+        "STATE".into(),
+        "MANAGED".into(),
+        "ID".into(),
+    ]];
+    for g in grants {
+        rows.push([
+            l(&g.target).into_owned(),
+            g.kind.to_string(),
+            l(&g.audience).into_owned(),
+            if g.active { "active" } else { "waiting" }.into(),
+            if g.managed { "team file" } else { "by hand" }.into(),
+            g.id.to_string(),
+        ]);
+    }
+    table(&rows)
+}
+
+/// Columns padded to the widest cell.
+pub fn table<const N: usize>(rows: &[[String; N]]) -> String {
+    let widths: Vec<usize> = (0..N)
+        .map(|i| rows.iter().map(|r| r[i].chars().count()).max().unwrap_or(0))
+        .collect();
+    rows.iter()
+        .map(|r| {
+            r.iter()
+                .enumerate()
+                .map(|(i, c)| format!("{c:<w$}", w = widths[i]))
+                .collect::<Vec<_>>()
+                .join("  ")
+                .trim_end()
+                .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub fn list_line(x: &p::List) -> String {
@@ -230,9 +385,30 @@ pub fn member_line(m: &p::ListMember) -> String {
     format!("member {} {}", l(&m.address), m.mode)
 }
 
+/// `link beta active since 2026-10-05 10:00Z`, with the request's note:
+/// the other org's note is marked as their (untrusted) words.
 pub fn link_line(x: &p::Link) -> String {
-    format!("link {} {}", l(&x.org), x.state)
+    let mut out = format!("link {} {}", l(&x.org), x.state);
+    if let Some(t) = &x.since {
+        out.push_str(&format!(" since {}", short_time(t)));
+    }
+    if let Some(n) = &x.note {
+        match x.state {
+            p::LinkState::Invited => out.push_str(&format!(
+                " note from {} (their words, untrusted): {}",
+                l(&x.org),
+                quoted_value(n)
+            )),
+            _ => out.push_str(&format!(" your note: {}", quoted_value(n))),
+        }
+    }
+    out
 }
+
+/// One line on why a recipient was rejected as `unreachable`.
+pub const UNREACHABLE: &str = "(unreachable: that org has not opened the seat to your org and it \
+is not a participant of this thread, or no such seat exists there; or your org lets only open \
+seats write to other orgs. See amail who --org <org>)";
 
 pub fn send_result(r: &p::SendResponse) -> String {
     let parts: Vec<String> = r
@@ -259,6 +435,10 @@ pub fn send_result(r: &p::SendResponse) -> String {
             l(&rej.address),
             l(&rej.reason)
         ));
+    }
+    if r.rejected.iter().any(|x| x.reason == "unreachable") {
+        out.push('\n');
+        out.push_str(UNREACHABLE);
     }
     if !r.notes.is_empty() {
         let notes: Vec<String> = r.notes.iter().map(note).collect();

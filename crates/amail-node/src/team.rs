@@ -4,6 +4,8 @@
 //!
 //! ```toml
 //! [team]
+//! name = "platform"             # optional: the team this file describes
+//! description = "Builds the platform."
 //! template = "staged-merge"     # built-in template, or a template directory
 //! repo = "/path/to/repo"
 //! workroot = "/path/to/worktrees"
@@ -26,7 +28,15 @@
 //! parent = "root"
 //! lead = { name = "be-lead", harness = "codex", model = "codex-model" }
 //! workers = { count = 3, prefix = "be" }   # be-1 .. be-3, reporting to be-lead
+//! description = "The backend: API and storage."
+//! open = "linked"               # or ["orgname", ...]; opens the group's team
+//! contacts = ["be-lead"]        # default for an open group: its lead
 //! ```
+//!
+//! Teams: with `[team] name`, the file is one team; its `[[group]]`s are
+//! sub-teams of it (nested as their parent seats are) and seats outside any
+//! group are its members. Without a name, each `[[group]]` is a team, a
+//! sub-team of the team of its parent seat when that seat is in a group.
 
 use crate::wire::GitAccess;
 use amail_proto::{PermissionMode, valid_name};
@@ -56,6 +66,11 @@ struct FileRaw {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TeamRaw {
+    /// The team this file describes (see the module documentation).
+    name: Option<String>,
+    description: Option<String>,
+    open: Option<toml::Value>,
+    contacts: Option<Vec<String>>,
     template: Option<String>,
     repo: Option<PathBuf>,
     workroot: Option<PathBuf>,
@@ -93,6 +108,10 @@ struct SeatRaw {
     cwd: Option<PathBuf>,
     display_name: Option<String>,
     paste_fallback: Option<bool>,
+    /// What the seat does, for others to find it.
+    description: Option<String>,
+    /// `"linked"` or `["orgname", ...]`: open the seat to these orgs.
+    open: Option<toml::Value>,
     /// `[[seat]]` only: join this group (as a worker of its lead, unless
     /// `parent` says otherwise).
     group: Option<String>,
@@ -103,6 +122,9 @@ struct SeatRaw {
 struct GroupRaw {
     name: String,
     parent: Option<String>,
+    description: Option<String>,
+    open: Option<toml::Value>,
+    contacts: Option<Vec<String>>,
     lead: SeatRaw,
     /// `{ count, prefix, ... }`, or an array of seat tables.
     workers: Option<toml::Value>,
@@ -120,6 +142,7 @@ struct WorkersRaw {
     dsh_jail: Option<bool>,
     role: Option<String>,
     role_file: Option<PathBuf>,
+    description: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -193,7 +216,11 @@ impl Position {
 pub struct SeatPlan {
     pub name: String,
     pub parent: Option<String>,
+    /// The seat's team: its group, or (with `[team] name`) the file's team.
     pub group: Option<String>,
+    pub description: Option<String>,
+    /// Audiences the file opens the seat to: `linked` or org names.
+    pub open: Vec<String>,
     pub harness: String,
     pub model: Option<String>,
     pub permission_mode: Option<PermissionMode>,
@@ -218,6 +245,25 @@ pub struct GroupPlan {
     pub workers: Vec<String>,
 }
 
+/// A team the file declares: the file's own (`[team] name`) or a group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TeamPlan {
+    pub name: String,
+    pub description: Option<String>,
+    /// The team's root seat: a group's lead; for the file's team, its only
+    /// seat without a parent (if there is just one).
+    pub root: Option<String>,
+    /// The parent team.
+    pub parent: Option<String>,
+    /// Member seats, in file order (lead first).
+    pub members: Vec<String>,
+    /// The team's contacts; `None`: the file does not say (whatever the
+    /// server has stays).
+    pub contacts: Option<Vec<String>>,
+    /// Audiences the file opens the team to: `linked` or org names.
+    pub open: Vec<String>,
+}
+
 /// An expanded team file.
 #[derive(Debug, Clone)]
 pub struct Team {
@@ -230,6 +276,10 @@ pub struct Team {
     /// Parents come before their children.
     pub seats: Vec<SeatPlan>,
     pub groups: Vec<GroupPlan>,
+    /// `[team] name`: the team this file describes.
+    pub name: Option<String>,
+    /// The teams the file declares, parents first.
+    pub teams: Vec<TeamPlan>,
 }
 
 /// A validation error, pointing at the entry it is about.
@@ -293,6 +343,50 @@ fn abs(base: &Path, p: &Path) -> PathBuf {
     } else {
         base.join(p)
     }
+}
+
+/// A description from the file: trimmed, `None` when empty, checked like
+/// the server checks it.
+fn description(what: &str, d: Option<&String>) -> Result<Option<String>, TeamError> {
+    let Some(d) = d.map(|d| d.trim()).filter(|d| !d.is_empty()) else {
+        return Ok(None);
+    };
+    amail_proto::check_description(d).map_err(|e| TeamError(format!("{what}: {e}")))?;
+    Ok(Some(d.to_string()))
+}
+
+/// `open = "linked"` or `open = ["orgname", ...]` (`"linked"` may be in the
+/// list): the audiences, sorted, without duplicates.
+fn open_list(what: &str, v: Option<&toml::Value>) -> Result<Vec<String>, TeamError> {
+    let bad = |x: &str| {
+        TeamError(format!(
+            "{what}: open {x}: expected \"linked\" (every linked org) or a list of org names, \
+             e.g. open = [\"other-org\"]"
+        ))
+    };
+    let items: Vec<String> = match v {
+        None => return Ok(Vec::new()),
+        Some(toml::Value::String(s)) if s.trim() == "linked" => vec!["linked".into()],
+        Some(toml::Value::String(s)) => return Err(bad(&format!("{s:?}"))),
+        Some(toml::Value::Array(a)) => a
+            .iter()
+            .map(|x| match x {
+                toml::Value::String(s) => Ok(s.trim().to_string()),
+                other => Err(bad(&other.to_string())),
+            })
+            .collect::<Result<_, _>>()?,
+        Some(other) => return Err(bad(&other.to_string())),
+    };
+    let mut out = BTreeSet::new();
+    for a in items {
+        if a != "linked" && !valid_name(&a) {
+            return Err(TeamError(format!(
+                "{what}: open: {a:?} is not an org name (must match [a-z0-9][a-z0-9._-]{{0,62}})"
+            )));
+        }
+        out.insert(a);
+    }
+    Ok(out.into_iter().collect())
 }
 
 fn harness_name(s: &str) -> Option<&'static str> {
@@ -459,10 +553,14 @@ pub fn parse(text: &str, base: &Path) -> Result<Team, TeamError> {
                 (None, None) => None,
             };
         let role = role.map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
+        let desc = description(&what, s.description.as_ref())?;
+        let open = open_list(&what, s.open.as_ref())?;
         seats.push(SeatPlan {
             name: s.name.clone(),
             parent,
             group,
+            description: desc,
+            open,
             harness: harness.to_string(),
             model: s
                 .model
@@ -564,6 +662,7 @@ pub fn parse(text: &str, base: &Path) -> Result<Team, TeamError> {
                         name: format!("{prefix}-{n}"),
                         role: w.role.clone(),
                         role_file: w.role_file.clone(),
+                        description: w.description.clone(),
                         ..Default::default()
                     };
                     add(
@@ -687,6 +786,7 @@ pub fn parse(text: &str, base: &Path) -> Result<Team, TeamError> {
         }
     }
 
+    let (teams, name) = teams_of(&raw, &mut ordered, &groups)?;
     let team = Team {
         base: base.to_path_buf(),
         template,
@@ -695,9 +795,198 @@ pub fn parse(text: &str, base: &Path) -> Result<Team, TeamError> {
         settings,
         seats: ordered,
         groups,
+        name,
+        teams,
     };
     team.check_workdirs()?;
     Ok(team)
+}
+
+/// A team's contacts as the file gives them: checked against its members;
+/// an open team without `contacts` gets `default` (its lead or root).
+fn contacts_of(
+    what: &str,
+    given: Option<&Vec<String>>,
+    members: &[String],
+    open: &[String],
+    default: Option<&String>,
+) -> Result<Option<Vec<String>>, TeamError> {
+    match given {
+        Some(cs) => {
+            let mut out: Vec<String> = Vec::new();
+            for c in cs {
+                if !members.contains(c) {
+                    return err(format!(
+                        "{what}: contact {c:?} is not a member of the team (members: {})",
+                        members.join(", ")
+                    ));
+                }
+                if !out.contains(c) {
+                    out.push(c.clone());
+                }
+            }
+            if out.is_empty() && !open.is_empty() {
+                return err(format!(
+                    "{what}: an open team needs at least one contact (contacts = [...])"
+                ));
+            }
+            Ok(Some(out))
+        }
+        None if open.is_empty() => Ok(None),
+        None => match default {
+            Some(d) => Ok(Some(vec![d.clone()])),
+            None => err(format!(
+                "{what}: an open team needs contacts: name them with contacts = [...]"
+            )),
+        },
+    }
+}
+
+/// The teams of a file (parents first) and its own team's name; sets the
+/// team of seats outside any group to the file's team.
+fn teams_of(
+    raw: &FileRaw,
+    seats: &mut [SeatPlan],
+    groups: &[GroupPlan],
+) -> Result<(Vec<TeamPlan>, Option<String>), TeamError> {
+    let t = &raw.team;
+    let own = t.name.as_deref().map(str::trim).filter(|n| !n.is_empty());
+    let mut teams: Vec<TeamPlan> = Vec::new();
+    match own {
+        None => {
+            for (field, set) in [
+                ("description", t.description.is_some()),
+                ("open", t.open.is_some()),
+                ("contacts", t.contacts.is_some()),
+            ] {
+                if set {
+                    return err(format!(
+                        "[team] {field}: give the file's team a name first ([team] name = \"...\")"
+                    ));
+                }
+            }
+        }
+        Some(n) => {
+            if !valid_name(n) {
+                return err(format!(
+                    "[team] name {n:?}: invalid team name (must match [a-z0-9][a-z0-9._-]{{0,62}})"
+                ));
+            }
+            if RESERVED_LISTS.contains(&n) {
+                return err(format!(
+                    "[team] name {n:?}: the name is reserved for a generated list"
+                ));
+            }
+            if seats.iter().any(|s| s.name == n) {
+                return err(format!(
+                    "[team] name {n:?}: a seat has the same name (seats and teams share names)"
+                ));
+            }
+            if groups.iter().any(|g| g.name == n) {
+                return err(format!("[team] name {n:?}: a [[group]] has the same name"));
+            }
+            for s in seats.iter_mut().filter(|s| s.group.is_none()) {
+                s.group = Some(n.to_string());
+            }
+            let members: Vec<String> = seats
+                .iter()
+                .filter(|s| s.group.as_deref() == Some(n))
+                .map(|s| s.name.clone())
+                .collect();
+            let tops: Vec<&SeatPlan> = seats.iter().filter(|s| s.parent.is_none()).collect();
+            let root = match tops.as_slice() {
+                [one] if members.contains(&one.name) => Some(one.name.clone()),
+                _ => None,
+            };
+            let open = open_list("[team]", t.open.as_ref())?;
+            let contacts = contacts_of(
+                "[team]",
+                t.contacts.as_ref(),
+                &members,
+                &open,
+                root.as_ref(),
+            )?;
+            teams.push(TeamPlan {
+                name: n.to_string(),
+                description: description("[team]", t.description.as_ref())?,
+                root,
+                parent: None,
+                members,
+                contacts,
+                open,
+            });
+        }
+    }
+    let team_of: HashMap<String, Option<String>> = seats
+        .iter()
+        .map(|s| (s.name.clone(), s.group.clone()))
+        .collect();
+    for (i, g) in raw.group.iter().enumerate() {
+        let what = format!("[[group]] #{} {:?}", i + 1, g.name);
+        let plan = groups
+            .iter()
+            .find(|x| x.name == g.name)
+            .expect("every group was expanded");
+        let mut members = vec![plan.lead.clone()];
+        members.extend(plan.workers.iter().cloned());
+        let parent = match &g.parent {
+            Some(p) => team_of.get(p).cloned().flatten(),
+            None => own.map(str::to_string),
+        };
+        let open = open_list(&what, g.open.as_ref())?;
+        let contacts = contacts_of(
+            &what,
+            g.contacts.as_ref(),
+            &members,
+            &open,
+            Some(&plan.lead),
+        )?;
+        teams.push(TeamPlan {
+            name: g.name.clone(),
+            description: description(&what, g.description.as_ref())?,
+            root: Some(plan.lead.clone()),
+            parent,
+            members,
+            contacts,
+            open,
+        });
+    }
+    // Team parents follow seat parents across groups, which can loop even
+    // when the seats do not (a worker with its own `parent`).
+    let parent_of: HashMap<&str, Option<&str>> = teams
+        .iter()
+        .map(|t| (t.name.as_str(), t.parent.as_deref()))
+        .collect();
+    for t in &teams {
+        let mut cur = t.parent.as_deref();
+        let mut steps = 0;
+        while let Some(p) = cur {
+            if p == t.name || steps > teams.len() {
+                return err(format!(
+                    "[[group]] {:?}: its parent seat puts the team inside itself (team \
+                     {p:?} is both above and below it)",
+                    t.name
+                ));
+            }
+            cur = parent_of.get(p).copied().flatten();
+            steps += 1;
+        }
+    }
+    let mut ordered: Vec<TeamPlan> = Vec::with_capacity(teams.len());
+    while ordered.len() < teams.len() {
+        for t in &teams {
+            if ordered.iter().any(|o| o.name == t.name) {
+                continue;
+            }
+            if t.parent
+                .as_ref()
+                .is_none_or(|p| ordered.iter().any(|o| &o.name == p))
+            {
+                ordered.push(t.clone());
+            }
+        }
+    }
+    Ok((ordered, own.map(str::to_string)))
 }
 
 impl Team {
@@ -822,16 +1111,21 @@ impl Team {
         Ok(())
     }
 
+    /// The member list of each team (named after it): `(name, members,
+    /// false)`. A team without members of its own has none.
+    pub fn team_lists(&self) -> Vec<(String, Vec<String>, bool)> {
+        self.teams
+            .iter()
+            .filter(|t| !t.members.is_empty())
+            .map(|t| (t.name.clone(), t.members.clone(), false))
+            .collect()
+    }
+
     /// The generated lists: `(name, members, post_policy_user_only)`. One
-    /// per group (lead and workers), `leads` (every seat with
+    /// per team ([`Team::team_lists`]), `leads` (every seat with
     /// subordinates) and `all` (every seat; only the user may post).
     pub fn lists(&self) -> Vec<(String, Vec<String>, bool)> {
-        let mut out = Vec::new();
-        for g in &self.groups {
-            let mut m = vec![g.lead.clone()];
-            m.extend(g.workers.iter().cloned());
-            out.push((g.name.clone(), m, false));
-        }
+        let mut out = self.team_lists();
         let leads: Vec<String> = self
             .seats
             .iter()
@@ -849,7 +1143,8 @@ impl Team {
         out
     }
 
-    /// The seats `--only` selects: a group's lead and workers, or one seat.
+    /// The seats `--only` selects: a group's lead and workers, the members
+    /// of the file's team, or one seat.
     pub fn select(&self, only: &[String]) -> Result<Vec<String>, TeamError> {
         if only.is_empty() {
             return Ok(self.seats.iter().map(|s| s.name.clone()).collect());
@@ -859,6 +1154,8 @@ impl Team {
             if let Some(g) = self.groups.iter().find(|g| &g.name == o) {
                 out.insert(g.lead.clone());
                 out.extend(g.workers.iter().cloned());
+            } else if let Some(t) = self.teams.iter().find(|t| &t.name == o) {
+                out.extend(t.members.iter().cloned());
             } else if self.seat(o).is_some() {
                 out.insert(o.clone());
             } else {
@@ -876,7 +1173,7 @@ impl Team {
             .collect())
     }
 
-    /// The zellij session suffix of a seat: its group, else `main`.
+    /// The zellij session suffix of a seat: its team, else `main`.
     pub fn session_group(&self, name: &str) -> String {
         self.seat(name)
             .and_then(|s| s.group.clone())
@@ -1194,6 +1491,237 @@ harness = "codex"
             let e = team(text).expect_err(text).0;
             assert!(e.contains(want), "{text:?}: got {e:?}, want {want:?}");
         }
+    }
+
+    #[test]
+    fn groups_become_teams_nested_as_written() {
+        let t = team(EXAMPLE).unwrap();
+        assert_eq!(t.name, None);
+        let names: Vec<&str> = t.teams.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(names, vec!["backend", "db"]);
+        let be = &t.teams[0];
+        assert_eq!(be.parent, None);
+        assert_eq!(be.root.as_deref(), Some("be-lead"));
+        assert_eq!(be.members, vec!["be-lead", "be-1", "be-2", "be-3"]);
+        assert_eq!(be.contacts, None);
+        assert!(be.open.is_empty());
+        // db's parent seat is in backend: a sub-team of it.
+        assert_eq!(t.teams[1].parent.as_deref(), Some("backend"));
+        // Seats outside groups are in no team.
+        assert_eq!(t.seat("root").unwrap().group, None);
+        assert_eq!(t.session_group("docs"), "main");
+    }
+
+    const NAMED: &str = r#"
+[team]
+name = "platform"
+description = "Builds the platform."
+workroot = "/w"
+open = ["beta", "linked", "beta"]
+
+[defaults]
+harness = "claude"
+
+[[seat]]
+name = "root"
+description = "  Runs the platform team.  "
+open = "linked"
+
+[[seat]]
+name = "docs"
+parent = "root"
+
+[[group]]
+name = "api"
+parent = "root"
+description = "The public API."
+open = ["beta"]
+lead = { name = "api-lead", description = "Leads the API." }
+workers = { count = 2, prefix = "api", description = "Writes API code." }
+
+[[group]]
+name = "store"
+parent = "api-1"
+contacts = ["store-2"]
+lead = { name = "store-lead" }
+workers = [{ name = "store-1" }, { name = "store-2", description = "On call.", open = ["gamma"] }]
+"#;
+
+    #[test]
+    fn a_named_file_is_one_team_with_sub_teams() {
+        let t = team(NAMED).unwrap();
+        assert_eq!(t.name.as_deref(), Some("platform"));
+        let names: Vec<&str> = t.teams.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(names, vec!["platform", "api", "store"]);
+        let pl = &t.teams[0];
+        assert_eq!(pl.description.as_deref(), Some("Builds the platform."));
+        assert_eq!(pl.parent, None);
+        assert_eq!(pl.root.as_deref(), Some("root"));
+        assert_eq!(pl.members, vec!["root", "docs"]);
+        assert_eq!(pl.open, vec!["beta", "linked"]);
+        // Open without contacts: its root.
+        assert_eq!(pl.contacts, Some(vec!["root".to_string()]));
+        let api = &t.teams[1];
+        assert_eq!(api.parent.as_deref(), Some("platform"));
+        assert_eq!(api.description.as_deref(), Some("The public API."));
+        assert_eq!(api.open, vec!["beta"]);
+        assert_eq!(api.contacts, Some(vec!["api-lead".to_string()]));
+        // store's parent seat is a worker of api.
+        let st = &t.teams[2];
+        assert_eq!(st.parent.as_deref(), Some("api"));
+        assert_eq!(st.contacts, Some(vec!["store-2".to_string()]));
+        assert!(st.open.is_empty());
+        // Seats: team, description, open.
+        let root = t.seat("root").unwrap();
+        assert_eq!(root.group.as_deref(), Some("platform"));
+        assert_eq!(root.description.as_deref(), Some("Runs the platform team."));
+        assert_eq!(root.open, vec!["linked"]);
+        assert_eq!(t.seat("docs").unwrap().group.as_deref(), Some("platform"));
+        assert_eq!(t.seat("docs").unwrap().description, None);
+        assert_eq!(
+            t.seat("api-lead").unwrap().description.as_deref(),
+            Some("Leads the API.")
+        );
+        assert_eq!(
+            t.seat("api-2").unwrap().description.as_deref(),
+            Some("Writes API code.")
+        );
+        let s2 = t.seat("store-2").unwrap();
+        assert_eq!(s2.description.as_deref(), Some("On call."));
+        assert_eq!(s2.open, vec!["gamma"]);
+        // Sessions and lists follow the teams.
+        assert_eq!(t.session_group("docs"), "platform");
+        let lists = t.team_lists();
+        assert_eq!(
+            lists[0],
+            (
+                "platform".to_string(),
+                vec!["root".to_string(), "docs".to_string()],
+                false
+            )
+        );
+        assert_eq!(lists.len(), 3);
+        assert_eq!(
+            t.select(&["platform".into()]).unwrap(),
+            vec!["root", "docs"]
+        );
+    }
+
+    #[test]
+    #[allow(clippy::useless_format)] // the cases read alike
+    fn new_fields_are_checked() {
+        let base = "[team]\nworkroot = \"/w\"\n[defaults]\nharness = \"claude\"\n";
+        let long = "x".repeat(501);
+        let cases: Vec<(String, &str)> = vec![
+            (
+                format!("{base}[[seat]]\nname = \"a\"\nopen = \"beta\"\n"),
+                "[[seat]] #1 \"a\": open \"beta\": expected \"linked\"",
+            ),
+            (
+                format!("{base}[[seat]]\nname = \"a\"\nopen = [\"Bad Org\"]\n"),
+                "[[seat]] #1 \"a\": open: \"Bad Org\" is not an org name",
+            ),
+            (
+                format!("{base}[[seat]]\nname = \"a\"\nopen = true\n"),
+                "open true",
+            ),
+            (
+                format!("{base}[[seat]]\nname = \"a\"\ndescription = \"{long}\"\n"),
+                "[[seat]] #1 \"a\": description",
+            ),
+            (
+                format!("{base}[[seat]]\nname = \"a\"\ndescription = \"one\\n\\ntwo\"\n"),
+                "[[seat]] #1 \"a\": description",
+            ),
+            (
+                format!(
+                    "{base}[[group]]\nname = \"g\"\nlead = {{ name = \"l\" }}\ncontacts = [\"x\"]\n"
+                ),
+                "[[group]] #1 \"g\": contact \"x\" is not a member of the team",
+            ),
+            (
+                format!(
+                    "{base}[[group]]\nname = \"g\"\nlead = {{ name = \"l\" }}\nopen = \"linked\"\ncontacts = []\n"
+                ),
+                "[[group]] #1 \"g\": an open team needs at least one contact",
+            ),
+            (
+                format!(
+                    "{base}[[group]]\nname = \"g\"\nlead = {{ name = \"l\" }}\ndescription = \"{long}\"\n"
+                ),
+                "[[group]] #1 \"g\": description",
+            ),
+            (
+                format!(
+                    "[team]\ndescription = \"x\"\nworkroot = \"/w\"\n[defaults]\nharness = \"claude\"\n[[seat]]\nname = \"a\"\n"
+                ),
+                "[team] description: give the file's team a name first",
+            ),
+            (
+                format!(
+                    "[team]\nopen = \"linked\"\nworkroot = \"/w\"\n[defaults]\nharness = \"claude\"\n[[seat]]\nname = \"a\"\n"
+                ),
+                "[team] open: give the file's team a name first",
+            ),
+            (
+                format!(
+                    "[team]\nname = \"a\"\nworkroot = \"/w\"\n[defaults]\nharness = \"claude\"\n[[seat]]\nname = \"a\"\n"
+                ),
+                "[team] name \"a\": a seat has the same name",
+            ),
+            (
+                format!(
+                    "[team]\nname = \"g\"\nworkroot = \"/w\"\n[defaults]\nharness = \"claude\"\n[[group]]\nname = \"g\"\nlead = {{ name = \"l\" }}\n"
+                ),
+                "[team] name \"g\": a [[group]] has the same name",
+            ),
+            (
+                format!(
+                    "[team]\nname = \"all\"\nworkroot = \"/w\"\n[defaults]\nharness = \"claude\"\n[[seat]]\nname = \"a\"\n"
+                ),
+                "reserved",
+            ),
+            (
+                format!(
+                    "[team]\nname = \"Big Team\"\nworkroot = \"/w\"\n[defaults]\nharness = \"claude\"\n[[seat]]\nname = \"a\"\n"
+                ),
+                "invalid team name",
+            ),
+            (
+                // Two seats without a parent: no root to default the contacts to.
+                format!(
+                    "[team]\nname = \"t\"\nopen = \"linked\"\nworkroot = \"/w\"\n[defaults]\nharness = \"claude\"\n\
+                         [[seat]]\nname = \"a\"\n[[seat]]\nname = \"b\"\n"
+                ),
+                "[team]: an open team needs contacts",
+            ),
+            (
+                format!(
+                    "[team]\nname = \"t\"\ncontacts = [\"x\"]\nworkroot = \"/w\"\n[defaults]\nharness = \"claude\"\n[[seat]]\nname = \"a\"\n"
+                ),
+                "[team]: contact \"x\" is not a member",
+            ),
+            (
+                // Team parents loop although seat parents do not.
+                format!(
+                    "{base}[[seat]]\nname = \"top\"\n\
+                     [[group]]\nname = \"a\"\nparent = \"bw\"\nlead = {{ name = \"la\" }}\nworkers = [{{ name = \"aw\" }}]\n\
+                     [[group]]\nname = \"b\"\nparent = \"aw\"\nlead = {{ name = \"lb\" }}\nworkers = [{{ name = \"bw\", parent = \"top\" }}]\n"
+                ),
+                "puts the team inside itself",
+            ),
+        ];
+        for (text, want) in &cases {
+            let e = team(text).expect_err(text).0;
+            assert!(e.contains(want), "{text:?}: got {e:?}, want {want:?}");
+        }
+        // Valid: an empty list closes; contacts without open are kept.
+        let t = team(&format!(
+            "{base}[[group]]\nname = \"g\"\nopen = []\ncontacts = [\"w\"]\nlead = {{ name = \"l\" }}\nworkers = [{{ name = \"w\" }}]\n"
+        ))
+        .unwrap();
+        assert!(t.teams[0].open.is_empty());
+        assert_eq!(t.teams[0].contacts, Some(vec!["w".to_string()]));
     }
 
     #[test]

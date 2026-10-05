@@ -35,6 +35,15 @@ impl std::fmt::Display for ApiError {
         for r in &self.body.error.rejected {
             write!(f, "\nrejected {}: {}", r.address, r.reason)?;
         }
+        if self
+            .body
+            .error
+            .rejected
+            .iter()
+            .any(|r| r.reason == "unreachable")
+        {
+            write!(f, "\n{}", crate::output::UNREACHABLE)?;
+        }
         Ok(())
     }
 }

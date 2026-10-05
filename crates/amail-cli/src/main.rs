@@ -3,6 +3,7 @@
 mod admin;
 mod client;
 mod onboard;
+mod openings_cmd;
 mod output;
 mod profiles;
 mod service;
@@ -157,8 +158,48 @@ enum Cmd {
     /// Show a thread (by thread id or the id of any message in it), or
     /// delete it (`amail thread delete <id>`).
     Thread(ThreadCli),
-    /// Directory: seats, lists and linked orgs.
-    Who,
+    /// Directory: seats (with descriptions and teams), teams, lists and
+    /// linked orgs; with --org, what another org shows yours.
+    Who {
+        /// Only entries whose name or description contains this text (any
+        /// case).
+        #[arg(long)]
+        search: Option<String>,
+        /// Another org: its card, and the seats and teams it opened to your
+        /// org (the addresses to write to there).
+        #[arg(long, value_name = "ORG", conflicts_with = "search")]
+        org: Option<String>,
+    },
+    /// Open a seat or team to other orgs (user token): its card becomes
+    /// visible to them and their seats may start threads with it (for a
+    /// team: with its contacts). Prints what each linked org now sees.
+    Open {
+        /// A seat or team of your org.
+        target: String,
+        /// Only to this org (the opening waits until the link with it is
+        /// active).
+        #[arg(long, value_name = "ORG", conflicts_with = "to_linked")]
+        to: Option<String>,
+        /// To every org your org has an active link with (the default).
+        #[arg(long)]
+        to_linked: bool,
+    },
+    /// Close an opening (user token), at once, in existing threads too.
+    /// Without --to or --to-linked: every opening of that seat or team.
+    Close {
+        target: String,
+        /// Only the opening to this org.
+        #[arg(long, value_name = "ORG", conflicts_with = "to_linked")]
+        to: Option<String>,
+        /// Only the opening to every linked org.
+        #[arg(long)]
+        to_linked: bool,
+    },
+    /// Your org's openings: which seats and teams are open to which orgs.
+    Openings,
+    /// Teams of your org: list, show, change.
+    #[command(subcommand)]
+    Team(openings_cmd::TeamCmd),
     /// Focus mode: only urgent mail reaches the seat until it ends.
     Focus {
         #[command(subcommand)]
@@ -668,6 +709,16 @@ enum SeatCmd {
         /// --permission-mode`, not from this setting.
         #[arg(long)]
         permission_mode: Option<String>,
+        /// What the seat does, for others to find it (shown to other orgs
+        /// on its card when it is open to them).
+        #[arg(long)]
+        description: Option<String>,
+        /// The seat's team (created when there is none of that name).
+        #[arg(long)]
+        team: Option<String>,
+        /// The seat is a contact of its team: opening the team opens it.
+        #[arg(long, requires = "team")]
+        contact: bool,
     },
     /// Change a seat's settings.
     Set {
@@ -684,6 +735,24 @@ enum SeatCmd {
         display_name: Option<String>,
         #[arg(long)]
         permission_mode: Option<String>,
+        /// What the seat does, for others to find it.
+        #[arg(long, conflicts_with = "no_description")]
+        description: Option<String>,
+        /// Remove the description.
+        #[arg(long)]
+        no_description: bool,
+        /// Move the seat to this team (created when there is none).
+        #[arg(long, conflicts_with = "no_team")]
+        team: Option<String>,
+        /// Take the seat out of its team.
+        #[arg(long)]
+        no_team: bool,
+        /// Make the seat a contact of its team.
+        #[arg(long, conflicts_with = "no_contact")]
+        contact: bool,
+        /// The seat is no longer a contact of its team.
+        #[arg(long)]
+        no_contact: bool,
     },
     Ls,
     Rm {
@@ -730,10 +799,21 @@ enum ListCmd {
 
 #[derive(Subcommand)]
 enum LinkCmd {
-    Request { org: String },
-    Accept { org: String },
+    /// Ask another org's user for a link (user token).
+    Request {
+        org: String,
+        /// A short note for their user (one paragraph, at most 500
+        /// characters), shown to them as your words.
+        #[arg(long)]
+        note: Option<String>,
+    },
+    Accept {
+        org: String,
+    },
     Ls,
-    Revoke { org: String },
+    Revoke {
+        org: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -762,7 +842,12 @@ enum TokenCmd {
 
 #[derive(Subcommand)]
 enum OrgCmd {
-    Show,
+    /// Your org: card, settings, openings and links (and a one-time notice,
+    /// shown once). With an org name: that org as yours sees it.
+    Show {
+        /// Another org's name.
+        org: Option<String>,
+    },
     /// Delete all mail of deleted orgs that your org keeps (user token).
     PurgeDeletedOrgs,
     /// Delete the org and all its data (seats, mail, lists, links, tokens).
@@ -796,6 +881,32 @@ enum OrgCmd {
         /// Remove the webhook.
         #[arg(long)]
         no_webhook: bool,
+        /// What the org is, on its card (one paragraph, at most 500
+        /// characters).
+        #[arg(long, conflicts_with = "no_description")]
+        description: Option<String>,
+        /// Remove the description.
+        #[arg(long)]
+        no_description: bool,
+        /// A display name for the card.
+        #[arg(long, conflicts_with = "no_display_name")]
+        display_name: Option<String>,
+        /// Remove the display name.
+        #[arg(long)]
+        no_display_name: bool,
+        /// `listed-by-name` (anyone signed in who knows the name can read
+        /// the card and ask for a link) or `hidden` (to orgs without an
+        /// active link, the org does not exist).
+        #[arg(long, value_parser = parse_visibility)]
+        visibility: Option<p::OrgVisibility>,
+        /// `any-seat` (every seat may write to linked orgs) or
+        /// `open-seats-only` (only you and the seats open to that org).
+        #[arg(long, value_parser = parse_outbound)]
+        outbound: Option<p::Outbound>,
+        /// New threads to other orgs a seat may start per hour (you are
+        /// exempt).
+        #[arg(long)]
+        new_threads_per_hour: Option<i64>,
     },
 }
 
@@ -1343,26 +1454,37 @@ async fn run(cli: Cli) -> Result<()> {
             }
             let v = serde_json::to_value(&t)?;
             out.show(&v, || {
-                Ok(t.messages
+                let mut text = t
+                    .messages
                     .iter()
                     .map(|m| output::message(m).trim_end().to_string())
                     .collect::<Vec<_>>()
-                    .join("\n---\n"))
+                    .join("\n---\n");
+                if !t.participants.is_empty() {
+                    text.push_str(
+                        "\n---\nseats of other orgs in this thread (you may answer them here):",
+                    );
+                    for c in &t.participants {
+                        text.push_str(&format!("\n  {}", output::card_line(c)));
+                    }
+                }
+                Ok(text)
             })
         }
-        Cmd::Who => {
-            let seats = c.raw(Method::GET, "/seats", None).await?;
-            let lists = c.raw(Method::GET, "/lists", None).await?;
-            let links = c.raw(Method::GET, "/links", None).await?;
-            let all = json!({ "seats": seats, "lists": lists, "links": links });
-            out.show(&all, || {
-                let mut text = Vec::new();
-                text.extend(parse::<Vec<p::Seat>>(&seats)?.iter().map(output::seat_line));
-                text.extend(parse::<Vec<p::List>>(&lists)?.iter().map(output::list_line));
-                text.extend(parse::<Vec<p::Link>>(&links)?.iter().map(output::link_line));
-                Ok(text.join("\n"))
-            })
-        }
+        Cmd::Who { search, org: None } => openings_cmd::who(&c, &out, search).await,
+        Cmd::Who { org: Some(o), .. } => openings_cmd::peer(&c, &out, &o).await,
+        Cmd::Open {
+            target,
+            to,
+            to_linked: _,
+        } => openings_cmd::open(&c, &out, &target, to).await,
+        Cmd::Close {
+            target,
+            to,
+            to_linked,
+        } => openings_cmd::close(&c, &out, &target, to, to_linked).await,
+        Cmd::Openings => openings_cmd::openings(&c, &out).await,
+        Cmd::Team(cmd) => openings_cmd::team(&c, &out, cmd).await,
         Cmd::Focus { cmd } => {
             let (method, seat, body) = match cmd {
                 FocusCmd::On { duration, seat } => {
@@ -1545,10 +1667,8 @@ async fn run(cli: Cli) -> Result<()> {
                 Ok(format!("deleted {deleted} messages of deleted orgs"))
             })
         }
-        Cmd::Org(OrgCmd::Show) => {
-            let v = c.raw(Method::GET, "/org", None).await?;
-            out.show(&v, || org_text(&v))
-        }
+        Cmd::Org(OrgCmd::Show { org: None }) => openings_cmd::org_show(&c, &out).await,
+        Cmd::Org(OrgCmd::Show { org: Some(o) }) => openings_cmd::peer(&c, &out, &o).await,
         Cmd::Org(OrgCmd::Set {
             send_rate_per_min,
             send_burst,
@@ -1559,13 +1679,32 @@ async fn run(cli: Cli) -> Result<()> {
             digest_interval_min,
             webhook_url,
             no_webhook,
+            description,
+            no_description,
+            display_name,
+            no_display_name,
+            visibility,
+            outbound,
+            new_threads_per_hour,
         }) => {
             let mut body = json!({
                 "send_rate_per_min": send_rate_per_min, "send_burst": send_burst,
                 "max_recipients": max_recipients, "max_thread_depth": max_thread_depth,
                 "ack_timeout_min": ack_timeout_min, "focus_max_min": focus_max_min,
-                "digest_interval_min": digest_interval_min,
+                "digest_interval_min": digest_interval_min, "visibility": visibility,
+                "outbound": outbound, "new_threads_per_hour": new_threads_per_hour,
             });
+            // `null` clears these, so they are only sent when asked.
+            for (k, v, clear) in [
+                ("description", description, no_description),
+                ("display_name", display_name, no_display_name),
+            ] {
+                if clear {
+                    body[k] = Value::Null;
+                } else if let Some(v) = v {
+                    body[k] = json!(v);
+                }
+            }
             // `webhook_url: null` clears it, so the key is only sent when asked.
             if no_webhook {
                 body["webhook_url"] = Value::Null;
@@ -1627,6 +1766,9 @@ async fn seat_cmd(c: &Client, out: &Out, cmd: SeatCmd) -> Result<()> {
             model,
             display_name,
             permission_mode,
+            description,
+            team,
+            contact,
         } => {
             let pm = permission_mode
                 .map(|m| m.parse::<p::PermissionMode>())
@@ -1634,7 +1776,8 @@ async fn seat_cmd(c: &Client, out: &Out, cmd: SeatCmd) -> Result<()> {
                 .map_err(anyhow::Error::msg)?;
             let body = json!({
                 "name": name, "parent": parent, "role": role, "harness": harness, "model": model,
-                "display_name": display_name, "permission_mode": pm,
+                "display_name": display_name, "permission_mode": pm, "description": description,
+                "group": team, "contact": contact,
             });
             let v = c.raw(Method::POST, "/seats", Some(&body)).await?;
             out.show(&v, || Ok(output::seat_line(&parse(&v)?)))
@@ -1647,12 +1790,31 @@ async fn seat_cmd(c: &Client, out: &Out, cmd: SeatCmd) -> Result<()> {
             model,
             display_name,
             permission_mode,
+            description,
+            no_description,
+            team,
+            no_team,
+            contact,
+            no_contact,
         } => {
             let pm = permission_mode
                 .map(|m| m.parse::<p::PermissionMode>())
                 .transpose()
                 .map_err(anyhow::Error::msg)?;
             let mut body = serde_json::Map::new();
+            for (k, v, clear) in [
+                ("description", description, no_description),
+                ("group", team, no_team),
+            ] {
+                if clear {
+                    body.insert(k.into(), Value::Null);
+                } else if let Some(v) = v {
+                    body.insert(k.into(), json!(v));
+                }
+            }
+            if contact || no_contact {
+                body.insert("contact".into(), json!(contact));
+            }
             for (k, v) in [
                 ("parent", parent),
                 ("role", role),
@@ -1798,9 +1960,13 @@ async fn list_cmd(c: &Client, out: &Out, cmd: ListCmd) -> Result<()> {
 
 async fn link_cmd(c: &Client, out: &Out, cmd: LinkCmd) -> Result<()> {
     let v = match &cmd {
-        LinkCmd::Request { org } => {
-            c.raw(Method::POST, "/links", Some(&json!({ "org": org })))
-                .await?
+        LinkCmd::Request { org, note } => {
+            c.raw(
+                Method::POST,
+                "/links",
+                Some(&json!({ "org": org, "note": note })),
+            )
+            .await?
         }
         LinkCmd::Accept { org } => {
             c.raw(Method::POST, &format!("/links/{}/accept", enc(org)), None)
@@ -1912,6 +2078,16 @@ async fn serve(
     };
     amail_server::serve(listener, state, shutdown).await?;
     Ok(())
+}
+
+fn parse_visibility(s: &str) -> Result<p::OrgVisibility, String> {
+    s.parse()
+        .map_err(|_| format!("{s:?}: expected listed-by-name or hidden"))
+}
+
+fn parse_outbound(s: &str) -> Result<p::Outbound, String> {
+    s.parse()
+        .map_err(|_| format!("{s:?}: expected any-seat or open-seats-only"))
 }
 
 fn parse_permission_mode(s: &str) -> Result<p::PermissionMode, String> {

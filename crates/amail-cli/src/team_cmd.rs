@@ -133,7 +133,7 @@ fn desired_seat(t: &Team, s: &team::SeatPlan, main: &str) -> p::NewSeat {
         model: s.model.clone(),
         permission_mode: s.permission_mode,
         group: s.group.clone(),
-        description: None,
+        description: s.description.clone(),
         contact: false,
     }
 }
@@ -166,7 +166,172 @@ fn seat_patch(
         json!(want.permission_mode),
     );
     field("group", json!(cur.group), json!(want.group));
+    // A description the file does not give stays as it is (it may have
+    // been set by hand).
+    if want.description.is_some() {
+        field(
+            "description",
+            json!(cur.description),
+            json!(want.description),
+        );
+    }
     (patch, changed)
+}
+
+/// Fields of a seat change that need no restart of its session.
+const NO_RESTART: &[&str] = &["group", "description"];
+
+/// What `up --prune` may delete, and which server teams belong to the file.
+///
+/// The file's teams are the teams it declares and, on the server, the teams
+/// below them (a group removed from the file keeps its place there). Seats
+/// not in the file are in its scope when they are in one of those teams; a
+/// seat in no team is in scope when the node supervises it and it sits in a
+/// seat tree of this file: for a file with teams, a tree that holds a
+/// member of its teams; for a file without teams, a tree with no team
+/// member at all. So several team files can be up in one org without one
+/// touching the other's seats.
+pub struct Scope {
+    /// Seats not in the file that belong to it (oldest first).
+    pub removed: Vec<String>,
+    /// Server teams that belong to the file (declared or below those).
+    pub owned: BTreeSet<String>,
+}
+
+pub fn scope(
+    t: &Team,
+    server: &[p::Seat],
+    teams: &[p::Team],
+    supervised: &BTreeSet<&str>,
+) -> Scope {
+    let declared: BTreeSet<&str> = t.teams.iter().map(|x| x.name.as_str()).collect();
+    let parent_team: BTreeMap<&str, Option<&str>> = teams
+        .iter()
+        .map(|x| (x.name.as_str(), x.parent.as_deref()))
+        .collect();
+    let mut owned: BTreeSet<String> = declared.iter().map(|x| x.to_string()).collect();
+    for x in teams {
+        let mut cur = Some(x.name.as_str());
+        let mut steps = 0;
+        while let Some(n) = cur {
+            if declared.contains(n) {
+                owned.insert(x.name.clone());
+                break;
+            }
+            steps += 1;
+            if steps > teams.len() {
+                break;
+            }
+            cur = parent_team.get(n).copied().flatten();
+        }
+    }
+    // Seat parents and teams: the server's, as the file will make them.
+    let mut parent: BTreeMap<&str, Option<&str>> = BTreeMap::new();
+    let mut team: BTreeMap<&str, Option<&str>> = BTreeMap::new();
+    for s in server.iter().filter(|s| s.kind == SeatKind::Agent) {
+        parent.insert(&s.name, s.parent.as_deref());
+        team.insert(&s.name, s.group.as_deref());
+    }
+    for s in &t.seats {
+        parent.insert(&s.name, s.parent.as_deref());
+        team.insert(&s.name, s.group.as_deref());
+    }
+    let top = |n: &str| -> String {
+        let mut n = n.to_string();
+        let mut steps = 0;
+        while let Some(Some(p)) = parent.get(n.as_str()) {
+            if steps > parent.len() || !parent.contains_key(p) {
+                break;
+            }
+            n = p.to_string();
+            steps += 1;
+        }
+        n
+    };
+    let mut ours_tops = BTreeSet::new();
+    let mut team_tops = BTreeSet::new();
+    for (n, tm) in &team {
+        if let Some(tm) = tm {
+            team_tops.insert(top(n));
+            if owned.contains(*tm) {
+                ours_tops.insert(top(n));
+            }
+        }
+    }
+    let in_file: BTreeSet<&str> = t.seats.iter().map(|s| s.name.as_str()).collect();
+    let mut removed = Vec::new();
+    for s in server.iter().filter(|s| s.kind == SeatKind::Agent) {
+        if in_file.contains(s.name.as_str()) {
+            continue;
+        }
+        let ours = match s.group.as_deref() {
+            Some(g) => owned.contains(g),
+            None if !supervised.contains(s.name.as_str()) => false,
+            None if t.teams.is_empty() => !team_tops.contains(&top(&s.name)),
+            None => ours_tops.contains(&top(&s.name)),
+        };
+        if ours {
+            removed.push(s.name.clone());
+        }
+    }
+    Scope { removed, owned }
+}
+
+/// `leads` (agent seats with subordinates) and `all` (every agent seat;
+/// only the user may post), from the server's seats: they cover every
+/// team file that is up in the org.
+fn org_lists(seats: &[p::Seat]) -> Vec<(String, Vec<String>, bool)> {
+    let agents: Vec<&p::Seat> = seats.iter().filter(|s| s.kind == SeatKind::Agent).collect();
+    let leads: Vec<String> = agents
+        .iter()
+        .filter(|s| agents.iter().any(|c| c.parent.as_deref() == Some(&s.name)))
+        .map(|s| s.name.clone())
+        .collect();
+    let mut out = Vec::new();
+    if !leads.is_empty() {
+        out.push(("leads".to_string(), leads, false));
+    }
+    out.push((
+        "all".to_string(),
+        agents.iter().map(|s| s.name.clone()).collect(),
+        true,
+    ));
+    out
+}
+
+/// The `TeamPut` that makes the server's team `cur` (if any) what the file
+/// declares, and the names of the fields that change.
+fn team_put(cur: Option<&p::Team>, want: &team::TeamPlan) -> (Value, Vec<&'static str>) {
+    let mut body = serde_json::Map::new();
+    let mut changed = Vec::new();
+    let mut field = |name: &'static str, a: Value, b: Value| {
+        if a != b {
+            body.insert(name.to_string(), b);
+            changed.push(name);
+        }
+    };
+    let cur_v = |f: fn(&p::Team) -> Value| cur.map(f).unwrap_or(Value::Null);
+    if want.description.is_some() {
+        field(
+            "description",
+            cur_v(|t| json!(t.description)),
+            json!(want.description),
+        );
+    }
+    field("root", cur_v(|t| json!(t.root)), json!(want.root));
+    field("parent", cur_v(|t| json!(t.parent)), json!(want.parent));
+    field("managed", cur_v(|t| json!(t.managed)), json!(true));
+    if let Some(cs) = &want.contacts {
+        let have: BTreeSet<String> = cur
+            .map(|t| t.contacts.iter().cloned().collect())
+            .unwrap_or_default();
+        let want_set: BTreeSet<String> = cs.iter().cloned().collect();
+        if have != want_set || cur.is_none() {
+            body.insert("contacts".into(), json!(cs));
+            changed.push("contacts");
+        }
+    }
+    (Value::Object(body), changed)
 }
 
 pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
@@ -203,13 +368,30 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
             bail!("seat {:?} in the team file is the org's user seat", s.name);
         }
     }
+    let in_file: BTreeSet<&str> = t.seats.iter().map(|s| s.name.as_str()).collect();
+    for x in &t.teams {
+        if by_name.contains_key(x.name.as_str()) && !in_file.contains(x.name.as_str()) {
+            bail!(
+                "team {:?} of the team file would clash with the existing seat of that name",
+                x.name
+            );
+        }
+    }
     let server_lists: Vec<p::List> = c.get("/lists").await?;
+    let server_teams: Vec<p::Team> = c.get("/teams").await?;
+    let server_grants: Vec<p::Grant> = c.get("/grants").await?;
     for (name, _, _) in t.lists() {
         if by_name.contains_key(name.as_str()) {
             bail!("the generated list {name:?} would clash with an existing seat of that name");
         }
     }
     let mut report: Vec<String> = Vec::new();
+    // Whether anything changed on the server.
+    let mut changed_any = false;
+    let info: p::OrgInfo = c.get("/org").await?;
+    if let Some(n) = crate::openings_cmd::take_notice(c, &info).await {
+        report.push(crate::openings_cmd::notice_text(&n));
+    }
 
     // 2. Working directories.
     if t.uses_worktrees() {
@@ -255,6 +437,7 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
                     .await
                     .with_context(|| format!("creating seat {}", s.name))?;
                 created.push(s.name.clone());
+                changed_any = true;
             }
             Some(cur) => {
                 let (patch, changed) = seat_patch(cur, &want);
@@ -268,8 +451,11 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
                 )
                 .await
                 .with_context(|| format!("updating seat {}", s.name))?;
+                changed_any = true;
                 report.push(format!("updated seat {}: {}", s.name, changed.join(", ")));
-                if live.contains_key(s.name.as_str()) && changed.iter().any(|f| *f != "group") {
+                if live.contains_key(s.name.as_str())
+                    && changed.iter().any(|f| !NO_RESTART.contains(f))
+                {
                     restart_needed.push(s.name.clone());
                     // A Codex session gets its role only in its first prompt.
                     if s.harness == "codex"
@@ -286,7 +472,6 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
         report.push(format!("created seats: {}", created.join(", ")));
     }
     // Seats that left the file.
-    let in_file: BTreeSet<&str> = t.seats.iter().map(|s| s.name.as_str()).collect();
     // Supervised seats that were deleted on the server (e.g. with `amail
     // seat rm` on another host): the node stops them and drops them.
     let mut gone: Vec<String> = rows
@@ -310,20 +495,12 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
             gone.join(", ")
         ));
     }
-    let mut removed: Vec<String> = rows
+    let supervised: BTreeSet<&str> = rows
         .iter()
-        .filter(|r| !in_file.contains(r.seat.as_str()) && !gone.contains(&r.seat))
-        .map(|r| r.seat.clone())
+        .filter(|r| !gone.contains(&r.seat))
+        .map(|r| r.seat.as_str())
         .collect();
-    for s in &server_seats {
-        if s.kind == SeatKind::Agent
-            && s.group.is_some()
-            && !in_file.contains(s.name.as_str())
-            && !removed.contains(&s.name)
-        {
-            removed.push(s.name.clone());
-        }
-    }
+    let Scope { removed, owned } = scope(&t, &server_seats, &server_teams, &supervised);
     if !removed.is_empty() && o.only.is_empty() {
         if o.prune {
             let supervised: Vec<String> = removed
@@ -345,6 +522,7 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
                 }
             }
             report.push(format!("pruned seats: {}", removed.join(", ")));
+            changed_any = true;
         } else {
             report.push(format!(
                 "not in the team file (kept; use --prune to delete): {}",
@@ -353,10 +531,138 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
         }
     }
 
-    // 4. Generated lists.
+    // 4. Teams and openings. Openings the file no longer declares are
+    // closed first (a team without contacts cannot stay open); new ones
+    // are added once the teams have their contacts.
+    let pruned: BTreeSet<&str> = if o.prune && o.only.is_empty() {
+        removed.iter().map(String::as_str).collect()
+    } else {
+        BTreeSet::new()
+    };
+    let mut declared: BTreeSet<(String, String)> = BTreeSet::new();
+    for s in &t.seats {
+        for a in &s.open {
+            declared.insert((s.name.clone(), a.clone()));
+        }
+    }
+    for x in &t.teams {
+        for a in &x.open {
+            declared.insert((x.name.clone(), a.clone()));
+        }
+    }
+    let targets: BTreeSet<&str> = in_file
+        .iter()
+        .copied()
+        .chain(removed.iter().map(String::as_str))
+        .chain(owned.iter().map(String::as_str))
+        .collect();
+    let mut grant_changes: Vec<Value> = Vec::new();
+    for g in &server_grants {
+        if !g.managed
+            || !targets.contains(g.target.as_str())
+            || pruned.contains(g.target.as_str())
+            || declared.contains(&(g.target.clone(), g.audience.clone()))
+        {
+            continue;
+        }
+        let v = c
+            .raw(Method::DELETE, &format!("/grants/{}", g.id), None)
+            .await
+            .with_context(|| format!("closing {} to {}", g.target, g.audience))?;
+        let ch: p::GrantChange = serde_json::from_value(v.clone())?;
+        report.push(format!(
+            "closed (no longer in the team file): {}",
+            crate::output::grant_what(g)
+        ));
+        report.extend(crate::output::sight_lines(&ch.changes));
+        grant_changes.push(v);
+        changed_any = true;
+    }
+    let teams_now: Vec<p::Team> = c.get("/teams").await?;
+    for x in &t.teams {
+        let cur = teams_now.iter().find(|y| y.name == x.name);
+        let existed = server_teams.iter().any(|y| y.name == x.name);
+        let (body, fields) = team_put(cur, x);
+        if fields.is_empty() {
+            continue;
+        }
+        c.raw(
+            Method::PUT,
+            &format!("/teams/{}", enc(&x.name)),
+            Some(&body),
+        )
+        .await
+        .with_context(|| format!("updating team {}", x.name))?;
+        changed_any = true;
+        report.push(if existed {
+            format!("updated team {}: {}", x.name, fields.join(", "))
+        } else {
+            format!("created team {}", x.name)
+        });
+    }
+    for (target, aud) in &declared {
+        if server_grants
+            .iter()
+            .any(|g| &g.target == target && &g.audience == aud)
+        {
+            continue;
+        }
+        let body = json!({
+            "target": target,
+            "audience": (aud != "linked").then_some(aud),
+            "managed": true,
+        });
+        let v = c
+            .raw(Method::POST, "/grants", Some(&body))
+            .await
+            .with_context(|| format!("opening {target} to {aud}"))?;
+        let ch: p::GrantChange = serde_json::from_value(v.clone())?;
+        if let Some(g) = &ch.grant {
+            report.push(format!("opened {}", crate::output::grant_text(g)));
+        }
+        report.extend(crate::output::sight_lines(&ch.changes));
+        grant_changes.push(v);
+        changed_any = true;
+    }
+    // Teams of the file that it no longer declares.
+    let declared_teams: BTreeSet<&str> = t.teams.iter().map(|x| x.name.as_str()).collect();
+    let seats_after: Vec<p::Seat> = c.get("/seats").await?;
+    let mut stale_teams = Vec::new();
+    for x in &teams_now {
+        if !x.managed || !owned.contains(&x.name) || declared_teams.contains(x.name.as_str()) {
+            continue;
+        }
+        let members = seats_after
+            .iter()
+            .filter(|s| s.group.as_deref() == Some(x.name.as_str()))
+            .count();
+        if o.prune && o.only.is_empty() && members == 0 {
+            c.raw(Method::DELETE, &format!("/teams/{}", enc(&x.name)), None)
+                .await
+                .with_context(|| format!("deleting team {}", x.name))?;
+            report.push(format!(
+                "deleted team {} (no longer in the team file)",
+                x.name
+            ));
+            changed_any = true;
+        } else {
+            stale_teams.push(x.name.clone());
+        }
+    }
+    if !stale_teams.is_empty() {
+        report.push(format!(
+            "teams no longer in the team file (amail up --prune deletes them once they have \
+             no members; amail team rm deletes one now): {}",
+            stale_teams.join(", ")
+        ));
+    }
+
+    // 5. Generated lists: one per team of the file, and `leads` and `all`
+    // over the org's agent seats.
     let lists_by_name: BTreeMap<&str, &p::List> =
         server_lists.iter().map(|l| (l.name.as_str(), l)).collect();
-    let wanted = t.lists();
+    let mut wanted = t.team_lists();
+    wanted.extend(org_lists(&seats_after));
     for (name, members, user_only) in &wanted {
         let policy = if *user_only {
             PostPolicy::UserOnly
@@ -376,6 +682,7 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
                 c.raw(Method::DELETE, &format!("/lists/{}", enc(name)), None)
                     .await?;
                 fresh = true;
+                changed_any = true;
             }
             Some(_) => {}
             None => fresh = true,
@@ -391,6 +698,7 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
             )
             .await
             .with_context(|| format!("creating list {name}"))?;
+            changed_any = true;
             BTreeSet::new()
         } else {
             let l: p::List = c.get(&format!("/lists/{}", enc(name))).await?;
@@ -420,6 +728,9 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
             )
             .await?;
         }
+        if !add.is_empty() || !drop.is_empty() {
+            changed_any = true;
+        }
         if fresh {
             report.push(format!("list {name}: {} members", want.len()));
         } else if !add.is_empty() || !drop.is_empty() {
@@ -431,9 +742,15 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
         }
     }
     let wanted_names: BTreeSet<&str> = wanted.iter().map(|(n, _, _)| n.as_str()).collect();
+    // A generated list of another team file's team is that file's.
     let stale: Vec<&str> = server_lists
         .iter()
-        .filter(|l| l.managed && !wanted_names.contains(l.name.as_str()))
+        .filter(|l| {
+            l.managed
+                && !wanted_names.contains(l.name.as_str())
+                && !team::RESERVED_LISTS.contains(&l.name.as_str())
+                && (owned.contains(&l.name) || !teams_now.iter().any(|x| x.name == l.name))
+        })
         .map(|l| l.name.as_str())
         .collect();
     if !stale.is_empty() {
@@ -443,6 +760,7 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
                     .await?;
             }
             report.push(format!("pruned lists: {}", stale.join(", ")));
+            changed_any = true;
         } else {
             report.push(format!(
                 "generated lists no longer in the team (use --prune): {}",
@@ -451,7 +769,11 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
         }
     }
 
-    // 5. Sessions, through the node.
+    if !changed_any {
+        report.push("seats, teams, openings and lists: no changes".into());
+    }
+
+    // 6. Sessions, through the node.
     let placements: Vec<SeatPlacement> = t
         .placements()
         .into_iter()
@@ -544,6 +866,8 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
         "seats": v["seats"],
         "report": report,
         "restart_needed": restart_needed,
+        "openings": grant_changes,
+        "changed": changed_any,
     });
     out.show(&all, || Ok(report.join("\n")))
 }
