@@ -5,7 +5,8 @@
   import { go } from '../lib/router.svelte';
   import { buildSend, replySubject, type ComposeError, type MetaRow } from '../lib/compose';
   import { ack, markRead } from '../lib/mailops';
-  import type { MessageResponse, SendResponse, Message, Delivery } from '../lib/types';
+  import { activeOrgs, peerCandidates } from '../lib/openings';
+  import type { Card, MessageResponse, SendResponse, Message, Delivery, ThreadResponse } from '../lib/types';
   import AddressInput from '../components/AddressInput.svelte';
   import MessageCard from '../components/MessageCard.svelte';
   import SendReceipt from '../components/SendReceipt.svelte';
@@ -26,6 +27,18 @@
   let bodyEl: HTMLTextAreaElement | undefined = $state();
   /** The answer to the last send: shown instead of the form. */
   let receipt = $state.raw<SendResponse | null>(null);
+  /** Another org's seats that wrote in the thread being answered. */
+  let participants = $state.raw<Card[]>([]);
+  /** Some recipients were rejected as unreachable. */
+  let unreachable = $state(false);
+
+  // Addresses of other orgs to offer: only what they opened to this org,
+  // and the participants of the thread being answered.
+  $effect(() => {
+    void store.links;
+    void store.loadPeers();
+  });
+  const external = $derived(peerCandidates(store.peerCards, activeOrgs(store.links), participants));
 
   $effect(() => {
     const reply = query.get('reply');
@@ -35,12 +48,16 @@
     receipt = null;
     subject = query.get('subject') ?? '';
     replyTo = null;
+    participants = [];
     if (!reply) return;
     get<MessageResponse>(`/v1/messages/${enc(reply)}?peek=1`)
       .then((r) => {
         const m = r.message;
         replyTo = m;
         replyDelivery = r.delivery;
+        get<ThreadResponse>(`/v1/threads/${enc(String(m.thread_id))}`)
+          .then((th) => (participants = th.participants ?? []))
+          .catch(() => undefined);
         const me = store.me?.seat;
         const toList = all ? [m.from, ...m.to.filter((a) => a !== me && a !== m.from)] : [m.from];
         to = toList.join(', ');
@@ -86,6 +103,7 @@
   async function send(e?: SubmitEvent) {
     e?.preventDefault();
     error = null;
+    unreachable = false;
     const { req, error: ce } = buildSend({ to, cc, subject, body, urgent, ack: ackReq, meta, inReplyTo: replyTo?.id });
     if (ce || !req) {
       error = ce ? errText(ce) : null;
@@ -103,6 +121,7 @@
     } catch (err) {
       if (err instanceof ApiError && err.rejected.length) {
         error = t('compose.rejected', { list: err.rejected.map((x) => `${x.address} (${x.reason})`).join(', ') });
+        unreachable = err.rejected.some((x) => x.reason === 'unreachable');
       } else error = err instanceof Error ? err.message : String(err);
     } finally {
       busy = false;
@@ -116,8 +135,8 @@
     <SendReceipt r={receipt} onagain={again} />
   {:else}
   <form class="card form" onsubmit={send}>
-    <div class="field"><label for="c-to">{t('compose.to')}</label><AddressInput id="c-to" label={t('compose.to')} bind:value={to} /></div>
-    <div class="field"><label for="c-cc">{t('compose.cc')}</label><AddressInput id="c-cc" label={t('compose.cc')} bind:value={cc} /></div>
+    <div class="field"><label for="c-to">{t('compose.to')}</label><AddressInput id="c-to" label={t('compose.to')} {external} bind:value={to} /></div>
+    <div class="field"><label for="c-cc">{t('compose.cc')}</label><AddressInput id="c-cc" label={t('compose.cc')} {external} bind:value={cc} /></div>
     <p class="hint faint">{t('compose.addrHint')}</p>
     <div class="field"><label for="c-subj">{t('compose.subject')}</label><input id="c-subj" type="text" maxlength="300" bind:value={subject} /></div>
     <textarea
@@ -154,6 +173,7 @@
       </div>
     </fieldset>
     {#if error}<p class="error" role="alert">{error}</p>{/if}
+    {#if unreachable}<p class="faint" data-testid="unreachable-hint">{t('compose.unreachable')}</p>{/if}
     <div class="row">
       <span class="spacer"></span>
       <button type="button" onclick={() => history.back()}>{t('compose.cancel')}</button>

@@ -57,7 +57,14 @@ export interface Seat {
   harness?: string;
   model?: string;
   permission_mode?: PermissionMode;
+  /** The seat's team (at most one). */
   group?: string;
+  /** What the seat does, for others to find it (shown to other orgs when open). */
+  description?: string;
+  /** A contact of its team: opening the team opens it. */
+  contact?: boolean;
+  /** Audiences the seat is open to (`linked` or org names), directly or as a team contact. */
+  open_to?: string[];
   created_at: string;
   presence?: Presence;
   /** In focus mode (only urgent mail reaches it) until then. */
@@ -70,7 +77,7 @@ export interface PresenceEvent extends Presence {
 
 /** A seat or list was created, changed or deleted (user streams). */
 export interface DirectoryEvent {
-  kind: 'seat' | 'list';
+  kind: 'seat' | 'list' | 'team' | 'grant';
   name: string;
   change: 'created' | 'updated' | 'deleted';
 }
@@ -101,6 +108,10 @@ export interface MessageHeader {
   meta?: Meta;
   /** The server's retention period removed the body. */
   expired?: boolean;
+  /** Addresses of `to` of another org the reader may not see (left out of `to`). */
+  to_hidden?: number;
+  /** As `to_hidden`, for `cc`. */
+  cc_hidden?: number;
 }
 
 export interface Message extends MessageHeader {
@@ -153,6 +164,8 @@ export interface StatusResponse {
 export interface ThreadResponse {
   thread_id: number;
   messages: Message[];
+  /** Seats of other orgs that wrote in this thread: they may be answered in it. */
+  participants?: Card[];
   /** Older messages were left out. */
   truncated?: boolean;
 }
@@ -277,12 +290,85 @@ export interface ListInfo {
   post_policy: PostPolicy;
   member_count: number;
   managed?: boolean;
-  members?: { address: string; mode: DeliveryMode }[];
+  /** `inactive`: a member of another org that gets no mail now. */
+  members?: { address: string; mode: DeliveryMode; inactive?: boolean }[];
 }
 
 export interface Link {
   org: string;
   state: LinkState;
+  /** When the link became active, or when it was requested. */
+  since?: string;
+  /** The note of the request (`invited`: the other user's text, untrusted). */
+  note?: string;
+}
+
+export type OrgVisibility = 'listed-by-name' | 'hidden';
+export type Outbound = 'any-seat' | 'open-seats-only';
+export type CardKind = 'user' | 'agent' | 'team';
+
+/** What another org may know of a seat or team. */
+export interface Card {
+  /** `name@org` for cards of another org. */
+  address: string;
+  kind: CardKind;
+  description?: string;
+}
+
+export interface OrgCard {
+  name: string;
+  display_name?: string;
+  description?: string;
+}
+
+/** `GET /v1/orgs/{name}`: another org as this org sees it. */
+export interface PeerOrg {
+  card: OrgCard;
+  link?: Link;
+  open_to_you: Card[];
+  you_open: Grant[];
+}
+
+export interface Team {
+  name: string;
+  description?: string;
+  root?: string;
+  parent?: string;
+  members: string[];
+  contacts: string[];
+  open_to?: string[];
+  managed?: boolean;
+  created_at: string;
+}
+
+/** An opening: `target` is shown to `audience` and may be written to. */
+export interface Grant {
+  id: number;
+  target: string;
+  kind: CardKind;
+  /** `linked` or an org name. */
+  audience: string;
+  /** False: a named org without an active link (the grant waits). */
+  active: boolean;
+  managed?: boolean;
+  created_at: string;
+}
+
+export interface NewGrant {
+  target: string;
+  audience?: string;
+}
+
+/** What a change does to what one linked org sees. */
+export interface SightChange {
+  org: string;
+  gains?: string[];
+  loses?: string[];
+}
+
+export interface GrantChange {
+  grant?: Grant;
+  changes: SightChange[];
 }
 
 export interface OrgInfo {
@@ -295,6 +381,13 @@ export interface OrgInfo {
   focus_max_min: number;
   digest_interval_min: number;
   webhook_url?: string;
+  display_name?: string;
+  description?: string;
+  visibility?: OrgVisibility;
+  outbound?: Outbound;
+  new_threads_per_hour?: number;
+  /** A one-time notice for the user; cleared with `DELETE /v1/org/notice`. */
+  notice?: string;
 }
 
 export interface TokenInfo {

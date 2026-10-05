@@ -45,9 +45,16 @@ describe('compose', () => {
     expect(currentToken('w1, be-')).toBe('be-');
     expect(completeToken('w1, be-', 'be-lead')).toBe('w1, be-lead, ');
   });
-  it('suggests seats, lists and linked-org addresses', () => {
+  it('suggests seats, lists and only the given addresses of other orgs', () => {
     const seats = [{ name: 'be-lead' }, { name: 'be-1' }, { name: 'web' }];
-    expect(suggest('be', seats, ['beta-team', 'ops'], ['acme']).map((s) => s.address)).toEqual(['be-1', 'be-lead', 'beta-team', 'be@acme']);
-    expect(suggest('ops@a', seats, [], ['acme', 'beta']).map((s) => s.address)).toEqual(['ops@acme']);
+    const ext = [
+      { address: 'help@acme', kind: 'open' as const, detail: 'support desk' },
+      { address: 'bert@beta', kind: 'participant' as const },
+    ];
+    expect(suggest('be', seats, ['beta-team', 'ops'], ext).map((s) => s.address)).toEqual(['be-1', 'be-lead', 'beta-team', 'bert@beta']);
+    // No made-up `name@org` for a linked org: only cards and participants.
+    expect(suggest('ops@a', seats, [], ext)).toEqual([]);
+    expect(suggest('help@', seats, [], ext)).toEqual([{ address: 'help@acme', kind: 'open', detail: 'support desk' }]);
+    expect(suggest('acme', seats, [], ext).map((s) => s.kind)).toEqual(['open']);
   });
 });

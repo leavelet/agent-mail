@@ -118,6 +118,11 @@ async function setup(procs: ChildProcess[]): Promise<void> {
   const org = 'acme';
   const userToken = (JSON.parse(run(['--json', 'admin', 'create-org', org, '--db', db])) as { token: string }).token;
   const bigToken = (JSON.parse(run(['--json', 'admin', 'create-org', 'scale', '--db', db])) as { token: string }).token;
+  // Other orgs: globex (linked with acme), initech (asks acme for a link).
+  const peerOrg = 'globex';
+  const peerToken = (JSON.parse(run(['--json', 'admin', 'create-org', peerOrg, '--db', db])) as { token: string }).token;
+  const inviter = 'initech';
+  const inviterToken = (JSON.parse(run(['--json', 'admin', 'create-org', inviter, '--db', db])) as { token: string }).token;
 
   const port = await freePort();
   const base = `http://127.0.0.1:${port}`;
@@ -163,6 +168,39 @@ async function setup(procs: ChildProcess[]): Promise<void> {
     to: ['owner'],
     subject: '数据库迁移方案',
     body: '建议先迁移只读副本，再切换主库。迁移期间检索服务保持可用。',
+  });
+
+  // The other orgs. globex opens its front desk to every linked org and
+  // its eng team (contact: eng-lead) to acme; quiet and eng-1 stay closed.
+  await call(base, peerToken, 'PATCH', '/org', { display_name: 'Globex Corporation', description: 'Builds the billing platform. Ask the front desk first.' });
+  const peerSeats = [
+    { name: 'help', description: 'Front desk of Globex: questions about the billing API.' },
+    { name: 'eng-lead', group: 'eng', contact: true, description: 'Leads billing engineering.' },
+    { name: 'eng-1', parent: 'eng-lead', group: 'eng', description: 'Billing engineer.' },
+    { name: 'quiet', description: 'Internal reviewer.' },
+  ];
+  for (const x of peerSeats) await call(base, peerToken, 'POST', '/seats', { harness: 'claude', model: 'sonnet', ...x });
+  await call(base, peerToken, 'PUT', '/teams/eng', { description: 'Billing engineering.', root: 'eng-lead' });
+  const peerSeatTokens: Record<string, string> = {};
+  for (const x of peerSeats) peerSeatTokens[x.name] = (await call<{ token: string }>(base, peerToken, 'POST', `/seats/${x.name}/tokens`, { label: 'e2e' })).token;
+  await call(base, userToken, 'POST', '/links', { org: peerOrg, note: 'acme here: let us coordinate the search API.' });
+  await call(base, peerToken, 'POST', `/links/${org}/accept`);
+  await call(base, peerToken, 'POST', '/grants', { target: 'help' });
+  await call(base, peerToken, 'POST', '/grants', { target: 'eng', audience: org });
+  await call(base, inviterToken, 'POST', '/links', { org, note: 'Initech would like to exchange release notes.' });
+  // Mail from globex: to acme's user with closed globex seats in To and Cc
+  // (acme sees a count), and from a closed seat that thereby becomes a
+  // participant of its thread.
+  await call(base, peerSeatTokens.help, 'POST', '/messages', {
+    to: [`owner@${org}`, 'quiet'],
+    cc: ['eng-1'],
+    subject: 'Billing API questions',
+    body: 'Which currency fields does your search index need?',
+  });
+  await call(base, peerSeatTokens.quiet, 'POST', '/messages', {
+    to: [`owner@${org}`],
+    subject: 'Review notes on the export format',
+    body: 'Two small remarks on the export format; answer here if you like.',
   });
 
   // A node that hosts be-1, whose transcript is a fixture file. Claude Code
@@ -272,6 +310,7 @@ async function setup(procs: ChildProcess[]): Promise<void> {
     transcript,
     node: nodeOk,
     big: { org: 'scale', userToken: bigToken, nodeToken: bigNode },
+    peer: { org: peerOrg, userToken: peerToken, seatTokens: peerSeatTokens, inviter },
     pub: { base: pubBase, invites, opToken, db: pubDb },
     pids: procs.map((p) => p.pid!).filter(Boolean),
   };

@@ -43,7 +43,7 @@
     return (name: string) => {
       const seat = store.seatMap.get(name);
       if (!seat) return false;
-      if (q && !name.includes(q) && !(seat.display_name ?? '').toLowerCase().includes(q)) return false;
+      if (q && !name.includes(q) && !(seat.display_name ?? '').toLowerCase().includes(q) && !(seat.description ?? '').toLowerCase().includes(q)) return false;
       if (states.size === 0) return true;
       if (seat.kind === 'user') return false;
       if (states.has('needs') && needsPerson(seat, now)) return true;

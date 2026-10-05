@@ -16,9 +16,12 @@
   import ComposePage from './pages/ComposePage.svelte';
   import AdminSeats from './pages/admin/AdminSeats.svelte';
   import AdminLists from './pages/admin/AdminLists.svelte';
-  import AdminLinks from './pages/admin/AdminLinks.svelte';
   import AdminTokens from './pages/admin/AdminTokens.svelte';
   import AdminSettings from './pages/admin/AdminSettings.svelte';
+  import AdminOpenings from './pages/admin/AdminOpenings.svelte';
+  import TeamsPage from './pages/TeamsPage.svelte';
+  import OthersPage from './pages/OthersPage.svelte';
+  import PeerOrgPage from './pages/PeerOrgPage.svelte';
   import RegisterPage from './pages/RegisterPage.svelte';
   import OperatorPage from './pages/OperatorPage.svelte';
 
@@ -94,8 +97,20 @@
           <button class="small" onclick={() => store.check()}>{t('app.retry')}</button>
         </div>
       {/if}
+      {#if store.orgNotice}
+        <div class="banner notice" role="status" data-testid="org-notice">
+          <span class="text">{store.orgNotice}</span>
+          <button class="small" onclick={() => store.dismissNotice()}>{t('app.dismiss')}</button>
+        </div>
+      {/if}
       {#if section === 'org' || section === 'seat'}
         <OrgPage selected={parts[1]} stateFilter={query.get('state') ?? undefined} />
+      {:else if section === 'teams'}
+        <TeamsPage selected={parts[1]} />
+      {:else if section === 'orgs' && parts[1]}
+        {#key parts[1]}<PeerOrgPage name={parts[1]} />{/key}
+      {:else if section === 'orgs'}
+        <OthersPage />
       {:else if section === 'needs'}
         <NeedsPage />
       {:else if section === 'inbox'}
@@ -108,7 +123,8 @@
         <ComposePage {query} />
       {:else if section === 'admin'}
         {#if parts[1] === 'lists'}<AdminLists />
-        {:else if parts[1] === 'links'}<AdminLinks />
+        {:else if parts[1] === 'links'}<OthersPage />
+        {:else if parts[1] === 'openings'}<AdminOpenings />
         {:else if parts[1] === 'tokens'}<AdminTokens />
         {:else if parts[1] === 'settings'}<AdminSettings />
         {:else}<AdminSeats />{/if}
@@ -141,6 +157,13 @@
     display: flex;
     gap: 10px;
     align-items: center;
+  }
+  .banner.notice {
+    background: var(--warn-weak);
+  }
+  .banner.notice .text {
+    white-space: pre-wrap;
+    flex: 1;
   }
   @media (max-width: 720px) {
     .shell {
