@@ -15,6 +15,9 @@
 #                    (Claude: via the inbox socket; Codex: `codex queue`)
 #   <seat>.injected  every hook answer the node gave
 #   <seat>.started   "<unix ms> <pid>" when a Claude session sent SessionStart
+#   <seat>.ready     "<pid>" once a Claude session's first turn has ended (or
+#                    at once in mode noturn): before that, mail sent to the
+#                    seat is shown by that turn's hooks, not by a wake-up
 #   sock/<seat>.sock the seat's inbox socket (served by the test)
 #   thread-<id>.seat the seat of a Codex thread (for `codex queue`)
 #   <seat>.run       created by the test: a shell script the session runs (like
@@ -143,6 +146,7 @@ if [ "$kind" = claude ]; then
     # A first turn, so the session can be resumed later (Claude Code
     # cannot resume a session that never had one), unless mode `noturn`.
     [ "$mode" = noturn ] || turn "\"first prompt\""
+    echo "$$" > "$D/$seat.ready"
 else
     if [ -z "$resumed" ]; then
         sid="thread-$$-$(now)"

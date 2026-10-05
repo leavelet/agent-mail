@@ -136,11 +136,26 @@ async fn row(h: &Harness, seat: &str) -> PsRow {
         .unwrap_or_else(|| panic!("no ps row for {seat}"))
 }
 
+/// Wait until `seat` is in `state`. For "idle", a Claude session must also
+/// have ended its first turn: between SessionStart and that turn's prompt
+/// the seat is idle too, and mail sent then is shown by the turn's
+/// UserPromptSubmit hook instead of a wake-up.
 async fn wait_state(h: &Harness, seat: &str, state: &str) {
     let t0 = Instant::now();
     loop {
         let rows = ps(h).await;
-        if rows.iter().any(|r| r.seat == seat && r.state == state) {
+        let first_turn_done = |r: &PsRow| {
+            state != "idle"
+                || r.harness != "claude"
+                || std::fs::read_to_string(h.fake.join(format!("{seat}.ready")))
+                    .ok()
+                    .and_then(|p| p.trim().parse::<u32>().ok())
+                    == r.pid
+        };
+        if rows
+            .iter()
+            .any(|r| r.seat == seat && r.state == state && first_turn_done(r))
+        {
             return;
         }
         if t0.elapsed() > Duration::from_secs(20) {
@@ -1344,9 +1359,12 @@ paste_fallback = false
             let m = h.mux.as_ref().unwrap();
             let r = row(&h, "p").await;
             let screen = amail_node::mux::Mux::screen(&**m, &r.mux_session, pp).await;
+            let status = h.api.get(&format!("/messages/{}/status", ids[0])).await;
             panic!(
-                "nothing typed into p: {r:?}\nscreen: {screen:?}\ntyped: {:?}",
-                typed(pp)
+                "nothing typed into p: {r:?}\nscreen: {screen:?}\ntyped: {:?}\n\
+                 mail status: {status}\nnode status: {}",
+                typed(pp),
+                h.status().await
             );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1365,7 +1383,15 @@ paste_fallback = false
     for s in ["q", "r"] {
         let t0 = Instant::now();
         while row(&h, s).await.attention.as_deref() != Some("wake-failed") {
-            assert!(t0.elapsed() < Duration::from_secs(20), "{s} not flagged");
+            if t0.elapsed() > Duration::from_secs(20) {
+                let k = if s == "q" { 1 } else { 2 };
+                let status = h.api.get(&format!("/messages/{}/status", ids[k])).await;
+                panic!(
+                    "{s} not flagged: {:?}\nmail status: {status}\nnode status: {}",
+                    row(&h, s).await,
+                    h.status().await
+                );
+            }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
