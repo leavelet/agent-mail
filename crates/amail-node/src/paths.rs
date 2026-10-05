@@ -76,6 +76,7 @@ pub fn check_node_socket(path: &Path) -> std::io::Result<()> {
 
 /// The process id and user id of the peer of a connected Unix socket
 /// (`SO_PEERCRED`), as they were when it connected.
+#[cfg(target_os = "linux")]
 pub fn peer_cred(fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result<(u32, u32)> {
     use std::os::fd::AsRawFd;
     let mut cred = libc::ucred {
@@ -98,6 +99,21 @@ pub fn peer_cred(fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result<(u32, u32)>
         return Err(std::io::Error::last_os_error());
     }
     Ok((cred.pid as u32, cred.uid))
+}
+
+/// The user id of the peer of a connected Unix socket (`getpeereid`); the
+/// process id is not known there (0). The node and session supervision
+/// run on Linux only; this keeps the socket checks of the other commands.
+#[cfg(not(target_os = "linux"))]
+pub fn peer_cred(fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result<(u32, u32)> {
+    use std::os::fd::AsRawFd;
+    let (mut uid, mut gid) = (0, 0);
+    // SAFETY: `uid` and `gid` are valid for writes.
+    let r = unsafe { libc::getpeereid(fd.as_raw_fd(), &mut uid, &mut gid) };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((0, uid))
 }
 
 /// Connect to the node socket at `path`, after [`check_node_socket`], and

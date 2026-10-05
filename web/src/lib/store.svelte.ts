@@ -173,6 +173,10 @@ class Store {
     this.es = es;
     es.onopen = () => {
       this.live = true;
+      // Presence events are not replayed: a change between the first load
+      // of the seats and this (re)connection would be missed, so load the
+      // seats again once the stream is open.
+      this.coalescer.add('d:seats');
     };
     es.addEventListener('mailbox', (e) => {
       try {

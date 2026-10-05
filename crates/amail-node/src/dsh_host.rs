@@ -318,7 +318,10 @@ async fn run_inner(a: HostArgs) -> Result<i32> {
             cmd.env_remove(&k);
         }
     }
+    // The host ends with the node (Linux: the parent-death signal; the node
+    // runs on Linux only).
     // SAFETY: prctl is async-signal-safe; nothing else runs in pre_exec.
+    #[cfg(target_os = "linux")]
     unsafe {
         cmd.pre_exec(|| {
             libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);

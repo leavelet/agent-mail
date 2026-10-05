@@ -227,15 +227,7 @@ impl Harness {
                         async move {
                             let claim = req.uri().path() == "/v1/claim";
                             let resp = next.run(req).await;
-                            if claim
-                                && left
-                                    .fetch_update(
-                                        std::sync::atomic::Ordering::SeqCst,
-                                        std::sync::atomic::Ordering::SeqCst,
-                                        |x| x.checked_sub(1),
-                                    )
-                                    .is_ok()
-                            {
+                            if claim && take_one(&left) {
                                 tokio::time::sleep(delay).await;
                             }
                             resp
@@ -585,4 +577,18 @@ pub async fn socket_request(sock: &Path, req: amail_node::wire::Request) -> Valu
     })
     .await
     .unwrap()
+}
+
+/// Take one from `left` unless it is 0 (a compare-and-swap loop, so that it
+/// builds without the method renamed in later Rust versions).
+fn take_one(left: &std::sync::atomic::AtomicUsize) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    let mut cur = left.load(SeqCst);
+    while cur > 0 {
+        match left.compare_exchange(cur, cur - 1, SeqCst, SeqCst) {
+            Ok(_) => return true,
+            Err(now) => cur = now,
+        }
+    }
+    false
 }

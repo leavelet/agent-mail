@@ -1,0 +1,5 @@
+# The Rust version the code is developed and checked with (CI uses it too),
+# so that a newer compiler's new lints do not break the build.
+[toolchain]
+channel = "1.98.1"
+components = ["rustfmt", "clippy"]
