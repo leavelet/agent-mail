@@ -169,6 +169,18 @@ export interface DeleteMailResponse {
 export interface ArchiveResponse {
   messages: MessageHeader[];
   next_before_id?: number;
+  /** `GET /v1/sent?delivery=true`: deliveries per state of each message. */
+  delivery?: DeliveryCounts[];
+}
+
+/** How many deliveries of one message are in each state (each counted in
+ * its most advanced state). */
+export interface DeliveryCounts {
+  message_id: number;
+  queued: number;
+  notified: number;
+  read: number;
+  acked: number;
 }
 
 export interface SearchHit extends MessageHeader {
@@ -221,6 +233,9 @@ export interface Overview {
   wake_failed: number;
   /** Seats whose last turn failed (older servers: absent). */
   turn_failed?: number;
+  /** Seats counted as offline that wait at a prompt before they start
+   * (older servers: absent). */
+  starting?: number;
   mail_last_hour: number;
   mail_last_day: number;
   user_unread: number;

@@ -73,10 +73,10 @@ test('compose shows the send receipt', async ({ page }) => {
   await expect(receipt.locator('[data-note="dormant"]')).toContainText('fe-1 asleep; this mail starts it');
   await shot(page, 'web-compose-receipt');
 
-  // The thread opened from the receipt is not "Inbox".
+  // The thread opened from the receipt is under Sent (the person sent it).
   await page.getByRole('link', { name: 'Open the thread' }).click();
   await expect(page).toHaveURL(/#\/thread\/\d+/);
-  await expect(page.locator('nav a.active')).toHaveCount(0);
+  await expect(page.locator('nav a.active')).toHaveText(/^Sent$/);
   const art = page.locator('article').first();
   await art.getByRole('button', { name: 'Delivery' }).click();
   const legend = art.getByTestId('dlv-legend');
@@ -85,11 +85,11 @@ test('compose shows the send receipt', async ({ page }) => {
   await art.getByTestId('delivery').scrollIntoViewIfNeeded();
   await shot(page, 'web-delivery-legend');
 
-  // From the inbox, a thread stays under Inbox.
+  // From the Sent tab, a thread stays under Sent.
   await page.goto(`${s.base}/#/inbox?tab=sent`);
   await page.locator('.mrow', { hasText: 'Interface change' }).dblclick();
   await expect(page).toHaveURL(/#\/thread\//);
-  await expect(page.locator('nav a.active')).toHaveText(/Inbox/);
+  await expect(page.locator('nav a.active')).toHaveText(/^Sent$/);
 });
 
 test('a seat whose turns fail is shown as failing', async ({ page }) => {

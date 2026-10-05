@@ -168,7 +168,9 @@ once: asleep (and whether this mail starts them), offline, focused (until
 when), or not answering wake-ups.
 
 The web interface shows the same receipt after **Compose → Send**, and
-explains the delivery states under each message's **Delivery** table.
+explains the delivery states under each message's **Delivery** table. Its
+**Sent** list shows for each message how many recipients' copies are
+acked, read, notified and queued.
 
 ## The user's queue ("needs you")
 

@@ -5,7 +5,7 @@
   import { t, ui } from '../lib/ui.svelte';
   import { go } from '../lib/router.svelte';
   import { get, qs } from '../lib/api';
-  import { fromEntry, fromHeader, newestFirst, type MailRow } from '../lib/mailrows';
+  import { fromEntry, fromSent, newestFirst, type MailRow } from '../lib/mailrows';
   import { typing, moveIndex } from '../lib/keys';
   import type { ArchiveResponse, InboxEntry, InboxResponse } from '../lib/types';
   import MailList from '../components/MailList.svelte';
@@ -51,9 +51,9 @@
         })
         .catch((e) => (error = String(e?.message ?? e)));
     } else {
-      get<ArchiveResponse>(`/v1/sent${qs({ limit: PAGE })}`)
+      get<ArchiveResponse>(`/v1/sent${qs({ limit: PAGE, delivery: 'true' })}`)
         .then((r) => {
-          sent = r.messages.map(fromHeader);
+          sent = fromSent(r);
           sentNext = r.next_before_id;
         })
         .catch((e) => (error = String(e?.message ?? e)));
@@ -71,8 +71,8 @@
       more = r.entries.length === PAGE || !!r.truncated;
       entries = [...r.entries, ...entries];
     } else if (sentNext) {
-      const r = await get<ArchiveResponse>(`/v1/sent${qs({ limit: PAGE, before_id: sentNext })}`);
-      sent = [...sent, ...r.messages.map(fromHeader)];
+      const r = await get<ArchiveResponse>(`/v1/sent${qs({ limit: PAGE, before_id: sentNext, delivery: 'true' })}`);
+      sent = [...sent, ...fromSent(r)];
       sentNext = r.next_before_id;
     }
   }

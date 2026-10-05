@@ -3,6 +3,7 @@
   import type { MailRow } from '../lib/mailrows';
   import { t, ui } from '../lib/ui.svelte';
   import { shortTime } from '../lib/time';
+  import { deliverySummary } from '../lib/delivery';
 
   let {
     rows,
@@ -50,7 +51,15 @@
         {#if r.snippet}<span class="snip faint">— <Vis text={r.snippet} /></span>{/if}
         {#if r.meta?.commit}<span class="chip neutral mono" title={r.meta.commit}>{r.meta.commit.slice(0, 8)}</span>{/if}
       </div>
-      <div class="when faint" title={r.created_at}>{shortTime(r.created_at, ui.now, ui.lang)}</div>
+      <div class="when faint">
+        {#if r.delivery}
+          {@const parts = deliverySummary(r.delivery)}
+          <span class="dsum" data-testid="delivery-summary" title={t('mail.dsum.long')}>
+            {#each parts as p, i}{#if i > 0}<span class="sep">·</span>{/if}<span class="ds ds-{p.state}" data-dstate={p.state}>{p.n} {t(`dlv.${p.state}`)}</span>{/each}
+          </span>
+        {/if}
+        <span title={r.created_at}>{shortTime(r.created_at, ui.now, ui.lang)}</span>
+      </div>
     </div>
   {/each}
 </div>
@@ -119,6 +128,24 @@
     font-size: 12px;
     white-space: nowrap;
     font-variant-numeric: tabular-nums;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .dsum {
+    display: inline-flex;
+    gap: 4px;
+    font-size: 11.5px;
+  }
+  .ds {
+    font-weight: 600;
+    color: var(--text);
+  }
+  .ds-acked {
+    color: var(--ok);
+  }
+  .ds-queued {
+    color: var(--faint);
   }
   .src {
     font-family: var(--font);

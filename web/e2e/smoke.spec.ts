@@ -136,7 +136,9 @@ test('the user deletes an internal thread', async ({ page }) => {
   page.once('dialog', (d) => void d.accept());
   await page.getByRole('button', { name: 'Delete' }).click();
   await expect(page.getByText('Deleted 2 messages.')).toBeVisible();
-  await expect(page.getByText('Thread not found.', { exact: false })).toBeVisible();
+  // The thread is gone; the page does not ask for it again.
+  await expect(page.getByRole('link', { name: 'Go to the archive' })).toBeVisible();
+  await expect(page.getByText('Thread not found.', { exact: false })).toHaveCount(0);
   const after = await api<{ stored_bytes: number }>(s.userToken, 'GET', '/org');
   expect(after.stored_bytes).toBeLessThan(before.stored_bytes);
 });

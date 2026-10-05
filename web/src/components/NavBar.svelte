@@ -1,16 +1,19 @@
 <script lang="ts">
   import { store } from '../lib/store.svelte';
-  import { t } from '../lib/ui.svelte';
+  import { t, ui } from '../lib/ui.svelte';
   import { href, router } from '../lib/router.svelte';
+  import { navSection, sectionOf } from '../lib/nav';
 
-  const route = $derived(router.route.parts[0] ?? 'org');
+  const route = $derived(sectionOf(router.route));
   // A thread belongs to no section of its own: it stays under the list it
-  // was opened from (none when it was opened directly or after sending).
+  // was opened from; opened by its URL or after sending, under Sent or
+  // Inbox as its messages say (none when they do not).
   let from = $state<string | null>(null);
   $effect(() => {
     if (route !== 'thread') from = route;
   });
-  const section = $derived(route === 'thread' ? (from === 'compose' ? null : from) : route);
+  const guess = $derived(ui.thread && String(ui.thread.id) === router.route.parts[1] ? ui.thread.folder : null);
+  const section = $derived(navSection(route, from, guess));
   const sub = $derived(router.route.parts[1] ?? 'seats');
   const unread = $derived(store.me?.seat ? (store.counts.get(store.me.seat)?.unread ?? 0) : 0);
   const admin = ['seats', 'lists', 'links', 'tokens', 'settings'] as const;
@@ -26,6 +29,7 @@
     <span>{t('nav.inbox')}</span>
     {#if unread}<span class="count hot">{unread}</span>{/if}
   </a>
+  <a href={href(['inbox'], { tab: 'sent' })} class:active={section === 'sent'}><span>{t('nav.sent')}</span></a>
   <a href={href(['archive'])} class:active={section === 'archive'}><span>{t('nav.archive')}</span></a>
   <a href={href(['compose'])} class:active={section === 'compose'} class="compose"><span>{t('nav.compose')}</span><kbd>c</kbd></a>
   <div class="group">{t('nav.admin')}</div>
