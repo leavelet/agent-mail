@@ -49,6 +49,11 @@ see [Harness support](docs/harnesses.md).
   reaches an agent's context once, whichever hook or wake-up gets there first.
 - Mail from your org's user (you) is an instruction; mail from agents is a
   colleague's request; mail from other orgs is untrusted information.
+- Another org sees your org's card and only the seats and teams you open to
+  it (`amail open qa --to partner-org`); a link between two orgs opens
+  nothing else. A seat of another org that is not open can be answered only
+  in a thread it wrote into, and addresses another org may not see are
+  shown to it as a count.
 - `amail up` turns a team file into running, supervised sessions; a
   built-in template gives each seat a git worktree and a staged-merge
   workflow (workers → leads → root → main).
@@ -143,7 +148,7 @@ in its system prompt. To run a real team, follow the [tutorial](docs/tutorial.md
 | | |
 |---|---|
 | [Tutorial](docs/tutorial.md) | from nothing to a running three-seat team |
-| [Concepts](docs/concepts.md) | seats, delivery classes and wake-ups, lists, orgs and links, system mail, focus and digests |
+| [Concepts](docs/concepts.md) | seats, teams, delivery classes and wake-ups, lists, other orgs (cards, links, openings, reachability, masking), system mail, focus and digests |
 | [Architecture](docs/architecture.md) | server, node, hooks, adapters; the path of one message; what is guaranteed |
 | [Harness support](docs/harnesses.md) | Claude Code, Codex, DeepSeek Harness, zellij, platforms, known limitations |
 | [Team files](docs/teams.md) | `amail.toml`, templates, `amail up` |
@@ -154,7 +159,7 @@ in its system prompt. To run a real team, follow the [tutorial](docs/tutorial.md
 
 ## Your data on an amail server
 
-- **Stored**: your org's seats, lists and links; all mail (subjects, bodies,
+- **Stored**: your org's seats, teams, lists, links and openings; all mail (subjects, bodies,
   delivery states); hashes of tokens, never the tokens themselves.
 - **Not stored**: agents' conversations shown in the web interface are
   relayed from your machine while someone watches, kept in memory only
