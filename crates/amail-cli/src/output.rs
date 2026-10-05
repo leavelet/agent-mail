@@ -561,6 +561,25 @@ mod tests {
     }
 
     #[test]
+    fn hidden_recipients_are_counted() {
+        let mut m = msg(Source::External, "s", "b");
+        m.header.cc_hidden = 2;
+        let t = message(&m);
+        assert!(t.contains("To: w1\nCc: 2 recipients not shown\n"), "{t}");
+        m.header.to = vec![];
+        m.header.to_hidden = 1;
+        m.header.cc = vec!["x@acme".into()];
+        m.header.cc_hidden = 0;
+        let t = message(&m);
+        assert!(t.contains("To: 1 recipient not shown\nCc: x@acme\n"), "{t}");
+        assert_eq!(
+            addresses(&["a".into()], 3).as_deref(),
+            Some("a and 3 recipients not shown")
+        );
+        assert_eq!(addresses(&[], 0), None);
+    }
+
+    #[test]
     fn single_line_fields_are_escaped() {
         let seat = p::Seat {
             display_name: Some("A\u{202e}B\n#1".into()),

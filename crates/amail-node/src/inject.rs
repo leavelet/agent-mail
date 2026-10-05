@@ -665,6 +665,15 @@ mod tests {
         );
         d.message.to = vec!["leads".into(), "core".into()];
         assert!(entry(&d, false).contains("via a list in To (leads, core)"));
+        // Addresses of another org the seat may not see are counted.
+        d.message.to = vec!["leads".into()];
+        d.message.to_hidden = 2;
+        assert!(
+            entry(&d, false).contains("via a list in To (leads and 2 recipients not shown)"),
+            "{}",
+            entry(&d, false)
+        );
+        d.message.to_hidden = 0;
         d.delivery.class = DeliveryClass::Cc;
         assert!(entry(&d, false).contains(" · cc · "));
         d.delivery.class = DeliveryClass::List;
