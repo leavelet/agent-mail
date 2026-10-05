@@ -249,6 +249,9 @@ pub struct Zellij {
     op: tokio::sync::Mutex<()>,
     /// Create sessions that a `zellij web` server may serve.
     web_sharing: bool,
+    /// Extra environment of every zellij command (tests point zellij's
+    /// directories at temporary ones with it; see [`Zellij::with_env`]).
+    env: Vec<(String, std::ffi::OsString)>,
 }
 
 fn kdl(s: &str) -> String {
@@ -275,7 +278,15 @@ impl Zellij {
             clients: Mutex::new(HashMap::new()),
             op: tokio::sync::Mutex::new(()),
             web_sharing: false,
+            env: Vec::new(),
         }
+    }
+
+    /// Run every zellij command with these variables set as well (after
+    /// the environment is scrubbed).
+    pub fn with_env(mut self, env: Vec<(String, std::ffi::OsString)>) -> Zellij {
+        self.env = env;
+        self
     }
 
     /// Let browsers attach to the sessions this node creates (through the
@@ -290,6 +301,9 @@ impl Zellij {
         let mut c = std::process::Command::new(&self.bin);
         scrub_env(&mut c);
         c.env("TERM", "xterm-256color");
+        for (k, v) in &self.env {
+            c.env(k, v);
+        }
         c
     }
 
@@ -1033,10 +1047,33 @@ mod tests {
         assert_eq!(back, p);
     }
 
+    type Env = Vec<(String, std::ffi::OsString)>;
+
+    /// zellij's four directories, fresh under `dir`: the test never uses
+    /// the person's own runtime, cache, configuration or data directories.
+    fn isolated(dir: &Path) -> Env {
+        [
+            "XDG_RUNTIME_DIR",
+            "XDG_CACHE_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+        ]
+        .iter()
+        .map(|v| {
+            let p = dir.join("zellij-xdg").join(v.to_lowercase());
+            std::fs::create_dir_all(&p).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
+            (v.to_string(), p.into_os_string())
+        })
+        .collect()
+    }
+
     /// Clients of a real zellij session: (client id, focused terminal pane).
-    fn real_clients(session: &str) -> Vec<(u32, u32)> {
+    fn real_clients(session: &str, env: &Env) -> Vec<(u32, u32)> {
         let out = std::process::Command::new("zellij")
             .args(["--session", session, "action", "list-clients"])
+            .envs(env.iter().map(|(k, v)| (k, v)))
             .output()
             .unwrap();
         String::from_utf8_lossy(&out.stdout)
@@ -1051,9 +1088,10 @@ mod tests {
             .collect()
     }
 
-    fn run_quiet(c: &[String]) -> bool {
+    fn run_quiet(c: &[String], env: &Env) -> bool {
         std::process::Command::new(&c[0])
             .args(&c[1..])
+            .envs(env.iter().map(|(k, v)| (k, v)))
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
@@ -1073,10 +1111,10 @@ mod tests {
     /// tab it created), also while another person is attached; once an
     /// attached client has typed, the busy check reports it.
     ///
-    /// Starts and kills its own zellij session. Run it only with zellij's
-    /// directories (XDG_RUNTIME_DIR, XDG_CACHE_HOME, XDG_CONFIG_HOME,
-    /// XDG_DATA_HOME) pointing at fresh directories and
-    /// AMAIL_TEST_REAL_ZELLIJ=1; see scripts/zellij-attach-check.sh.
+    /// Starts and kills its own zellij session, with zellij's directories
+    /// (XDG_RUNTIME_DIR, XDG_CACHE_HOME, XDG_CONFIG_HOME, XDG_DATA_HOME) in
+    /// its temporary directory. Runs with AMAIL_TEST_REAL_ZELLIJ=1 and
+    /// `--ignored`.
     #[tokio::test]
     #[ignore = "needs zellij and isolated zellij directories"]
     async fn real_zellij_attach_lands_on_the_seat_tab() {
@@ -1087,7 +1125,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let session = std::env::var("AMAIL_TEST_ZELLIJ_SESSION")
             .unwrap_or_else(|_| format!("amail-test-attach-{}", std::process::id()));
-        let z = Zellij::new("zellij", dir.path(), 160, 40);
+        let env = isolated(dir.path());
+        let z = Zellij::new("zellij", dir.path(), 160, 40).with_env(env.clone());
         let mut panes = HashMap::new();
         for t in ["alpha", "beta", "gamma"] {
             let spec = PaneSpec {
@@ -1104,33 +1143,35 @@ mod tests {
         }
         // Creating tabs left the headless client on the last one: a plain
         // `zellij attach` would start there.
-        assert_eq!(real_clients(&session), vec![(1, panes["gamma"])]);
+        assert_eq!(real_clients(&session, &env), vec![(1, panes["gamma"])]);
 
         let mut people = Vec::new();
         for t in ["alpha", "beta"] {
             let plan = z.attach_plan(&session, Some(t), Some(panes[t]));
-            assert!(!run_quiet(plan.busy_check.as_ref().unwrap()), "busy");
+            assert!(!run_quiet(plan.busy_check.as_ref().unwrap(), &env), "busy");
             for c in &plan.focus {
-                run_quiet(c);
+                run_quiet(c, &env);
             }
-            let before: Vec<u32> = real_clients(&session).iter().map(|c| c.0).collect();
+            let before: Vec<u32> = real_clients(&session, &env).iter().map(|c| c.0).collect();
             let mut cmd = std::process::Command::new(&plan.attach[0]);
-            cmd.args(&plan.attach[1..]).env("TERM", "xterm-256color");
+            cmd.args(&plan.attach[1..])
+                .env("TERM", "xterm-256color")
+                .envs(env.iter().map(|(k, v)| (k, v)));
             people.push(Headless::spawn(&mut cmd, 100, 30).unwrap());
             wait_until("the new client", || {
-                real_clients(&session)
+                real_clients(&session, &env)
                     .iter()
                     .any(|c| !before.contains(&c.0))
             })
             .await;
-            let new = real_clients(&session)
+            let new = real_clients(&session, &env)
                 .into_iter()
                 .find(|c| !before.contains(&c.0))
                 .unwrap();
             assert_eq!(new.1, panes[t], "the client for {t} is on another pane");
         }
         // Both people still see their tabs.
-        let now = real_clients(&session);
+        let now = real_clients(&session, &env);
         assert!(now.iter().any(|c| c.1 == panes["alpha"]), "{now:?}");
         assert!(now.iter().any(|c| c.1 == panes["beta"]), "{now:?}");
 
@@ -1145,7 +1186,7 @@ mod tests {
             }
         }
         let check = plan.busy_check.clone().unwrap();
-        wait_until("the busy check", || run_quiet(&check)).await;
+        wait_until("the busy check", || run_quiet(&check, &env)).await;
 
         drop(people);
         z.kill_session(&session).await.unwrap();

@@ -2,7 +2,11 @@
 //! TUI (`common/fake_tui.py`): the screen checks pass only for an empty
 //! input box, and what is pasted and submitted is exactly the nudge.
 //! Skipped (with a notice) when `zellij` or `python3` is not installed.
-//! Uses a zellij session of its own, removed at the end.
+//! Uses a zellij session of its own, removed at the end (also when the
+//! test fails), with zellij's directories in the test's temporary
+//! directory (see `common::zellij_env`).
+
+mod common;
 
 use amail_node::mux::{Mux, PaneSpec, Zellij};
 use std::path::Path;
@@ -42,8 +46,15 @@ async fn paste_into_real_panes() {
     }
     let dir = tempfile::tempdir().unwrap();
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/common/fake_tui.py");
-    let z = Zellij::new("zellij", dir.path(), 200, 50);
+    let z = common::test_zellij("zellij", dir.path(), 200, 50);
     let session = format!("amail-pastetest-{:08x}", rand_u32());
+    // Declared after `dir`, so dropped first: the session goes before its
+    // directories.
+    let _cleanup = common::ZellijSession {
+        bin: "zellij".into(),
+        env: common::zellij_env(dir.path()),
+        name: session.clone(),
+    };
     let mut panes = Vec::new();
     for mode in ["empty", "draft", "dialog"] {
         let logf = dir.path().join(format!("{mode}.log"));

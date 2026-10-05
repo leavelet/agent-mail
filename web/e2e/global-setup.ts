@@ -6,6 +6,7 @@
 
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import net from 'node:net';
 import path from 'node:path';
 import { AGENTS, ROOT, STATE_FILE, type E2eState } from './env';
@@ -13,10 +14,20 @@ import { AGENTS, ROOT, STATE_FILE, type E2eState } from './env';
 const BIN = process.env.AMAIL_BIN ?? path.resolve(ROOT, '../target/debug/amail');
 const CLEAR = ['AMAIL_URL', 'AMAIL_TOKEN', 'AMAIL_PROFILE', 'AMAIL_SEAT', 'AMAIL_NODE_SOCK', 'AMAIL_STATE_DIR', 'AMAIL_DB', 'AMAIL_NODE_TOKEN', 'CODEX_HOME', 'CLAUDE_CODE_MESSAGING_SOCKET', 'CLAUDE_PID'];
 
+// zellij's directories for every process started here (the node may run
+// zellij): fresh ones, never the person's own sessions, cache, configuration
+// or data.
+const XDG_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'amail-e2e-xdg-'));
+const XDG: Record<string, string> = {};
+for (const [k, sub] of [['XDG_RUNTIME_DIR', 'run'], ['XDG_CACHE_HOME', 'cache'], ['XDG_CONFIG_HOME', 'config'], ['XDG_DATA_HOME', 'data']]) {
+  XDG[k] = path.join(XDG_ROOT, sub);
+  fs.mkdirSync(XDG[k], { mode: 0o700 });
+}
+
 function env(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   const e: NodeJS.ProcessEnv = { ...process.env };
   for (const k of CLEAR) delete e[k];
-  return { ...e, ...extra };
+  return { ...e, ...XDG, ...extra };
 }
 
 // AMAIL_E2E_PORT_BASE: take ports from there on instead of free ones the

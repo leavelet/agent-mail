@@ -592,3 +592,88 @@ fn take_one(left: &std::sync::atomic::AtomicUsize) -> bool {
     }
     false
 }
+
+/// zellij's directories for a test: fresh ones under `dir`, never the
+/// person's own (their sessions, sockets, cache and configuration).
+pub fn zellij_env(dir: &std::path::Path) -> Vec<(String, std::ffi::OsString)> {
+    let mut env = Vec::new();
+    for (var, sub) in [
+        ("XDG_RUNTIME_DIR", "run"),
+        ("XDG_CACHE_HOME", "cache"),
+        ("XDG_CONFIG_HOME", "config"),
+        ("XDG_DATA_HOME", "data"),
+    ] {
+        let p = dir.join("zellij-xdg").join(sub);
+        std::fs::create_dir_all(&p).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        env.push((var.to_string(), p.into_os_string()));
+    }
+    assert_zellij_isolated(&env, dir);
+    env
+}
+
+/// The guard: refuse to start zellij unless each of its four directories
+/// is set and lies under the test's own temporary directory `dir` (so it is
+/// neither the person's runtime directory nor their cache, configuration or
+/// data).
+pub fn assert_zellij_isolated(env: &[(String, std::ffi::OsString)], dir: &std::path::Path) {
+    for var in [
+        "XDG_RUNTIME_DIR",
+        "XDG_CACHE_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+    ] {
+        let v = env
+            .iter()
+            .find(|(k, _)| k == var)
+            .map(|(_, v)| std::path::PathBuf::from(v));
+        let ok = v.as_ref().is_some_and(|p| p.starts_with(dir) && p.is_dir())
+            && std::env::var_os(var)
+                .is_none_or(|own| v.as_deref() != Some(std::path::Path::new(&own)));
+        assert!(
+            ok,
+            "refusing to start zellij: {var} must be a fresh directory under the test's temporary directory {} (got {v:?})",
+            dir.display()
+        );
+    }
+}
+
+/// A zellij for a test, with isolated directories (see [`zellij_env`]).
+pub fn test_zellij(
+    bin: &str,
+    dir: &std::path::Path,
+    cols: u16,
+    rows: u16,
+) -> amail_node::mux::Zellij {
+    amail_node::mux::Zellij::new(bin, dir, cols, rows).with_env(zellij_env(dir))
+}
+
+/// Kills a test's zellij session by name when dropped (also when the test
+/// fails), with the test's isolated directories.
+pub struct ZellijSession {
+    pub bin: String,
+    pub env: Vec<(String, std::ffi::OsString)>,
+    pub name: String,
+}
+
+impl Drop for ZellijSession {
+    fn drop(&mut self) {
+        for args in [
+            vec!["kill-session", self.name.as_str()],
+            vec!["delete-session", "--force", self.name.as_str()],
+        ] {
+            let mut c = std::process::Command::new(&self.bin);
+            c.args(&args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            for (k, v) in &self.env {
+                c.env(k, v);
+            }
+            let _ = c.status();
+        }
+    }
+}
