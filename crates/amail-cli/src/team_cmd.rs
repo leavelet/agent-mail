@@ -183,14 +183,14 @@ const NO_RESTART: &[&str] = &["group", "description"];
 
 /// What `up --prune` may delete, and which server teams belong to the file.
 ///
-/// The file's teams are the teams it declares and, on the server, the teams
-/// below them (a group removed from the file keeps its place there). Seats
-/// not in the file are in its scope when they are in one of those teams; a
-/// seat in no team is in scope when the node supervises it and it sits in a
-/// seat tree of this file: for a file with teams, a tree that holds a
-/// member of its teams; for a file without teams, a tree with no team
-/// member at all. So several team files can be up in one org without one
-/// touching the other's seats.
+/// The file's teams are the teams it declares, the managed teams with
+/// members in the file's seat trees (a group that left the file), and on
+/// the server the teams below those. Seats not in the file are in its scope
+/// when they are in one of those teams; a seat in no team is in scope when
+/// the node supervises it and it sits in a seat tree of this file (one that
+/// holds a seat of the file or a member of its teams), or, for a file
+/// without teams, in a tree with no team member at all. So several team
+/// files can be up in one org without one touching the other's seats.
 pub struct Scope {
     /// Seats not in the file that belong to it (oldest first).
     pub removed: Vec<String>,
@@ -204,27 +204,6 @@ pub fn scope(
     teams: &[p::Team],
     supervised: &BTreeSet<&str>,
 ) -> Scope {
-    let declared: BTreeSet<&str> = t.teams.iter().map(|x| x.name.as_str()).collect();
-    let parent_team: BTreeMap<&str, Option<&str>> = teams
-        .iter()
-        .map(|x| (x.name.as_str(), x.parent.as_deref()))
-        .collect();
-    let mut owned: BTreeSet<String> = declared.iter().map(|x| x.to_string()).collect();
-    for x in teams {
-        let mut cur = Some(x.name.as_str());
-        let mut steps = 0;
-        while let Some(n) = cur {
-            if declared.contains(n) {
-                owned.insert(x.name.clone());
-                break;
-            }
-            steps += 1;
-            if steps > teams.len() {
-                break;
-            }
-            cur = parent_team.get(n).copied().flatten();
-        }
-    }
     // Seat parents and teams: the server's, as the file will make them.
     let mut parent: BTreeMap<&str, Option<&str>> = BTreeMap::new();
     let mut team: BTreeMap<&str, Option<&str>> = BTreeMap::new();
@@ -236,6 +215,7 @@ pub fn scope(
         parent.insert(&s.name, s.parent.as_deref());
         team.insert(&s.name, s.group.as_deref());
     }
+    // The top of a seat's tree (seat parents stay within a team file).
     let top = |n: &str| -> String {
         let mut n = n.to_string();
         let mut steps = 0;
@@ -248,7 +228,36 @@ pub fn scope(
         }
         n
     };
-    let mut ours_tops = BTreeSet::new();
+    let file_tops: BTreeSet<String> = t.seats.iter().map(|s| top(&s.name)).collect();
+    // Declared teams, managed teams with members in the file's seat trees
+    // (a group that left the file), and the teams below them.
+    let mut roots: BTreeSet<&str> = t.teams.iter().map(|x| x.name.as_str()).collect();
+    for x in teams.iter().filter(|x| x.managed) {
+        if x.members.iter().any(|m| file_tops.contains(&top(m))) {
+            roots.insert(&x.name);
+        }
+    }
+    let parent_team: BTreeMap<&str, Option<&str>> = teams
+        .iter()
+        .map(|x| (x.name.as_str(), x.parent.as_deref()))
+        .collect();
+    let mut owned: BTreeSet<String> = roots.iter().map(|x| x.to_string()).collect();
+    for x in teams {
+        let mut cur = Some(x.name.as_str());
+        let mut steps = 0;
+        while let Some(n) = cur {
+            if roots.contains(n) {
+                owned.insert(x.name.clone());
+                break;
+            }
+            steps += 1;
+            if steps > teams.len() {
+                break;
+            }
+            cur = parent_team.get(n).copied().flatten();
+        }
+    }
+    let mut ours_tops = file_tops.clone();
     let mut team_tops = BTreeSet::new();
     for (n, tm) in &team {
         if let Some(tm) = tm {
@@ -267,8 +276,10 @@ pub fn scope(
         let ours = match s.group.as_deref() {
             Some(g) => owned.contains(g),
             None if !supervised.contains(s.name.as_str()) => false,
-            None if t.teams.is_empty() => !team_tops.contains(&top(&s.name)),
-            None => ours_tops.contains(&top(&s.name)),
+            None => {
+                let tp = top(&s.name);
+                ours_tops.contains(&tp) || (t.teams.is_empty() && !team_tops.contains(&tp))
+            }
         };
         if ours {
             removed.push(s.name.clone());
@@ -345,6 +356,20 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
             "amail up needs a user token (AMAIL_TOKEN), not a {} token",
             me.scope
         );
+    }
+    let opens = t
+        .seats
+        .iter()
+        .map(|s| (&s.name, &s.open))
+        .chain(t.teams.iter().map(|x| (&x.name, &x.open)));
+    for (name, open) in opens {
+        if open.contains(&me.org) {
+            bail!(
+                "{name}: open = [{:?}] names your own org; inside the org every seat is \
+                 reachable already",
+                me.org
+            );
+        }
     }
     let main = match (&t.repo, t.uses_worktrees()) {
         (Some(repo), true) => {

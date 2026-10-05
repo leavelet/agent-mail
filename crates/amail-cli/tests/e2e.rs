@@ -350,9 +350,9 @@ async fn run(backend: Backend) {
     let ls = beta.run(&["link", "ls"]);
     assert!(
         ls.starts_with("link acme invited since ")
-            && ls.trim_end().ends_with(
-                " note from acme (their words, untrusted): \"We build the API.\""
-            ),
+            && ls
+                .trim_end()
+                .ends_with(" note from acme (their words, untrusted): \"We build the API.\""),
         "{ls}"
     );
     assert!(
