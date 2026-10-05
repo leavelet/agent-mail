@@ -372,6 +372,8 @@ async fn run(backend: Backend) {
             && opened.contains("acme now sees: x"),
         "{opened}"
     );
+    // lead is not a contact of acme for beta: the user seat (open by
+    // default) is added in Cc.
     let s = lead.run(&[
         "send",
         "--to",
@@ -384,6 +386,10 @@ async fn run(backend: Backend) {
         "Please review.",
         "--urgent",
     ]);
+    assert!(
+        s.contains("\ncc: owner (added: your org's contact for beta;"),
+        "{s}"
+    );
     let iface = first_id(&s);
     let xin = x.run(&["inbox"]);
     assert!(
@@ -392,18 +398,12 @@ async fn run(backend: Backend) {
         )),
         "{xin}"
     );
-    // w1 (in Cc) is neither open to beta nor in the thread: masked.
+    // Everyone on the message is visible to everyone on it.
     let read = x.run(&["read", &iface.to_string()]);
-    assert!(
-        read.contains("To: x\nCc: 1 recipient not shown\n"),
-        "{read}"
-    );
-    let j = x.json(&["read", &iface.to_string()]);
-    assert_eq!(j["message"]["cc"], serde_json::json!([]), "{j}");
-    assert_eq!(j["message"]["cc_hidden"], 1, "{j}");
+    assert!(read.contains("To: x\nCc: w1@acme, owner@acme\n"), "{read}");
     let back = x.run(&["reply", &iface.to_string(), "--all", "-m", "LGTM"]);
     assert!(
-        back.contains("lead@acme=1") && !back.contains("w1@acme"),
+        back.contains("lead@acme=1") && back.contains("w1@acme=1") && back.contains("owner@acme=1"),
         "{back}"
     );
     assert!(

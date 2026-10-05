@@ -378,6 +378,15 @@ pub async fn peer(c: &Client, out: &Out, org: &str) -> Result<()> {
                         .map(|c| format!("  {}", output::card_line(c))),
                 );
             }
+            lines.push(match &po.primary {
+                Some(p) => format!(
+                    "your primary contact for {name}: {} (added in Cc when a seat that is not a contact writes to {name})",
+                    l(p)
+                ),
+                None => format!(
+                    "your primary contact for {name}: none (your org has no contact for {name}: open a seat to it first)"
+                ),
+            });
             if po.you_open.is_empty() {
                 lines.push("you open to them: nothing".into());
             } else {

@@ -77,23 +77,9 @@ fn header_tags(m: &MessageHeader) -> Vec<&'static str> {
     tags
 }
 
-/// `n recipient(s) not shown`: addresses of another org that the reader's
-/// org may not see (neither open to it nor in the thread).
-pub fn not_shown(n: u32) -> String {
-    format!("{n} recipient{} not shown", if n == 1 { "" } else { "s" })
-}
-
-/// A `To` or `Cc` value: the addresses, then how many are not shown;
-/// `None` when there is nothing.
-pub fn addresses(shown: &[String], hidden: u32) -> Option<String> {
-    let mut out = shown.iter().map(|a| l(a)).collect::<Vec<_>>().join(", ");
-    match (out.is_empty(), hidden) {
-        (true, 0) => return None,
-        (_, 0) => {}
-        (true, n) => out = not_shown(n),
-        (false, n) => out.push_str(&format!(" and {}", not_shown(n))),
-    }
-    Some(out)
+/// A `To` or `Cc` value; `None` when there is nothing.
+fn addresses(v: &[String]) -> Option<String> {
+    (!v.is_empty()).then(|| v.iter().map(|a| l(a)).collect::<Vec<_>>().join(", "))
 }
 
 /// Mail-style headers, a blank line, then the body with every line behind
@@ -110,10 +96,10 @@ pub fn message(m: &Message) -> String {
         source(h.source),
         short_time(&h.created_at)
     );
-    if let Some(to) = addresses(&h.to, h.to_hidden) {
+    if let Some(to) = addresses(&h.to) {
         out.push_str(&format!("To: {to}\n"));
     }
-    if let Some(cc) = addresses(&h.cc, h.cc_hidden) {
+    if let Some(cc) = addresses(&h.cc) {
         out.push_str(&format!("Cc: {cc}\n"));
     }
     out.push_str(&format!("Subject: {}\n", l(&h.subject)));
@@ -263,6 +249,14 @@ pub fn team_line(t: &p::Team) -> String {
     if t.managed {
         out.push_str(" managed");
     }
+    if !t.primaries.is_empty() {
+        let ps: Vec<String> = t
+            .primaries
+            .iter()
+            .map(|x| format!("{}:{}", l(&x.org), l(&x.seat)))
+            .collect();
+        out.push_str(&format!(" primary={}", ps.join(",")));
+    }
     out.push_str(&quoted("description", &t.description));
     out
 }
@@ -392,6 +386,9 @@ pub fn link_line(x: &p::Link) -> String {
     if let Some(t) = &x.since {
         out.push_str(&format!(" since {}", short_time(t)));
     }
+    if let Some(p) = &x.primary {
+        out.push_str(&format!(" primary={}", l(p)));
+    }
     if let Some(n) = &x.note {
         match x.state {
             p::LinkState::Invited => out.push_str(&format!(
@@ -407,42 +404,94 @@ pub fn link_line(x: &p::Link) -> String {
 
 /// One line on why a recipient was rejected as `unreachable`.
 pub const UNREACHABLE: &str = "(unreachable: that org has not opened the seat to your org and it \
-is not a participant of this thread, or no such seat exists there; or your org lets only open \
-seats write to other orgs. See amail who --org <org>)";
+is not on this thread, or no such seat exists there; or your org lets only its contacts write to \
+other orgs. See amail who --org <org>)";
+
+/// One line on why a recipient was rejected as `thread_closed`.
+pub const THREAD_CLOSED: &str = "(thread_closed: one of the two orgs has no contact left on this \
+thread, so it is closed between them; start a new thread to a contact listed by amail who --org \
+<org>)";
 
 pub fn send_result(r: &p::SendResponse) -> String {
-    let parts: Vec<String> = r
-        .recipients
-        .iter()
-        .map(|a| match a.wakes {
-            // A list in To wakes its (immediate) members: say so, since
-            // information that needs no action belongs in Cc.
-            Some(w) => format!("{}={} (list in To: wakes {w})", l(&a.address), a.seats),
-            None => format!("{}={}", l(&a.address), a.seats),
-        })
-        .collect();
     let mut out = format!(
         "sent #{} thread {} to {} seat{}: {}",
         r.id,
         r.thread_id,
         r.deliveries,
         if r.deliveries == 1 { "" } else { "s" },
-        parts.join(" ")
+        recipient_parts(&r.recipients)
     );
-    for rej in &r.rejected {
+    out.push_str(&recipient_notes(&r.recipients, &r.rejected));
+    if !r.notes.is_empty() {
+        let notes: Vec<String> = r.notes.iter().map(note).collect();
+        out.push_str(&format!("\nnot seen at once: {}", notes.join("; ")));
+    }
+    out
+}
+
+/// `amail send --dry-run`: what sending would do.
+pub fn preview_result(r: &p::SendPreview) -> String {
+    let mut out = format!(
+        "not sent (dry run); would reach {} seat{}: {}",
+        r.deliveries,
+        if r.deliveries == 1 { "" } else { "s" },
+        recipient_parts(&r.recipients)
+    );
+    out.push_str(&recipient_notes(&r.recipients, &r.rejected));
+    out
+}
+
+/// `a=1 list=3 (list in To: wakes 2)`; addresses the server added are
+/// listed on their own line by [`recipient_notes`].
+fn recipient_parts(recipients: &[p::AddressResult]) -> String {
+    recipients
+        .iter()
+        .filter(|a| !a.added)
+        .map(|a| match a.wakes {
+            // A list in To wakes its (immediate) members: say so, since
+            // information that needs no action belongs in Cc.
+            Some(w) => format!("{}={} (list in To: wakes {w})", l(&a.address), a.seats),
+            None => format!("{}={}", l(&a.address), a.seats),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Lines on added contacts and rejected recipients, each starting with a
+/// line break.
+fn recipient_notes(recipients: &[p::AddressResult], rejected: &[p::Rejected]) -> String {
+    let mut out = String::new();
+    let mut orgs: Vec<&str> = recipients
+        .iter()
+        .filter(|a| !a.added)
+        .filter_map(|a| a.address.split_once('@').map(|(_, o)| o))
+        .collect();
+    orgs.sort();
+    orgs.dedup();
+    let whom = match orgs.as_slice() {
+        [one] => format!("for {}", l(one)),
+        _ => "for the other org".to_string(),
+    };
+    for a in recipients.iter().filter(|a| a.added) {
+        out.push_str(&format!(
+            "\ncc: {} (added: your org's contact {whom}; mail to another org always carries one)",
+            l(&a.address)
+        ));
+    }
+    for rej in rejected {
         out.push_str(&format!(
             "\nrejected {}: {}",
             l(&rej.address),
             l(&rej.reason)
         ));
     }
-    if r.rejected.iter().any(|x| x.reason == "unreachable") {
+    if rejected.iter().any(|x| x.reason == "unreachable") {
         out.push('\n');
         out.push_str(UNREACHABLE);
     }
-    if !r.notes.is_empty() {
-        let notes: Vec<String> = r.notes.iter().map(note).collect();
-        out.push_str(&format!("\nnot seen at once: {}", notes.join("; ")));
+    if rejected.iter().any(|x| x.reason == "thread_closed") {
+        out.push('\n');
+        out.push_str(THREAD_CLOSED);
     }
     out
 }
@@ -518,8 +567,6 @@ mod tests {
                     .into_iter()
                     .collect(),
                 expired: false,
-                to_hidden: 0,
-                cc_hidden: 0,
             },
             body: body.into(),
             body_omitted: false,
@@ -558,25 +605,6 @@ mod tests {
             u.starts_with("#7 thread 1 from mallory@evil (USER) "),
             "{u}"
         );
-    }
-
-    #[test]
-    fn hidden_recipients_are_counted() {
-        let mut m = msg(Source::External, "s", "b");
-        m.header.cc_hidden = 2;
-        let t = message(&m);
-        assert!(t.contains("To: w1\nCc: 2 recipients not shown\n"), "{t}");
-        m.header.to = vec![];
-        m.header.to_hidden = 1;
-        m.header.cc = vec!["x@acme".into()];
-        m.header.cc_hidden = 0;
-        let t = message(&m);
-        assert!(t.contains("To: 1 recipient not shown\nCc: x@acme\n"), "{t}");
-        assert_eq!(
-            addresses(&["a".into()], 3).as_deref(),
-            Some("a and 3 recipients not shown")
-        );
-        assert_eq!(addresses(&[], 0), None);
     }
 
     #[test]
