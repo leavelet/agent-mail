@@ -54,7 +54,7 @@ exit code.
 | command | |
 |---|---|
 | `amail seat add <name> [--parent p] [--role r] [--harness claude\|codex\|dsh] [--model m] [--display-name d] [--permission-mode default\|unattended]` | create a seat (the permission mode is stored for display; launches take it from the team file or `amail run --permission-mode`) |
-| `amail seat set/ls/rm/token` | change, list, delete a seat; issue a seat token |
+| `amail seat set/ls/rm/token` | change, list, delete a seat; issue a seat token. `rm` also stops the seat and drops it from the node on this host, if that node runs it |
 | `amail list create <name> [--policy anyone\|members\|user_only] [--description d]` | create a list |
 | `amail list ls [name]` / `rm` / `add <list> <members...> [--mode immediate\|digest\|archive]` / `remove` | lists and members |
 | `amail link request <org>` / `accept <org>` / `ls` / `revoke <org>` | links with other orgs |
@@ -76,7 +76,7 @@ exit code.
 | `amail run <seat> [--harness claude\|codex\|dsh] [--permission-mode default\|unattended] [--git-access worktree\|full\|off] [--dsh-jail on\|off] [-- args]` | start the seat's harness session in this terminal. `--permission-mode unattended` runs it without permission prompts; without the flag a seat placed by `amail up` uses its team file's `permission_mode` and any other seat keeps the prompts. The server's seat setting is not used. `--git-access` (Codex seats) sets what the sandbox may write in the git repository (see [harness support](harnesses.md)); without it a seat placed by `amail up` uses its team file's `git_access`, any other seat `worktree` |
 | `amail up [-f amail.toml] [--only g,s] [--no-start] [--prune]` | bring a team up from a team file ([team files](teams.md)) |
 | `amail down [--only g,s]` / `amail ps` | stop the team's sessions / one line per seat: state, zellij pane, pending mail, last activity (ACTIVE: the seat's last hook or launch; after a node restart, the last write to its conversation log until its next hook), and whether a person is needed |
-| `amail attach <group or seat>` / `amail sleep <seat>` / `amail wake <seat>` | attach to a group's zellij session / put a seat to sleep / start it now |
+| `amail attach <group or seat>` / `amail sleep <seat>` / `amail wake <seat>` | attach this terminal to a group's zellij session (for a seat: on the seat's tab) / put a seat to sleep / start it now |
 
 Node options: `--url`, `--token` (`AMAIL_NODE_TOKEN`), `--state-dir`
 (`AMAIL_STATE_DIR`, default `~/.local/share/amail`), `--socket`
