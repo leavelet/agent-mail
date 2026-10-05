@@ -294,7 +294,8 @@ async fn archive_starts_from_the_org(b: Backend, t: &str) {
     assert_eq!(rest, vec![from_small]);
     // A seat of the org: its sent mail or mailbox directly.
     let v = big.get("/archive/messages?to=owner&limit=5").await;
-    assert_eq!(ids(&v), vec![own, from_small]);
+    // (Then the notice of the link.)
+    assert_eq!(ids(&v)[..2], [own, from_small]);
     let v = big.get("/sent?limit=2").await;
     assert_eq!(ids(&v)[0], own);
     assert_eq!(ids(&v).len(), 2);
@@ -305,7 +306,7 @@ async fn archive_starts_from_the_org(b: Backend, t: &str) {
     assert_eq!(ids(&v), vec![from_small]);
     // The small org: its own message only, whatever the filter.
     let v = small.get("/archive/messages?limit=500").await;
-    assert_eq!(ids(&v), vec![from_small]);
+    assert_eq!(own_ids(&v), vec![from_small]);
     assert!(v.get("next_before_id").is_none());
     for f in [
         "from=owner@big",
@@ -315,7 +316,7 @@ async fn archive_starts_from_the_org(b: Backend, t: &str) {
     ] {
         let v = small.get(&format!("/archive/messages?{f}")).await;
         assert!(v.get("next_before_id").is_none(), "{f}: {v}");
-        assert!(ids(&v).iter().all(|id| *id == from_small), "{f}: {v}");
+        assert!(own_ids(&v).iter().all(|id| *id == from_small), "{f}: {v}");
     }
     let (s, _, _) = small
         .call(Method::GET, &format!("/threads/{own}"), None)
@@ -343,19 +344,43 @@ async fn archive_to_another_org_matches_named_addresses(b: Backend, t: &str) {
     bravo
         .ok(Method::PUT, "/lists/team/members/secret-ops", None)
         .await;
-    let via_list = alpha
-        .send(json!({"to": ["team@bravo"], "subject": "to the list", "body": "x"}))
+    // Another org's list cannot be addressed.
+    let (s, _, _) = alpha
+        .call(
+            Method::POST,
+            "/messages",
+            Some(json!({"to": ["team@bravo"], "subject": "to the list", "body": "x"})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    let g = bravo
+        .ok(
+            Method::POST,
+            "/grants",
+            Some(json!({"target": "secret-ops"})),
+        )
         .await;
     let named = alpha
-        .send(json!({"to": ["secret-ops@bravo"], "subject": "named", "body": "y"}))
+        .send(json!({"to": ["secret-ops@bravo"], "cc": ["owner@bravo"], "subject": "named", "body": "y"}))
         .await;
     let v = alpha.get("/archive/messages?to=secret-ops@bravo").await;
     assert_eq!(ids(&v), vec![named], "{v}");
-    let v = alpha.get("/archive/messages?to=team@bravo").await;
-    assert_eq!(ids(&v), vec![via_list], "{v}");
-    // Bravo sees its own seat's mailbox, list mail included.
+    // Bravo sees its own seat's mailbox.
     let v = bravo.get("/archive/messages?to=secret-ops").await;
-    assert_eq!(ids(&v), vec![named, via_list], "{v}");
+    assert_eq!(ids(&v), vec![named], "{v}");
+    // Once bravo closes the seat, alpha cannot search by it (the message
+    // still shows under bravo's open user seat).
+    bravo
+        .ok(
+            Method::DELETE,
+            &format!("/grants/{}", g["grant"]["id"]),
+            None,
+        )
+        .await;
+    let v = alpha.get("/archive/messages?to=secret-ops@bravo").await;
+    assert_eq!(ids(&v), Vec::<i64>::new(), "{v}");
+    let v = alpha.get("/archive/messages?to=owner@bravo").await;
+    assert_eq!(ids(&v), vec![named], "{v}");
 }
 
 async fn concurrent_queries_are_limited(b: Backend, t: &str) {
@@ -531,4 +556,15 @@ async fn seat_list_cuts_long_roles(b: Backend, t: &str) {
     let one = acme.get("/seats/dev").await;
     assert_eq!(one["role"].as_str().unwrap().len(), 16_000);
     assert!(one.get("role_truncated").is_none());
+}
+
+/// The ids of an archive page without the mail system's notices.
+fn own_ids(v: &Value) -> Vec<i64> {
+    v["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["source"] != "system")
+        .map(|m| m["id"].as_i64().unwrap())
+        .collect()
 }

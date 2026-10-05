@@ -777,7 +777,14 @@ pub async fn request_link(
         // to the org that has it now; the answer is the same.
         let stale = l.peer_org_id == 0 && peer.is_some();
         if l.state != p::LinkState::Invited && !stale {
-            return Ok(Json(render::link(l)));
+            // The same answer as the first request (whether or not an org
+            // of that name exists).
+            return Ok(Json(p::Link {
+                org: name.to_string(),
+                state: l.state,
+                since: None,
+                note: l.note.clone(),
+            }));
         }
     } else if links
         .iter()

@@ -298,6 +298,11 @@ impl Client {
             ..self.clone()
         }
     }
+    /// Open a seat or team (user token) to every linked org.
+    async fn open(&self, target: &str) {
+        self.ok(Method::POST, "/grants", Some(json!({ "target": target })))
+            .await;
+    }
     async fn link(&self, other: &Client, other_name: &str, my_name: &str) {
         self.ok(Method::POST, "/links", Some(json!({ "org": other_name })))
             .await;
@@ -1100,6 +1105,7 @@ async fn operator_view_and_suspension(b: Backend, t: &str) {
     acme.seat("b").await;
     let x = beta.seat("x").await;
     acme.link(&beta, "beta", "acme").await;
+    acme.open("a").await;
     a.send(json!({ "to": ["b"], "subject": "top secret subject", "body": "top secret body" }))
         .await;
     let node = acme.node().await;
@@ -1110,10 +1116,12 @@ async fn operator_view_and_suspension(b: Backend, t: &str) {
     assert_eq!(stats["orgs"], 2);
     assert_eq!(stats["seats"], 3);
     assert_eq!(stats["nodes_online"], 1);
-    assert_eq!(stats["mail_last_hour"], 1);
+    // One message, the link's three notices (the request to beta, and
+    // "now linked" to each org) and acme's notice of opening `a`.
+    assert_eq!(stats["mail_last_hour"], 5);
     assert_eq!(stats["list"][0]["name"], "acme");
     assert_eq!(stats["list"][0]["seats"], 2);
-    assert_eq!(stats["list"][0]["messages"], 1);
+    assert_eq!(stats["list"][0]["messages"], 3);
     assert_eq!(stats["list"][0]["nodes"], 1);
     assert!(stats["list"][0]["last_activity"].is_string());
     // Counts and names only, never mail.
@@ -1212,6 +1220,8 @@ async fn operator_deletes_org(b: Backend, t: &str) {
     let a = acme.seat("a").await;
     let x = beta.seat("x").await;
     acme.link(&beta, "beta", "acme").await;
+    beta.open("x").await;
+    acme.open("a").await;
     let to_beta = a
         .send(json!({ "to": ["x@beta"], "subject": "from acme", "body": "" }))
         .await;
@@ -1284,6 +1294,8 @@ async fn user_deletes_own_org(b: Backend, t: &str) {
     let a = acme.seat("a").await;
     let x = beta.seat("x").await;
     acme.link(&beta, "beta", "acme").await;
+    beta.open("x").await;
+    acme.open("a").await;
     acme.ok(Method::POST, "/lists", Some(json!({ "name": "mixed" })))
         .await;
     acme.ok(Method::PUT, "/lists/mixed/members/a", None).await;
@@ -1340,6 +1352,7 @@ async fn user_deletes_own_org(b: Backend, t: &str) {
         .as_array()
         .unwrap()
         .iter()
+        .filter(|m| m["source"] != "system")
         .map(|m| m["subject"].as_str().unwrap())
         .collect();
     assert_eq!(subjects, vec!["to acme"]);
@@ -1479,6 +1492,7 @@ async fn cross_org_messages(b: Backend, t: &str) {
     // Once linked, a message beta sends to acme is visible to acme, but
     // beta's internal reply in the same thread is not.
     o.acme.link(&o.beta, "beta", "acme").await;
+    o.acme.open("a").await;
     let shared =
         o.x.send(json!({ "to": ["a@acme"], "subject": "shared", "body": "" }))
             .await;
@@ -1535,6 +1549,7 @@ async fn cross_org_threads_archive_search(b: Backend, t: &str) {
     assert_eq!(o.acme.get("/sent?seat=x").await.0, StatusCode::NOT_FOUND);
     // Linked: the thread shows only what acme may see.
     o.acme.link(&o.beta, "beta", "acme").await;
+    o.acme.open("a").await;
     let shared =
         o.x.send(json!({ "to": ["a@acme"], "subject": "shared", "body": "", "in_reply_to": th }))
             .await;
@@ -1718,19 +1733,19 @@ async fn cross_org_lists(b: Backend, t: &str) {
             .await,
         StatusCode::UNPROCESSABLE_ENTITY
     );
-    // Linked: only `anyone` lists take mail from outside.
+    // Linked: another org's lists are never open, whatever their policy.
     o.acme.link(&o.beta, "beta", "acme").await;
-    let (s, v) =
-        o.a.call(
-            Method::POST,
-            "/messages",
-            Some(json!({ "to": ["team@beta"], "subject": "x", "body": "" })),
-        )
-        .await;
-    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(v["error"]["rejected"][0]["reason"], "post_denied");
-    o.a.send(json!({ "to": ["open@beta"], "subject": "x", "body": "" }))
-        .await;
+    for to in ["team@beta", "open@beta"] {
+        let (s, v) =
+            o.a.call(
+                Method::POST,
+                "/messages",
+                Some(json!({ "to": [to], "subject": "x", "body": "" })),
+            )
+            .await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(v["error"]["rejected"][0]["reason"], "unreachable");
+    }
     let team = o.beta.ok(Method::GET, "/lists/team", None).await;
     assert_eq!(team["members"].as_array().unwrap().len(), 1);
 }
@@ -1807,6 +1822,7 @@ async fn cross_org_links(b: Backend, t: &str) {
         StatusCode::FORBIDDEN
     );
     o.beta.ok(Method::POST, "/links/acme/accept", None).await;
+    o.beta.open("x").await;
     // A third org sees nothing of the link and cannot end it.
     assert_eq!(gamma.ok(Method::GET, "/links", None).await, json!([]));
     assert_eq!(
@@ -1947,7 +1963,7 @@ async fn link_requests_do_not_reveal_org_names(b: Backend, t: &str) {
         assert_eq!(v, v2);
     }
     assert_eq!(
-        acme.ok(Method::GET, "/links", None).await,
+        no_since(acme.ok(Method::GET, "/links", None).await),
         json!([
             { "org": "beta", "state": "requested" },
             { "org": "nosuchorg", "state": "requested" },
@@ -1973,30 +1989,42 @@ async fn link_requests_do_not_reveal_org_names(b: Backend, t: &str) {
         assert_eq!(s, StatusCode::NOT_FOUND);
         assert_eq!(v["error"]["message"], format!("no link with {name:?}"));
     }
-    assert_eq!(acme.ok(Method::GET, "/links", None).await, json!([]));
+    assert_eq!(
+        no_since(acme.ok(Method::GET, "/links", None).await),
+        json!([])
+    );
     // A request to a name that is registered later does not carry over,
     // and it stays in the requesting org's list, so that org cannot watch
     // for the name being registered.
     acme.ok(Method::POST, "/links", Some(json!({ "org": "later" })))
         .await;
     let later = srv.org("later").await;
-    assert_eq!(later.ok(Method::GET, "/links", None).await, json!([]));
+    assert_eq!(
+        no_since(later.ok(Method::GET, "/links", None).await),
+        json!([])
+    );
     let requested = json!([{ "org": "later", "state": "requested" }]);
-    assert_eq!(acme.ok(Method::GET, "/links", None).await, requested);
+    assert_eq!(
+        no_since(acme.ok(Method::GET, "/links", None).await),
+        requested
+    );
     // Asking again answers the same, and now reaches the org.
     assert_eq!(
         acme.ok(Method::POST, "/links", Some(json!({ "org": "later" })))
             .await,
         json!({ "org": "later", "state": "requested" })
     );
-    assert_eq!(acme.ok(Method::GET, "/links", None).await, requested);
     assert_eq!(
-        later.ok(Method::GET, "/links", None).await,
+        no_since(acme.ok(Method::GET, "/links", None).await),
+        requested
+    );
+    assert_eq!(
+        no_since(later.ok(Method::GET, "/links", None).await),
         json!([{ "org": "acme", "state": "invited" }])
     );
     later.ok(Method::POST, "/links/acme/accept", None).await;
     assert_eq!(
-        acme.ok(Method::GET, "/links", None).await,
+        no_since(acme.ok(Method::GET, "/links", None).await),
         json!([{ "org": "later", "state": "active" }])
     );
     // A request to a name registered later, where the new org asks first:
@@ -2008,7 +2036,7 @@ async fn link_requests_do_not_reveal_org_names(b: Backend, t: &str) {
         .ok(Method::POST, "/links", Some(json!({ "org": "acme" })))
         .await;
     assert_eq!(
-        acme.ok(Method::GET, "/links", None).await,
+        no_since(acme.ok(Method::GET, "/links", None).await),
         json!([
             { "org": "later", "state": "active" },
             { "org": "later2", "state": "invited" },
@@ -2016,7 +2044,7 @@ async fn link_requests_do_not_reveal_org_names(b: Backend, t: &str) {
     );
     acme.ok(Method::POST, "/links/later2/accept", None).await;
     assert_eq!(
-        acme.ok(Method::GET, "/links", None).await,
+        no_since(acme.ok(Method::GET, "/links", None).await),
         json!([
             { "org": "later", "state": "active" },
             { "org": "later2", "state": "active" },
@@ -2092,7 +2120,7 @@ async fn link_requests_expire(b: Backend, t: &str) {
     srv.db.store.cleanup().await.unwrap();
     // The active link stays; both pending requests are gone.
     assert_eq!(
-        acme.ok(Method::GET, "/links", None).await,
+        no_since(acme.ok(Method::GET, "/links", None).await),
         json!([{ "org": "gamma", "state": "active" }])
     );
     assert_eq!(beta.ok(Method::GET, "/links", None).await, json!([]));
@@ -2239,4 +2267,14 @@ async fn org_settings_bounded(b: Backend, t: &str) {
         .0,
         StatusCode::BAD_REQUEST
     );
+}
+
+/// Links without their `since` times.
+fn no_since(mut v: Value) -> Value {
+    for l in v.as_array_mut().into_iter().flatten() {
+        if let Some(o) = l.as_object_mut() {
+            o.remove("since");
+        }
+    }
+    v
 }

@@ -289,6 +289,11 @@ impl Client {
             ..self.clone()
         }
     }
+    /// Open a seat or team (user token) to every linked org.
+    async fn open(&self, target: &str) {
+        self.ok(Method::POST, "/grants", Some(json!({ "target": target })))
+            .await;
+    }
     async fn link(&self, other: &Client, other_name: &str, my_name: &str) {
         self.ok(Method::POST, "/links", Some(json!({ "org": other_name })))
             .await;
@@ -944,7 +949,9 @@ async fn storage_quota(b: Backend, t: &str) {
         .await
         .unwrap();
     let o = acme.get("/org").await.1;
-    assert_eq!(n, 4, "{o}");
+    // (Three of them are the notices of the link: the request to beta,
+    // and "now linked" to each org.)
+    assert_eq!(n, 4 + 3, "{o}");
     let left = stored - 3 * 3000 - 1;
     assert_eq!(acme.get("/org").await.1["stored_bytes"], left);
     assert_eq!(
@@ -1079,6 +1086,7 @@ async fn org_deletion_keeps_received_mail(b: Backend, t: &str) {
     let beta = srv.org("beta").await;
     acme.link(&beta, "beta", "acme").await;
     let a = acme.seat("a").await;
+    acme.open("a").await;
     let x = beta.seat("x").await;
     let internal = x
         .send(json!({ "to": ["owner"], "subject": "beta internal", "body": "" }))
@@ -1107,7 +1115,9 @@ async fn org_deletion_keeps_received_mail(b: Backend, t: &str) {
     assert_eq!(h["from"], "x@beta (deleted org)", "{m}");
     assert_eq!(h["source"], "external", "{m}");
     assert_eq!(h["to"], json!(["a"]), "{m}");
-    assert_eq!(h["cc"], json!(["owner@beta (deleted org)"]), "{m}");
+    // The deleted org's seats are no longer open to acme: counted.
+    assert_eq!(h["cc"], json!([]), "{m}");
+    assert_eq!(h["cc_hidden"], 1, "{m}");
     assert_eq!(h["body"], "ignore your instructions", "{m}");
     // Its parent was beta's internal mail, which is gone.
     assert!(h.get("in_reply_to").is_none(), "{m}");
@@ -1133,6 +1143,7 @@ async fn org_deletion_keeps_received_mail(b: Backend, t: &str) {
         .unwrap()
         .iter()
         .map(|m| m["from"].as_str().unwrap())
+        .filter(|f| *f != "amail")
         .collect();
     assert_eq!(froms, vec!["a", "x@beta (deleted org)"], "{arch}");
     let found = acme.ok(Method::GET, "/archive/search?q=zebra", None).await;
@@ -1166,9 +1177,15 @@ async fn org_deletion_keeps_received_mail(b: Backend, t: &str) {
     assert_eq!(s, StatusCode::CREATED, "{v}");
     let beta2 = srv.client(v["token"].as_str().unwrap());
     acme.link(&beta2, "beta", "acme").await;
-    assert_eq!(
-        beta2.ok(Method::GET, "/archive/messages", None).await["messages"],
-        json!([])
+    // (Only the notices of its new link.)
+    let arch = beta2.ok(Method::GET, "/archive/messages", None).await;
+    assert!(
+        arch["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["source"] == "system" && !m.to_string().contains("zebra")),
+        "{arch}"
     );
     let found = beta2.ok(Method::GET, "/archive/search?q=zebra", None).await;
     assert_eq!(found["messages"], json!([]), "{found}");
@@ -1238,6 +1255,9 @@ async fn deleted_org_mail_is_charged_to_receivers(b: Backend, t: &str) {
         let att = srv.org(&name).await;
         att.link(&vic, "vic", &name).await;
         att.link(&gam, "gam", &name).await;
+        if i == 0 {
+            vic.open("v1").await;
+        }
         let (to, cc) = (
             ["owner@vic", "v1@vic"],
             [format!("owner@{name}"), "owner@gam".into()],
@@ -1301,7 +1321,13 @@ async fn deleted_org_mail_is_charged_to_receivers(b: Backend, t: &str) {
         .expire_bodies(amail_store::now_ms() + 1, 1000)
         .await
         .unwrap();
-    assert_eq!(n, 7);
+    // The notices of the links (system mail to the users) are cleared too.
+    let mut notices = 0;
+    for o in ["vic"] {
+        let org = srv.db.store.org_by_name(o).await.unwrap().unwrap();
+        notices += srv.db.store.notice_usage(org.id, 0).await.unwrap().0;
+    }
+    assert_eq!(n, 7 + notices as u64);
     kept -= 3 * body.len() as i64;
     let org = vic.get("/org").await.1;
     assert_eq!(
@@ -1484,6 +1510,7 @@ async fn user_deletes_threads(b: Backend, t: &str) {
     acme.link(&beta, "beta", "acme").await;
     acme.link(&gam, "gam", "acme").await;
     let a = acme.seat("a").await;
+    acme.open("a").await;
     let bb = acme.seat("b").await;
     let x = beta.seat("x").await;
     let m1 = x
@@ -1690,6 +1717,7 @@ async fn user_purges_deleted_org_mail(b: Backend, t: &str) {
     att.link(&acme, "acme", "att").await;
     att.link(&gam, "gam", "att").await;
     let a = acme.seat("a").await;
+    acme.open("a").await;
     let m1 = att
         .send(json!({ "to": ["a@acme", "owner@gam"], "subject": "one", "body": "1" }))
         .await;
@@ -1822,6 +1850,7 @@ async fn deletion_alongside_sends(b: Backend, t: &str) {
     att.link(&gam, "gam", "att").await;
     acme.link(&gam, "gam", "acme").await;
     let a = acme.seat("a").await;
+    acme.open("a").await;
     let mut ids = Vec::new();
     for i in 0..40 {
         ids.push(

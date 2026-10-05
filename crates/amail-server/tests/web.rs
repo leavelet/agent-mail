@@ -293,6 +293,8 @@ async fn search_english_chinese_short_and_visibility(srv: Server) {
     acme.ok(Method::POST, "/links", Some(json!({ "org": "beta" })))
         .await;
     beta.ok(Method::POST, "/links/acme/accept", None).await;
+    acme.ok(Method::POST, "/grants", Some(json!({ "target": "a" })))
+        .await;
     x.send(json!({ "to": ["a@acme"], "subject": "cross-org note", "body": "跨组织的检索测试" }))
         .await;
     assert_eq!(
@@ -855,6 +857,11 @@ async fn archive_by_recipient(srv: Server) {
     acme.ok(Method::POST, "/links", Some(json!({ "org": "beta" })))
         .await;
     beta.ok(Method::POST, "/links/acme/accept", None).await;
+    // (A link opens no agent seat by itself.)
+    beta.ok(Method::POST, "/grants", Some(json!({ "target": "x" })))
+        .await;
+    acme.ok(Method::POST, "/grants", Some(json!({ "target": "a" })))
+        .await;
     a.send(json!({ "to": ["x@beta"], "subject": "to x", "body": "" }))
         .await;
     x.send(json!({ "to": ["a@acme"], "subject": "x to a", "body": "" }))
