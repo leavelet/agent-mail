@@ -30,7 +30,7 @@
       </li>
     {/each}
     {#each r.rejected as x}
-      <li class="error" data-rejected={x.address}>{t('compose.receipt.rejected', { address: x.address, reason: x.reason })}</li>
+      <li class="error" data-rejected={x.address}>{t('compose.receipt.rejected', { address: x.address, reason: x.reason })}{#if x.reason === 'unreachable'} <span class="faint">{t('compose.unreachable')}</span>{/if}</li>
     {/each}
   </ul>
   {#if r.notes?.length}

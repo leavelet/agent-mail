@@ -15,8 +15,9 @@
   const guess = $derived(ui.thread && String(ui.thread.id) === router.route.parts[1] ? ui.thread.folder : null);
   const section = $derived(navSection(route, from, guess));
   const sub = $derived(router.route.parts[1] ?? 'seats');
+  const invited = $derived(store.links.filter((l) => l.state === 'invited').length);
   const unread = $derived(store.me?.seat ? (store.counts.get(store.me.seat)?.unread ?? 0) : 0);
-  const admin = ['seats', 'lists', 'links', 'tokens', 'settings'] as const;
+  const admin = ['seats', 'lists', 'openings', 'tokens', 'settings'] as const;
 </script>
 
 <nav class="nav" aria-label="main">
@@ -25,6 +26,11 @@
     {#if store.attention.length}<span class="count alert">{store.attention.length}</span>{/if}
   </a>
   <a href={href(['org'])} class:active={section === 'org' || section === 'seat'}><span>{t('nav.org')}</span></a>
+  <a href={href(['teams'])} class:active={section === 'teams'}><span>{t('nav.teams')}</span></a>
+  <a href={href(['orgs'])} class:active={section === 'orgs' || (section === 'admin' && sub === 'links')}>
+    <span>{t('nav.others')}</span>
+    {#if invited}<span class="count alert" title={t('others.invited', { n: invited })}>{invited}</span>{/if}
+  </a>
   <a href={href(['inbox'])} class:active={section === 'inbox'}>
     <span>{t('nav.inbox')}</span>
     {#if unread}<span class="count hot">{unread}</span>{/if}

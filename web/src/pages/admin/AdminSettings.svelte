@@ -3,7 +3,7 @@
   import { t } from '../../lib/ui.svelte';
   import { store } from '../../lib/store.svelte';
   import * as notify from '../../lib/notify';
-  import type { OrgInfo } from '../../lib/types';
+  import type { OrgInfo, OrgVisibility, Outbound } from '../../lib/types';
   import DataNotice from '../../components/DataNotice.svelte';
 
   let org = $state.raw<OrgInfo | null>(null);
@@ -15,6 +15,14 @@
   let focusMax = $state(240);
   let digestInterval = $state(30);
   let webhook = $state('');
+  // The org's card and its rules for other orgs.
+  let displayName = $state('');
+  let description = $state('');
+  let visibility = $state<OrgVisibility>('listed-by-name');
+  let outbound = $state<Outbound>('any-seat');
+  let newThreads = $state(10);
+  let cardMsg = $state<string | null>(null);
+  let cardError = $state<string | null>(null);
   let msg = $state<string | null>(null);
   let error = $state<string | null>(null);
 
@@ -28,6 +36,31 @@
     focusMax = o.focus_max_min;
     digestInterval = o.digest_interval_min;
     webhook = o.webhook_url ?? '';
+    displayName = o.display_name ?? '';
+    description = o.description ?? '';
+    visibility = o.visibility ?? 'listed-by-name';
+    outbound = o.outbound ?? 'any-seat';
+    newThreads = o.new_threads_per_hour ?? 10;
+  }
+
+  async function saveCard(e: SubmitEvent) {
+    e.preventDefault();
+    cardMsg = null;
+    cardError = null;
+    try {
+      fill(
+        await patch<OrgInfo>('/v1/org', {
+          display_name: displayName.trim() || null,
+          description: description.trim() || null,
+          visibility,
+          outbound,
+          new_threads_per_hour: newThreads,
+        }),
+      );
+      cardMsg = t('admin.saved');
+    } catch (err) {
+      cardError = err instanceof Error ? err.message : String(err);
+    }
   }
 
   $effect(() => {
@@ -105,7 +138,28 @@
 <div class="page">
   <div class="page-head"><h1>{t('nav.admin')} · {t('nav.settings')}</h1>{#if org}<span class="mono faint">{org.name}</span>{/if}</div>
   {#if org}
-    <form class="card form" onsubmit={save}>
+    <form class="card form" onsubmit={saveCard} aria-labelledby="s-card" data-testid="org-card-form">
+      <h2 id="s-card">{t('settings.card')}</h2>
+      <p class="faint hint0">{t('settings.cardHint')}</p>
+      <label><span>{t('settings.displayName')}</span><input type="text" maxlength="200" bind:value={displayName} /></label>
+      <label><span>{t('seat.description')}</span><textarea rows="2" maxlength="500" bind:value={description}></textarea></label>
+      <label><span>{t('settings.visibility')}</span>
+        <select bind:value={visibility}>
+          <option value="listed-by-name">{t('settings.visibility.listed')}</option>
+          <option value="hidden">{t('settings.visibility.hidden')}</option>
+        </select></label>
+      <p class="faint hint">{t(visibility === 'hidden' ? 'settings.visibility.hidden.long' : 'settings.visibility.listed.long')}</p>
+      <label><span>{t('settings.outbound')}</span>
+        <select bind:value={outbound}>
+          <option value="any-seat">{t('settings.outbound.any')}</option>
+          <option value="open-seats-only">{t('settings.outbound.open')}</option>
+        </select></label>
+      <p class="faint hint">{t(outbound === 'any-seat' ? 'settings.outbound.any.long' : 'settings.outbound.open.long')}</p>
+      <label><span>{t('settings.newThreads')}</span><input type="number" min="0" bind:value={newThreads} /></label>
+      <div class="row"><button class="primary" type="submit">{t('admin.save')}</button>{#if cardMsg}<span class="ok">{cardMsg}</span>{/if}</div>
+      {#if cardError}<p class="error" role="alert">{cardError}</p>{/if}
+    </form>
+    <form class="card form limits" onsubmit={save}>
       <label><span>{t('admin.org.rate')}</span><input type="number" min="0" bind:value={rate} /></label>
       <label><span>{t('admin.org.burst')}</span><input type="number" min="1" bind:value={burst} /></label>
       <label><span>{t('admin.org.maxRecipients')}</span><input type="number" min="1" bind:value={maxRecipients} /></label>
@@ -174,6 +228,12 @@
   }
   label span {
     color: var(--muted);
+  }
+  textarea {
+    font-family: var(--font);
+  }
+  .limits {
+    margin-top: 14px;
   }
   .hint {
     margin: -2px 0 0 270px;

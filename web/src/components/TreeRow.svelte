@@ -83,6 +83,8 @@
     {/if}
     <span class="mono seatname" title={visible(seat.display_name ?? seat.name)}>{seat.name}</span>
     {#if isUser}<span class="chip neutral">{t('org.you')}</span>{/if}
+    {#if seat.open_to?.length}<span class="chip open" data-testid="open-chip" title={t('open.to', { list: seat.open_to.map((a) => (a === 'linked' ? t('open.linked') : a)).join(', ') })}>{t('open.chip')}</span>{/if}
+    {#if seat.description}<span class="desc faint" title={visible(seat.description)}>{visible(seat.description)}</span>{/if}
     {#if row.hasChildren && !row.expanded && below}
       <span class="below" title={t('org.subtree', { n: size })}>
         {#each SEAT_STATES as s}
@@ -141,11 +143,25 @@
     overflow: hidden;
   }
   .seatname {
+    flex: none;
+    max-width: 70%;
     font-size: 12.5px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
     font-weight: 550;
+  }
+  .desc {
+    font-size: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+  .chip.open {
+    color: var(--ok);
+    background: var(--ok-weak);
+    flex: none;
   }
   .user .seatname {
     color: var(--accent);
@@ -230,6 +246,9 @@
     --bgc: var(--accent-weak);
   }
   @container tree (max-width: 720px) {
+    .desc {
+      display: none;
+    }
     .trow {
       grid-template-columns: minmax(140px, 1fr) 118px minmax(0, 150px) 60px;
     }

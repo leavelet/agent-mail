@@ -94,31 +94,36 @@ export function completeToken(field: string, addr: string): string {
 
 export interface Suggestion {
   address: string;
-  kind: 'seat' | 'list' | 'org';
+  /** `open`: a seat of another org open to this org; `participant`: a seat
+   * of another org that wrote in the thread being answered. */
+  kind: 'seat' | 'list' | 'open' | 'participant';
   detail?: string;
 }
 
-/** Suggestions for the token being typed: seats, lists, then `name@org` for linked orgs. */
+/**
+ * Suggestions for the token being typed: seats and lists of the org, then
+ * addresses of other orgs from `external` (only what other orgs opened to
+ * this org and the participants of the thread being answered; see
+ * `peerCandidates`). A token with `@` matches only addresses of other orgs.
+ */
 export function suggest(
   token: string,
   seats: { name: string; detail?: string }[],
   lists: string[],
-  orgs: string[],
+  external: { address: string; kind: 'open' | 'participant'; detail?: string }[],
   limit = 8,
 ): Suggestion[] {
-  const [name, org] = token.split('@', 2);
   const out: Suggestion[] = [];
-  if (org === undefined) {
-    const rank = (n: string) => (n.startsWith(name) ? 0 : n.includes(name) ? 1 : 2);
-    const seatHits = seats.filter((s) => rank(s.name) < 2).sort((a, b) => rank(a.name) - rank(b.name) || a.name.localeCompare(b.name));
+  const rank = (n: string, q: string) => (n.startsWith(q) ? 0 : n.includes(q) ? 1 : 2);
+  if (!token.includes('@')) {
+    const seatHits = seats.filter((s) => rank(s.name, token) < 2).sort((a, b) => rank(a.name, token) - rank(b.name, token) || a.name.localeCompare(b.name));
     for (const s of seatHits) out.push({ address: s.name, kind: 'seat', detail: s.detail });
-    for (const l of lists.filter((l) => rank(l) < 2).sort((a, b) => rank(a) - rank(b) || a.localeCompare(b)))
+    for (const l of lists.filter((l) => rank(l, token) < 2).sort((a, b) => rank(a, token) - rank(b, token) || a.localeCompare(b)))
       out.push({ address: l, kind: 'list' });
   }
-  if (name) {
-    for (const o of orgs) {
-      if (org === undefined || o.startsWith(org)) out.push({ address: `${name}@${o}`, kind: 'org', detail: o });
-    }
-  }
+  const ext = external
+    .filter((e) => rank(e.address, token) < 2)
+    .sort((a, b) => rank(a.address, token) - rank(b.address, token) || a.address.localeCompare(b.address));
+  for (const e of ext) out.push({ address: e.address, kind: e.kind, detail: e.detail });
   return out.slice(0, limit);
 }

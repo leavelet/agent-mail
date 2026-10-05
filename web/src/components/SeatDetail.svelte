@@ -5,7 +5,9 @@
   const isList = (a: string) => store.lists.some((l) => l.name === a);
   import { t, ui } from '../lib/ui.svelte';
   import { href, go } from '../lib/router.svelte';
-  import { get, qs, ApiError } from '../lib/api';
+  import { get, patch, qs, enc, ApiError } from '../lib/api';
+  import { grantsOf } from '../lib/openings';
+  import OpeningsEditor from './OpeningsEditor.svelte';
   import { KNOWN_ATTENTION, focusUntil, seatStatus, stateLongKey, nodeOpBlock, terminalHref } from '../lib/presence';
   import { duration, shortTime } from '../lib/time';
   import { fromEntry, fromSent, newestFirst, type MailRow } from '../lib/mailrows';
@@ -88,6 +90,32 @@
   const starting = $derived(!!status?.starting);
   const tf = $derived(p?.turn_failed);
   const terminal = $derived(terminalHref(p?.terminal_url));
+
+  // The description: what others read about the seat (other orgs too, when open).
+  let editingDesc = $state(false);
+  let desc = $state('');
+  let descError = $state<string | null>(null);
+  function editDesc() {
+    desc = seat?.description ?? '';
+    descError = null;
+    editingDesc = true;
+  }
+  async function saveDesc(e: SubmitEvent) {
+    e.preventDefault();
+    descError = null;
+    try {
+      await patch(`/v1/seats/${enc(name)}`, { description: desc.trim() || null });
+      await store.refreshSeats();
+      editingDesc = false;
+    } catch (err) {
+      descError = err instanceof Error ? err.message : String(err);
+    }
+  }
+  // Audiences the seat is open to only as a contact of its team.
+  const inherited = $derived.by(() => {
+    const own = new Set(grantsOf(store.grants, name).map((g) => g.audience));
+    return (seat?.open_to ?? []).filter((a) => !own.has(a));
+  });
 </script>
 
 {#if !seat}
@@ -137,6 +165,29 @@
     {/if}
 
     <dl class="facts">
+      <dt>{t('seat.description')}</dt>
+      <dd data-testid="seat-description">
+        {#if editingDesc}
+          <form class="descform" onsubmit={saveDesc}>
+            <textarea rows="2" maxlength="500" aria-label={t('seat.description')} bind:value={desc}></textarea>
+            <div class="row">
+              <button class="small primary" type="submit">{t('admin.save')}</button>
+              <button class="small" type="button" onclick={() => (editingDesc = false)}>{t('admin.cancel')}</button>
+              <span class="faint">{t('seat.descriptionHint')}</span>
+            </div>
+            {#if descError}<p class="error" role="alert">{descError}</p>{/if}
+          </form>
+        {:else}
+          {#if seat.description}<span class="desc"><Vis text={seat.description} /></span>{:else}<span class="faint">{t('seat.noDescription')}</span>{/if}
+          <button class="small ghost" onclick={editDesc}>{t('admin.edit')}</button>
+        {/if}
+      </dd>
+      <dt>{t('seat.team')}</dt>
+      <dd>
+        {#if seat.group}<a class="mono" href={href(['teams', seat.group])}>{seat.group}</a>{#if seat.contact}<span class="chip neutral" title={t('team.contact.long')}>{t('team.contact')}</span>{/if}{:else}<span class="faint">{t('seat.noTeam')}</span>{/if}
+      </dd>
+      <dt>{t('open.title')}</dt>
+      <dd><OpeningsEditor target={seat.name} team={seat.contact ? seat.group : undefined} {inherited} /></dd>
       <dt>{t('seat.parent')}</dt>
       <dd>{#if seat.parent}<a class="mono" href={href(['org', seat.parent])}>{seat.parent}</a>{:else}<span class="faint">{t('seat.none')}</span>{/if}</dd>
       <dt>{t('seat.children')}</dt>
@@ -152,7 +203,6 @@
         <dd><Vis text={[seat.harness ?? p?.harness, seat.model].filter(Boolean).join(' · ') || '—'} />{#if seat.permission_mode} · <span class="faint">{seat.permission_mode}</span>{/if}</dd>
         <dt>{t('seat.node')}</dt>
         <dd>{#if p?.node}<span class="mono">{p.node}</span>{:else if p}<span class="faint">—</span>{:else}<span class="faint">{t('seat.noNode')}</span>{/if}</dd>
-        {#if seat.group}<dt>{t('seat.group')}</dt><dd class="mono"><Vis text={seat.group} /></dd>{/if}
         <dt>{t('seat.terminal')}</dt>
         <dd>
           {#if terminal}
@@ -284,6 +334,20 @@
   }
   .kids {
     gap: 4px 10px;
+  }
+  .desc {
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .descform {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    flex: 1;
+    min-width: 0;
+  }
+  .descform textarea {
+    width: 100%;
   }
   .cmd {
     padding: 1px 6px;

@@ -18,6 +18,8 @@ export interface E2eState {
   transcript: string;
   node: boolean;
   big?: { org: string; userToken: string; nodeToken: string };
+  /** A linked org (`globex`) with seat tokens, and an org that asked acme for a link (`initech`). */
+  peer: { org: string; userToken: string; seatTokens: Record<string, string>; inviter: string };
   /** The public-mode server: invite codes and an operator token. */
   pub: { base: string; invites: string[]; opToken: string; db: string };
   pids: number[];
@@ -59,15 +61,15 @@ export async function login(page: Page, token: string, opts: { lang?: 'en' | 'zh
   await page.locator('.shell').waitFor();
 }
 
-export const AGENTS: { name: string; parent?: string; harness: string; model: string; group?: string; role: string }[] = [
-  { name: 'root', harness: 'claude', model: 'sonnet', role: 'Overall technical lead: splits the work, reviews, merges into main.' },
-  { name: 'be-lead', parent: 'root', harness: 'codex', model: 'codex-model', group: 'backend', role: 'Leads the backend group (storage and API).' },
+export const AGENTS: { name: string; parent?: string; harness: string; model: string; group?: string; role: string; description?: string; contact?: boolean }[] = [
+  { name: 'root', harness: 'claude', model: 'sonnet', role: 'Overall technical lead: splits the work, reviews, merges into main.', description: 'Technical lead of acme: plans the work and merges it.' },
+  { name: 'be-lead', parent: 'root', harness: 'codex', model: 'codex-model', group: 'backend', role: 'Leads the backend group (storage and API).', description: 'Backend questions: storage, search, the HTTP API.', contact: true },
   { name: 'be-1', parent: 'be-lead', harness: 'claude', model: 'sonnet', group: 'backend', role: 'Backend worker: storage layer.' },
   { name: 'be-2', parent: 'be-lead', harness: 'claude', model: 'sonnet', group: 'backend', role: 'Backend worker: HTTP API.' },
   { name: 'fe-lead', parent: 'root', harness: 'claude', model: 'sonnet', group: 'frontend', role: 'Leads the frontend group.' },
   { name: 'fe-1', parent: 'fe-lead', harness: 'claude', model: 'sonnet', group: 'frontend', role: 'Frontend worker: org tree.' },
   { name: 'fe-2', parent: 'fe-lead', harness: 'codex', model: 'codex-model', group: 'frontend', role: 'Frontend worker: mail views.' },
-  { name: 'docs', parent: 'root', harness: 'claude', model: 'sonnet', role: 'Writes the user documentation (中文和英文).' },
+  { name: 'docs', parent: 'root', harness: 'claude', model: 'sonnet', role: 'Writes the user documentation (中文和英文).', description: 'User documentation in English and Chinese.' },
 ];
 
 /** Fake presence for the seats no real node hosts (it expires after 90 s). */

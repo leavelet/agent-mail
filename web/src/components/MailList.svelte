@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { maskedKey } from '../lib/openings';
   import Vis from './Vis.svelte';
   import type { MailRow } from '../lib/mailrows';
   import { t, ui } from '../lib/ui.svelte';
@@ -41,6 +42,7 @@
       <div class="who mono" title={showTo ? r.to.join(', ') : r.from}>
         {#if r.unread}<span class="udot" aria-label={t('mail.unread')}></span>{/if}
         {showTo ? `→ ${r.to.join(', ')}` : r.from}
+        {#if showTo && r.to_hidden}<span class="faint" data-testid="to-hidden" title={t('mail.hidden.long')}>{t(maskedKey(r.to_hidden, r.to.length > 0), { n: r.to_hidden })}</span>{/if}
         {#if !showTo && r.source !== 'agent'}<span class="src src-{r.source}" title={t(`mail.source.${r.source}.long`)}>{t(`mail.source.${r.source}`)}</span>{/if}
       </div>
       <div class="subj">

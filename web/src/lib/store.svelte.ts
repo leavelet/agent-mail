@@ -8,8 +8,14 @@ import { Coalescer } from './coalesce';
 import { announce, itemKey, newItems } from './notify';
 import { go } from './router.svelte';
 import { t } from './ui.svelte';
+import { activeOrgs } from './openings';
 import type {
   AttentionItem,
+  Card,
+  Grant,
+  OrgInfo,
+  PeerOrg,
+  Team,
   CountsResponse,
   DirectoryEvent,
   Link,
@@ -39,6 +45,12 @@ class Store {
   attention = $state.raw<AttentionItem[]>([]);
   lists = $state.raw<ListInfo[]>([]);
   links = $state.raw<Link[]>([]);
+  teams = $state.raw<Team[]>([]);
+  grants = $state.raw<Grant[]>([]);
+  /** Per org with an active link: the cards it opened to this org (loaded on demand). */
+  peerCards = $state.raw<Map<string, Card[]>>(new Map());
+  /** The one-time notice of the org for the user, until dismissed. */
+  orgNotice = $state<string | null>(null);
   /** The event stream is open. */
   live = $state(false);
   /** Node event streams open for the org (null: not known yet). */
@@ -136,7 +148,8 @@ class Store {
 
   private async start() {
     this.loadError = null;
-    await Promise.all([this.refreshSeats(), this.refreshCounts(), this.refreshAttention(), this.refreshOverview(), this.refreshDirectory()]).catch(
+    void this.loadNotice();
+    await Promise.all([this.refreshSeats(), this.refreshCounts(), this.refreshAttention(), this.refreshOverview(), this.refreshDirectory(), this.refreshOpenings()]).catch(
       (e) => (this.loadError = e instanceof Error ? e.message : String(e)),
     );
     this.connect();
@@ -183,7 +196,10 @@ class Store {
     es.addEventListener('directory', (e) => {
       try {
         const d = JSON.parse((e as MessageEvent).data) as DirectoryEvent;
-        this.coalescer.add(d.kind === 'list' ? 'd:lists' : 'd:seats');
+        // Teams and grants change seats too (team, contact, open to).
+        if (d.kind === 'list') this.coalescer.add('d:lists');
+        else this.coalescer.add('d:seats');
+        if (d.kind === 'team' || d.kind === 'grant') this.coalescer.add('d:openings');
       } catch {
         // Ignore malformed events.
       }
@@ -242,6 +258,7 @@ class Store {
       jobs.push(this.refreshSeats().then(() => this.refreshCounts()));
     }
     if (keys.has('d:lists')) jobs.push(this.refreshDirectory());
+    if (keys.has('d:openings')) jobs.push(this.refreshOpenings());
     if (presenceChanged && this.presence.size) {
       const updates = this.presence;
       this.presence = new Map();
@@ -318,6 +335,51 @@ class Store {
     const [lists, links] = await Promise.all([get<ListInfo[]>('/v1/lists'), get<Link[]>('/v1/links')]);
     this.lists = lists;
     this.links = links;
+  }
+
+  /** Teams and grants of the org. */
+  async refreshOpenings(): Promise<void> {
+    const [teams, grants] = await Promise.all([get<Team[]>('/v1/teams'), get<Grant[]>('/v1/grants')]);
+    this.teams = teams;
+    this.grants = grants;
+  }
+
+  /** After a change of grants, teams or links: everything they show. */
+  async openingsChanged(): Promise<void> {
+    this.peerLoaded = '';
+    await Promise.all([this.refreshOpenings(), this.refreshSeats(), this.refreshDirectory()]).catch(() => undefined);
+  }
+
+  private peerLoaded = '';
+  /** Load the cards each org with an active link opened to this org (for
+   * address completion); again only when the active links changed. */
+  async loadPeers(): Promise<void> {
+    const orgs = activeOrgs(this.links);
+    const key = orgs.join(',');
+    if (key === this.peerLoaded) return;
+    this.peerLoaded = key;
+    const next = new Map<string, Card[]>();
+    await Promise.all(
+      orgs.map((o) =>
+        get<PeerOrg>(`/v1/orgs/${enc(o)}`)
+          .then((p) => next.set(o, p.open_to_you))
+          .catch(() => undefined),
+      ),
+    );
+    this.peerCards = next;
+  }
+
+  async loadNotice(): Promise<void> {
+    try {
+      this.orgNotice = (await get<OrgInfo>('/v1/org')).notice ?? null;
+    } catch {
+      // No notice.
+    }
+  }
+
+  async dismissNotice(): Promise<void> {
+    this.orgNotice = null;
+    await del('/v1/org/notice').catch(() => undefined);
   }
 
   /** Called after the user changed mail state (read, ack, sent). */

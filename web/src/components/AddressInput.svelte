@@ -3,8 +3,14 @@
   import { store } from '../lib/store.svelte';
   import { t } from '../lib/ui.svelte';
   import { currentToken, completeToken, suggest, type Suggestion } from '../lib/compose';
+  import type { PeerCandidate } from '../lib/openings';
 
-  let { value = $bindable(''), id, label }: { value: string; id: string; label: string } = $props();
+  let {
+    value = $bindable(''),
+    id,
+    label,
+    external = [],
+  }: { value: string; id: string; label: string; external?: PeerCandidate[] } = $props();
 
   let focused = $state(false);
   let active = $state(0);
@@ -13,9 +19,9 @@
     focused && token
       ? suggest(
           token,
-          store.seats.filter((s) => s.kind === 'agent').map((s) => ({ name: s.name, detail: visible([s.harness, s.role?.split('\n', 1)[0]].filter(Boolean).join(' · ')) })),
+          store.seats.filter((s) => s.kind === 'agent').map((s) => ({ name: s.name, detail: visible(s.description ?? [s.harness, s.role?.split('\n', 1)[0]].filter(Boolean).join(' · ')) })),
           store.lists.map((l) => l.name),
-          store.links.filter((l) => l.state === 'active').map((l) => l.org),
+          external.map((e) => ({ ...e, detail: e.detail === undefined ? undefined : visible(e.detail) })),
         )
       : [],
   );
@@ -66,7 +72,7 @@
     <ul class="sugg card" id="{id}-list" role="listbox">
       {#each items as s, i}
         <li role="option" aria-selected={i === active} class:active={i === active}>
-          <button type="button" tabindex="-1" onmousedown={(e) => e.preventDefault()} onclick={() => pick(s)}>
+          <button type="button" tabindex="-1" data-address={s.address} onmousedown={(e) => e.preventDefault()} onclick={() => pick(s)}>
             <span class="mono addr">{s.address}</span>
             <span class="kind">{t(`compose.sugg.${s.kind}`)}</span>
             {#if s.detail}<span class="faint detail">{s.detail}</span>{/if}
