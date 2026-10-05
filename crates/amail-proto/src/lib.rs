@@ -132,9 +132,9 @@ string_enum!(
 
 string_enum!(
     /// Which seats of the org may write to other orgs. `any-seat`: every
-    /// seat. `open-seats-only`: the user, and seats open to the receiving
-    /// org.
-    Outbound { AnySeat => "any-seat", OpenSeatsOnly => "open-seats-only" }
+    /// seat. `contacts-only`: the user, and the seats that are contacts
+    /// for the receiving org (open to it).
+    Outbound { AnySeat => "any-seat", ContactsOnly => "contacts-only" }
 );
 
 string_enum!(
@@ -486,6 +486,11 @@ pub struct AddressResult {
     /// `archive` mode are not).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wakes: Option<u32>,
+    /// The server added this address (in `cc`): the sender's org's primary
+    /// contact for another org on the message, because no contact of the
+    /// sender's org was on it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub added: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -495,8 +500,10 @@ pub struct Rejected {
     /// seat or list of that name in your org), `not_linked` (no active link
     /// with that org, or no such org), `unreachable` (the other org has not
     /// opened that seat to your org and it is not a participant of this
-    /// thread, your org lets only open seats write outside, or no seat of
-    /// that name exists there: these cases answer alike), `post_denied`.
+    /// thread, your org lets only contacts write outside, or no seat of
+    /// that name exists there: these cases answer alike), `thread_closed`
+    /// (one of the two orgs has no contact left on this thread),
+    /// `post_denied`.
     pub reason: String,
 }
 
@@ -522,26 +529,6 @@ pub struct MessageHeader {
     /// The retention period cleared the body (the header is kept).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub expired: bool,
-    /// Addresses of `to` the reader may not see: seats and lists of
-    /// another org that are neither open to the reader's org nor
-    /// participants of this thread. They are left out of `to` and counted
-    /// here.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub to_hidden: u32,
-    /// As `to_hidden`, for `cc`.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub cc_hidden: u32,
-}
-
-fn is_zero(n: &u32) -> bool {
-    *n == 0
-}
-
-impl MessageHeader {
-    /// Addresses left out of `to` and `cc` together.
-    pub fn hidden(&self) -> u32 {
-        self.to_hidden + self.cc_hidden
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -646,9 +633,9 @@ pub struct MemberCounts {
 pub struct ThreadResponse {
     pub thread_id: i64,
     pub messages: Vec<Message>,
-    /// Cards of the seats of other orgs that wrote into this thread
-    /// (messages that reached the caller's org): they may be answered in
-    /// this thread, whether or not their org opened them.
+    /// Cards of the seats of other orgs that take part in this thread (were
+    /// on a message of it that crossed orgs): they may be addressed in
+    /// replies in this thread, whether or not their org opened them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub participants: Vec<Card>,
     /// Older messages were left out (a thread answers at most its newest
@@ -964,10 +951,6 @@ pub struct NewList {
 pub struct ListMember {
     pub address: String,
     pub mode: DeliveryMode,
-    /// A member of another org that gets no mail now: the link ended or
-    /// its org no longer opens it to this org.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub inactive: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -988,6 +971,41 @@ pub struct Link {
     /// org's note to you, untrusted text; `requested`: yours).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Active links: your org's primary contact for that org (the seat
+    /// the server adds in Cc when a seat that is not a contact writes to
+    /// it); absent when your org has no contact for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<String>,
+}
+
+/// `PATCH /v1/links/{org}` (user): set your org's primary contact for that
+/// org, or a team's (`team`). `primary: null` returns to the default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LinkPatch {
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub primary: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
+}
+
+/// A team's primary contact for one linked org.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamPrimary {
+    pub org: String,
+    pub seat: String,
+}
+
+/// `POST /v1/messages/preview`: what sending would do, without sending.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SendPreview {
+    pub recipients: Vec<AddressResult>,
+    pub rejected: Vec<Rejected>,
+    /// Distinct recipient seats.
+    pub deliveries: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1145,6 +1163,9 @@ pub struct PeerOrg {
     /// The caller's org's grants whose audience includes that org.
     #[serde(default)]
     pub you_open: Vec<Grant>,
+    /// The caller's org's primary contact for that org (active link).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<String>,
 }
 
 /// A team: a named group of seats of one org, with an optional root seat
@@ -1170,6 +1191,10 @@ pub struct Team {
     /// Created by `amail up` from a team file.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub managed: bool,
+    /// The team's own primary contacts per linked org (used for senders in
+    /// the team).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub primaries: Vec<TeamPrimary>,
     pub created_at: String,
 }
 

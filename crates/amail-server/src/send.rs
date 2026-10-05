@@ -12,14 +12,18 @@
 //! - `name@org` for another org requires an active link (else
 //!   `not_linked`, also when there is no such org or it is hidden) and
 //!   resolves only to a seat that the reachability rule
-//!   ([`crate::boundary::Reach`]) lets the message reach. Anything else (a
-//!   closed seat, a list, a name that does not exist there) is rejected
-//!   alike with `unreachable`, after the same lookups.
-//! - List members are seats: local ones, or external `name@org` seats. An
-//!   external member is delivered only when the reachability rule lets the
-//!   message reach it now, so mail never crosses between unlinked orgs or
-//!   to a seat its org no longer opens.
-//!   Expansion is one level deep; there are no nested lists.
+//!   ([`crate::boundary::Reach`]) accepts: a contact of that org for the
+//!   sender's org, or a participant of the thread. Anything else (a seat
+//!   that is neither, a list, a name that does not exist there) is
+//!   rejected alike with `unreachable`, after the same lookups. When the
+//!   thread crossed between the two orgs before and one of them has no
+//!   contact left on it, the recipients there get `thread_closed`.
+//! - A message that reaches another org names no list (422
+//!   `list_on_cross_org`), and carries a contact of the sender's org for
+//!   each other org: when none is on it, the server adds the org's primary
+//!   contact for that org in Cc (422 `no_contact` when there is none).
+//! - List members are seats of the list's own org. Expansion is one level
+//!   deep; there are no nested lists.
 //! - A new thread that reaches another org takes a token from the sending
 //!   seat's budget of new threads to other orgs (the org's
 //!   `new_threads_per_hour`; the user seat is exempt).
@@ -28,11 +32,11 @@
 
 use crate::AppState;
 use crate::auth::Auth;
-use crate::boundary::Reach;
+use crate::boundary::{Reach, Verdict};
 use crate::error::{ApiError, ApiResult};
 use amail_proto::{
-    Address, AddressResult, DeliveryClass, DeliveryMode, PostPolicy, Priority, RecipientNote,
-    Rejected, SeatKind, SeatState, SendRequest, SendResponse,
+    self as p, Address, AddressResult, DeliveryClass, DeliveryMode, PostPolicy, Priority,
+    RecipientNote, Rejected, SeatKind, SeatState, SendRequest, SendResponse,
 };
 use amail_store::{NewDelivery, NewMessage, Org, Seat};
 use std::collections::HashMap;
@@ -159,14 +163,35 @@ fn valid_meta_key(k: &str) -> bool {
         })
 }
 
-async fn send_inner(
-    st: &AppState,
-    auth: &Auth,
-    sender: &Seat,
-    req: SendRequest,
-) -> ApiResult<SendResponse> {
-    let org = &auth.org;
+/// `POST /v1/messages/preview`: the recipients a message would have
+/// (with the contact the server would add) and its rejections, without
+/// sending it or using any budget.
+pub async fn preview(st: &AppState, auth: &Auth, req: SendRequest) -> ApiResult<p::SendPreview> {
+    let sender = auth.mail_seat()?.clone();
+    if req.to.is_empty() && req.cc.is_empty() {
+        return Err(ApiError::bad_request("at least one recipient is required"));
+    }
+    check_sizes(&req)?;
+    let (r, _) = resolve_all(st, auth, &sender, &req).await?;
+    Ok(p::SendPreview {
+        deliveries: r.seats.len() as u32,
+        recipients: r.results,
+        rejected: r.rejected,
+    })
+}
 
+/// The thread a message joins: `(thread, parent, depth)`.
+type Placement = (Option<i64>, Option<i64>, i64);
+
+/// Thread inheritance, the hop limit and recipient resolution (with the
+/// rules for other orgs).
+async fn resolve_all<'a>(
+    st: &'a AppState,
+    auth: &'a Auth,
+    sender: &'a Seat,
+    req: &SendRequest,
+) -> ApiResult<(Resolver<'a>, Placement)> {
+    let org = &auth.org;
     // Thread inheritance and the hop limit.
     let (thread_id, parent_id, depth) = match req.in_reply_to {
         None => (None, None, 0),
@@ -195,7 +220,23 @@ async fn send_inner(
     for a in &req.cc {
         r.resolve(a, DeliveryClass::Cc).await?;
     }
+    if r.seats.is_empty() {
+        let mut e = ApiError::unprocessable("no_recipients", "no recipient could be resolved");
+        e.rejected = r.rejected;
+        return Err(e);
+    }
+    r.cross_org().await?;
+    Ok((r, (thread_id, parent_id, depth)))
+}
 
+async fn send_inner(
+    st: &AppState,
+    auth: &Auth,
+    sender: &Seat,
+    req: SendRequest,
+) -> ApiResult<SendResponse> {
+    let org = &auth.org;
+    let (mut r, (thread_id, parent_id, depth)) = resolve_all(st, auth, sender, &req).await?;
     if r.seats.is_empty() {
         let mut e = ApiError::unprocessable("no_recipients", "no recipient could be resolved");
         e.rejected = r.rejected;
@@ -249,8 +290,8 @@ async fn send_inner(
         depth,
         subject: req.subject,
         body: req.body,
-        to_addrs: r.to_addrs,
-        cc_addrs: r.cc_addrs,
+        to_addrs: std::mem::take(&mut r.to_addrs),
+        cc_addrs: std::mem::take(&mut r.cc_addrs),
         priority,
         ack_required,
         meta: req.meta,
@@ -290,13 +331,15 @@ async fn send_inner(
         st.bus.publish(*org_id, events);
     }
     notify_users(st, org, &r.orgs, &sent).await;
+    r.tell_new_participants(&msg.deliveries, sent.thread_id, &msg.subject)
+        .await;
     let notes = notes(st, org, sender, &msg.deliveries, priority).await;
 
     Ok(SendResponse {
         id: sent.message_id,
         thread_id: sent.thread_id,
-        recipients: r.results,
-        rejected: r.rejected,
+        recipients: std::mem::take(&mut r.results),
+        rejected: std::mem::take(&mut r.rejected),
         deliveries: sent.seqs.len() as u32,
         notes,
     })
@@ -399,14 +442,7 @@ async fn notify_users(
             message = st.store.message(sent.message_id).await.ok().flatten();
         }
         let Some(m) = &message else { return };
-        // The header as that org's user sees it.
-        let header = match crate::boundary::View::load(st, target, [m]).await {
-            Ok(v) => v.header(m),
-            Err(e) => {
-                tracing::warn!("webhook of org {}: {}", target.name, e.message);
-                continue;
-            }
-        };
+        let header = crate::render::header(m, target);
         let Some(slot) = webhook_slot(st, org_id, org.id) else {
             tracing::warn!(
                 "webhook of org {}: notice for message {} dropped, too many in flight",
@@ -461,6 +497,8 @@ struct Resolver<'a> {
     orgs: HashMap<String, Option<Org>>,
     /// The reachability rule, with its facts for this send.
     reach: Reach<'a>,
+    /// A list of the sender's org was named.
+    named_list: bool,
     /// (org id, name) -> seat, for names looked up by `prefetch`.
     seat_cache: HashMap<(i64, String), Option<Seat>>,
 }
@@ -478,7 +516,8 @@ impl<'a> Resolver<'a> {
             to_addrs: Vec::new(),
             cc_addrs: Vec::new(),
             orgs: HashMap::new(),
-            reach: Reach::new(st, org, Some(sender), thread),
+            reach: Reach::new(st, org, sender, thread),
+            named_list: false,
             seat_cache: HashMap::new(),
         }
     }
@@ -604,15 +643,23 @@ impl<'a> Resolver<'a> {
 
         let mut wakes = None;
         let count = if !local {
-            // Another org: a seat the rule lets the message reach. A list
-            // (lists are never open), a closed seat and a name that does
-            // not exist there are answered alike.
+            // Another org: a seat the rule accepts. A list (lists cannot be
+            // addressed across orgs), a seat that is neither a contact nor
+            // a participant, and a name that does not exist there are
+            // answered alike.
             let seat = self.seat(target.id, &addr.name).await?;
-            if !self.reach.allows(&target, seat.as_ref()).await? {
-                self.reject(raw, "unreachable");
-                return Ok(());
+            match self.reach.check(&target, seat.as_ref()).await? {
+                Verdict::Accepted => {}
+                Verdict::Unreachable => {
+                    self.reject(raw, "unreachable");
+                    return Ok(());
+                }
+                Verdict::ThreadClosed => {
+                    self.reject(raw, "thread_closed");
+                    return Ok(());
+                }
             }
-            let seat = seat.expect("allowed seats exist");
+            let seat = seat.expect("accepted seats exist");
             self.add(
                 seat.id,
                 seat.org_id,
@@ -631,6 +678,7 @@ impl<'a> Resolver<'a> {
             );
             1
         } else if let Some(list) = self.st.store.list_by_name(target.id, &addr.name).await? {
+            self.named_list = true;
             let members = self.st.store.list_members(list.id).await?;
             let allowed = match list.post_policy {
                 PostPolicy::Anyone => true,
@@ -684,31 +732,175 @@ impl<'a> Resolver<'a> {
                 address: shown,
                 seats: count,
                 wakes,
+                added: false,
             });
         }
         Ok(())
     }
 
-    /// Resolve an external list member (`name@org`) to a seat, if the
-    /// reachability rule lets the message reach it.
+    /// A list member that is not a seat of the list's org: lists hold
+    /// seats of their own org only (older memberships of other orgs' seats
+    /// get no mail).
     async fn external_member(&mut self, address: &str) -> ApiResult<Option<Seat>> {
         let Ok(a) = address.parse::<Address>() else {
             return Ok(None);
         };
-        let Some(org) = self
-            .org_named(a.org_or(&self.org.name).to_string().as_str())
-            .await?
-        else {
-            return Ok(None);
-        };
-        if org.id == self.org.id {
-            return self.seat(org.id, &a.name).await;
+        if a.org.as_deref().is_none_or(|o| o == self.org.name) {
+            return self.seat(self.org.id, &a.name).await;
         }
-        let seat = self.seat(org.id, &a.name).await?;
-        Ok(if self.reach.allows(&org, seat.as_ref()).await? {
-            seat
-        } else {
-            None
-        })
+        Ok(None)
+    }
+
+    /// The rules for a message that reaches other orgs: no list on it, and
+    /// a contact of the sender's org for each of them (the org's primary
+    /// contact is added in Cc when none is on it).
+    async fn cross_org(&mut self) -> ApiResult<()> {
+        let others: std::collections::BTreeSet<i64> = self
+            .seats
+            .values()
+            .map(|(d, _)| d.org_id)
+            .filter(|o| *o != self.org.id)
+            .collect();
+        if others.is_empty() {
+            return Ok(());
+        }
+        if self.named_list {
+            return Err(ApiError::unprocessable(
+                "list_on_cross_org",
+                "lists cannot be addressed on mail to other orgs: name the seats instead",
+            ));
+        }
+        for b in others {
+            let Some(peer) = self.orgs.values().flatten().find(|o| o.id == b).cloned() else {
+                continue;
+            };
+            let ours = self.reach.ours(&peer).await?.clone();
+            let on = ours.has_seat_id(self.sender.id)
+                || self.seats.keys().any(|id| ours.has_seat_id(*id));
+            if on {
+                continue;
+            }
+            let Some(c) = self.reach.primary(&peer).await? else {
+                return Err(ApiError::unprocessable(
+                    "no_contact",
+                    format!(
+                        "your org has no contact for {0}: mail to {0} must carry one of your org's seats that is open to it; the user can open one (amail open <seat> --to {0})",
+                        peer.name
+                    ),
+                ));
+            };
+            self.add(
+                c.id,
+                self.org.id,
+                &c.name,
+                DeliveryClass::Cc,
+                DeliveryMode::Immediate,
+            );
+            let canonical = format!("{}@{}", c.name, self.org.name);
+            if !self.cc_addrs.contains(&canonical) && !self.to_addrs.contains(&canonical) {
+                self.cc_addrs.push(canonical);
+                self.results.push(AddressResult {
+                    address: c.name.clone(),
+                    seats: 1,
+                    wakes: None,
+                    added: true,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// After the message was stored: tell each org's user about its seats
+    /// that are not contacts for another org on the message and that just
+    /// became participants of the thread (once per seat and thread).
+    async fn tell_new_participants(
+        &mut self,
+        deliveries: &[NewDelivery],
+        thread: i64,
+        subject: &str,
+    ) {
+        if let Err(e) = self.new_participants(deliveries, thread, subject).await {
+            tracing::warn!("participant notices of thread {thread}: {}", e.message);
+        }
+    }
+
+    async fn new_participants(
+        &mut self,
+        deliveries: &[NewDelivery],
+        thread: i64,
+        subject: &str,
+    ) -> ApiResult<()> {
+        let mut on: Vec<(i64, i64)> = vec![(self.sender.id, self.org.id)];
+        on.extend(deliveries.iter().map(|d| (d.seat_id, d.org_id)));
+        let orgs: std::collections::BTreeSet<i64> = on.iter().map(|(_, o)| *o).collect();
+        if orgs.len() < 2 {
+            return Ok(());
+        }
+        let before = self.reach.parts().await?.clone();
+        let mut by_id: HashMap<i64, Org> = self
+            .orgs
+            .values()
+            .flatten()
+            .map(|o| (o.id, o.clone()))
+            .collect();
+        by_id.insert(self.org.id, self.org.clone());
+        let names: HashMap<i64, String> = self
+            .seats
+            .iter()
+            .map(|(id, (_, n))| (*id, n.clone()))
+            .chain(std::iter::once((self.sender.id, self.sender.name.clone())))
+            .collect();
+        for &o in &orgs {
+            let Some(org) = by_id.get(&o).cloned() else {
+                continue;
+            };
+            let mut lines = Vec::new();
+            for &(seat, so) in &on {
+                if so != o || before.contains_key(&seat) || lines.iter().any(|(s, _)| *s == seat) {
+                    continue;
+                }
+                if self
+                    .st
+                    .store
+                    .user_seat(o)
+                    .await?
+                    .is_some_and(|u| u.id == seat)
+                {
+                    continue;
+                }
+                let mut not_for = Vec::new();
+                for &p in &orgs {
+                    if p == o {
+                        continue;
+                    }
+                    let Some(peer) = by_id.get(&p) else { continue };
+                    let contacts = crate::boundary::sight(self.st, peer, Some(&org))
+                        .await?
+                        .remove(&org.name)
+                        .unwrap_or_default();
+                    if !contacts.has_seat_id(seat) {
+                        not_for.push(peer.name.clone());
+                    }
+                }
+                if !not_for.is_empty() {
+                    lines.push((seat, not_for));
+                }
+            }
+            for (seat, not_for) in lines {
+                let name = names.get(&seat).cloned().unwrap_or_default();
+                let peers = not_for.join(", ");
+                crate::notices::tell_user(
+                    self.st,
+                    o,
+                    &format!("Seat {name} takes part in a thread with {peers}"),
+                    &format!(
+                        "Seat {name} of your org is now on thread {thread} (\"{}\") together with {peers}. It is not a contact of your org for {peers}: they see its card (name, kind, description) in this thread and may address it in replies there, but not in new threads, and it does not appear among the seats your org opens to them.\n",
+                        amail_proto::text::line(subject)
+                    ),
+                )
+                .await;
+            }
+        }
+        Ok(())
     }
 }

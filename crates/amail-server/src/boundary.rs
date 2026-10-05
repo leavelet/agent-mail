@@ -1,32 +1,34 @@
 //! The boundary between orgs: what one org may see of another, and which
-//! messages may cross from one to the other (see docs/concepts.md,
-//! "Openings").
+//! messages may cross from one to the other (see docs/concepts.md, "Other
+//! orgs").
 //!
 //! Two things live here and nowhere else:
 //!
-//! - [`Reach`]: the reachability rule. Sending, replying and list
-//!   expansion ask it whether a message from a seat of one org may reach a
-//!   seat of another; list displays ask it whether an external member
-//!   would get mail.
-//! - [`sight`] and [`View`]: what org B may see of org A. [`sight`] gives
-//!   the cards A opened to B (from A's grants); [`View`] adds the thread
-//!   participants and renders every message header, card and delivery row
-//!   that B is shown. Every read path that shows another org's seats goes
-//!   through them.
+//! - [`Reach`]: the reachability rule. Sending and replying ask it whether
+//!   a message from a seat of one org may reach a seat of another, and
+//!   which contact of the sender's org must be on it.
+//! - [`sight`]: what org B may see of org A: the cards A opened to B (from
+//!   A's grants). Cards of other orgs on every read path (the view of
+//!   another org, `amail who --org`, address completion, the seats' and
+//!   teams' openings) come from it; thread participants come from
+//!   [`participants`].
 //!
-//! The rule (spec section 4): a message from seat `x` of org A to seat `y`
-//! of org B is accepted when A and B have an active link, `y` is open to A
-//! (a grant on `y`, or on a team of which `y` is a contact, whose audience
-//! is every linked org or A) or `y` wrote a message of this thread that
-//! reached a seat of A, and A lets `x` write outside (A's `outbound` is
-//! `any-seat`, or `x` is A's user, or `x` is open to B).
+//! The rule (spec section 4): every thread that crosses two orgs has at
+//! least one contact of each org on it. A contact of A for B is a seat of A
+//! open to B. A message from seat `x` of A with recipients in B is accepted
+//! when A and B have an active link; every recipient in B is a contact of
+//! B for A or already a participant of the thread (a seat on an earlier
+//! message of the thread that crossed orgs); a thread that crossed between
+//! A and B still has a contact of each on it; A's `outbound` setting lets
+//! `x` write outside; and the message names no list. When no contact of A
+//! for B is on the message, the server adds A's primary contact for B in
+//! Cc.
 
 use crate::AppState;
 use crate::error::ApiResult;
-use crate::render;
-use amail_proto::{self as p, Address, CardKind, SeatKind};
-use amail_store::{CardRec, GrantFilter, GrantRec, GrantTarget, MessageRec, Org, Seat};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use amail_proto::{self as p, CardKind, SeatKind};
+use amail_store::{CardRec, GrantFilter, GrantRec, GrantTarget, Org, Seat};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// What one org (the grantor) shows one other org (the audience): the
 /// seats it opened (directly, or as contacts of an opened team) and the
@@ -37,11 +39,14 @@ pub struct OpenSet {
     pub org_name: String,
     pub seats: BTreeMap<String, CardRec>,
     pub teams: BTreeMap<String, CardRec>,
+    /// Seat names in the order their grants were made (the first one is
+    /// the default primary contact after the user seat).
+    pub order: Vec<String>,
 }
 
 impl OpenSet {
-    pub fn has_seat(&self, name: &str) -> bool {
-        self.seats.contains_key(name)
+    pub fn has_seat_id(&self, id: i64) -> bool {
+        self.seats.values().any(|c| c.id == id)
     }
 
     /// The cards, teams first, as the audience sees them (`name@org`).
@@ -101,12 +106,16 @@ pub fn opened(grants: &[GrantRec], audience: &str) -> HashMap<i64, OpenSet> {
         });
         match &g.target {
             GrantTarget::Seat(s) => {
-                set.seats.insert(s.name.clone(), s.clone());
+                if set.seats.insert(s.name.clone(), s.clone()).is_none() {
+                    set.order.push(s.name.clone());
+                }
             }
             GrantTarget::Team { team, contacts } => {
                 set.teams.insert(team.name.clone(), team.clone());
                 for s in contacts {
-                    set.seats.insert(s.name.clone(), s.clone());
+                    if set.seats.insert(s.name.clone(), s.clone()).is_none() {
+                        set.order.push(s.name.clone());
+                    }
                 }
             }
         }
@@ -197,34 +206,8 @@ pub fn diff(
     out
 }
 
-/// After a change of what `org` shows: the seats an audience org no longer
-/// sees stop being thread participants for it, so that the closing holds
-/// in existing threads too.
-pub async fn close_lost(
-    st: &AppState,
-    before: &BTreeMap<String, OpenSet>,
-    after: &BTreeMap<String, OpenSet>,
-) -> ApiResult<()> {
-    for (org, b) in before {
-        let lost: Vec<i64> = b
-            .seats
-            .iter()
-            .filter(|(n, _)| after.get(org).is_none_or(|a| !a.seats.contains_key(*n)))
-            .map(|(_, c)| c.id)
-            .collect();
-        if lost.is_empty() {
-            continue;
-        }
-        if let Some(o) = st.store.org_by_name(org).await? {
-            st.store.forget_thread_peers(o.id, &lost).await?;
-        }
-    }
-    Ok(())
-}
-
 /// Run `change` (something that may change what `org` shows other orgs)
-/// and return its result with the changes of sight, after closing what
-/// was lost (see [`close_lost`]).
+/// and return its result with the changes of sight.
 pub async fn changing<T>(
     st: &AppState,
     org: &Org,
@@ -233,8 +216,20 @@ pub async fn changing<T>(
     let before = shown_by(st, org).await?;
     let out = change.await?;
     let after = shown_by(st, org).await?;
-    close_lost(st, &before, &after).await?;
     Ok((out, diff(&before, &after)))
+}
+
+/// Why a recipient of another org is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Accepted,
+    /// Not a contact for the sender's org, not a participant of the
+    /// thread, the sender may not write outside, or no such seat: answered
+    /// alike.
+    Unreachable,
+    /// The thread crossed between the two orgs before and one of them has
+    /// no contact left on it.
+    ThreadClosed,
 }
 
 /// The reachability rule (see the module documentation), with the facts it
@@ -242,35 +237,28 @@ pub async fn changing<T>(
 pub struct Reach<'a> {
     st: &'a AppState,
     org: &'a Org,
-    /// `None`: no particular sender (whether a list member would get mail).
-    sender: Option<&'a Seat>,
+    sender: &'a Seat,
     thread: Option<i64>,
     links: HashMap<i64, bool>,
-    /// Per other org: what it opened to the sender's org.
-    open: HashMap<i64, OpenSet>,
-    /// Per other org: whether the sender may write to it.
-    outbound: HashMap<i64, bool>,
-    /// Seats of other orgs that wrote into the thread, in mail that reached
-    /// the sender's org.
-    peers: Option<HashSet<i64>>,
+    /// Per other org: its contacts for the sender's org.
+    theirs: HashMap<i64, OpenSet>,
+    /// Per other org: the sender's org's contacts for it.
+    ours: HashMap<i64, OpenSet>,
+    /// The thread's participants before this message: seat id -> org id.
+    parts: Option<HashMap<i64, i64>>,
 }
 
 impl<'a> Reach<'a> {
-    pub fn new(
-        st: &'a AppState,
-        org: &'a Org,
-        sender: Option<&'a Seat>,
-        thread: Option<i64>,
-    ) -> Self {
+    pub fn new(st: &'a AppState, org: &'a Org, sender: &'a Seat, thread: Option<i64>) -> Self {
         Reach {
             st,
             org,
             sender,
             thread,
             links: HashMap::new(),
-            open: HashMap::new(),
-            outbound: HashMap::new(),
-            peers: None,
+            theirs: HashMap::new(),
+            ours: HashMap::new(),
+            parts: None,
         }
     }
 
@@ -288,243 +276,166 @@ impl<'a> Reach<'a> {
         Ok(b)
     }
 
-    async fn open_set(&mut self, to: &Org) -> ApiResult<&OpenSet> {
-        if !self.open.contains_key(&to.id) {
+    /// The contacts of `to` for the sender's org.
+    pub async fn theirs(&mut self, to: &Org) -> ApiResult<&OpenSet> {
+        if !self.theirs.contains_key(&to.id) {
             let set = sight(self.st, self.org, Some(to))
                 .await?
                 .remove(&to.name)
                 .unwrap_or_default();
-            self.open.insert(to.id, set);
+            self.theirs.insert(to.id, set);
         }
-        Ok(&self.open[&to.id])
+        Ok(&self.theirs[&to.id])
     }
 
-    async fn peers(&mut self) -> ApiResult<&HashSet<i64>> {
-        if self.peers.is_none() {
-            let set = match self.thread {
+    /// The sender's org's contacts for `to`.
+    pub async fn ours(&mut self, to: &Org) -> ApiResult<&OpenSet> {
+        if !self.ours.contains_key(&to.id) {
+            let set = sight(self.st, to, Some(self.org))
+                .await?
+                .remove(&self.org.name)
+                .unwrap_or_default();
+            self.ours.insert(to.id, set);
+        }
+        Ok(&self.ours[&to.id])
+    }
+
+    /// The thread's participants before this message (seat id -> org id).
+    pub async fn parts(&mut self) -> ApiResult<&HashMap<i64, i64>> {
+        if self.parts.is_none() {
+            let map = match self.thread {
                 Some(t) => self
                     .st
                     .store
-                    .thread_peers(self.org.id, &[t])
+                    .thread_parts(&[t])
                     .await?
                     .into_iter()
-                    .map(|p| p.card.id)
+                    .map(|p| (p.card.id, p.org_id))
                     .collect(),
-                None => HashSet::new(),
+                None => HashMap::new(),
             };
-            self.peers = Some(set);
+            self.parts = Some(map);
         }
-        Ok(self.peers.as_ref().expect("loaded"))
+        Ok(self.parts.as_ref().expect("loaded"))
     }
 
     /// Whether the org's `outbound` setting lets the sender write to `to`.
     async fn may_write_out(&mut self, to: &Org) -> ApiResult<bool> {
-        let Some(sender) = self.sender else {
-            return Ok(true);
-        };
-        if self.org.outbound == p::Outbound::AnySeat || sender.kind == SeatKind::User {
+        if self.org.outbound == p::Outbound::AnySeat || self.sender.kind == SeatKind::User {
             return Ok(true);
         }
-        if let Some(&b) = self.outbound.get(&to.id) {
-            return Ok(b);
-        }
-        // What the sender's org shows `to`, as `to` sees it.
-        let b = sight(self.st, to, Some(self.org))
-            .await?
-            .get(&self.org.name)
-            .is_some_and(|s| s.has_seat(&sender.name));
-        self.outbound.insert(to.id, b);
-        Ok(b)
+        let id = self.sender.id;
+        Ok(self.ours(to).await?.has_seat_id(id))
     }
 
-    /// Whether a message may reach seat `seat` (`None`: there is no seat of
-    /// that name) of `to`. The same facts are looked up whether or not the
-    /// seat exists, so that the answer takes the same time either way.
-    pub async fn allows(&mut self, to: &Org, seat: Option<&Seat>) -> ApiResult<bool> {
-        if to.id == self.org.id {
-            return Ok(seat.is_some());
+    /// Whether the thread crossed between the two orgs before and has lost
+    /// every contact of one of them.
+    async fn thread_closed(&mut self, to: &Org) -> ApiResult<bool> {
+        let parts: Vec<(i64, i64)> = self.parts().await?.iter().map(|(s, o)| (*s, *o)).collect();
+        if !parts.iter().any(|(_, o)| *o == to.id) {
+            return Ok(false);
         }
-        let linked = self.linked(to.id).await?;
-        let open = self
-            .open_set(to)
-            .await?
-            .has_seat(seat.map_or("", |s| &s.name));
-        let participant = self.peers().await?.contains(&seat.map_or(0, |s| s.id));
+        let theirs = self.theirs(to).await?.clone();
+        let ours = self.ours(to).await?.clone();
+        let has =
+            |set: &OpenSet, org: i64| parts.iter().any(|(s, o)| *o == org && set.has_seat_id(*s));
+        Ok(!(has(&theirs, to.id) && has(&ours, self.org.id)))
+    }
+
+    /// The rule for one recipient, seat `seat` (`None`: no seat of that
+    /// name) of the other org `to`, which has an active link with the
+    /// sender's org. The same facts are looked up whether or not the seat
+    /// exists, so that the answer takes the same time either way.
+    pub async fn check(&mut self, to: &Org, seat: Option<&Seat>) -> ApiResult<Verdict> {
+        let id = seat.map_or(0, |s| s.id);
+        let contact = self.theirs(to).await?.has_seat_id(id);
+        let participant = self.parts().await?.get(&id) == Some(&to.id);
         let out = self.may_write_out(to).await?;
-        Ok(seat.is_some() && decide(linked, open, participant, out))
+        let closed = self.thread_closed(to).await?;
+        Ok(if seat.is_none() || !decide(contact, participant, out) {
+            Verdict::Unreachable
+        } else if closed {
+            Verdict::ThreadClosed
+        } else {
+            Verdict::Accepted
+        })
     }
-}
 
-/// Section 4 of the spec, from its facts.
-pub fn decide(linked: bool, open: bool, participant: bool, outbound: bool) -> bool {
-    linked && (open || participant) && outbound
-}
-
-/// What `viewer` is shown of messages and deliveries: the cards other orgs
-/// opened to it and the participants of the threads in question. Load it
-/// with [`View::load`] for the messages to be shown; it looks nothing up
-/// when they name no seat of another org.
-pub struct View {
-    pub viewer: Org,
-    open: HashMap<String, OpenSet>,
-    /// Thread -> `(org name, seat name)` of its participants of other orgs.
-    peers: HashMap<i64, HashSet<(String, String)>>,
-}
-
-impl View {
-    /// A view that shows nothing of other orgs (for messages that name
-    /// none).
-    pub fn own(viewer: &Org) -> View {
-        View {
-            viewer: viewer.clone(),
-            open: HashMap::new(),
-            peers: HashMap::new(),
+    /// The seat of the sender's org to add in Cc for `to` when no contact of
+    /// the sender's org is on the message: the primary contact of the
+    /// sender's team (or of a team above it), else the org's, while it is
+    /// still a contact for `to`; else the user seat if it is open to `to`;
+    /// else the seat opened to `to` first. `None`: the org has no contact
+    /// for `to`.
+    pub async fn primary(&mut self, to: &Org) -> ApiResult<Option<CardRec>> {
+        let ours = self.ours(to).await?.clone();
+        if ours.seats.is_empty() {
+            return Ok(None);
         }
-    }
-
-    /// The view for showing `msgs` to `viewer`.
-    pub async fn load<'m>(
-        st: &AppState,
-        viewer: &Org,
-        msgs: impl IntoIterator<Item = &'m MessageRec>,
-    ) -> ApiResult<View> {
-        let mut v = View::own(viewer);
-        let threads: BTreeSet<i64> = msgs
-            .into_iter()
-            .filter(|m| m.org_id != viewer.id && v.names_others(m))
-            .map(|m| m.thread_id)
-            .collect();
-        v.fill(st, threads).await?;
-        Ok(v)
-    }
-
-    /// The view for showing deliveries of messages of these threads (for
-    /// example a message's delivery status).
-    pub async fn for_threads(st: &AppState, viewer: &Org, threads: &[i64]) -> ApiResult<View> {
-        let mut v = View::own(viewer);
-        v.fill(st, threads.iter().copied().collect()).await?;
-        Ok(v)
-    }
-
-    async fn fill(&mut self, st: &AppState, threads: BTreeSet<i64>) -> ApiResult<()> {
-        if threads.is_empty() {
-            return Ok(());
-        }
-        self.open = sight(st, &self.viewer, None).await?;
-        let ids: Vec<i64> = threads.into_iter().collect();
-        for p in st.store.thread_peers(self.viewer.id, &ids).await? {
-            self.peers
-                .entry(p.thread_id)
-                .or_default()
-                .insert((p.org_name, p.card.name));
-        }
-        Ok(())
-    }
-
-    /// Whether `m` names a seat or list of an org other than the viewer's.
-    fn names_others(&self, m: &MessageRec) -> bool {
-        let own = format!("@{}", self.viewer.name);
-        m.to_addrs
-            .iter()
-            .chain(&m.cc_addrs)
-            .any(|a| !a.ends_with(&own))
-    }
-
-    /// Whether the viewer may see seat `name` of org `org` in `thread`: its
-    /// own seats; another org's seats that are open to it, or that wrote
-    /// into the thread in mail that reached it.
-    pub fn shows(&self, thread: Option<i64>, org: &str, name: &str) -> bool {
-        org == self.viewer.name
-            || self.open.get(org).is_some_and(|s| s.has_seat(name))
-            || thread.is_some_and(|t| {
-                self.peers
-                    .get(&t)
-                    .is_some_and(|p| p.contains(&(org.to_string(), name.to_string())))
-            })
-    }
-
-    /// Addresses of `list` the viewer may see (relative to its org), and
-    /// how many it may not.
-    fn mask(&self, m: &MessageRec, list: &[String]) -> (Vec<String>, u32) {
-        let mut shown = Vec::with_capacity(list.len());
-        let mut hidden = 0;
-        for a in list {
-            let visible = m.org_id == self.viewer.id
-                || match a.parse::<Address>() {
-                    Ok(addr) => {
-                        let org = addr.org.as_deref().unwrap_or(&m.org_name);
-                        self.shows(Some(m.thread_id), org, &addr.name)
-                    }
-                    Err(_) => false,
-                };
-            if visible {
-                shown.push(render::rel(a, &self.viewer));
-            } else {
-                hidden += 1;
+        let set = self.st.store.primaries(self.org.id).await?;
+        let by_id = |id: i64| ours.seats.values().find(|c| c.id == id).cloned();
+        // The sender's team, then the teams above it.
+        if let Some(mut team) = self.sender.team_id {
+            let teams = self.st.store.teams(self.org.id).await?;
+            for _ in 0..teams.len() {
+                if let Some(c) = set
+                    .iter()
+                    .find(|(p, t, _)| *p == to.id && *t == Some(team))
+                    .and_then(|(_, _, s)| by_id(*s))
+                {
+                    return Ok(Some(c));
+                }
+                match teams
+                    .iter()
+                    .find(|t| t.id == team)
+                    .and_then(|t| t.parent_id)
+                {
+                    Some(up) => team = up,
+                    None => break,
+                }
             }
         }
-        (shown, hidden)
-    }
-
-    /// The header of `m` as the viewer sees it. The viewer's org's own
-    /// messages are shown as written; in the messages of other orgs, the
-    /// addresses of other orgs' seats and lists that the viewer may not see
-    /// are counted instead of named.
-    pub fn header(&self, m: &MessageRec) -> p::MessageHeader {
-        let (to, to_hidden) = self.mask(m, &m.to_addrs);
-        let (cc, cc_hidden) = self.mask(m, &m.cc_addrs);
-        p::MessageHeader {
-            id: m.id,
-            thread_id: m.thread_id,
-            in_reply_to: m.parent_id,
-            from: render::addr(&m.sender_name, &m.org_name, &self.viewer),
-            source: render::source(m, &self.viewer),
-            to,
-            cc,
-            subject: m.subject.clone(),
-            priority: m.priority,
-            ack_required: m.ack_required,
-            lines: m.lines,
-            created_at: render::ts(m.created_at),
-            meta: m.meta.clone(),
-            expired: m.expired_at.is_some(),
-            to_hidden,
-            cc_hidden,
-        }
-    }
-
-    pub fn message(&self, m: &MessageRec) -> p::Message {
-        p::Message {
-            header: self.header(m),
-            body: m.body.clone(),
-            body_omitted: false,
-        }
-    }
-
-    pub fn entry(&self, e: &amail_store::Entry) -> p::InboxEntry {
-        p::InboxEntry {
-            delivery: render::delivery(&e.delivery, &self.viewer),
-            message: self.header(&e.message),
-            body: None,
-            preview: None,
-        }
-    }
-
-    /// Whether a delivery of a message of `thread` to `d`'s seat may be
-    /// shown to the viewer (its own seats, and other orgs' seats it may
-    /// see).
-    pub fn shows_delivery(&self, thread: i64, d: &amail_store::DeliveryRec) -> bool {
-        d.org_id == self.viewer.id || self.shows(Some(thread), &d.org_name, &d.seat_name)
-    }
-
-    /// Cards of the participants of other orgs in `thread`.
-    pub async fn participants(st: &AppState, viewer: &Org, thread: i64) -> ApiResult<Vec<p::Card>> {
-        Ok(st
-            .store
-            .thread_peers(viewer.id, &[thread])
-            .await?
+        if let Some(c) = set
             .iter()
-            .map(|p| card(&p.card, &p.org_name))
-            .collect())
+            .find(|(p, t, _)| *p == to.id && t.is_none())
+            .and_then(|(_, _, s)| by_id(*s))
+        {
+            return Ok(Some(c));
+        }
+        if let Some(u) = ours.seats.values().find(|c| c.kind == Some(SeatKind::User)) {
+            return Ok(Some(u.clone()));
+        }
+        Ok(ours.order.first().and_then(|n| ours.seats.get(n)).cloned())
     }
+}
+
+/// Section 4 of the spec for one recipient, from its facts: a contact for
+/// the sender's org or a participant of the thread, and the sender may
+/// write outside. (The link and the thread's contacts are checked before.)
+pub fn decide(contact: bool, participant: bool, outbound: bool) -> bool {
+    (contact || participant) && outbound
+}
+
+/// The org's primary contact for `peer` as shown to the org (no sender
+/// team): the org's own if still a contact, else the default.
+pub async fn org_primary(st: &AppState, org: &Org, peer: &Org) -> ApiResult<Option<String>> {
+    let user = st.store.user_seat(org.id).await?;
+    let Some(user) = user else { return Ok(None) };
+    let mut plain = user.clone();
+    plain.team_id = None;
+    let mut r = Reach::new(st, org, &plain, None);
+    Ok(r.primary(peer).await?.map(|c| c.name))
+}
+
+/// Cards of the participants of `thread` that belong to other orgs than
+/// `viewer`'s.
+pub async fn participants(st: &AppState, viewer: &Org, thread: i64) -> ApiResult<Vec<p::Card>> {
+    Ok(st
+        .store
+        .thread_parts(&[thread])
+        .await?
+        .iter()
+        .filter(|p| p.org_id != viewer.id)
+        .map(|p| card(&p.card, &p.org_name))
+        .collect())
 }

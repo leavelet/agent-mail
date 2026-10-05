@@ -112,6 +112,8 @@ async fn teams_out(st: &AppState, org: &Org) -> ApiResult<Vec<p::Team>> {
     let teams = st.store.teams(org.id).await?;
     let seats = st.store.seats(org.id).await?;
     let grants = own_grants(st, org).await?;
+    let primaries = st.store.primaries(org.id).await?;
+    let links = st.store.links(org.id).await?;
     let mut open: HashMap<i64, Vec<String>> = HashMap::new();
     for g in &grants {
         if let GrantTarget::Team { team, .. } = &g.target {
@@ -138,6 +140,20 @@ async fn teams_out(st: &AppState, org: &Org) -> ApiResult<Vec<p::Team>> {
                     .collect(),
                 open_to: open.remove(&t.id).unwrap_or_default(),
                 managed: t.managed,
+                primaries: primaries
+                    .iter()
+                    .filter(|(_, team, _)| *team == Some(t.id))
+                    .filter_map(|(peer, _, seat)| {
+                        Some(p::TeamPrimary {
+                            org: links
+                                .iter()
+                                .find(|l| l.peer_org_id == *peer)?
+                                .peer_name
+                                .clone(),
+                            seat: seats.iter().find(|s| s.id == *seat)?.name.clone(),
+                        })
+                    })
+                    .collect(),
                 created_at: render::ts(t.created_at),
             }
         })
@@ -492,6 +508,7 @@ pub async fn peer_org(
         link: link.map(render::link),
         open_to_you: Vec::new(),
         you_open: Vec::new(),
+        primary: None,
     };
     if org.id == auth.org.id {
         return Ok(Json(out));
@@ -508,6 +525,7 @@ pub async fn peer_org(
             .into_iter()
             .filter(|g| g.audience == "linked" || g.audience == org.name)
             .collect();
+        out.primary = boundary::org_primary(&st, &auth.org, &org).await?;
     }
     Ok(Json(out))
 }

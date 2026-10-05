@@ -1271,6 +1271,7 @@ macro_rules! impl_store_common {
                     .execute(&mut *c)
                     .await?;
                 sqlx::query("DELETE FROM grants WHERE team_id = $1").bind(team.id).execute(&mut *c).await?;
+                sqlx::query("DELETE FROM team_primaries WHERE team_id = $1").bind(team.id).execute(&mut *c).await?;
                 sqlx::query("DELETE FROM teams WHERE id = $1").bind(team.id).execute(&mut *c).await?;
                 Ok(true)
             }
@@ -1364,18 +1365,17 @@ macro_rules! impl_store_common {
                 Ok(n > 0)
             }
 
-            /// Seats of other orgs that wrote into these threads, in mail
-            /// that reached `org_id` (see `thread_peers`).
-            pub async fn thread_peers(c: &mut Conn, org_id: i64, thread_ids: &[i64]) -> Result<Vec<ThreadPeer>> {
+            /// Participants of these threads (see `thread_parts`), with
+            /// their orgs.
+            pub async fn thread_parts(c: &mut Conn, thread_ids: &[i64]) -> Result<Vec<ThreadPeer>> {
                 if thread_ids.is_empty() {
                     return Ok(Vec::new());
                 }
                 let mut b = sqlx::QueryBuilder::<Db>::new(
                     "SELECT tp.thread_id, s.org_id, o.name AS org_name, s.id AS seat_id, s.name AS seat_name, \
-                     s.kind, s.description FROM thread_peers tp JOIN seats s ON s.id = tp.seat_id \
-                     JOIN orgs o ON o.id = s.org_id WHERE o.deleted_at IS NULL AND tp.org_id = ",
+                     s.kind, s.description FROM thread_parts tp JOIN seats s ON s.id = tp.seat_id \
+                     JOIN orgs o ON o.id = s.org_id WHERE tp.thread_id IN (",
                 );
-                b.push_bind(org_id).push(" AND tp.thread_id IN (");
                 let mut l = b.separated(", ");
                 for t in thread_ids {
                     l.push_bind(*t);
@@ -1385,18 +1385,62 @@ macro_rules! impl_store_common {
                 collect(rows, PeerRow::into_peer)
             }
 
-            /// The seats stop being participants of the threads of `org_id`.
-            pub async fn forget_thread_peers(c: &mut Conn, org_id: i64, seat_ids: &[i64]) -> Result<u64> {
-                let mut n = 0;
-                for s in seat_ids {
-                    n += sqlx::query("DELETE FROM thread_peers WHERE seat_id = $1 AND org_id = $2")
-                        .bind(*s)
-                        .bind(org_id)
-                        .execute(&mut *c)
-                        .await?
-                        .rows_affected();
+            /// The org's primary contacts: `(peer org id, team id or None
+            /// for the org's own, seat id)`.
+            pub async fn primaries(c: &mut Conn, org_id: i64) -> Result<Vec<(i64, Option<i64>, i64)>> {
+                let mut out: Vec<(i64, Option<i64>, i64)> = sqlx::query_as::<_, (i64, i64)>(
+                    "SELECT peer_org_id, primary_seat_id FROM links WHERE org_id = $1 AND primary_seat_id IS NOT NULL",
+                )
+                .bind(org_id)
+                .fetch_all(&mut *c)
+                .await?
+                .into_iter()
+                .map(|(p, s)| (p, None, s))
+                .collect();
+                let teams: Vec<(i64, i64, i64)> = sqlx::query_as(
+                    "SELECT tp.peer_org_id, tp.team_id, tp.seat_id FROM team_primaries tp \
+                     JOIN teams t ON t.id = tp.team_id WHERE t.org_id = $1",
+                )
+                .bind(org_id)
+                .fetch_all(&mut *c)
+                .await?;
+                out.extend(teams.into_iter().map(|(p, t, s)| (p, Some(t), s)));
+                Ok(out)
+            }
+
+            /// Set (`Some`) or clear the org's primary contact for `peer`, or
+            /// a team's.
+            pub async fn set_primary(c: &mut Conn, org_id: i64, peer_id: i64, team_id: Option<i64>, seat_id: Option<i64>) -> Result<()> {
+                match team_id {
+                    None => {
+                        let n = sqlx::query("UPDATE links SET primary_seat_id = $1 WHERE org_id = $2 AND peer_org_id = $3")
+                            .bind(seat_id)
+                            .bind(org_id)
+                            .bind(peer_id)
+                            .execute(&mut *c)
+                            .await?
+                            .rows_affected();
+                        if n == 0 {
+                            return Err(StoreError::NotFound("link".into()));
+                        }
+                    }
+                    Some(t) => {
+                        sqlx::query("DELETE FROM team_primaries WHERE team_id = $1 AND peer_org_id = $2")
+                            .bind(t)
+                            .bind(peer_id)
+                            .execute(&mut *c)
+                            .await?;
+                        if let Some(s) = seat_id {
+                            sqlx::query("INSERT INTO team_primaries (team_id, peer_org_id, seat_id) VALUES ($1, $2, $3)")
+                                .bind(t)
+                                .bind(peer_id)
+                                .bind(s)
+                                .execute(&mut *c)
+                                .await?;
+                        }
+                    }
                 }
-                Ok(n)
+                Ok(())
             }
 
             pub async fn insert_token(c: &mut Conn, t: &NewToken) -> Result<()> {
@@ -1897,6 +1941,11 @@ macro_rules! impl_store_common {
                     .execute(&mut *c)
                     .await?;
                 sqlx::query("DELETE FROM grants WHERE seat_id = $1").bind(seat.id).execute(&mut *c).await?;
+                sqlx::query("DELETE FROM team_primaries WHERE seat_id = $1").bind(seat.id).execute(&mut *c).await?;
+                sqlx::query("UPDATE links SET primary_seat_id = NULL WHERE primary_seat_id = $1")
+                    .bind(seat.id)
+                    .execute(&mut *c)
+                    .await?;
                 sqlx::query("UPDATE teams SET root_seat_id = NULL WHERE root_seat_id = $1")
                     .bind(seat.id)
                     .execute(&mut *c)
@@ -2083,16 +2132,6 @@ macro_rules! impl_store_common {
                 .execute(&mut *c)
                 .await?
                 .rows_affected();
-                // Neither org's seats take part in the other's threads any
-                // more (a new link starts without them).
-                sqlx::query(
-                    "DELETE FROM thread_peers WHERE (org_id = $1 AND seat_id IN (SELECT id FROM seats WHERE org_id = $2)) \
-                     OR (org_id = $2 AND seat_id IN (SELECT id FROM seats WHERE org_id = $1))",
-                )
-                .bind(org_id)
-                .bind(peer_id)
-                .execute(&mut *c)
-                .await?;
                 Ok(n > 0)
             }
 
@@ -3483,7 +3522,7 @@ macro_rules! impl_store_common {
                 }
                 // After its deliveries are gone, the mail it sent that no
                 // other org received has no deliveries left.
-                let steps: [&str; 23] = [
+                let steps: [&str; 25] = [
                     "DELETE FROM web_sessions WHERE token_id IN (SELECT id FROM tokens WHERE org_id = $1)",
                     "DELETE FROM tokens WHERE org_id = $1",
                     "DELETE FROM claim_keys WHERE seat_id IN (SELECT id FROM seats WHERE org_id = $1)",
@@ -3493,7 +3532,9 @@ macro_rules! impl_store_common {
                     "DELETE FROM node_streams WHERE org_id = $1",
                     "UPDATE messages SET ack_due = NULL WHERE org_id = $1 AND ack_due IS NOT NULL",
                     "DELETE FROM thread_seats WHERE org_id = $1",
-                    "DELETE FROM thread_peers WHERE org_id = $1 OR seat_id IN (SELECT id FROM seats WHERE org_id = $1)",
+                    "DELETE FROM thread_parts WHERE org_id = $1",
+                    "DELETE FROM team_primaries WHERE peer_org_id = $1 OR team_id IN (SELECT id FROM teams WHERE org_id = $1)",
+                    "UPDATE links SET primary_seat_id = NULL WHERE primary_seat_id IN (SELECT id FROM seats WHERE org_id = $1)",
                     "DELETE FROM grants WHERE org_id = $1",
                     "UPDATE seats SET team_id = NULL, contact = FALSE, description = NULL WHERE org_id = $1",
                     "DELETE FROM teams WHERE org_id = $1",
@@ -4293,14 +4334,17 @@ macro_rules! impl_store_common {
                 run!(self.write, |c| q::remove_grant(c, org_id, id).await)
             }
 
-            async fn thread_peers(&self, org_id: i64, thread_ids: &[i64]) -> $crate::Result<Vec<$crate::ThreadPeer>> {
+            async fn thread_parts(&self, thread_ids: &[i64]) -> $crate::Result<Vec<$crate::ThreadPeer>> {
                 let ids = thread_ids.to_vec();
-                run!(self.read, |c| q::thread_peers(c, org_id, &ids).await)
+                run!(self.read, |c| q::thread_parts(c, &ids).await)
             }
 
-            async fn forget_thread_peers(&self, org_id: i64, seat_ids: &[i64]) -> $crate::Result<u64> {
-                let ids = seat_ids.to_vec();
-                run!(self.write, |c| q::forget_thread_peers(c, org_id, &ids).await)
+            async fn primaries(&self, org_id: i64) -> $crate::Result<Vec<(i64, Option<i64>, i64)>> {
+                run!(self.read, |c| q::primaries(c, org_id).await)
+            }
+
+            async fn set_primary(&self, org_id: i64, peer_id: i64, team_id: Option<i64>, seat_id: Option<i64>) -> $crate::Result<()> {
+                run!(self.write, |c| q::set_primary(c, org_id, peer_id, team_id, seat_id).await)
             }
 
             async fn clear_org_notice(&self, org_id: i64) -> $crate::Result<()> {

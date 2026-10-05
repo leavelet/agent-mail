@@ -192,8 +192,8 @@ pub struct GrantFilter {
     pub audience: Option<(i64, String)>,
 }
 
-/// A seat of another org that wrote into a thread (see
-/// [`crate::Store::thread_peers`]).
+/// A participant of a thread that crosses orgs (see
+/// [`crate::Store::thread_parts`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ThreadPeer {
     pub thread_id: i64,

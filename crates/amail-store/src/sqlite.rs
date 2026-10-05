@@ -310,10 +310,14 @@ INSERT INTO deliveries (org_id, message_id, seat_id, class, mode, seq, mod_seq)
 SELECT json_extract(j.value, '$.o'), (SELECT MAX(id) FROM messages), s.id,
        json_extract(j.value, '$.c'), json_extract(j.value, '$.m'), s.last_seq, s.last_seq
   FROM json_each($14) j JOIN seats s ON s.id = json_extract(j.value, '$.s');
-INSERT OR IGNORE INTO thread_peers (thread_id, org_id, seat_id)
-SELECT DISTINCT m.thread_id, d.org_id, m.sender_seat_id
-  FROM deliveries d JOIN messages m ON m.id = d.message_id
- WHERE d.message_id = (SELECT MAX(id) FROM messages) AND d.org_id <> m.org_id;
+INSERT OR IGNORE INTO thread_parts (thread_id, seat_id, org_id)
+SELECT m.thread_id, m.sender_seat_id, m.org_id FROM messages m
+ WHERE m.id = (SELECT MAX(id) FROM messages)
+   AND EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = m.id AND d.org_id <> m.org_id)
+UNION ALL
+SELECT m.thread_id, d.seat_id, d.org_id FROM deliveries d JOIN messages m ON m.id = d.message_id
+ WHERE d.message_id = (SELECT MAX(id) FROM messages)
+   AND EXISTS (SELECT 1 FROM deliveries d2 WHERE d2.message_id = m.id AND d2.org_id <> m.org_id);
 UPDATE orgs SET stored_bytes = stored_bytes + $17
        + $19 * (SELECT COUNT(*) FROM deliveries WHERE message_id = (SELECT MAX(id) FROM messages))
  WHERE id = $1;

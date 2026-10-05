@@ -217,19 +217,21 @@ impl PgStore {
                 .bind(&seats)
                 .execute(&mut *c)
                 .await?;
-                // The sender takes part in the thread for every other org
-                // that got the message (see migration 0018).
-                sqlx::query(
-                    "INSERT INTO thread_peers (thread_id, org_id, seat_id) \
-                     SELECT DISTINCT $1::bigint, o, $2::bigint FROM UNNEST($3::bigint[]) AS t(o) WHERE o <> $4 \
-                     ORDER BY 2 ON CONFLICT DO NOTHING",
-                )
-                .bind(thread_id)
-                .bind(m.sender_seat_id)
-                .bind(&orgs)
-                .bind(m.org_id)
-                .execute(&mut *c)
-                .await?;
+                // A message that reaches another org makes its sender and
+                // all its recipients participants of the thread (see
+                // migration 0018).
+                if orgs.iter().any(|o| *o != m.org_id) {
+                    sqlx::query(
+                        "INSERT INTO thread_parts (thread_id, seat_id, org_id) \
+                         SELECT $1, s, o FROM UNNEST($2::bigint[], $3::bigint[]) AS t(s, o) \
+                         ORDER BY 2 ON CONFLICT DO NOTHING",
+                    )
+                    .bind(thread_id)
+                    .bind([vec![m.sender_seat_id], seats.clone()].concat())
+                    .bind([vec![m.org_id], orgs.clone()].concat())
+                    .execute(&mut *c)
+                    .await?;
+                }
                 // Last, so the org's row stays locked only until the commit.
                 // The message and every delivery are charged (see
                 // `message_bytes`); refused over the quota, and when the org

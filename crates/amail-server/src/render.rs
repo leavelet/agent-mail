@@ -2,7 +2,7 @@
 
 use amail_proto as p;
 use amail_proto::{Address, SeatKind, Source};
-use amail_store::{DeliveryRec, List, MessageRec, Org, Seat};
+use amail_store::{DeliveryRec, Entry, List, MessageRec, Org, Seat};
 
 pub fn ts(ms: i64) -> String {
     jiff::Timestamp::from_millisecond(ms)
@@ -25,8 +25,7 @@ pub fn addr(name: &str, org: &str, viewer: &Org) -> String {
     }
 }
 
-/// A stored (`name@org`) address relative to the viewer's org.
-pub fn rel(stored: &str, viewer: &Org) -> String {
+fn rel(stored: &str, viewer: &Org) -> String {
     match stored.parse::<Address>() {
         Ok(a) => a.relative_to(&viewer.name),
         Err(_) => stored.to_string(),
@@ -78,6 +77,33 @@ pub fn lead(body: &str, max: usize) -> String {
     out
 }
 
+pub fn header(m: &MessageRec, viewer: &Org) -> p::MessageHeader {
+    p::MessageHeader {
+        id: m.id,
+        thread_id: m.thread_id,
+        in_reply_to: m.parent_id,
+        from: addr(&m.sender_name, &m.org_name, viewer),
+        source: source(m, viewer),
+        to: m.to_addrs.iter().map(|a| rel(a, viewer)).collect(),
+        cc: m.cc_addrs.iter().map(|a| rel(a, viewer)).collect(),
+        subject: m.subject.clone(),
+        priority: m.priority,
+        ack_required: m.ack_required,
+        lines: m.lines,
+        created_at: ts(m.created_at),
+        meta: m.meta.clone(),
+        expired: m.expired_at.is_some(),
+    }
+}
+
+pub fn message(m: &MessageRec, viewer: &Org) -> p::Message {
+    p::Message {
+        header: header(m, viewer),
+        body: m.body.clone(),
+        body_omitted: false,
+    }
+}
+
 /// Size of `v` as JSON.
 pub fn json_len<T: serde::Serialize>(v: &T) -> usize {
     serde_json::to_vec(v).map(|b| b.len()).unwrap_or(usize::MAX)
@@ -125,6 +151,15 @@ pub fn delivery(d: &DeliveryRec, viewer: &Org) -> p::Delivery {
         notified_via: d.notified_via.clone(),
         read_at: d.read_at.map(ts),
         acked_at: d.acked_at.map(ts),
+    }
+}
+
+pub fn entry(e: &Entry, viewer: &Org) -> p::InboxEntry {
+    p::InboxEntry {
+        delivery: delivery(&e.delivery, viewer),
+        message: header(&e.message, viewer),
+        body: None,
+        preview: None,
     }
 }
 
@@ -267,6 +302,7 @@ pub fn link(l: &amail_store::Link) -> p::Link {
         state: l.state,
         since: Some(ts(l.since)),
         note: l.note.clone(),
+        primary: None,
     }
 }
 

@@ -130,9 +130,9 @@ pub async fn patch_org(
     }
     if org.outbound != auth.org.outbound {
         changed.push(match org.outbound {
-            p::Outbound::OpenSeatsOnly => {
-                "outbound: open-seats-only. Only you and the seats open to an org may now write \
-                 to that org."
+            p::Outbound::ContactsOnly => {
+                "outbound: contacts-only. Only you and your org's contacts for an org (the seats \
+                 open to it) may now write to that org."
             }
             p::Outbound::AnySeat => "outbound: any-seat. Every seat may now write to linked orgs.",
         });
@@ -504,29 +504,13 @@ pub async fn get_list(
         Ok((l, members))
     })
     .await?;
-    // Members of other orgs get mail only while the rule lets it reach them.
-    let mut reach = crate::boundary::Reach::new(&st, &auth.org, None, None);
-    let mut out = Vec::with_capacity(members.len());
-    for m in members {
-        let inactive = match (m.seat_id, m.address.parse::<Address>()) {
-            (None, Ok(a)) => match a.org.as_deref() {
-                Some(o) => match st.store.org_by_name(o).await? {
-                    Some(org) if org.suspended_at.is_none() => {
-                        let seat = st.store.seat_by_name(org.id, &a.name).await?;
-                        !reach.allows(&org, seat.as_ref()).await?
-                    }
-                    _ => true,
-                },
-                None => false,
-            },
-            _ => false,
-        };
-        out.push(p::ListMember {
+    let out = members
+        .into_iter()
+        .map(|m| p::ListMember {
             address: m.address,
             mode: m.mode,
-            inactive,
-        });
-    }
+        })
+        .collect();
     Ok(Json(render::list(&l, Some(out))))
 }
 
@@ -581,35 +565,11 @@ pub async fn put_member(
                 })?;
             Some(seat.id)
         }
-        Some(org) => {
-            let peer = st
-                .store
-                .org_by_name(org)
-                .await?
-                .filter(|o| o.suspended_at.is_none());
-            let linked = st
-                .store
-                .link_active(auth.org.id, peer.as_ref().map_or(0, |o| o.id))
-                .await?;
-            let peer = peer.filter(|_| linked).ok_or_else(|| {
-                ApiError::unprocessable(
-                    "not_linked",
-                    format!("org {org:?} is not linked with {:?}", auth.org.name),
-                )
-            })?;
-            // Only a seat that org opens to this one; a closed seat and a
-            // name that does not exist answer alike.
-            let seat = st.store.seat_by_name(peer.id, &a.name).await?;
-            let open = crate::boundary::sight(&st, &auth.org, Some(&peer))
-                .await?
-                .get(&peer.name)
-                .is_some_and(|s| s.has_seat(&a.name));
-            if seat.is_none() || !open {
-                return Err(ApiError::not_found(format!(
-                    "no seat {a} open to your org (a list may hold only seats of other orgs that are open to yours)"
-                )));
-            }
-            None
+        Some(_) => {
+            return Err(ApiError::unprocessable(
+                "local_only",
+                "a list holds seats of its own org only (mail to other orgs names their seats)",
+            ));
         }
     };
     let member = Member {
@@ -636,7 +596,6 @@ pub async fn put_member(
     Ok(Json(p::ListMember {
         address: member.address,
         mode,
-        inactive: false,
     }))
 }
 
@@ -666,14 +625,89 @@ pub async fn delete_member(
 
 pub async fn list_links(State(st): State<AppState>, auth: Auth) -> ApiResult<Json<Vec<p::Link>>> {
     auth.require_directory()?;
-    Ok(Json(
-        st.store
-            .links(auth.org.id)
-            .await?
-            .iter()
-            .map(render::link)
-            .collect(),
-    ))
+    let mut out = Vec::new();
+    for l in st.store.links(auth.org.id).await? {
+        let mut v = render::link(&l);
+        if l.state == p::LinkState::Active
+            && let Some(peer) = st.store.org_by_id(l.peer_org_id).await?
+        {
+            v.primary = crate::boundary::org_primary(&st, &auth.org, &peer).await?;
+        }
+        out.push(v);
+    }
+    Ok(Json(out))
+}
+
+/// `PATCH /v1/links/{org}` (user): set the org's primary contact for a
+/// linked org, or a team's (`team`). The seat must be a contact for that
+/// org (open to it).
+pub async fn patch_link(
+    State(st): State<AppState>,
+    auth: Auth,
+    Path(org): Path<String>,
+    Json(req): Json<p::LinkPatch>,
+) -> ApiResult<Json<p::Link>> {
+    auth.require_user()?;
+    let links = st.store.links(auth.org.id).await?;
+    let l = links
+        .iter()
+        .find(|l| l.peer_name == org && l.peer_org_id != 0 && l.state == p::LinkState::Active)
+        .ok_or_else(|| ApiError::not_found(format!("no active link with {org:?}")))?;
+    let peer = st
+        .store
+        .org_by_id(l.peer_org_id)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("no active link with {org:?}")))?;
+    let team = match &req.team {
+        None => None,
+        Some(t) => Some(
+            st.store
+                .teams(auth.org.id)
+                .await?
+                .into_iter()
+                .find(|x| &x.name == t)
+                .ok_or_else(|| ApiError::not_found(format!("no team {t:?}")))?,
+        ),
+    };
+    let seat = match &req.primary {
+        None => return Err(ApiError::bad_request("give primary (a seat name, or null)")),
+        Some(None) => None,
+        Some(Some(name)) => {
+            let contacts = crate::boundary::shown_by(&st, &auth.org)
+                .await?
+                .remove(&peer.name)
+                .unwrap_or_default();
+            let c = contacts.seats.get(name).ok_or_else(|| {
+                ApiError::unprocessable(
+                    "not_a_contact",
+                    format!(
+                        "{name:?} is not open to {org}: open it first (amail open {name} --to {org})"
+                    ),
+                )
+            })?;
+            Some(c.id)
+        }
+    };
+    st.store
+        .set_primary(auth.org.id, peer.id, team.as_ref().map(|t| t.id), seat)
+        .await?;
+    let mut v = render::link(l);
+    v.primary = crate::boundary::org_primary(&st, &auth.org, &peer).await?;
+    crate::notices::tell_user(
+        &st,
+        auth.org.id,
+        &format!("Primary contact for {org} changed"),
+        &format!(
+            "{} primary contact for {org} is now {}. It is added in Cc when a seat that is not a contact writes to {org}.\n",
+            match &team {
+                Some(t) => format!("Team {}'s", t.name),
+                None => "Your org's".to_string(),
+            },
+            req.primary.flatten().unwrap_or_else(|| "the default (the user seat if it is open, else the seat opened first)".into())
+        ),
+    )
+    .await;
+    Ok(Json(v))
 }
 
 /// Another org by name, as `me` may know it: a suspended org counts as
@@ -771,6 +805,7 @@ pub async fn request_link(
         state,
         since: None,
         note: note.map(str::to_string),
+        primary: None,
     };
     if let Some(l) = links.iter().find(|l| l.peer_name == name) {
         // A request made while no org had the name is replaced by a request
@@ -784,6 +819,7 @@ pub async fn request_link(
                 state: l.state,
                 since: None,
                 note: l.note.clone(),
+                primary: None,
             }));
         }
     } else if links
@@ -870,6 +906,7 @@ pub async fn accept_link(
         state: p::LinkState::Active,
         since: Some(render::ts(amail_store::now_ms())),
         note: None,
+        primary: None,
     }))
 }
 

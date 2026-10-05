@@ -59,21 +59,35 @@ SELECT s.org_id, s.id, NULL, CAST(strftime('%s', 'now') AS INTEGER) * 1000
   FROM seats s JOIN orgs o ON o.id = s.org_id
  WHERE s.kind = 'user' AND s.deleted_at IS NULL AND o.deleted_at IS NULL;
 
--- Thread participants: seat `seat_id` (of another org) sent a message of
--- the thread that was delivered to a seat of `org_id`. Added with such
--- deliveries; removed when the seat stops being open to that org and when
--- the two orgs' link ends.
-CREATE TABLE thread_peers (
+-- Participants of threads that cross orgs: every seat (sender or
+-- recipient) of a message of the thread that reached more than one org,
+-- with the seat's org. Added when such a message is sent.
+CREATE TABLE thread_parts (
     thread_id BIGINT NOT NULL,
-    org_id    BIGINT NOT NULL,
     seat_id   BIGINT NOT NULL,
-    PRIMARY KEY (thread_id, org_id, seat_id)
+    org_id    BIGINT NOT NULL,
+    PRIMARY KEY (thread_id, seat_id)
 ) WITHOUT ROWID;
-CREATE INDEX thread_peers_seat ON thread_peers(seat_id, org_id);
-INSERT OR IGNORE INTO thread_peers (thread_id, org_id, seat_id)
-SELECT DISTINCT m.thread_id, d.org_id, m.sender_seat_id
-  FROM deliveries d JOIN messages m ON m.id = d.message_id
- WHERE d.org_id <> m.org_id;
+INSERT OR IGNORE INTO thread_parts (thread_id, seat_id, org_id)
+SELECT DISTINCT m.thread_id, m.sender_seat_id, m.org_id FROM messages m
+ WHERE EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = m.id AND d.org_id <> m.org_id);
+INSERT OR IGNORE INTO thread_parts (thread_id, seat_id, org_id)
+SELECT DISTINCT m.thread_id, d.seat_id, d.org_id FROM deliveries d JOIN messages m ON m.id = d.message_id
+ WHERE EXISTS (SELECT 1 FROM deliveries d2 WHERE d2.message_id = m.id AND d2.org_id <> m.org_id);
+
+-- Primary contacts: the seat of an org that the server adds in Cc when a
+-- seat that is not a contact writes to a linked org. Per linked org
+-- (`links.primary_seat_id`) and per team (`team_primaries`).
+ALTER TABLE links ADD COLUMN primary_seat_id BIGINT REFERENCES seats(id);
+CREATE TABLE team_primaries (
+    team_id      BIGINT NOT NULL REFERENCES teams(id),
+    peer_org_id  BIGINT NOT NULL REFERENCES orgs(id),
+    seat_id      BIGINT NOT NULL REFERENCES seats(id),
+    PRIMARY KEY (team_id, peer_org_id)
+);
+
+-- Lists hold seats of their own org only.
+DELETE FROM list_members WHERE seat_id IS NULL;
 
 -- Links: when they became active, and the requester's note.
 ALTER TABLE links ADD COLUMN active_at BIGINT;
@@ -82,5 +96,5 @@ UPDATE links SET active_at = created_at WHERE state = 'active';
 ALTER TABLE link_requests ADD COLUMN note TEXT;
 
 -- Orgs with links learn once that links no longer open everything.
-UPDATE orgs SET notice = 'Links no longer open your whole org: another org now sees your org''s card and only the seats and teams you open to it (amail open). After this upgrade only your user seat is open to linked orgs. See docs/concepts.md (Openings).'
+UPDATE orgs SET notice = 'Links no longer open your whole org: another org now sees your org''s card and only the seats and teams you open to it (amail open), and mail between orgs always carries a contact of each org. After this upgrade only your user seat is open to linked orgs, and lists hold seats of your own org only. See docs/concepts.md (Other orgs).'
  WHERE deleted_at IS NULL AND id IN (SELECT org_id FROM links);

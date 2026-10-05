@@ -3,7 +3,6 @@
 
 use crate::AppState;
 use crate::auth::Auth;
-use crate::boundary::View;
 use crate::error::{ApiError, ApiResult, Json, Path, Query};
 pub use crate::limits::Pool;
 use crate::render;
@@ -63,6 +62,15 @@ pub async fn send(
     Ok(Json(crate::send::send(&st, &auth, req).await?))
 }
 
+/// `POST /v1/messages/preview`: see [`crate::send::preview`].
+pub async fn preview(
+    State(st): State<AppState>,
+    auth: Auth,
+    Json(req): Json<p::SendRequest>,
+) -> ApiResult<Json<p::SendPreview>> {
+    Ok(Json(crate::send::preview(&st, &auth, req).await?))
+}
+
 #[derive(Deserialize)]
 pub struct InboxParams {
     seat: Option<String>,
@@ -98,8 +106,10 @@ pub async fn inbox(
     } else {
         st.store.inbox(seat.id, &query).await?
     };
-    let view = View::load(&st, &auth.org, entries.iter().map(|e| &e.message)).await?;
-    let mut entries: Vec<p::InboxEntry> = entries.iter().map(|e| view.entry(e)).collect();
+    let mut entries: Vec<p::InboxEntry> = entries
+        .iter()
+        .map(|e| render::entry(e, &auth.org))
+        .collect();
     // Paging backwards, the entries next to `before_seq` (the end) stay.
     let truncated = render::fit(&mut entries, MAX_PAGE_BYTES, query.before_seq.is_some());
     Ok(Json(p::InboxResponse {
@@ -133,9 +143,8 @@ pub async fn read(
             None => None,
         }
     };
-    let view = View::load(&st, &auth.org, [&m]).await?;
     Ok(Json(p::MessageResponse {
-        message: view.message(&m),
+        message: render::message(&m, &auth.org),
         delivery: delivery.map(|d| render::delivery(&d, &auth.org)),
     }))
 }
@@ -174,16 +183,8 @@ pub async fn status(
         Ok(store.recipients(id).await?)
     })
     .await?;
-    // Recipients of other orgs the caller may no longer see (their org
-    // closed them since) are left out.
-    let view = if rows.iter().any(|d| d.org_id != auth.org.id) {
-        View::for_threads(&st, &auth.org, &[m.thread_id]).await?
-    } else {
-        View::own(&auth.org)
-    };
     let recipients = rows
         .iter()
-        .filter(|d| view.shows_delivery(m.thread_id, d))
         .map(|d| {
             let delivery = render::delivery(d, &auth.org);
             p::RecipientStatus {
@@ -231,16 +232,11 @@ pub async fn thread(
     if truncated {
         found.remove(0);
     }
-    let view = View::load(&st, &auth.org, found.iter().map(|t| &t.message)).await?;
-    let participants = if found.iter().any(|t| t.message.org_id != auth.org.id) {
-        View::participants(&st, &auth.org, id).await?
-    } else {
-        Vec::new()
-    };
+    let participants = crate::boundary::participants(&st, &auth.org, id).await?;
     let mut messages: Vec<p::Message> = found
         .iter()
         .map(|t| {
-            let mut m = view.message(&t.message);
+            let mut m = render::message(&t.message, &auth.org);
             m.body_omitted = t.body_omitted;
             m
         })
@@ -321,11 +317,10 @@ pub async fn claim(
     let (entries, bump) = st.store.claim(seat.id, &filter).await?;
     publish(&st, &seat.name, bump);
     let max = inline_max.unwrap_or(0);
-    let view = View::load(&st, &auth.org, entries.iter().map(|e| &e.message)).await?;
     let entries = entries
         .iter()
         .map(|e| {
-            let mut out = view.entry(e);
+            let mut out = render::entry(e, &auth.org);
             if max > 0 && e.message.body.chars().count() <= max {
                 out.body = Some(e.message.body.clone());
             }
@@ -391,8 +386,10 @@ pub async fn changes(
     })
     .await?;
     let full = entries.len() as i64 == limit;
-    let view = View::load(&st, &auth.org, entries.iter().map(|e| &e.message)).await?;
-    let mut entries: Vec<p::InboxEntry> = entries.iter().map(|e| view.entry(e)).collect();
+    let mut entries: Vec<p::InboxEntry> = entries
+        .iter()
+        .map(|e| render::entry(e, &auth.org))
+        .collect();
     let cut = render::fit(&mut entries, MAX_PAGE_BYTES, false);
     let next = entries.last().map(|e| e.delivery.mod_seq).unwrap_or(since);
     Ok(Json(p::ChangesResponse {
@@ -606,22 +603,7 @@ pub async fn archive(
             let a: Address = a
                 .parse()
                 .map_err(|e| ApiError::bad_request(format!("to: {e}")))?;
-            let org = a.org_or(&auth.org.name).to_string();
-            // Another org's seat: only one the org may see (open to it, or
-            // a participant of the thread asked for). Any other name finds
-            // nothing, after the same query.
-            let visible = org == auth.org.name || {
-                let view = match q.thread {
-                    Some(t) => View::for_threads(&st, &auth.org, &[t]).await?,
-                    None => View::for_threads(&st, &auth.org, &[0]).await?,
-                };
-                view.shows(q.thread, &org, &a.name)
-            };
-            if visible {
-                Some((org, a.name))
-            } else {
-                Some((org, "-".to_string()))
-            }
+            Some((a.org_or(&auth.org.name).to_string(), a.name))
         }
     };
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
@@ -641,15 +623,20 @@ pub async fn archive(
         Ok(store.archive(org_id, &query).await?)
     })
     .await?;
-    let view = View::load(&st, &auth.org, &page.messages).await?;
-    Ok(Json(archive_response(page, &view)))
+    Ok(Json(archive_response(page, &auth.org)))
 }
 
 /// An archive page as sent: within [`MAX_PAGE_BYTES`], continuing after
 /// the last message kept when it was cut.
-pub fn archive_response(page: amail_store::ArchivePage, view: &View) -> p::ArchiveResponse {
-    let mut messages: Vec<p::MessageHeader> =
-        page.messages.iter().map(|m| view.header(m)).collect();
+pub fn archive_response(
+    page: amail_store::ArchivePage,
+    org: &amail_store::Org,
+) -> p::ArchiveResponse {
+    let mut messages: Vec<p::MessageHeader> = page
+        .messages
+        .iter()
+        .map(|m| render::header(m, org))
+        .collect();
     let next_before_id = if render::fit(&mut messages, MAX_PAGE_BYTES, false) {
         messages.last().map(|m| m.id)
     } else {

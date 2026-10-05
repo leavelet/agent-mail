@@ -200,12 +200,21 @@ pub trait Store: Send + Sync + 'static {
         managed: bool,
     ) -> Result<i64>;
     async fn remove_grant(&self, org_id: i64, id: i64) -> Result<bool>;
-    /// Seats of other orgs that wrote into these threads in mail that
-    /// reached a seat of `org_id`.
-    async fn thread_peers(&self, org_id: i64, thread_ids: &[i64]) -> Result<Vec<ThreadPeer>>;
-    /// These seats (of other orgs) stop being participants of the threads
-    /// of `org_id`.
-    async fn forget_thread_peers(&self, org_id: i64, seat_ids: &[i64]) -> Result<u64>;
+    /// Participants of these threads: every seat of a message of the
+    /// thread that reached more than one org, with its org.
+    async fn thread_parts(&self, thread_ids: &[i64]) -> Result<Vec<ThreadPeer>>;
+    /// The org's primary contacts: `(peer org id, team id, seat id)`; team
+    /// `None` is the org's own for that peer.
+    async fn primaries(&self, org_id: i64) -> Result<Vec<(i64, Option<i64>, i64)>>;
+    /// Set or clear (`None`) the org's (`team_id` `None`) or a team's
+    /// primary contact for `peer_id`. The org's needs a link row.
+    async fn set_primary(
+        &self,
+        org_id: i64,
+        peer_id: i64,
+        team_id: Option<i64>,
+        seat_id: Option<i64>,
+    ) -> Result<()>;
     /// Clear the org's one-time notice.
     async fn clear_org_notice(&self, org_id: i64) -> Result<()>;
     /// Take one token from the seat's budget of new threads to other orgs

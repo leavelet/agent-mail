@@ -111,24 +111,10 @@ async fn escalate(st: &AppState, due: &AckDue, now: i64) -> amail_store::Result<
         .collect();
     let waited = due.due - due.created_at;
     let mut who = Vec::new();
-    // Seats of other orgs that the sender's org may no longer see are
-    // counted, not named (see `crate::boundary::View`).
-    let mut hidden = 0;
-    let (rows, view) = if laggards.iter().any(|l| l.org_id != due.org_id) {
-        let org = store.org_by_id(due.org_id).await?;
-        match org {
-            Some(org) => (
-                store.recipients(due.message_id).await?,
-                Some(
-                    crate::boundary::View::for_threads(st, &org, &[msg.thread_id])
-                        .await
-                        .map_err(|e| amail_store::StoreError::Invalid(e.message))?,
-                ),
-            ),
-            None => (Vec::new(), None),
-        }
+    let rows = if laggards.iter().any(|l| l.org_id != due.org_id) {
+        store.recipients(due.message_id).await?
     } else {
-        (Vec::new(), None)
+        Vec::new()
     };
     for l in &laggards {
         let mut s = if l.org_id == due.org_id {
@@ -137,13 +123,6 @@ async fn escalate(st: &AppState, due: &AckDue, now: i64) -> amail_store::Result<
             let Some(d) = rows.iter().find(|d| d.seat_id == l.seat_id) else {
                 continue;
             };
-            if !view
-                .as_ref()
-                .is_some_and(|v| v.shows_delivery(msg.thread_id, d))
-            {
-                hidden += 1;
-                continue;
-            }
             format!("{}@{}", l.name, d.org_name)
         };
         if due.stage >= 1
@@ -153,12 +132,6 @@ async fn escalate(st: &AppState, due: &AckDue, now: i64) -> amail_store::Result<
             s.push_str(&format!(" (lead: {p})"));
         }
         who.push(s);
-    }
-    if hidden > 0 {
-        who.push(format!(
-            "{hidden} recipient{} not shown",
-            if hidden == 1 { "" } else { "s" }
-        ));
     }
     let (next_stage, next_due, body, cc) = if due.stage == 0 {
         let next = (!leads.is_empty()).then_some(now + waited.max(1000));

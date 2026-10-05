@@ -196,6 +196,7 @@ pub fn router(state: AppState) -> Router {
             axum::routing::delete(operator::delete_org),
         )
         .route("/messages", post(mail::send))
+        .route("/messages/preview", post(mail::preview))
         .route("/messages/{id}", get(mail::read))
         .route("/messages/{id}/ack", post(mail::ack))
         .route("/messages/{id}/status", get(mail::status))
@@ -276,7 +277,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/links", get(d::list_links).post(d::request_link))
         .route("/links/{org}/accept", post(d::accept_link))
-        .route("/links/{org}", axum::routing::delete(d::revoke_link));
+        .route(
+            "/links/{org}",
+            axum::routing::delete(d::revoke_link).patch(d::patch_link),
+        );
     let v1 = v1
         .fallback(|| async { error::ApiError::not_found("no such endpoint") })
         .method_not_allowed_fallback(|| async {

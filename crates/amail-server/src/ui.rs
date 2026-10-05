@@ -69,12 +69,10 @@ fn seat_items(presence: &HashMap<String, Presence>) -> Vec<AttentionItem> {
 async fn attention_items(st: &AppState, auth: &Auth) -> ApiResult<Vec<AttentionItem>> {
     let user = auth.mail_seat()?;
     let entries = st.store.attention(user.id, ATTENTION_LIMIT).await?;
-    let view =
-        crate::boundary::View::load(st, &auth.org, entries.iter().map(|e| &e.message)).await?;
     let mut urgent = Vec::new();
     let mut normal = Vec::new();
     for e in &entries {
-        let header = view.header(&e.message);
+        let header = render::header(&e.message, &auth.org);
         // Mail from the server itself (settings changed, acknowledgements
         // overdue) asks for no answer: a notice, until it is read.
         let kind = if e.message.ack_required && e.delivery.acked_at.is_none() {
@@ -282,8 +280,7 @@ pub async fn sent(
     } else {
         st.store.archive(auth.org.id, &query).await?
     };
-    let view = crate::boundary::View::load(&st, &auth.org, &page.messages).await?;
-    let mut out = crate::mail::archive_response(page, &view);
+    let mut out = crate::mail::archive_response(page, &auth.org);
     if q.delivery && !out.messages.is_empty() {
         // One grouped query over the page's messages, on the index of
         // deliveries by message.
@@ -340,13 +337,11 @@ pub async fn search(
         Ok(store.search(org_id, &query).await?)
     })
     .await?;
-    let view =
-        crate::boundary::View::load(&st, &auth.org, r.hits.iter().map(|h| &h.message)).await?;
     let mut messages: Vec<p::SearchHit> = r
         .hits
         .iter()
         .map(|h| p::SearchHit {
-            header: view.header(&h.message),
+            header: render::header(&h.message, &auth.org),
             snippet: snippet(h),
         })
         .collect();
