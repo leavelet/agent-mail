@@ -3597,15 +3597,17 @@ macro_rules! impl_store_common {
                     "UPDATE seats SET display_name = NULL, role = NULL, harness = NULL, model = NULL, \
                      permission_mode = NULL, group_name = NULL, focus_until = NULL WHERE org_id = $1",
                 ];
-                for sql in steps {
-                    sqlx::query(sql).bind(org_id).execute(&mut *c).await?;
-                }
+                // (Before its seats go: the budget rows refer to them.)
                 if DIALECT == Dialect::Postgres {
                     sqlx::query("DELETE FROM thread_budget WHERE seat_id IN (SELECT id FROM seats WHERE org_id = $1)")
                         .bind(org_id)
                         .execute(&mut *c)
                         .await?;
                 }
+                for sql in steps {
+                    sqlx::query(sql).bind(org_id).execute(&mut *c).await?;
+                }
+
                 sqlx::query("UPDATE seats SET deleted_at = $1 WHERE org_id = $2 AND deleted_at IS NULL")
                     .bind(now)
                     .bind(org_id)

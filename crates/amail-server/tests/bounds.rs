@@ -1859,7 +1859,9 @@ async fn deletion_alongside_sends(b: Backend, t: &str) {
     let mut ids = Vec::new();
     for i in 0..40 {
         ids.push(
-            att.send(json!({ "to": ["a@acme", "owner@acme", "owner@gam"], "subject": format!("m{i}"), "body": "x" }))
+            // (In Cc: a seat takes at most 20 new threads an hour in To
+            // from one other org.)
+            att.send(json!({ "cc": ["a@acme", "owner@acme", "owner@gam"], "subject": format!("m{i}"), "body": "x" }))
                 .await,
         );
     }
