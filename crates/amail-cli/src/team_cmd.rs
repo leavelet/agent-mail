@@ -4,6 +4,7 @@
 
 use crate::Out;
 use crate::client::{Client, enc};
+use amail_node::mux::AttachPlan;
 use amail_node::team::{self, Team};
 use amail_node::wire::{GitAccess, PsRow, Request, SeatPlacement};
 use amail_proto::{self as p, PostPolicy, SeatKind, TokenScope};
@@ -52,6 +53,38 @@ pub fn policy_text(v: &Value) -> Option<String> {
         _ => "",
     };
     Some(format!("{p}{source}: {what}"))
+}
+
+/// Whether the node on this host works for the server `c` talks to (the
+/// same URL), so that a seat missing on that server may be forgotten.
+fn node_serves(c: &Client) -> bool {
+    node(&Request::Status, Duration::from_secs(10))
+        .ok()
+        .and_then(|v| {
+            v["server"]
+                .as_str()
+                .map(|u| u.trim_end_matches('/') == c.base())
+        })
+        .unwrap_or(false)
+}
+
+/// After seat `seat` was deleted on the server: if the node on this host
+/// supervises it, stop it and remove it from the node's seats. Returns
+/// whether that was done. No node: nothing to do.
+pub fn forget_deleted(c: &Client, seat: &str) -> Result<bool> {
+    if !amail_node::paths::socket().exists() {
+        return Ok(false);
+    }
+    if !ps_rows()?.iter().any(|r| r.seat == seat) || !node_serves(c) {
+        return Ok(false);
+    }
+    node(
+        &Request::Forget {
+            seats: vec![seat.to_string()],
+        },
+        Duration::from_secs(60),
+    )?;
+    Ok(true)
 }
 
 fn ps_rows() -> Result<Vec<PsRow>> {
@@ -244,9 +277,28 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
     }
     // Seats that left the file.
     let in_file: BTreeSet<&str> = t.seats.iter().map(|s| s.name.as_str()).collect();
+    // Supervised seats that were deleted on the server (e.g. with `amail
+    // seat rm` on another host): the node stops them and drops them.
+    let gone: Vec<String> = rows
+        .iter()
+        .filter(|r| !in_file.contains(r.seat.as_str()) && !by_name.contains_key(r.seat.as_str()))
+        .map(|r| r.seat.clone())
+        .collect();
+    if !gone.is_empty() && node_serves(c) {
+        node(
+            &Request::Forget {
+                seats: gone.clone(),
+            },
+            Duration::from_secs(60),
+        )?;
+        report.push(format!(
+            "stopped and dropped seats that no longer exist on the server: {}",
+            gone.join(", ")
+        ));
+    }
     let mut removed: Vec<String> = rows
         .iter()
-        .filter(|r| !in_file.contains(r.seat.as_str()))
+        .filter(|r| !in_file.contains(r.seat.as_str()) && !gone.contains(&r.seat))
         .map(|r| r.seat.clone())
         .collect();
     for s in &server_seats {
@@ -596,13 +648,57 @@ pub fn attach(target: &str) -> Result<()> {
         },
         Duration::from_secs(10),
     )?;
-    let cmds: Vec<Vec<String>> = serde_json::from_value(v["commands"].clone())?;
-    let Some((last, before)) = cmds.split_last() else {
-        bail!("nothing to attach to");
+    let plan: AttachPlan = if v["plan"].is_object() {
+        serde_json::from_value(v["plan"].clone())?
+    } else {
+        // A node from before attach plans: run all commands but the last,
+        // then exec the last.
+        let mut cmds: Vec<Vec<String>> = serde_json::from_value(v["commands"].clone())?;
+        let attach = cmds.pop().context("nothing to attach to")?;
+        AttachPlan {
+            session: v["session"].as_str().unwrap_or_default().to_string(),
+            tab: None,
+            pane: None,
+            busy_check: None,
+            focus: cmds,
+            attach,
+        }
     };
-    for c in before {
-        let _ = std::process::Command::new(&c[0]).args(&c[1..]).status();
+    if plan.attach.is_empty() || plan.focus.iter().any(Vec::is_empty) {
+        bail!("the node sent an empty command");
     }
+    // Quiet: these print tab ids and errors that mean nothing here.
+    let quiet = |c: &[String]| {
+        std::process::Command::new(&c[0])
+            .args(&c[1..])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    };
+    let busy = plan
+        .busy_check
+        .as_deref()
+        .is_some_and(|c| !c.is_empty() && quiet(c));
+    if busy {
+        if let Some(tab) = &plan.tab {
+            eprintln!(
+                "Another terminal attached to session {} is in use, so amail cannot choose the \
+                 tab this one starts on. Go to tab {tab:?} yourself (in zellij: Ctrl t, then \
+                 the arrow keys, then Enter).",
+                plan.session
+            );
+            if std::io::IsTerminal::is_terminal(&std::io::stderr()) {
+                std::thread::sleep(Duration::from_secs(3));
+            }
+        }
+    } else {
+        for c in &plan.focus {
+            quiet(c);
+        }
+    }
+    let last = &plan.attach;
     let err = std::process::Command::new(&last[0]).args(&last[1..]).exec();
     Err(anyhow::anyhow!("running {}: {err}", last[0]))
 }

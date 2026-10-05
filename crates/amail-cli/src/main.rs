@@ -1680,7 +1680,24 @@ async fn seat_cmd(c: &Client, out: &Out, cmd: SeatCmd) -> Result<()> {
             let v = c
                 .raw(Method::DELETE, &format!("/seats/{}", enc(&name)), None)
                 .await?;
-            out.show(&v, || Ok(format!("removed seat {name}")))
+            // The node on this host stops supervising it.
+            let stopped = match team_cmd::forget_deleted(c, &name) {
+                Ok(x) => x,
+                Err(e) => {
+                    eprintln!(
+                        "the node on this host could not stop seat {name}: {e:#}; \
+                         `amail up` removes it from the node later"
+                    );
+                    false
+                }
+            };
+            out.show(&v, || {
+                Ok(if stopped {
+                    format!("removed seat {name}; stopped it on this host")
+                } else {
+                    format!("removed seat {name}")
+                })
+            })
         }
         SeatCmd::Token { name, label } => {
             let v = c

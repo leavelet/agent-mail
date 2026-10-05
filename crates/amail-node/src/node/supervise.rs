@@ -1306,22 +1306,23 @@ impl Node {
 
     pub(super) fn sup_locate(&self, target: &str) -> Value {
         let st = self.lock();
-        let (session, pane) = if let Some(m) = st.saved.managed.get(target) {
-            (m.mux_session.clone(), m.pane)
+        let (session, tab, pane) = if let Some(m) = st.saved.managed.get(target) {
+            (m.mux_session.clone(), Some(m.tab.clone()), m.pane)
         } else if let Some(m) = st
             .saved
             .managed
             .values()
             .find(|m| m.group.as_deref().unwrap_or("main") == target)
         {
-            (m.mux_session.clone(), None)
+            (m.mux_session.clone(), None, None)
         } else {
             return json!({"error": format!("no supervised seat or group {target:?} (see amail ps)")});
         };
         json!({
             "session": session,
+            "tab": tab,
             "pane": pane,
-            "commands": self.mux.attach_commands(&session, pane),
+            "plan": self.mux.attach_plan(&session, tab.as_deref(), pane),
         })
     }
 }

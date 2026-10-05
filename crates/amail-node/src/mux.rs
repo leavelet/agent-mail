@@ -91,9 +91,31 @@ pub trait Mux: Send + Sync + 'static {
     /// Periodic upkeep of the sessions in use (headless clients).
     async fn maintain(&self, sessions: &[String]);
 
-    /// Commands that attach the caller's terminal to `session`, focused on
-    /// `pane`: run all but the last, then exec the last.
-    fn attach_commands(&self, session: &str, pane: Option<u32>) -> Vec<Vec<String>>;
+    /// How to attach the caller's terminal to `session`, showing tab `tab`
+    /// (the seat's pane is the only pane of its tab). `tab` is `None` for a
+    /// whole group.
+    fn attach_plan(&self, session: &str, tab: Option<&str>, pane: Option<u32>) -> AttachPlan;
+}
+
+/// Steps that attach a terminal to a session on a given tab. `amail attach`
+/// runs them in the caller's terminal: `busy_check`, then (unless it
+/// succeeded) every `focus` command, then it execs `attach`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttachPlan {
+    pub session: String,
+    pub tab: Option<String>,
+    pub pane: Option<u32>,
+    /// Exits with status 0 when the `focus` commands would act on a client
+    /// that is already attached (a person's) instead of choosing the tab of
+    /// the new client. The `focus` commands are then skipped.
+    #[serde(default)]
+    pub busy_check: Option<Vec<String>>,
+    /// Commands that choose the tab a new client starts on. Their failures
+    /// are ignored.
+    #[serde(default)]
+    pub focus: Vec<Vec<String>>,
+    /// The command that attaches (exec'd last).
+    pub attach: Vec<String>,
 }
 
 /// Environment variables of the node that must not reach sessions.
@@ -122,6 +144,9 @@ pub fn scrub_env(cmd: &mut std::process::Command) {
 /// A client process on a pseudo-terminal of fixed size, output discarded.
 struct Headless {
     child: std::process::Child,
+    /// The terminal's keyboard side (tests type into real zellij clients).
+    #[cfg(test)]
+    input: std::fs::File,
 }
 
 impl Headless {
@@ -164,6 +189,8 @@ impl Headless {
         };
         use std::os::fd::AsRawFd;
         set_cloexec(master.as_raw_fd());
+        #[cfg(test)]
+        let input = master.try_clone()?;
         cmd.stdin(std::process::Stdio::from(slave.try_clone()?))
             .stdout(std::process::Stdio::from(slave.try_clone()?))
             .stderr(std::process::Stdio::from(slave));
@@ -187,7 +214,11 @@ impl Headless {
             let mut buf = [0u8; 65536];
             while matches!(m.read(&mut buf), Ok(n) if n > 0) {}
         });
-        Ok(Headless { child })
+        Ok(Headless {
+            child,
+            #[cfg(test)]
+            input,
+        })
     }
 
     fn running(&mut self) -> bool {
@@ -612,19 +643,34 @@ impl Mux for Zellij {
         }
     }
 
-    fn attach_commands(&self, session: &str, pane: Option<u32>) -> Vec<Vec<String>> {
-        let mut out = Vec::new();
-        if let Some(p) = pane {
-            out.push(
-                [&self.bin, "--session", session, "action", "focus-pane-id"]
-                    .iter()
-                    .map(|s| s.to_string())
-                    .chain([format!("terminal_{p}")])
-                    .collect(),
-            );
+    /// zellij 0.45 has no way to attach on a given tab, and its CLI actions
+    /// cannot name a client. A new client starts on the tab of the
+    /// session's first client (normally the node's headless client). A CLI
+    /// action acts for the last client that typed and is still attached,
+    /// and when there is none, `go-to-tab-name` acts for the first client.
+    /// So: if no attached client has typed (`current-tab-info` then fails:
+    /// it has no client to report on), move the first client to the tab,
+    /// then attach. `focus-pane-id` is not used: without a client that
+    /// typed it does nothing.
+    fn attach_plan(&self, session: &str, tab: Option<&str>, pane: Option<u32>) -> AttachPlan {
+        let action = |args: &[&str]| -> Vec<String> {
+            [self.bin.as_str(), "--session", session, "action"]
+                .iter()
+                .chain(args)
+                .map(|s| s.to_string())
+                .collect()
+        };
+        AttachPlan {
+            session: session.to_string(),
+            tab: tab.map(str::to_string),
+            pane,
+            busy_check: tab.map(|_| action(&["current-tab-info"])),
+            focus: tab
+                .map(|t| action(&["go-to-tab-name", t]))
+                .into_iter()
+                .collect(),
+            attach: vec![self.bin.clone(), "attach".into(), session.into()],
         }
-        out.push(vec![self.bin.clone(), "attach".into(), session.into()]);
-        out
     }
 }
 
@@ -653,6 +699,8 @@ pub struct ProcessMux {
     /// How long after its process ended a pane is marked exited, in ms
     /// (zellij takes a moment too).
     exit_delay_ms: std::sync::atomic::AtomicU64,
+    /// Where the commands of [`Mux::attach_plan`] record what they target.
+    attach_log: Mutex<Option<PathBuf>>,
 }
 
 impl ProcessMux {
@@ -664,7 +712,15 @@ impl ProcessMux {
             sessions: Mutex::new(HashMap::new()),
             typed: Mutex::new(Vec::new()),
             exit_delay_ms: std::sync::atomic::AtomicU64::new(0),
+            attach_log: Mutex::new(None),
         }
+    }
+
+    /// Make the commands of [`Mux::attach_plan`] append lines to `path`:
+    /// `focus <session> <tab> <pane>` and `attach <session>`. The busy
+    /// check succeeds while a file `<path>.busy` exists.
+    pub fn set_attach_log(&self, path: &Path) {
+        *self.attach_log.lock().unwrap() = Some(path.to_path_buf());
     }
 
     /// Mark panes exited only `d` after their process ended.
@@ -884,12 +940,31 @@ impl Mux for ProcessMux {
 
     async fn maintain(&self, _sessions: &[String]) {}
 
-    fn attach_commands(&self, session: &str, pane: Option<u32>) -> Vec<Vec<String>> {
-        vec![vec![
-            "true".into(),
-            session.into(),
-            pane.map(|p| p.to_string()).unwrap_or_default(),
-        ]]
+    fn attach_plan(&self, session: &str, tab: Option<&str>, pane: Option<u32>) -> AttachPlan {
+        let log = self.attach_log.lock().unwrap().clone();
+        let log = log.map(|p| p.to_string_lossy().into_owned());
+        let sh = |script: &str, args: &[&str]| -> Vec<String> {
+            match &log {
+                Some(l) => ["/bin/sh", "-c", script, l]
+                    .iter()
+                    .chain(args)
+                    .map(|s| s.to_string())
+                    .collect(),
+                None => ["true"].iter().chain(args).map(|s| s.to_string()).collect(),
+            }
+        };
+        let pane_s = pane.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
+        AttachPlan {
+            session: session.to_string(),
+            tab: tab.map(str::to_string),
+            pane,
+            busy_check: tab.map(|_| sh(r#"test -e "$0.busy""#, &[])),
+            focus: tab
+                .map(|t| sh(r#"echo "focus $1 $2 $3" >> "$0""#, &[session, t, &pane_s]))
+                .into_iter()
+                .collect(),
+            attach: sh(r#"echo "attach $1" >> "$0""#, &[session]),
+        }
     }
 }
 
@@ -915,5 +990,164 @@ mod tests {
             "{t}"
         );
         assert!(t.contains("args \"run\" \"be-1\""), "{t}");
+    }
+
+    /// A seat: probe for a client that typed, move the first client to the
+    /// seat's tab, attach. A group: just attach.
+    #[test]
+    fn zellij_attach_plan() {
+        let z = Zellij::new("/bin/zj", Path::new("/tmp/x"), 200, 60);
+        let p = z.attach_plan("amail-o-g", Some("gw-1"), Some(7));
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(p.session, "amail-o-g");
+        assert_eq!(p.tab.as_deref(), Some("gw-1"));
+        assert_eq!(p.pane, Some(7));
+        assert_eq!(
+            p.busy_check,
+            Some(v(&[
+                "/bin/zj",
+                "--session",
+                "amail-o-g",
+                "action",
+                "current-tab-info"
+            ]))
+        );
+        assert_eq!(
+            p.focus,
+            vec![v(&[
+                "/bin/zj",
+                "--session",
+                "amail-o-g",
+                "action",
+                "go-to-tab-name",
+                "gw-1"
+            ])]
+        );
+        assert_eq!(p.attach, v(&["/bin/zj", "attach", "amail-o-g"]));
+        let g = z.attach_plan("amail-o-g", None, None);
+        assert_eq!(g.busy_check, None);
+        assert!(g.focus.is_empty());
+        assert_eq!(g.attach, v(&["/bin/zj", "attach", "amail-o-g"]));
+        // Round trip through the node's answer.
+        let back: AttachPlan = serde_json::from_value(serde_json::to_value(&p).unwrap()).unwrap();
+        assert_eq!(back, p);
+    }
+
+    /// Clients of a real zellij session: (client id, focused terminal pane).
+    fn real_clients(session: &str) -> Vec<(u32, u32)> {
+        let out = std::process::Command::new("zellij")
+            .args(["--session", session, "action", "list-clients"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .skip(1)
+            .filter_map(|l| {
+                let mut w = l.split_whitespace();
+                let id = w.next()?.parse().ok()?;
+                let pane = w.next()?.strip_prefix("terminal_")?.parse().ok()?;
+                Some((id, pane))
+            })
+            .collect()
+    }
+
+    fn run_quiet(c: &[String]) -> bool {
+        std::process::Command::new(&c[0])
+            .args(&c[1..])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    async fn wait_until(what: &str, mut f: impl FnMut() -> bool) {
+        let t0 = Instant::now();
+        while !f() {
+            assert!(t0.elapsed() < Duration::from_secs(15), "timed out: {what}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// The attach plan with real zellij: a new client starts on the named
+    /// tab although the node's headless client was elsewhere (on the last
+    /// tab it created), also while another person is attached; once an
+    /// attached client has typed, the busy check reports it.
+    ///
+    /// Starts and kills its own zellij session. Run it only with zellij's
+    /// directories (XDG_RUNTIME_DIR, XDG_CACHE_HOME, XDG_CONFIG_HOME,
+    /// XDG_DATA_HOME) pointing at fresh directories and
+    /// AMAIL_TEST_REAL_ZELLIJ=1; see scripts/zellij-attach-check.sh.
+    #[tokio::test]
+    #[ignore = "needs zellij and isolated zellij directories"]
+    async fn real_zellij_attach_lands_on_the_seat_tab() {
+        if std::env::var("AMAIL_TEST_REAL_ZELLIJ").as_deref() != Ok("1") {
+            eprintln!("AMAIL_TEST_REAL_ZELLIJ is not 1: skipped");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let session = std::env::var("AMAIL_TEST_ZELLIJ_SESSION")
+            .unwrap_or_else(|_| format!("amail-test-attach-{}", std::process::id()));
+        let z = Zellij::new("zellij", dir.path(), 160, 40);
+        let mut panes = HashMap::new();
+        for t in ["alpha", "beta", "gamma"] {
+            let spec = PaneSpec {
+                name: t.to_string(),
+                cwd: dir.path().to_path_buf(),
+                argv: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "echo PANE-$0; exec sleep 600".into(),
+                    t.into(),
+                ],
+            };
+            panes.insert(t, z.open(&session, t, &spec).await.unwrap());
+        }
+        // Creating tabs left the headless client on the last one: a plain
+        // `zellij attach` would start there.
+        assert_eq!(real_clients(&session), vec![(1, panes["gamma"])]);
+
+        let mut people = Vec::new();
+        for t in ["alpha", "beta"] {
+            let plan = z.attach_plan(&session, Some(t), Some(panes[t]));
+            assert!(!run_quiet(plan.busy_check.as_ref().unwrap()), "busy");
+            for c in &plan.focus {
+                run_quiet(c);
+            }
+            let before: Vec<u32> = real_clients(&session).iter().map(|c| c.0).collect();
+            let mut cmd = std::process::Command::new(&plan.attach[0]);
+            cmd.args(&plan.attach[1..]).env("TERM", "xterm-256color");
+            people.push(Headless::spawn(&mut cmd, 100, 30).unwrap());
+            wait_until("the new client", || {
+                real_clients(&session)
+                    .iter()
+                    .any(|c| !before.contains(&c.0))
+            })
+            .await;
+            let new = real_clients(&session)
+                .into_iter()
+                .find(|c| !before.contains(&c.0))
+                .unwrap();
+            assert_eq!(new.1, panes[t], "the client for {t} is on another pane");
+        }
+        // Both people still see their tabs.
+        let now = real_clients(&session);
+        assert!(now.iter().any(|c| c.1 == panes["alpha"]), "{now:?}");
+        assert!(now.iter().any(|c| c.1 == panes["beta"]), "{now:?}");
+
+        // A person types (Ctrl t, l, Esc: next tab): the busy check now
+        // succeeds, so `amail attach` would not move that person's view.
+        let plan = z.attach_plan(&session, Some("gamma"), Some(panes["gamma"]));
+        {
+            use std::io::Write;
+            for k in [&b"\x14"[..], b"l", b"\x1b"] {
+                people[0].input.write_all(k).unwrap();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        }
+        let check = plan.busy_check.clone().unwrap();
+        wait_until("the busy check", || run_quiet(&check)).await;
+
+        drop(people);
+        z.kill_session(&session).await.unwrap();
     }
 }

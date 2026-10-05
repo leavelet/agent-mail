@@ -1569,7 +1569,8 @@ fn untrusted_socket_is_refused() {
             let mut line = String::new();
             let _ = std::io::BufReader::new(&c).read_line(&mut line);
             let cmd = vec!["/bin/sh".to_string(), "-c".into(), format!("touch {m}")];
-            let resp = json!({"commands": [cmd], "program": "/bin/sh",
+            let resp = json!({"commands": [cmd], "plan": {"session": "s", "attach": cmd},
+                              "program": "/bin/sh",
                               "args": ["-c", format!("touch {m}")], "env": {}, "stdout": "x"});
             let _ = writeln!(c, "{resp}");
         }

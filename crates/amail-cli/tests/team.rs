@@ -51,6 +51,8 @@ team_tests!(
     paste_fallback_types_only_when_safe,
     server_permission_mode_is_informational,
     agent_up_is_reported,
+    attach_chooses_the_seat_tab,
+    removed_seats_leave_the_node,
 );
 
 async fn setup(
@@ -1479,4 +1481,161 @@ async fn agent_up_is_reported(b: Backend) {
         assert!(text.contains(want), "missing {want:?} in:\n{text}");
     }
     cli(&h, &["down"]).await;
+}
+
+fn attach_log(h: &Harness) -> Vec<String> {
+    std::fs::read_to_string(h.dir.path().join("attach.log"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// `amail attach <seat>` moves the session's view to the seat's tab before
+/// it attaches (a new zellij client starts on that tab); `amail attach
+/// <group>` attaches without choosing a tab; while another client of the
+/// session is in use, attach chooses no tab and says which tab to go to.
+async fn attach_chooses_the_seat_tab(b: Backend) {
+    let Some(h) = setup(b, "attach_chooses_the_seat_tab", None).await else {
+        return;
+    };
+    let _inboxes: Vec<FakeInbox> = ["root", "gw-1", "gw-2"]
+        .iter()
+        .map(|s| inbox(&h, s))
+        .collect();
+    write_team(&h, TEAM);
+    up(&h, &[]).await;
+    for s in ["root", "g-lead", "gw-1", "gw-2"] {
+        wait_state(&h, s, "idle").await;
+    }
+    let log = h.dir.path().join("attach.log");
+    h.mux.as_ref().unwrap().set_attach_log(&log);
+    let w2 = row(&h, "gw-2").await;
+    let w1 = row(&h, "gw-1").await;
+    let session = w2.mux_session.clone();
+    assert_eq!(w1.mux_session, session);
+    assert_ne!(w1.pane, w2.pane);
+
+    // The node's answer names the session, the seat's tab and its pane.
+    let v = h
+        .node
+        .as_ref()
+        .unwrap()
+        .node
+        .handle(Request::Locate {
+            target: "gw-2".into(),
+        })
+        .await;
+    assert_eq!(v["session"], session.as_str(), "{v}");
+    assert_eq!(v["tab"], "gw-2", "{v}");
+    assert_eq!(v["pane"], json!(w2.pane), "{v}");
+    assert_eq!(v["plan"]["tab"], "gw-2", "{v}");
+
+    // A seat: its tab is chosen, then the terminal attaches.
+    let (ok, out) = cli(&h, &["attach", "gw-2"]).await;
+    assert!(ok, "{out}");
+    assert_eq!(
+        attach_log(&h),
+        vec![
+            format!("focus {session} gw-2 {}", w2.pane.unwrap()),
+            format!("attach {session}"),
+        ]
+    );
+    std::fs::remove_file(&log).unwrap();
+    let (ok, out) = cli(&h, &["attach", "gw-1"]).await;
+    assert!(ok, "{out}");
+    assert_eq!(
+        attach_log(&h),
+        vec![
+            format!("focus {session} gw-1 {}", w1.pane.unwrap()),
+            format!("attach {session}"),
+        ]
+    );
+
+    // A group: the session, no tab.
+    std::fs::remove_file(&log).unwrap();
+    let (ok, out) = cli(&h, &["attach", "g"]).await;
+    assert!(ok, "{out}");
+    assert_eq!(attach_log(&h), vec![format!("attach {session}")]);
+
+    // Another client is in use: no tab is chosen; the person is told which.
+    std::fs::remove_file(&log).unwrap();
+    std::fs::write(h.dir.path().join("attach.log.busy"), "").unwrap();
+    let (ok, out) = cli(&h, &["attach", "gw-1"]).await;
+    assert!(ok, "{out}");
+    assert_eq!(attach_log(&h), vec![format!("attach {session}")]);
+    assert!(out.contains("Go to tab \"gw-1\" yourself"), "{out}");
+
+    // Unknown target.
+    let (ok, out) = cli(&h, &["attach", "nobody"]).await;
+    assert!(!ok);
+    assert!(out.contains("no supervised seat or group"), "{out}");
+}
+
+/// A seat deleted on the server leaves the node: `amail seat rm` stops and
+/// drops it on this host's node; `amail up` drops supervised seats that
+/// were deleted elsewhere (and says so); `ps` and `down` no longer list them.
+async fn removed_seats_leave_the_node(b: Backend) {
+    let Some(h) = setup(b, "removed_seats_leave_the_node", None).await else {
+        return;
+    };
+    let _inboxes: Vec<FakeInbox> = ["root", "gw-1", "gw-2"]
+        .iter()
+        .map(|s| inbox(&h, s))
+        .collect();
+    write_team(&h, TEAM);
+    up(&h, &[]).await;
+    for s in ["root", "g-lead", "gw-1", "gw-2"] {
+        wait_state(&h, s, "idle").await;
+    }
+    let w2_pid = row(&h, "gw-2").await.pid.unwrap();
+
+    // `seat rm` on this host: the session stops, the node drops the seat.
+    let (ok, out) = cli(&h, &["seat", "rm", "gw-2"]).await;
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("removed seat gw-2; stopped it on this host"),
+        "{out}"
+    );
+    assert!(ps(&h).await.iter().all(|r| r.seat != "gw-2"));
+    wait_for("gw-2's process to end", || !alive(w2_pid)).await;
+
+    // Deleted on the server by someone else (another host, the web): the
+    // next `up` drops it.
+    let w1_pid = row(&h, "gw-1").await.pid.unwrap();
+    h.api
+        .call(reqwest::Method::DELETE, "/seats/gw-1", None)
+        .await;
+    assert!(ps(&h).await.iter().any(|r| r.seat == "gw-1"));
+    write_team(
+        &h,
+        &TEAM.replace("workers = { count = 2, prefix = \"gw\" }\n", ""),
+    );
+    let out = up(&h, &[]).await;
+    assert!(
+        out.contains("stopped and dropped seats that no longer exist on the server: gw-1"),
+        "{out}"
+    );
+    assert!(!out.contains("not in the team file"), "{out}");
+    assert!(ps(&h).await.iter().all(|r| r.seat != "gw-1"));
+    wait_for("gw-1's process to end", || !alive(w1_pid)).await;
+    let (ok, out) = cli(&h, &["ps"]).await;
+    assert!(ok, "{out}");
+    assert!(!out.contains("gw-1") && !out.contains("gw-2"), "{out}");
+    let out = up(&h, &[]).await;
+    assert!(!out.contains("gw-"), "{out}");
+    let (ok, out) = cli(&h, &["down"]).await;
+    assert!(ok, "{out}");
+    assert!(!out.contains("gw-"), "{out}");
+
+    // A seat the node does not supervise; and no node at all.
+    h.api.post("/seats", json!({"name": "loose"})).await;
+    let (ok, out) = cli(&h, &["seat", "rm", "loose"]).await;
+    assert!(ok, "{out}");
+    assert!(out.trim_end().ends_with("removed seat loose"), "{out}");
+    h.api.post("/seats", json!({"name": "loose2"})).await;
+    let none = h.dir.path().join("no-node.sock");
+    let (ok, out) = cli_sock(&h, &none, &["seat", "rm", "loose2"]).await;
+    assert!(ok, "{out}");
+    assert!(out.trim_end().ends_with("removed seat loose2"), "{out}");
 }
