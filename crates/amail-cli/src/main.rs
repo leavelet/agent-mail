@@ -673,6 +673,10 @@ struct SendOpts {
     /// 10m; default: the org's ack_timeout_min).
     #[arg(long, value_name = "DURATION", requires = "ack")]
     ack_timeout: Option<String>,
+    /// Send nothing: show who would get the message, which contact of your
+    /// org the server would add in Cc, and what would be rejected.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 impl SendOpts {
@@ -810,6 +814,27 @@ enum LinkCmd {
     Accept {
         org: String,
     },
+    /// Set your org's primary contact for a linked org (user token): the
+    /// seat the server adds in Cc when a seat that is not a contact writes
+    /// to that org. It must be open to that org.
+    Set {
+        org: String,
+        /// The seat (a contact for that org).
+        #[arg(
+            long,
+            conflicts_with = "no_primary",
+            required_unless_present = "no_primary"
+        )]
+        primary: Option<String>,
+        /// Back to the default (the user seat if it is open, else the seat
+        /// opened first).
+        #[arg(long)]
+        no_primary: bool,
+        /// Set the primary contact of this team instead (used for senders
+        /// in the team).
+        #[arg(long)]
+        team: Option<String>,
+    },
     Ls,
     Revoke {
         org: String,
@@ -900,7 +925,8 @@ enum OrgCmd {
         #[arg(long, value_parser = parse_visibility)]
         visibility: Option<p::OrgVisibility>,
         /// `any-seat` (every seat may write to linked orgs) or
-        /// `open-seats-only` (only you and the seats open to that org).
+        /// `contacts-only` (only you and your org's contacts for that org,
+        /// the seats open to it).
         #[arg(long, value_parser = parse_outbound)]
         outbound: Option<p::Outbound>,
         /// New threads to other orgs a seat may start per hour (you are
@@ -1297,8 +1323,7 @@ async fn run(cli: Cli) -> Result<()> {
                 "priority": if opts.urgent { "urgent" } else { "normal" }, "ack_required": opts.ack,
                 "ack_timeout_s": opts.ack_timeout_s()?, "body": read_body(opts.body)?,
             });
-            let v = c.raw(Method::POST, "/messages", Some(&body)).await?;
-            out.show(&v, || Ok(output::send_result(&parse(&v)?)))
+            send(&c, &out, &body, opts.dry_run).await
         }
         Cmd::Inbox { all, seat, limit } => {
             let mut q = format!("limit={limit}");
@@ -1365,8 +1390,7 @@ async fn run(cli: Cli) -> Result<()> {
                 "priority": if opts.urgent { "urgent" } else { "normal" }, "ack_required": opts.ack,
                 "body": read_body(opts.body)?,
             });
-            let v = c.raw(Method::POST, "/messages", Some(&body)).await?;
-            out.show(&v, || Ok(output::send_result(&parse(&v)?)))
+            send(&c, &out, &body, opts.dry_run).await
         }
         Cmd::Ack { id } => {
             let v = c
@@ -1717,6 +1741,16 @@ async fn run(cli: Cli) -> Result<()> {
     }
 }
 
+/// Send `body`, or with `dry_run` only preview it.
+async fn send(c: &Client, out: &Out, body: &Value, dry_run: bool) -> Result<()> {
+    if dry_run {
+        let v = c.raw(Method::POST, "/messages/preview", Some(body)).await?;
+        return out.show(&v, || Ok(output::preview_result(&parse(&v)?)));
+    }
+    let v = c.raw(Method::POST, "/messages", Some(body)).await?;
+    out.show(&v, || Ok(output::send_result(&parse(&v)?)))
+}
+
 /// Bytes in MiB: `1.5 MiB`.
 fn mib(bytes: i64) -> String {
     format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
@@ -1973,6 +2007,19 @@ async fn link_cmd(c: &Client, out: &Out, cmd: LinkCmd) -> Result<()> {
                 .await?
         }
         LinkCmd::Ls => c.raw(Method::GET, "/links", None).await?,
+        LinkCmd::Set {
+            org,
+            primary,
+            no_primary: _,
+            team,
+        } => {
+            c.raw(
+                Method::PATCH,
+                &format!("/links/{}", enc(org)),
+                Some(&json!({ "primary": primary, "team": team })),
+            )
+            .await?
+        }
         LinkCmd::Revoke { org } => {
             c.raw(Method::DELETE, &format!("/links/{}", enc(org)), None)
                 .await?
@@ -1982,6 +2029,15 @@ async fn link_cmd(c: &Client, out: &Out, cmd: LinkCmd) -> Result<()> {
         Ok(match &cmd {
             LinkCmd::Ls => lines(&parse::<Vec<p::Link>>(&v)?, output::link_line),
             LinkCmd::Revoke { org } => format!("revoked link with {org}"),
+            LinkCmd::Set {
+                org,
+                primary,
+                team: Some(t),
+                ..
+            } => match primary {
+                Some(p) => format!("team {t}'s primary contact for {org}: {p}"),
+                None => format!("team {t} uses the org's primary contact for {org}"),
+            },
             _ => output::link_line(&parse(&v)?),
         })
     })
@@ -2087,7 +2143,7 @@ fn parse_visibility(s: &str) -> Result<p::OrgVisibility, String> {
 
 fn parse_outbound(s: &str) -> Result<p::Outbound, String> {
     s.parse()
-        .map_err(|_| format!("{s:?}: expected any-seat or open-seats-only"))
+        .map_err(|_| format!("{s:?}: expected any-seat or contacts-only"))
 }
 
 fn parse_permission_mode(s: &str) -> Result<p::PermissionMode, String> {

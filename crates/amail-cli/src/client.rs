@@ -44,6 +44,15 @@ impl std::fmt::Display for ApiError {
         {
             write!(f, "\n{}", crate::output::UNREACHABLE)?;
         }
+        if self
+            .body
+            .error
+            .rejected
+            .iter()
+            .any(|r| r.reason == "thread_closed")
+        {
+            write!(f, "\n{}", crate::output::THREAD_CLOSED)?;
+        }
         Ok(())
     }
 }

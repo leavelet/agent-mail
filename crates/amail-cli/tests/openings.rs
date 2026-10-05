@@ -1,6 +1,7 @@
 //! What one org opens to another, through the `amail` command line: `open`,
 //! `close`, `openings`, `team`, `org show [<org>]`, `who --search/--org`,
-//! link notes, masked recipients and the one-time org notice. Two orgs on
+//! link notes, primary contacts, the contact added in Cc, lists on
+//! cross-org mail and the one-time org notice. Two orgs on
 //! an in-process server; every test runs on SQLite and (with
 //! `AMAIL_TEST_PG_URL`) Postgres.
 
@@ -349,7 +350,7 @@ async fn open_close_and_the_view_from_both_sides(b: Backend) {
         .await;
     assert!(err.contains("no_contacts"), "{err}");
 
-    // Mail: Cc of a closed seat is masked for beta, in text and JSON.
+    // Mail: nobody on a cross-org message is hidden.
     let out = e.run(&beta, &["open", "bob", "--to", "acme"]).await;
     assert!(out.contains("acme now sees: bob"), "{out}");
     let sent = e
@@ -360,33 +361,31 @@ async fn open_close_and_the_view_from_both_sides(b: Backend) {
             ],
         )
         .await;
-    // "sent #12 thread 10 ..."
-    let id: i64 = sent
-        .split('#')
-        .nth(1)
-        .unwrap()
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .parse()
-        .unwrap();
+    // api is a contact: nothing is added.
+    assert!(!sent.contains("added"), "{sent}");
+    let id = msg_id(&sent);
     let read = e.run(&bob, &["read", &id.to_string()]).await;
-    assert!(
-        read.contains("To: bob\nCc: 1 recipient not shown\n"),
-        "{read}"
-    );
+    assert!(read.contains("To: bob\nCc: secret@acme\n"), "{read}");
     let j = e.json(&bob, &["read", &id.to_string(), "--peek"]).await;
-    assert_eq!(j["message"]["cc"], serde_json::json!([]), "{j}");
-    assert_eq!(j["message"]["cc_hidden"], 1, "{j}");
-    assert!(!j.to_string().contains("secret"), "{j}");
+    assert_eq!(
+        j["message"]["cc"],
+        serde_json::json!(["secret@acme"]),
+        "{j}"
+    );
     let thread = e.run(&bob, &["thread", &id.to_string()]).await;
-    assert!(thread.contains("Cc: 1 recipient not shown"), "{thread}");
-    // Acme sees its own Cc.
-    let own = e.run(&acme, &["read", &id.to_string(), "--peek"]).await;
-    assert!(own.contains("Cc: secret\n"), "{own}");
-    // Bob may answer api; secret is unreachable, explained in one line.
-    e.run(&bob, &["reply", &id.to_string(), "-m", "Thanks."])
+    assert!(
+        thread.contains("seats of other orgs in this thread (you may answer them here):")
+            && thread.contains("card secret@acme agent description=\"Internal only.\""),
+        "{thread}"
+    );
+    // secret is on the thread now: bob may answer it there, not elsewhere.
+    let back = e
+        .run(&bob, &["reply", &id.to_string(), "--all", "-m", "Thanks."])
         .await;
+    assert!(
+        back.contains("api@acme=1") && back.contains("secret@acme=1"),
+        "{back}"
+    );
     let out = e
         .fails(&bob, &["send", "--to", "secret@acme", "-s", "x", "-m", "y"])
         .await;
@@ -404,6 +403,115 @@ async fn open_close_and_the_view_from_both_sides(b: Backend) {
     assert!(
         out.contains("rejected secret@acme: unreachable\n(unreachable: "),
         "{out}"
+    );
+
+    // A seat that is not a contact writes out: the primary contact is
+    // added in Cc (shown before sending with --dry-run).
+    let helper = e.seat_token(&acme, "helper").await;
+    let dry = e
+        .run(
+            &helper,
+            &[
+                "send",
+                "--to",
+                "bob@beta",
+                "-s",
+                "Q",
+                "-m",
+                "?",
+                "--dry-run",
+            ],
+        )
+        .await;
+    assert!(
+        dry.starts_with("not sent (dry run); would reach 2 seats: bob@beta=1\ncc: owner (added: your org's contact for beta;"),
+        "{dry}"
+    );
+    let j = e
+        .json(
+            &helper,
+            &[
+                "send",
+                "--to",
+                "bob@beta",
+                "-s",
+                "Q",
+                "-m",
+                "?",
+                "--dry-run",
+            ],
+        )
+        .await;
+    assert!(
+        j["recipients"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["address"] == "owner" && r["added"] == true),
+        "{j}"
+    );
+    let err = e
+        .fails(&acme, &["link", "set", "beta", "--primary", "secret"])
+        .await;
+    assert!(err.contains("not_a_contact"), "{err}");
+    let set = e
+        .run(&acme, &["link", "set", "beta", "--primary", "api"])
+        .await;
+    assert!(
+        set.contains("link beta active since ") && set.contains(" primary=api"),
+        "{set}"
+    );
+    assert!(
+        e.run(&acme, &["link", "ls"]).await.contains(" primary=api"),
+        "link ls"
+    );
+    let v = e.run(&acme, &["org", "show", "beta"]).await;
+    assert!(v.contains("your primary contact for beta: api ("), "{v}");
+    let sent = e
+        .run(&helper, &["send", "--to", "bob@beta", "-s", "Q", "-m", "?"])
+        .await;
+    assert!(
+        sent.contains(": bob@beta=1\ncc: api (added: your org's contact for beta;"),
+        "{sent}"
+    );
+    let read = e
+        .run(&bob, &["read", &msg_id(&sent).to_string(), "--peek"])
+        .await;
+    assert!(read.contains("To: bob\nCc: api@acme\n"), "{read}");
+    // A team's own primary contact.
+    let out = e
+        .run(
+            &acme,
+            &["link", "set", "beta", "--primary", "api", "--team", "core"],
+        )
+        .await;
+    assert_eq!(out.trim(), "team core's primary contact for beta: api");
+    let t = e.run(&acme, &["team", "show", "core"]).await;
+    assert!(t.contains(" primary=beta:api"), "{t}");
+    e.run(&acme, &["link", "set", "beta", "--no-primary"]).await;
+    assert!(
+        e.run(&acme, &["link", "ls"])
+            .await
+            .contains(" primary=owner"),
+        "default primary"
+    );
+    // Lists hold own seats only and are refused on cross-org mail.
+    e.run(&acme, &["list", "create", "devs"]).await;
+    e.run(&acme, &["list", "add", "devs", "api"]).await;
+    let err = e.fails(&acme, &["list", "add", "devs", "bob@beta"]).await;
+    assert!(
+        err.contains("local_only") && err.contains("a list holds seats of its own org only"),
+        "{err}"
+    );
+    let err = e
+        .fails(
+            &api,
+            &["send", "--to", "bob@beta,devs", "-s", "x", "-m", "y"],
+        )
+        .await;
+    assert!(
+        err.contains("list_on_cross_org") && err.contains("name the seats"),
+        "{err}"
     );
 
     // Closing.
@@ -433,7 +541,7 @@ async fn open_close_and_the_view_from_both_sides(b: Backend) {
     let v = e.run(&bob, &["who", "--org", "acme"]).await;
     assert!(
         v.contains(
-            "open to you (mail these as name@org):\n  card owner@acme user\nyou open to them:"
+            "open to you (mail these as name@org):\n  card owner@acme user\nyour primary contact for acme: boss"
         ),
         "{v}"
     );
@@ -442,6 +550,23 @@ async fn open_close_and_the_view_from_both_sides(b: Backend) {
         .fails(&bob, &["send", "--to", "api@acme", "-s", "x", "-m", "y"])
         .await;
     assert!(out.contains("unreachable"), "{out}");
+    // Acme has no contact left on the first thread: closed both ways.
+    let out = e
+        .fails(&bob, &["reply", &id.to_string(), "-m", "Still there?"])
+        .await;
+    assert!(
+        out.contains("rejected api@acme: thread_closed") && out.contains("(thread_closed: "),
+        "{out}"
+    );
+    // No contact at all: refused, with the reason.
+    e.run(&acme, &["close", "owner"]).await;
+    let out = e
+        .fails(&secret, &["send", "--to", "bob@beta", "-s", "x", "-m", "y"])
+        .await;
+    assert!(
+        out.contains("no_contact") && out.contains("your org has no contact for beta"),
+        "{out}"
+    );
 
     // Every change was told to the user.
     let subjects = e.system_subjects(&acme).await;
@@ -451,6 +576,7 @@ async fn open_close_and_the_view_from_both_sides(b: Backend) {
         "Openings changed: secret opened to gamma",
         "Openings changed: api closed to linked",
         "Openings changed: core closed to beta",
+        "Primary contact for beta changed",
     ] {
         assert!(
             subjects.iter().any(|s| s == want),
@@ -485,7 +611,7 @@ async fn org_settings_and_the_notice(b: Backend) {
                 "--visibility",
                 "hidden",
                 "--outbound",
-                "open-seats-only",
+                "contacts-only",
                 "--new-threads-per-hour",
                 "3",
             ],
@@ -502,7 +628,7 @@ async fn org_settings_and_the_notice(b: Backend) {
         "{show}"
     );
     assert!(
-        show.contains("visibility=hidden outbound=open-seats-only new_threads_per_hour=3"),
+        show.contains("visibility=hidden outbound=contacts-only new_threads_per_hour=3"),
         "{show}"
     );
     assert!(show.contains("\nlinks: none"), "{show}");
@@ -532,6 +658,15 @@ async fn org_settings_and_the_notice(b: Backend) {
         subjects.iter().any(|s| s == "Org settings changed"),
         "{subjects:?}"
     );
+}
+
+/// The id in "sent #12 thread 10 ...".
+fn msg_id(sent: &str) -> i64 {
+    sent.split('#')
+        .nth(1)
+        .and_then(|x| x.split_whitespace().next())
+        .and_then(|x| x.parse().ok())
+        .unwrap_or_else(|| panic!("no id in {sent:?}"))
 }
 
 /// Give org `org` a one-time notice, as the migration does.
