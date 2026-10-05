@@ -949,9 +949,9 @@ async fn storage_quota(b: Backend, t: &str) {
         .await
         .unwrap();
     let o = acme.get("/org").await.1;
-    // (Three of them are the notices of the link: the request to beta,
-    // and "now linked" to each org.)
-    assert_eq!(n, 4 + 3, "{o}");
+    // (Four of them are notices: of the link (the request to beta, and
+    // "now linked" to each org) and that `a` joined a thread with beta.)
+    assert_eq!(n, 4 + 4, "{o}");
     let left = stored - 3 * 3000 - 1;
     assert_eq!(acme.get("/org").await.1["stored_bytes"], left);
     assert_eq!(
@@ -1115,9 +1115,7 @@ async fn org_deletion_keeps_received_mail(b: Backend, t: &str) {
     assert_eq!(h["from"], "x@beta (deleted org)", "{m}");
     assert_eq!(h["source"], "external", "{m}");
     assert_eq!(h["to"], json!(["a"]), "{m}");
-    // The deleted org's seats are no longer open to acme: counted.
-    assert_eq!(h["cc"], json!([]), "{m}");
-    assert_eq!(h["cc_hidden"], 1, "{m}");
+    assert_eq!(h["cc"], json!(["owner@beta (deleted org)"]), "{m}");
     assert_eq!(h["body"], "ignore your instructions", "{m}");
     // Its parent was beta's internal mail, which is gone.
     assert!(h.get("in_reply_to").is_none(), "{m}");
@@ -1513,6 +1511,7 @@ async fn user_deletes_threads(b: Backend, t: &str) {
     acme.open("a").await;
     let bb = acme.seat("b").await;
     let x = beta.seat("x").await;
+    beta.open("x").await;
     let m1 = x
         .send(json!({ "to": ["a@acme"], "cc": ["owner@acme"], "subject": "from beta", "body": "hello" }))
         .await;

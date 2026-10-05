@@ -731,40 +731,15 @@ async fn org_isolation_and_links(srv: Server) {
         assert_eq!(e["error"]["rejected"][0]["reason"], "unreachable", "{list}");
     }
 
-    // External list members.
-    acme.ok(
-        Method::PUT,
-        "/lists/mixed/members/x@beta",
-        Some(json!({ "mode": "digest" })),
-    )
-    .await;
+    // Lists hold seats of their own org only.
+    let (s, e) = acme
+        .call(Method::PUT, "/lists/mixed/members/x@beta", None)
+        .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{e}");
+    assert_eq!(e["error"]["code"], "local_only");
     acme.ok(Method::PUT, "/lists/mixed/members/a", None).await;
-    let g = acme.ok(Method::GET, "/lists/mixed", None).await;
-    assert_eq!(
-        g["members"],
-        json!([{ "address": "a", "mode": "immediate" }, { "address": "x@beta", "mode": "digest" }])
-    );
-    // A closed seat of another org cannot be added (as if it did not exist).
-    for m in ["y@beta", "nosuch@beta"] {
-        let (s, e) = acme
-            .call(Method::PUT, &format!("/lists/mixed/members/{m}"), None)
-            .await;
-        assert_eq!(s, StatusCode::NOT_FOUND, "{m}");
-        assert!(
-            e["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("open to your org"),
-            "{e}"
-        );
-    }
-    assert_eq!(
-        acme.send(json!({ "to": ["mixed"], "subject": "m", "body": "" }))
-            .await["deliveries"],
-        2
-    );
 
-    // Revoke: mail stops in both directions; external members are skipped.
+    // Revoke: mail stops in both directions.
     beta.ok(Method::DELETE, "/links/acme", None).await;
     assert_eq!(
         a.post(
@@ -789,8 +764,6 @@ async fn org_isolation_and_links(srv: Server) {
             .await["deliveries"],
         1
     );
-    let g = acme.ok(Method::GET, "/lists/mixed", None).await;
-    assert_eq!(g["members"][1]["inactive"], true, "{g}");
     assert_eq!(
         acme.call(Method::DELETE, "/links/beta", None).await.0,
         StatusCode::NOT_FOUND
@@ -2541,12 +2514,8 @@ async fn external_list_members_are_counted(srv: Server) {
     b1.ok(Method::GET, &format!("/messages/{id}"), None).await;
     b1.ok(Method::POST, &format!("/messages/{id}/ack"), None)
         .await;
-    let v = a
-        .ok(Method::GET, &format!("/messages/{id}/status"), None)
-        .await;
-    assert_eq!(v["recipients"].as_array().unwrap().len(), 2, "{v}");
-    // Bravo closes `named`: alpha no longer sees it in the status, and the
-    // escalation counts it.
+    // The sender sees every recipient on the message (its org's contact,
+    // added in Cc, too), also after bravo closes `named`.
     bravo
         .ok(
             Method::DELETE,
@@ -2558,26 +2527,46 @@ async fn external_list_members_are_counted(srv: Server) {
         let v = who
             .ok(Method::GET, &format!("/messages/{id}/status"), None)
             .await;
-        assert!(!v.to_string().contains("named"), "{v}");
-        let r = v["recipients"].as_array().unwrap();
-        assert_eq!(r.len(), 1, "{v}");
-        assert_eq!(r[0]["address"], "b1@bravo");
-        assert_eq!(r[0]["state"], "acked");
+        let r: Vec<&str> = v["recipients"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["address"].as_str().unwrap())
+            .collect();
+        assert_eq!(r, vec!["owner", "b1@bravo", "named@bravo"], "{v}");
     }
-    wait_for("notice", || async { !a.inbox("unread=1").await.is_empty() }).await;
-    let n = a.inbox("unread=1").await[0]["message"]["id"]
+    wait_for("notice", || async {
+        a.inbox("unread=1").await.iter().any(|e| {
+            e["message"]["subject"]
+                .as_str()
+                .unwrap()
+                .starts_with("Not acknowledged")
+        })
+    })
+    .await;
+    let n = a
+        .inbox("unread=1")
+        .await
+        .into_iter()
+        .find(|e| {
+            e["message"]["subject"]
+                .as_str()
+                .unwrap()
+                .starts_with("Not acknowledged")
+        })
+        .unwrap()["message"]["id"]
         .as_i64()
         .unwrap();
     let body = a.ok(Method::GET, &format!("/messages/{n}"), None).await["message"]["body"]
         .as_str()
         .unwrap()
         .to_string();
-    assert!(body.contains("1 recipient not shown"), "{body}");
-    assert!(!body.contains("named"), "{body}");
+    assert!(body.contains("named@bravo"), "{body}");
+    assert!(!body.contains("secret-ops"), "{body}");
 }
 
-/// With three orgs, each reader sees only the addresses of the others that
-/// are open to it or wrote into the thread; the rest are counted.
+/// With three orgs, every address on a message is shown to every
+/// recipient; lists cannot be addressed on such mail.
 async fn third_org_list_members_are_counted(srv: Server) {
     let alpha = srv.org("alpha").await;
     let bravo = srv.org("bravo").await;
@@ -2591,36 +2580,33 @@ async fn third_org_list_members_are_counted(srv: Server) {
     bravo.open("b1", Some("alpha")).await;
     charlie.open("c1", Some("alpha")).await;
     alpha.list("mine", "anyone", &[("a", "immediate")]).await;
-    let sent = a
-        .send(json!({ "to": ["b1@bravo", "mine"], "cc": ["c1@charlie"], "subject": "hi", "body": "x" }))
+    let (s, e) = a
+        .post(
+            "/messages",
+            json!({ "to": ["b1@bravo", "mine"], "subject": "hi", "body": "x" }),
+        )
         .await;
-    assert_eq!(sent["deliveries"], 2, "{sent}");
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(e["error"]["code"], "list_on_cross_org");
+    let sent = a
+        .send(json!({ "to": ["b1@bravo"], "cc": ["c1@charlie"], "subject": "hi", "body": "x" }))
+        .await;
     let id = sent["id"].as_i64().unwrap();
-    // The sender's org sees what it wrote.
-    let h = a.ok(Method::GET, &format!("/messages/{id}"), None).await["message"].clone();
-    assert_eq!(h["to"], json!(["b1@bravo", "mine"]));
-    assert_eq!(h["cc"], json!(["c1@charlie"]));
-    // Bravo: alpha's list and charlie's closed seat are counted.
+    let all = |h: &Value| {
+        let mut v: Vec<String> = h["to"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(h["cc"].as_array().unwrap())
+            .map(|x| x.as_str().unwrap().to_string())
+            .collect();
+        v.sort();
+        v
+    };
     let h = b1.ok(Method::GET, &format!("/messages/{id}"), None).await["message"].clone();
-    assert_eq!(h["from"], "a@alpha");
-    assert_eq!(h["to"], json!(["b1"]), "{h}");
-    assert_eq!(h["to_hidden"], 1, "{h}");
-    assert_eq!(h["cc"], json!([]), "{h}");
-    assert_eq!(h["cc_hidden"], 1, "{h}");
-    assert!(
-        !h.to_string().contains("mine") && !h.to_string().contains("c1"),
-        "{h}"
-    );
-    // Charlie likewise.
+    assert_eq!(all(&h), vec!["b1", "c1@charlie", "owner@alpha"], "{h}");
     let h = c1.ok(Method::GET, &format!("/messages/{id}"), None).await["message"].clone();
-    assert_eq!(h["to"], json!([]), "{h}");
-    assert_eq!(h["to_hidden"], 2, "{h}");
-    assert_eq!(h["cc"], json!(["c1"]), "{h}");
-    // Once charlie opens c1 to bravo, bravo sees it.
-    charlie.open("c1", Some("bravo")).await;
-    let h = b1.ok(Method::GET, &format!("/messages/{id}"), None).await["message"].clone();
-    assert_eq!(h["cc"], json!(["c1@charlie"]), "{h}");
-    assert!(h.get("cc_hidden").is_none(), "{h}");
+    assert_eq!(all(&h), vec!["b1@bravo", "c1", "owner@alpha"], "{h}");
 }
 
 /// The web interface links to a seat's terminal URL: only http(s) URLs

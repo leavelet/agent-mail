@@ -1301,8 +1301,6 @@ async fn user_deletes_own_org(b: Backend, t: &str) {
     acme.ok(Method::PUT, "/lists/mixed/members/a", None).await;
     beta.ok(Method::POST, "/lists", Some(json!({ "name": "partners" })))
         .await;
-    beta.ok(Method::PUT, "/lists/partners/members/a@acme", None)
-        .await;
     beta.ok(Method::PUT, "/lists/partners/members/x", None)
         .await;
     a.send(json!({ "to": ["owner"], "subject": "searchable zebra", "body": "zebra body" }))
@@ -1340,8 +1338,8 @@ async fn user_deletes_own_org(b: Backend, t: &str) {
     for c in [&acme, &a] {
         assert_eq!(c.get("/whoami").await.0, StatusCode::UNAUTHORIZED);
     }
-    // Beta: its list lost the external member; its mail to acme stays in
-    // its archive (sent by beta), now delivered to nobody in acme.
+    // Beta: its list is unchanged; its mail to acme stays in its archive
+    // (sent by beta), now delivered to nobody in acme.
     let l = beta.ok(Method::GET, "/lists/partners", None).await;
     assert_eq!(
         l["members"],
@@ -2269,11 +2267,12 @@ async fn org_settings_bounded(b: Backend, t: &str) {
     );
 }
 
-/// Links without their `since` times.
+/// Links without their `since` times and primary contacts.
 fn no_since(mut v: Value) -> Value {
     for l in v.as_array_mut().into_iter().flatten() {
         if let Some(o) = l.as_object_mut() {
             o.remove("since");
+            o.remove("primary");
         }
     }
     v

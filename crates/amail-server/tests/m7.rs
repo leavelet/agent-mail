@@ -42,12 +42,12 @@ m7_tests!(
     teams_open_their_contacts,
     descriptions_and_cards,
     peer_org_view,
-    thread_participants,
-    closing_holds_in_existing_threads,
-    link_end_closes_both_directions,
-    outbound_open_seats_only,
-    lists_across_orgs,
-    masking_on_every_read_path,
+    contact_added_and_participants,
+    primary_contacts,
+    thread_closes_without_contacts,
+    outbound_contacts_only,
+    lists_stay_inside,
+    no_hidden_recipients,
     new_thread_budget,
     hidden_orgs,
     notices_for_every_change,
@@ -594,65 +594,219 @@ async fn peer_org_view(srv: Server) {
     assert_eq!(s, StatusCode::NOT_FOUND, "{v}");
 }
 
-/// A closed seat that writes to an open seat of another org becomes a
-/// participant of that thread only.
-async fn thread_participants(srv: Server) {
+/// The invariant: a seat that is not a contact writes out; its org's
+/// primary contact is added in Cc; the other side answers both in the
+/// thread, cannot start a new thread to the non-contact and does not see it
+/// among the org's cards; introducing works for one's own colleagues only;
+/// the user is told once per seat and thread.
+async fn contact_added_and_participants(srv: Server) {
     let a = srv.org("alpha").await;
     let b = srv.org("bravo").await;
-    let closed = a.seat("closed").await;
+    let x = a.seat("x").await;
+    a.seat("z").await;
+    let o = b.seat("o").await;
+    b.seat("q").await;
     a.ok(
         Method::PATCH,
-        "/seats/closed",
+        "/seats/x",
         Some(json!({ "description": "Asks about parsers." })),
     )
     .await;
-    let contact = b.seat("contact").await;
     a.link(&b, "bravo", "alpha").await;
-    b.open("contact", None).await;
-    let first = closed
-        .sent(json!({ "to": ["contact@bravo"], "subject": "q", "body": "?" }))
+    b.open("o", None).await;
+    let r = x
+        .send(json!({ "to": ["o@bravo"], "subject": "q", "body": "?" }))
         .await;
-    // The other side replies in the thread.
-    let reply = contact
-        .sent(json!({ "to": ["closed@alpha"], "subject": "a", "body": "!", "in_reply_to": first }))
+    let added: Vec<&Value> = r["recipients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|x| x["added"] == true)
+        .collect();
+    assert_eq!(added.len(), 1, "{r}");
+    assert_eq!(added[0]["address"], "owner");
+    let first = r["id"].as_i64().unwrap();
+    // The stored message shows it, in Cc, to everyone on it.
+    let h = o
+        .ok(Method::GET, &format!("/messages/{first}?peek=1"), None)
+        .await["message"]
+        .clone();
+    assert_eq!(h["to"], json!(["o"]));
+    assert_eq!(h["cc"], json!(["owner@alpha"]));
+    assert_eq!(h["from"], "x@alpha");
+    let mine = x.ok(Method::GET, &format!("/messages/{first}"), None).await["message"].clone();
+    assert_eq!(mine["cc"], json!(["owner"]));
+    // The added contact gets class cc (not woken).
+    let st = x
+        .ok(Method::GET, &format!("/messages/{first}/status"), None)
         .await;
-    // Another seat of bravo, in the same thread (it can read it once it
-    // is in it): bravo's user sees the thread.
-    let t = b.ok(Method::GET, &format!("/threads/{first}"), None).await;
-    assert_eq!(t["participants"][0]["address"], "closed@alpha", "{t}");
-    assert_eq!(t["participants"][0]["description"], "Asks about parsers.");
-    b.send(json!({ "to": ["closed@alpha"], "subject": "b", "body": "", "in_reply_to": reply }))
+    let owner = st["recipients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["address"] == "owner")
+        .unwrap()
+        .clone();
+    assert_eq!(owner["class"], "cc", "{st}");
+    // The sender sees every recipient's state, in both orgs.
+    assert!(st.to_string().contains("o@bravo"), "{st}");
+    // The thread's participants, with the non-contact's card.
+    let t = o.ok(Method::GET, &format!("/threads/{first}"), None).await;
+    let parts: Vec<&str> = t["participants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["address"].as_str().unwrap())
+        .collect();
+    assert_eq!(parts, vec!["owner@alpha", "x@alpha"], "{t}");
+    assert_eq!(t["participants"][1]["description"], "Asks about parsers.");
+    // The other side replies to both in the thread.
+    let reply = o
+        .sent(json!({ "to": ["x@alpha"], "cc": ["owner@alpha"], "subject": "a", "body": "!", "in_reply_to": first }))
         .await;
-    // No new thread to it, and it is not in bravo's view of alpha.
-    assert_eq!(
-        contact.refused(to_body(&["closed@alpha"])).await,
-        "unreachable"
-    );
+    // No new thread to the non-contact; not among alpha's cards.
+    assert_eq!(o.refused(to_body(&["x@alpha"])).await, "unreachable");
     let v = b.ok(Method::GET, "/orgs/alpha", None).await;
-    assert!(!v.to_string().contains("closed"), "{v}");
-    // A reply that names a field the client made up does not help: the
-    // thread is taken from the message replied to.
-    let other = closed
-        .sent(json!({ "to": ["contact@bravo"], "subject": "q2", "body": "" }))
+    assert!(!v.to_string().contains("x@alpha"), "{v}");
+    // Introducing: x adds its colleague z; z is a participant then.
+    let r2 = x
+        .send(json!({ "to": ["o@bravo"], "cc": ["z"], "subject": "b", "body": "", "in_reply_to": reply }))
         .await;
-    assert_ne!(other, first);
-    // Participation is per thread: a thread the closed seat did not write
-    // into does not reach it.
-    let t2 = b
-        .sent(json!({ "to": ["owner@alpha"], "subject": "t2", "body": "" }))
+    // (x is no contact; the primary contact is added again.)
+    assert!(r2.to_string().contains("\"added\":true"), "{r2}");
+    o.send(json!({ "to": ["z@alpha"], "subject": "c", "body": "", "in_reply_to": r2["id"] }))
         .await;
-    let (s, v) = b
+    // Nobody adds the other org's seat that is neither contact nor
+    // participant.
+    let (s, v) = x
         .post(
             "/messages",
-            json!({ "to": ["closed@alpha"], "subject": "x", "body": "", "in_reply_to": t2 }),
+            json!({ "to": ["q@bravo"], "subject": "d", "body": "", "in_reply_to": reply }),
         )
         .await;
     assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
     assert_eq!(v["error"]["rejected"][0]["reason"], "unreachable");
+    // The user was told once about x and once about z.
+    let n = a.notices().await;
+    let about = |who: &str| {
+        n.iter()
+            .filter(|s| s.starts_with(&format!("Seat {who} takes part")))
+            .count()
+    };
+    assert_eq!((about("x"), about("z")), (1, 1), "{n:?}");
+    // Bravo's contact is a contact: no notice in bravo.
+    assert!(!b.notices().await.iter().any(|s| s.contains("takes part")));
 }
 
-/// Closing a seat closes it at once, in existing threads too.
-async fn closing_holds_in_existing_threads(srv: Server) {
+/// The primary contact: the team's, else the org's (set per linked org),
+/// else the user seat if open, else the seat opened first. With no contact
+/// at all the send is refused with a reason that says so.
+async fn primary_contacts(srv: Server) {
+    let a = srv.org("alpha").await;
+    let b = srv.org("bravo").await;
+    b.seat("o").await;
+    a.link(&b, "bravo", "alpha").await;
+    b.open("o", None).await;
+    for (s, t) in [
+        ("w", Some("core")),
+        ("lead", Some("core")),
+        ("front", None),
+        ("solo", None),
+    ] {
+        a.ok(
+            Method::POST,
+            "/seats",
+            Some(json!({ "name": s, "group": t })),
+        )
+        .await;
+    }
+    let w = a.token_for("w").await;
+    let solo = a.token_for("solo").await;
+    let added = |v: &Value| {
+        v["recipients"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|x| x["added"] == true)
+            .map(|x| x["address"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    // Default: the user seat (open).
+    assert_eq!(added(&w.send(to_body(&["o@bravo"])).await), vec!["owner"]);
+    // The user closes the user seat: the seat opened first.
+    let user = a.ok(Method::GET, "/grants", None).await[0].clone();
+    a.ok(Method::DELETE, &format!("/grants/{}", user["id"]), None)
+        .await;
+    a.open("front", None).await;
+    a.open("lead", Some("bravo")).await;
+    assert_eq!(added(&w.send(to_body(&["o@bravo"])).await), vec!["front"]);
+    // The org's primary for bravo.
+    let l = a
+        .ok(
+            Method::PATCH,
+            "/links/bravo",
+            Some(json!({ "primary": "lead" })),
+        )
+        .await;
+    assert_eq!(l["primary"], "lead");
+    assert_eq!(added(&solo.send(to_body(&["o@bravo"])).await), vec!["lead"]);
+    // A team's primary, for senders in that team.
+    a.ok(
+        Method::PATCH,
+        "/links/bravo",
+        Some(json!({ "primary": "front", "team": "core" })),
+    )
+    .await;
+    assert_eq!(added(&w.send(to_body(&["o@bravo"])).await), vec!["front"]);
+    assert_eq!(added(&solo.send(to_body(&["o@bravo"])).await), vec!["lead"]);
+    let t = a.ok(Method::GET, "/teams/core", None).await;
+    assert_eq!(t["primaries"], json!([{ "org": "bravo", "seat": "front" }]));
+    // Only seats open to that org.
+    let (s, v) = a
+        .call(
+            Method::PATCH,
+            "/links/bravo",
+            Some(json!({ "primary": "solo" })),
+        )
+        .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+    assert_eq!(v["error"]["code"], "not_a_contact");
+    // A contact sending, or a contact on the message: nothing added.
+    let lead = a.token_for("lead").await;
+    assert!(added(&lead.send(to_body(&["o@bravo"])).await).is_empty());
+    assert!(
+        added(
+            &solo
+                .send(json!({ "to": ["o@bravo"], "cc": ["front"], "subject": "s", "body": "" }))
+                .await
+        )
+        .is_empty()
+    );
+    // The preview says what would be added, sending nothing.
+    let n = b.ok(Method::GET, "/inbox", None).await;
+    let pv = solo
+        .ok(
+            Method::POST,
+            "/messages/preview",
+            Some(to_body(&["o@bravo"])),
+        )
+        .await;
+    assert_eq!(added(&pv), vec!["lead"]);
+    assert_eq!(b.ok(Method::GET, "/inbox", None).await, n);
+    // No contact at all.
+    for g in a.ok(Method::GET, "/grants", None).await.as_array().unwrap() {
+        a.ok(Method::DELETE, &format!("/grants/{}", g["id"]), None)
+            .await;
+    }
+    let (s, v) = solo.post("/messages", to_body(&["o@bravo"])).await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+    assert_eq!(v["error"]["code"], "no_contact");
+    assert!(v["error"]["message"].as_str().unwrap().contains("bravo"));
+}
+
+/// Once an org has no contact left on a thread, or the link ends, no new
+/// message can be sent on the thread in either direction.
+async fn thread_closes_without_contacts(srv: Server) {
     let a = srv.org("alpha").await;
     let b = srv.org("bravo").await;
     let x = a.seat("x").await;
@@ -665,45 +819,27 @@ async fn closing_holds_in_existing_threads(srv: Server) {
     let r = o
         .sent(json!({ "to": ["x@alpha"], "subject": "a", "body": "", "in_reply_to": first }))
         .await;
-    x.send(json!({ "to": ["o@bravo"], "subject": "b", "body": "", "in_reply_to": r }))
-        .await;
+    // Bravo closes its only contact on the thread.
     let closed = b.close(&g).await;
     assert_eq!(
         closed["changes"],
         json!([{ "org": "alpha", "loses": ["o"] }])
     );
-    let (s, v) = x
-        .post(
-            "/messages",
-            json!({ "to": ["o@bravo"], "subject": "c", "body": "", "in_reply_to": r }),
-        )
-        .await;
-    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
-    assert_eq!(v["error"]["rejected"][0]["reason"], "unreachable");
-    // Stored mail stays; o may still write in the thread, which makes it
-    // a participant again.
+    for (who, to, parent) in [(&x, "o@bravo", r), (&o, "x@alpha", first)] {
+        let (s, v) = who
+            .post(
+                "/messages",
+                json!({ "to": [to], "subject": "z", "body": "", "in_reply_to": parent }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+        assert_eq!(v["error"]["rejected"][0]["reason"], "thread_closed", "{v}");
+    }
+    // Stored mail stays.
     assert_eq!(x.get(&format!("/messages/{r}")).await.0, StatusCode::OK);
-    let r2 = o
-        .sent(json!({ "to": ["x@alpha"], "subject": "again", "body": "", "in_reply_to": r }))
-        .await;
-    x.send(json!({ "to": ["o@bravo"], "subject": "d", "body": "", "in_reply_to": r2 }))
-        .await;
-}
-
-/// Ending the link stops mail both ways, in existing threads too; a new
-/// link starts without the old participants.
-async fn link_end_closes_both_directions(srv: Server) {
-    let a = srv.org("alpha").await;
-    let b = srv.org("bravo").await;
-    let x = a.seat("x").await;
-    let o = b.seat("o").await;
-    a.link(&b, "bravo", "alpha").await;
+    // Open again: the thread goes on. The link ends: not_linked both ways.
     b.open("o", None).await;
-    let first = x
-        .sent(json!({ "to": ["o@bravo"], "subject": "q", "body": "" }))
-        .await;
-    let r = o
-        .sent(json!({ "to": ["x@alpha"], "subject": "a", "body": "", "in_reply_to": first }))
+    x.send(json!({ "to": ["o@bravo"], "subject": "b", "body": "", "in_reply_to": r }))
         .await;
     a.ok(Method::DELETE, "/links/bravo", None).await;
     for (who, to, parent) in [(&x, "o@bravo", r), (&o, "x@alpha", first)] {
@@ -716,25 +852,11 @@ async fn link_end_closes_both_directions(srv: Server) {
         assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
         assert_eq!(v["error"]["rejected"][0]["reason"], "not_linked");
     }
-    // Linked again: the participant does not carry over; the grant applies
-    // again, and once x writes into the thread it is a participant again.
-    a.link(&b, "bravo", "alpha").await;
-    let (s, v) = o
-        .post(
-            "/messages",
-            json!({ "to": ["x@alpha"], "subject": "z", "body": "", "in_reply_to": first }),
-        )
-        .await;
-    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
-    x.send(json!({ "to": ["o@bravo"], "subject": "z", "body": "", "in_reply_to": r }))
-        .await;
-    o.send(json!({ "to": ["x@alpha"], "subject": "z", "body": "", "in_reply_to": first }))
-        .await;
 }
 
-/// `outbound = open-seats-only`: only the user and seats open to the
+/// `outbound = contacts-only`: only the user and the org's contacts for the
 /// receiving org may write to it; every seat still sees the cards.
-async fn outbound_open_seats_only(srv: Server) {
+async fn outbound_contacts_only(srv: Server) {
     let a = srv.org("alpha").await;
     let b = srv.org("bravo").await;
     let x = a.seat("x").await;
@@ -746,7 +868,7 @@ async fn outbound_open_seats_only(srv: Server) {
     a.ok(
         Method::PATCH,
         "/org",
-        Some(json!({ "outbound": "open-seats-only" })),
+        Some(json!({ "outbound": "contacts-only" })),
     )
     .await;
     assert_eq!(x.refused(to_body(&["o@bravo"])).await, "unreachable");
@@ -754,7 +876,6 @@ async fn outbound_open_seats_only(srv: Server) {
     a.send(to_body(&["o@bravo"])).await;
     let v = x.ok(Method::GET, "/orgs/bravo", None).await;
     assert_eq!(v["open_to_you"].as_array().unwrap().len(), 2, "{v}");
-    // Inside the org nothing changes.
     x.send(to_body(&["open"])).await;
     a.ok(
         Method::PATCH,
@@ -765,101 +886,92 @@ async fn outbound_open_seats_only(srv: Server) {
     x.send(to_body(&["o@bravo"])).await;
 }
 
-/// A list may hold only seats of other orgs that are open to its org; a
-/// membership whose opening is removed stops delivering and is shown as
-/// inactive.
-async fn lists_across_orgs(srv: Server) {
-    let a = srv.org("alpha").await;
-    let b = srv.org("bravo").await;
-    a.seat("x").await;
-    let o = b.seat("o").await;
-    b.seat("closed").await;
-    a.link(&b, "bravo", "alpha").await;
-    let g = b.open("o", None).await;
-    a.ok(Method::POST, "/lists", Some(json!({ "name": "partners" })))
-        .await;
-    a.ok(Method::PUT, "/lists/partners/members/o@bravo", None)
-        .await;
-    let (s, closed) = a
-        .call(Method::PUT, "/lists/partners/members/closed@bravo", None)
-        .await;
-    let (s2, missing) = a
-        .call(Method::PUT, "/lists/partners/members/nosuch@bravo", None)
-        .await;
-    assert_eq!((s, s2), (StatusCode::NOT_FOUND, StatusCode::NOT_FOUND));
-    assert_eq!(
-        closed["error"]["message"]
-            .as_str()
-            .unwrap()
-            .replace("closed", "?"),
-        missing["error"]["message"]
-            .as_str()
-            .unwrap()
-            .replace("nosuch", "?")
-    );
-    let v = a.send(to_body(&["partners"])).await;
-    assert_eq!(v["deliveries"], 1);
-    assert_eq!(o.inbox().await.len(), 1);
-    b.close(&g).await;
-    let (s, v) = a.post("/messages", to_body(&["partners"])).await;
-    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
-    let l = a.ok(Method::GET, "/lists/partners", None).await;
-    assert_eq!(l["members"][0]["inactive"], true, "{l}");
-}
-
-/// Masked addresses on every path that shows another org's message:
-/// inbox, read, thread, claim, changes, archive, search, sent, attention.
-async fn masking_on_every_read_path(srv: Server) {
+/// Lists hold seats of their own org only, and cannot be addressed on mail
+/// that crosses orgs.
+async fn lists_stay_inside(srv: Server) {
     let a = srv.org("alpha").await;
     let b = srv.org("bravo").await;
     let x = a.seat("x").await;
-    a.seat("secret-ops").await;
-    a.ok(
-        Method::POST,
-        "/lists",
-        Some(json!({ "name": "internal-team" })),
-    )
-    .await;
-    a.ok(Method::PUT, "/lists/internal-team/members/secret-ops", None)
-        .await;
+    b.seat("o").await;
     a.link(&b, "bravo", "alpha").await;
-    let id = x
-        .sent(
-            json!({ "to": ["owner@bravo", "secret-ops"], "cc": ["internal-team"],
-                       "subject": "maskme zeta", "body": "hello", "ack_required": true }),
+    b.open("o", None).await;
+    a.ok(Method::POST, "/lists", Some(json!({ "name": "team" })))
+        .await;
+    a.seat("y").await;
+    a.ok(Method::PUT, "/lists/team/members/x", None).await;
+    a.ok(Method::PUT, "/lists/team/members/y", None).await;
+    let (s, v) = a
+        .call(Method::PUT, "/lists/team/members/o@bravo", None)
+        .await;
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+    assert_eq!(v["error"]["code"], "local_only");
+    let (s, v) = a
+        .post(
+            "/messages",
+            json!({ "to": ["o@bravo"], "cc": ["team"], "subject": "s", "body": "" }),
         )
         .await;
-    let check = |h: &Value, what: &str| {
-        let t = h.to_string();
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+    assert_eq!(v["error"]["code"], "list_on_cross_org");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("name the seats")
+    );
+    // Inside the org the list works as before.
+    x.send(to_body(&["team"])).await;
+}
+
+/// No hidden recipients: every address on a cross-org message appears the
+/// same for every recipient, on every path that shows it.
+async fn no_hidden_recipients(srv: Server) {
+    let a = srv.org("alpha").await;
+    let b = srv.org("bravo").await;
+    let x = a.seat("x").await;
+    a.seat("helper").await;
+    let o = b.seat("o").await;
+    a.link(&b, "bravo", "alpha").await;
+    b.open("o", None).await;
+    let id = x
+        .sent(
+            json!({ "to": ["o@bravo", "helper"], "subject": "visible zeta", "body": "hello",
+                       "ack_required": true }),
+        )
+        .await;
+    let want = |h: &Value, what: &str| {
+        let mut all: Vec<String> = h["to"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(h["cc"].as_array().unwrap())
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        all.sort();
+        assert_eq!(all, vec!["helper@alpha", "o", "owner@alpha"], "{what}: {h}");
         assert!(
-            !t.contains("secret-ops") && !t.contains("internal-team"),
-            "{what}: {t}"
+            h.get("to_hidden").is_none() && h.get("cc_hidden").is_none(),
+            "{what}"
         );
-        assert_eq!(h["to"], json!(["owner"]), "{what}: {t}");
-        assert_eq!(h["to_hidden"], 1, "{what}: {t}");
-        assert_eq!(h["cc_hidden"], 1, "{what}: {t}");
     };
-    let e = b.inbox().await;
-    let e = e.iter().find(|e| e["message"]["id"] == id).unwrap();
-    check(&e["message"], "inbox");
-    check(
-        &b.ok(Method::GET, &format!("/messages/{id}?peek=1"), None)
-            .await["message"],
-        "read",
-    );
-    check(
-        &b.ok(Method::GET, &format!("/threads/{id}"), None).await["messages"][0],
-        "thread",
-    );
-    let c = b.ok(Method::GET, "/changes?since=0", None).await;
-    let e = c["entries"]
+    let e = o.ok(Method::GET, "/inbox", None).await;
+    let e = e["entries"]
         .as_array()
         .unwrap()
         .iter()
         .find(|e| e["message"]["id"] == id)
         .unwrap()
         .clone();
-    check(&e["message"], "changes");
+    want(&e["message"], "inbox");
+    want(
+        &o.ok(Method::GET, &format!("/messages/{id}?peek=1"), None)
+            .await["message"],
+        "read",
+    );
+    want(
+        &o.ok(Method::GET, &format!("/threads/{id}"), None).await["messages"][0],
+        "thread",
+    );
     let arch = b.ok(Method::GET, "/archive/messages", None).await;
     let h = arch["messages"]
         .as_array()
@@ -868,43 +980,18 @@ async fn masking_on_every_read_path(srv: Server) {
         .find(|m| m["id"] == id)
         .unwrap()
         .clone();
-    check(&h, "archive");
-    let s = b.ok(Method::GET, "/archive/search?q=zeta", None).await;
-    check(&s["messages"][0], "search");
-    let att = b.ok(Method::GET, "/attention", None).await;
-    let item = att["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|i| i["message"]["id"] == id)
-        .unwrap()
-        .clone();
-    check(&item["message"], "attention");
-    let cl = b
-        .ok(
-            Method::POST,
-            "/claim",
-            Some(json!({ "via": "test", "inline_body_max": 100 })),
-        )
+    want(&h, "archive");
+    want(
+        &b.ok(Method::GET, "/archive/search?q=zeta", None).await["messages"][0],
+        "search",
+    );
+    let cl = o
+        .ok(Method::POST, "/claim", Some(json!({ "via": "test" })))
         .await;
-    let e = cl["entries"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|e| e["message"]["id"] == id)
-        .unwrap()
-        .clone();
-    check(&e["message"], "claim");
-    // The sender's org sees what it wrote.
-    let mine = a.ok(Method::GET, &format!("/messages/{id}"), None).await;
-    assert_eq!(mine["message"]["to"], json!(["owner@bravo", "secret-ops"]));
-    let sent = x.ok(Method::GET, "/sent", None).await;
-    assert_eq!(sent["messages"][0]["cc"], json!(["internal-team"]));
-    // A reply-all from bravo cannot name what it cannot see.
-    let r = b
-        .send(json!({ "to": ["x@alpha"], "subject": "Re", "body": "", "in_reply_to": id }))
-        .await;
-    assert_eq!(r["deliveries"], 1);
+    want(&cl["entries"][0]["message"], "claim");
+    // The other org's recipients see the helper's and the contact's cards.
+    let t = o.ok(Method::GET, &format!("/threads/{id}"), None).await;
+    assert_eq!(t["participants"].as_array().unwrap().len(), 3, "{t}");
 }
 
 /// New threads to other orgs per seat are limited; replies are not; the
@@ -1096,9 +1183,9 @@ async fn other_org_learns_nothing(srv: Server) {
     let internal = x
         .sent(json!({ "to": ["owner"], "subject": "INTERNALSUBJECT", "body": "INTERNALBODY" }))
         .await;
-    // The user writes out, naming internal seats and lists in Cc.
+    // The user writes out.
     let to_b = a
-        .sent(json!({ "to": ["owner@bravo"], "cc": ["secretlist", "secretseat"], "subject": "hello", "body": "hi" }))
+        .sent(json!({ "to": ["owner@bravo"], "subject": "hello", "body": "hi" }))
         .await;
     let y = b.seat("y").await;
     let secrets = [
@@ -1240,29 +1327,15 @@ async fn closed_and_missing_answer_alike(srv: Server) {
         m[2] * 1e3
     );
     assert!(hi < lo * 3.0 + 0.002, "medians differ too much: {m:?}");
-    // The same for list members and org cards.
-    let mut times: Vec<Vec<f64>> = vec![Vec::new(); 2];
-    for _ in 0..rounds {
-        for (k, name) in ["closed", "nosuch"].iter().enumerate() {
-            let t = Instant::now();
-            let (s, _) = a
-                .call(
-                    Method::PUT,
-                    &format!("/lists/mine/members/{name}@bravo"),
-                    None,
-                )
-                .await;
-            times[k].push(t.elapsed().as_secs_f64());
-            assert_eq!(s, StatusCode::NOT_FOUND);
-        }
-    }
-    let m: Vec<f64> = times.iter_mut().map(median).collect();
-    eprintln!(
-        "list member closed/missing: medians {:.3} / {:.3} ms",
-        m[0] * 1e3,
-        m[1] * 1e3
-    );
-    assert!(m[0].max(m[1]) < m[0].min(m[1]) * 3.0 + 0.002, "{m:?}");
+    // List members of another org: refused alike (lists hold seats of
+    // their own org only).
+    let (s1, v1) = a
+        .call(Method::PUT, "/lists/mine/members/closed@bravo", None)
+        .await;
+    let (s2, v2) = a
+        .call(Method::PUT, "/lists/mine/members/nosuch@bravo", None)
+        .await;
+    assert_eq!((s1, v1), (s2, v2));
     let c = srv.org("hidden").await;
     c.ok(
         Method::PATCH,

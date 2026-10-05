@@ -368,8 +368,8 @@ async fn archive_to_another_org_matches_named_addresses(b: Backend, t: &str) {
     // Bravo sees its own seat's mailbox.
     let v = bravo.get("/archive/messages?to=secret-ops").await;
     assert_eq!(ids(&v), vec![named], "{v}");
-    // Once bravo closes the seat, alpha cannot search by it (the message
-    // still shows under bravo's open user seat).
+    // Every address on the message stays visible to alpha, also once
+    // bravo closes the seat.
     bravo
         .ok(
             Method::DELETE,
@@ -378,7 +378,7 @@ async fn archive_to_another_org_matches_named_addresses(b: Backend, t: &str) {
         )
         .await;
     let v = alpha.get("/archive/messages?to=secret-ops@bravo").await;
-    assert_eq!(ids(&v), Vec::<i64>::new(), "{v}");
+    assert_eq!(ids(&v), vec![named], "{v}");
     let v = alpha.get("/archive/messages?to=owner@bravo").await;
     assert_eq!(ids(&v), vec![named], "{v}");
 }

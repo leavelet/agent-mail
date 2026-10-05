@@ -123,11 +123,10 @@ async fn migrate(backend: Backend) {
             .notice
             .is_none()
     );
-    // The thread's participants.
-    let p = store.thread_peers(beta.id, &[1]).await.unwrap();
-    assert_eq!(p.len(), 1);
-    assert_eq!(p[0].card.name, "a1");
-    assert!(store.thread_peers(alpha.id, &[1]).await.unwrap().is_empty());
+    // The thread's participants: both seats of the message that crossed.
+    let p = store.thread_parts(&[1]).await.unwrap();
+    let names: Vec<(&str, i64)> = p.iter().map(|x| (x.card.name.as_str(), x.org_id)).collect();
+    assert_eq!(names, vec![("a1", alpha.id), ("b1", beta.id)]);
 }
 
 #[tokio::test]

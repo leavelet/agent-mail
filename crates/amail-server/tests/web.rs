@@ -648,7 +648,7 @@ async fn webhook_on_user_mail(srv: Server) {
     acme.ok(Method::POST, "/links", Some(json!({ "org": "beta" })))
         .await;
     beta.ok(Method::POST, "/links/acme/accept", None).await;
-    // (A seat of beta that is not open to acme is counted, not named.)
+    // (x is no contact of beta: beta's user seat is added in Cc.)
     beta.ok(
         Method::POST,
         "/seats",
@@ -661,9 +661,13 @@ async fn webhook_on_user_mail(srv: Server) {
     assert_eq!(v.len(), 2);
     assert_eq!(v[1]["message"]["from"], "x@beta");
     assert_eq!(v[1]["message"]["source"], "external");
-    assert_eq!(v[1]["message"]["cc"], json!([]), "{:?}", v[1]);
-    assert_eq!(v[1]["message"]["cc_hidden"], 1, "{:?}", v[1]);
-    assert!(!v[1].to_string().contains("y-internal"), "{:?}", v[1]);
+    // Every address on it, with beta's contact added in Cc.
+    assert_eq!(
+        v[1]["message"]["cc"],
+        json!(["y-internal@beta", "owner@beta"]),
+        "{:?}",
+        v[1]
+    );
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(got.lock().unwrap().len(), 2);
     // Cleared: no more notices.

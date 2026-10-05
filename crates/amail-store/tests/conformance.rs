@@ -1950,40 +1950,43 @@ async fn grants_and_thread_peers(s: S) {
         t => panic!("{t:?}"),
     }
     assert!(g[1].managed);
-    // Participants.
-    let sent = s.send(&msg(a.id, x.id, "q", &[(&y, C::To)])).await.unwrap();
-    let p = s.thread_peers(b.id, &[sent.thread_id]).await.unwrap();
-    assert_eq!(p.len(), 1);
-    assert_eq!(p[0].card.name, "x");
-    assert_eq!(p[0].org_name, "alpha");
+    // Participants: every seat of a message that crossed orgs.
+    let internal = s
+        .send(&msg(a.id, x.id, "i", &[(&ub_seat(&s, a.id).await, C::To)]))
+        .await
+        .unwrap();
     assert!(
-        s.thread_peers(a.id, &[sent.thread_id])
+        s.thread_parts(&[internal.thread_id])
             .await
             .unwrap()
             .is_empty()
     );
+    let sent = s.send(&msg(a.id, x.id, "q", &[(&y, C::To)])).await.unwrap();
+    let p = s.thread_parts(&[sent.thread_id]).await.unwrap();
+    let names: Vec<(&str, &str)> = p
+        .iter()
+        .map(|x| (x.org_name.as_str(), x.card.name.as_str()))
+        .collect();
+    assert_eq!(names, vec![("alpha", "x"), ("bravo", "y")]);
     let mut r = msg(b.id, ub.id, "a", &[(&x, C::To)]);
     r.thread_id = Some(sent.thread_id);
     s.send(&r).await.unwrap();
-    assert_eq!(
-        s.thread_peers(a.id, &[sent.thread_id]).await.unwrap().len(),
-        1
-    );
-    assert_eq!(s.forget_thread_peers(b.id, &[x.id]).await.unwrap(), 1);
-    assert!(
-        s.thread_peers(b.id, &[sent.thread_id])
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert_eq!(s.thread_parts(&[sent.thread_id]).await.unwrap().len(), 3);
+    // Primary contacts: per link and per team.
+    s.set_primary(a.id, b.id, None, Some(x.id)).await.unwrap();
+    s.set_primary(a.id, b.id, Some(team.id), Some(x.id))
+        .await
+        .unwrap();
+    let mut pr = s.primaries(a.id).await.unwrap();
+    pr.sort();
+    assert_eq!(pr, vec![(b.id, None, x.id), (b.id, Some(team.id), x.id)]);
+    s.set_primary(a.id, b.id, Some(team.id), None)
+        .await
+        .unwrap();
+    assert_eq!(s.primaries(a.id).await.unwrap().len(), 1);
     s.revoke_link(a.id, b.id).await.unwrap();
-    assert!(
-        s.thread_peers(a.id, &[sent.thread_id])
-            .await
-            .unwrap()
-            .is_empty()
-    );
     assert!(s.grants(&toward_b).await.unwrap().is_empty());
+    assert!(s.primaries(a.id).await.unwrap().is_empty());
     // Deleting the team removes its grant and the membership.
     assert!(s.delete_team(a.id, "core").await.unwrap());
     assert!(
@@ -1994,4 +1997,9 @@ async fn grants_and_thread_peers(s: S) {
             .team_id
             .is_none()
     );
+}
+
+/// The org's user seat.
+async fn ub_seat(s: &S, org_id: i64) -> Seat {
+    s.user_seat(org_id).await.unwrap().unwrap()
 }
