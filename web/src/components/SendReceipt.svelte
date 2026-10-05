@@ -21,7 +21,7 @@
   <ul class="addrs">
     {#each r.recipients as a}
       <li data-address={a.address}>
-        <span class="mono"><Vis text={a.address} /></span>:
+        <span class="mono"><Vis text={a.address} /></span>{#if a.added} <span class="chip neutral" data-testid="added" title={t('compose.receipt.added.long')}>{t('compose.receipt.added')}</span>{/if}:
         {#if a.wakes !== undefined}
           <span title={t('compose.receipt.listWakes.long')}>{t('compose.receipt.listWakes', { n: a.seats, w: a.wakes })}</span>
         {:else}
@@ -30,7 +30,7 @@
       </li>
     {/each}
     {#each r.rejected as x}
-      <li class="error" data-rejected={x.address}>{t('compose.receipt.rejected', { address: x.address, reason: x.reason })}{#if x.reason === 'unreachable'} <span class="faint">{t('compose.unreachable')}</span>{/if}</li>
+      <li class="error" data-rejected={x.address}>{t('compose.receipt.rejected', { address: x.address, reason: x.reason })}{#if x.reason === 'unreachable'} <span class="faint">{t('compose.unreachable')}</span>{:else if x.reason === 'thread_closed'} <span class="faint">{t('compose.threadClosed')}</span>{/if}</li>
     {/each}
   </ul>
   {#if r.notes?.length}

@@ -3,12 +3,12 @@
   // to this org and what this org opens to it.
   import Vis from '../components/Vis.svelte';
   import ChangePreview from '../components/ChangePreview.svelte';
-  import { get, post, del, enc, ApiError } from '../lib/api';
+  import { get, post, patch, del, enc, ApiError } from '../lib/api';
   import { store } from '../lib/store.svelte';
   import { t, ui } from '../lib/ui.svelte';
   import { href } from '../lib/router.svelte';
   import { fullTime } from '../lib/time';
-  import type { Pending } from '../lib/openings';
+  import { contactsFor, type Pending } from '../lib/openings';
   import type { PeerOrg } from '../lib/types';
 
   let { name }: { name: string } = $props();
@@ -51,6 +51,13 @@
     const teams = store.teams.filter((x) => x.contacts.length > 0).map((x) => x.name);
     return [...store.seats.map((s) => s.name), ...teams].filter((x) => !has.has(x));
   });
+
+  // The primary contact: '' sets the default.
+  const contacts = $derived(contactsFor(store.seats, name));
+  let primary = $derived(peer?.primary ?? '');
+  function setPrimary() {
+    void act(() => patch(`/v1/links/${enc(name)}`, { primary: primary || null }));
+  }
 
   async function act(f: () => Promise<unknown>) {
     actError = null;
@@ -157,6 +164,20 @@
             {/each}
           </tbody>
         </table>
+        <div class="primary" data-testid="primary-contact">
+          <strong>{t('peer.primary', { org: name })}:</strong>
+          {#if peer.primary}<a class="mono" href={href(['org', peer.primary])} data-testid="primary-now">{peer.primary}</a>{:else}<span class="error">{t('peer.primaryNone', { org: name })}</span>{/if}
+          <span class="faint sub2">{t('peer.primary.long', { org: name })}</span>
+          {#if contacts.length}
+            <div class="row">
+              <select bind:value={primary} aria-label={t('peer.primary', { org: name })}>
+                <option value="">{t('peer.primaryDefault')}</option>
+                {#each contacts as c}<option value={c}>{c}</option>{/each}
+              </select>
+              <button class="small" onclick={setPrimary} data-testid="primary-set">{t('peer.primarySet')}</button>
+            </div>
+          {/if}
+        </div>
         {#if !pending}
           <div class="row add">
             <select bind:value={pick} aria-label={t('open.target')}>
@@ -254,6 +275,19 @@
   .acts {
     text-align: right;
     white-space: nowrap;
+  }
+  .primary {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 6px 0 2px;
+    border-top: 1px solid var(--border);
+  }
+  .sub2 {
+    font-size: 12px;
+  }
+  .primary select {
+    max-width: 360px;
   }
   .add select {
     max-width: 240px;

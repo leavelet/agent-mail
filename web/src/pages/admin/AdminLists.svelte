@@ -92,7 +92,7 @@
           <table>
             <tbody>
               {#each detail.members as m (m.address)}
-                <tr><td class="mono">{m.address}{#if m.inactive} <span class="chip neutral" title={t('admin.inactive.long')}>{t('admin.inactive')}</span>{/if}</td><td class="faint">{m.mode}</td>
+                <tr><td class="mono">{m.address}</td><td class="faint">{m.mode}</td>
                   <td class="acts"><button class="small ghost danger" onclick={() => act(() => del(`/v1/lists/${enc(open ?? '')}/members/${enc(m.address)}`))}>{t('admin.delete')}</button></td></tr>
               {/each}
             </tbody>

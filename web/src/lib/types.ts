@@ -108,10 +108,6 @@ export interface MessageHeader {
   meta?: Meta;
   /** The server's retention period removed the body. */
   expired?: boolean;
-  /** Addresses of `to` of another org the reader may not see (left out of `to`). */
-  to_hidden?: number;
-  /** As `to_hidden`, for `cc`. */
-  cc_hidden?: number;
 }
 
 export interface Message extends MessageHeader {
@@ -164,7 +160,7 @@ export interface StatusResponse {
 export interface ThreadResponse {
   thread_id: number;
   messages: Message[];
-  /** Seats of other orgs that wrote in this thread: they may be answered in it. */
+  /** Seats of other orgs on cross-org messages of this thread: they may be addressed in replies. */
   participants?: Card[];
   /** Older messages were left out. */
   truncated?: boolean;
@@ -233,10 +229,25 @@ export interface SendResponse {
   id: number;
   thread_id: number;
   /** `wakes`: for a list in To, how many members are notified at once (which wakes idle ones). */
-  recipients: { address: string; seats: number; wakes?: number }[];
+  recipients: AddressResult[];
   rejected: { address: string; reason: string }[];
   deliveries: number;
   notes?: RecipientNote[];
+}
+
+export interface AddressResult {
+  address: string;
+  seats: number;
+  wakes?: number;
+  /** Added by the server in Cc: this org's primary contact for another org on the message. */
+  added?: boolean;
+}
+
+/** `POST /v1/messages/preview`: what sending would do; nothing is sent. */
+export interface SendPreview {
+  recipients: AddressResult[];
+  rejected: { address: string; reason: string }[];
+  deliveries: number;
 }
 
 export interface Overview {
@@ -290,8 +301,7 @@ export interface ListInfo {
   post_policy: PostPolicy;
   member_count: number;
   managed?: boolean;
-  /** `inactive`: a member of another org that gets no mail now. */
-  members?: { address: string; mode: DeliveryMode; inactive?: boolean }[];
+  members?: { address: string; mode: DeliveryMode }[];
 }
 
 export interface Link {
@@ -301,10 +311,18 @@ export interface Link {
   since?: string;
   /** The note of the request (`invited`: the other user's text, untrusted). */
   note?: string;
+  /** Active links: this org's primary contact for that org (added in Cc when needed). */
+  primary?: string;
+}
+
+/** A team's own primary contact for one linked org. */
+export interface TeamPrimary {
+  org: string;
+  seat: string;
 }
 
 export type OrgVisibility = 'listed-by-name' | 'hidden';
-export type Outbound = 'any-seat' | 'open-seats-only';
+export type Outbound = 'any-seat' | 'contacts-only';
 export type CardKind = 'user' | 'agent' | 'team';
 
 /** What another org may know of a seat or team. */
@@ -327,6 +345,8 @@ export interface PeerOrg {
   link?: Link;
   open_to_you: Card[];
   you_open: Grant[];
+  /** This org's primary contact for that org (active link). */
+  primary?: string;
 }
 
 export interface Team {
@@ -338,6 +358,7 @@ export interface Team {
   contacts: string[];
   open_to?: string[];
   managed?: boolean;
+  primaries?: TeamPrimary[];
   created_at: string;
 }
 

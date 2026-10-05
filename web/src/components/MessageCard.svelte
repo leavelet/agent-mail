@@ -6,7 +6,6 @@
   import { t, ui } from '../lib/ui.svelte';
   import { fullTime } from '../lib/time';
   import { href } from '../lib/router.svelte';
-  import { maskedKey } from '../lib/openings';
   import MetaView from './MetaView.svelte';
   import DeliveryTable from './DeliveryTable.svelte';
 
@@ -56,10 +55,8 @@
     </div>
     <h2 id="subj-{message.id}">{#if message.subject}<Vis text={message.subject} />{:else}{t('mail.noSubject')}{/if}</h2>
     <div class="rcpt">
-      <span class="k">{t('mail.to')}</span><span class="mono">{message.to.join(', ') || (message.to_hidden ? '' : '—')}</span>
-      {#if message.to_hidden}<span class="masked" data-testid="to-hidden" title={t('mail.hidden.long')}>{t(maskedKey(message.to_hidden, message.to.length > 0), { n: message.to_hidden })}</span>{/if}
-      {#if message.cc.length || message.cc_hidden}<span class="k">{t('mail.cc')}</span><span class="mono">{message.cc.join(', ')}</span>{/if}
-      {#if message.cc_hidden}<span class="masked" data-testid="cc-hidden" title={t('mail.hidden.long')}>{t(maskedKey(message.cc_hidden, message.cc.length > 0), { n: message.cc_hidden })}</span>{/if}
+      <span class="k">{t('mail.to')}</span><span class="mono">{message.to.join(', ') || '—'}</span>
+      {#if message.cc.length}<span class="k">{t('mail.cc')}</span><span class="mono">{message.cc.join(', ')}</span>{/if}
       {#if message.in_reply_to}<span class="faint">{t('mail.inReplyTo', { id: message.in_reply_to })}</span>{/if}
       {#if showThreadLink}<a href={href(['thread', message.thread_id], { m: message.id })}>{t('mail.thread')} #{message.thread_id}</a>{/if}
     </div>
@@ -132,10 +129,6 @@
   }
   .rcpt .k {
     color: var(--muted);
-  }
-  .masked {
-    color: var(--muted);
-    font-style: italic;
   }
   .src {
     font-size: 10.5px;

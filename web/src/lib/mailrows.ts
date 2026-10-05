@@ -9,9 +9,6 @@ export interface MailRow {
   from: string;
   to: string[];
   cc: string[];
-  /** Addresses of other orgs left out of `to` / `cc`. */
-  to_hidden?: number;
-  cc_hidden?: number;
   subject: string;
   created_at: string;
   priority: Priority;

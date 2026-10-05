@@ -3,10 +3,10 @@
   import { store } from '../lib/store.svelte';
   import { t } from '../lib/ui.svelte';
   import { go } from '../lib/router.svelte';
-  import { buildSend, replySubject, type ComposeError, type MetaRow } from '../lib/compose';
+  import { buildSend, isAddress, parseAddresses, replySubject, type ComposeError, type MetaRow } from '../lib/compose';
   import { ack, markRead } from '../lib/mailops';
-  import { activeOrgs, peerCandidates } from '../lib/openings';
-  import type { Card, MessageResponse, SendResponse, Message, Delivery, ThreadResponse } from '../lib/types';
+  import { activeOrgs, addedContacts, otherOrgs, peerCandidates, sendErrorKey } from '../lib/openings';
+  import type { Card, MessageResponse, SendPreview, SendResponse, Message, Delivery, ThreadResponse } from '../lib/types';
   import AddressInput from '../components/AddressInput.svelte';
   import MessageCard from '../components/MessageCard.svelte';
   import SendReceipt from '../components/SendReceipt.svelte';
@@ -39,6 +39,58 @@
     void store.loadPeers();
   });
   const external = $derived(peerCandidates(store.peerCards, activeOrgs(store.links), participants));
+
+  // Before sending mail to another org: ask the server what it would do
+  // (POST /v1/messages/preview), to say which contact of this org it adds
+  // in Cc and which addresses it would refuse.
+  let preview = $state.raw<{ added: { seat: string; orgs: string[] }[]; rejected: SendPreview['rejected'] } | null>(null);
+  let previewError = $state<string | null>(null);
+  $effect(() => {
+    const req = { to: parseAddresses(to), cc: parseAddresses(cc), subject: '', body: '', in_reply_to: replyTo?.id };
+    const all = [...req.to, ...req.cc];
+    // Asked again after a send and when openings change.
+    void receipt;
+    void store.grants;
+    // The last answer stays until the next one arrives.
+    if (otherOrgs(all).length === 0 || !all.every(isAddress)) {
+      preview = null;
+      previewError = null;
+      return;
+    }
+    let stale = false;
+    const timer = setTimeout(() => {
+      post<SendPreview>('/v1/messages/preview', req)
+        .then((r) => {
+          if (stale) return;
+          preview = { added: addedContacts(r.recipients, all), rejected: r.rejected };
+          previewError = null;
+        })
+        .catch((e) => {
+          if (stale) return;
+          if (e instanceof ApiError && e.rejected.length) {
+            preview = { added: [], rejected: e.rejected };
+            previewError = null;
+          } else {
+            preview = null;
+            previewError = errorText(e);
+          }
+        });
+    }, 400);
+    return () => {
+      stale = true;
+      clearTimeout(timer);
+    };
+  });
+
+  /** A refusal of the whole message, in words. */
+  function errorText(e: unknown): string {
+    if (e instanceof ApiError) {
+      const key = sendErrorKey(e.code);
+      if (key) return t(key);
+    }
+    return e instanceof Error ? e.message : String(e);
+  }
+  const reasonText = (r: string) => (r === 'unreachable' ? t('compose.unreachable') : r === 'thread_closed' ? t('compose.threadClosed') : r);
 
   $effect(() => {
     const reply = query.get('reply');
@@ -122,7 +174,7 @@
       if (err instanceof ApiError && err.rejected.length) {
         error = t('compose.rejected', { list: err.rejected.map((x) => `${x.address} (${x.reason})`).join(', ') });
         unreachable = err.rejected.some((x) => x.reason === 'unreachable');
-      } else error = err instanceof Error ? err.message : String(err);
+      } else error = errorText(err);
     } finally {
       busy = false;
     }
@@ -138,6 +190,17 @@
     <div class="field"><label for="c-to">{t('compose.to')}</label><AddressInput id="c-to" label={t('compose.to')} {external} bind:value={to} /></div>
     <div class="field"><label for="c-cc">{t('compose.cc')}</label><AddressInput id="c-cc" label={t('compose.cc')} {external} bind:value={cc} /></div>
     <p class="hint faint">{t('compose.addrHint')}</p>
+    {#if preview?.added.length || preview?.rejected.length || previewError}
+      <div class="before" data-testid="send-preview">
+        {#each preview?.added ?? [] as a}
+          <p class="added" data-testid="added-contact">{t('compose.added', { seat: a.seat, org: a.orgs.join(', ') })}</p>
+        {/each}
+        {#each preview?.rejected ?? [] as r}
+          <p class="error" data-rejected={r.address}>{t('compose.willReject', { address: r.address })} {reasonText(r.reason)}</p>
+        {/each}
+        {#if previewError}<p class="error">{previewError}</p>{/if}
+      </div>
+    {/if}
     <div class="field"><label for="c-subj">{t('compose.subject')}</label><input id="c-subj" type="text" maxlength="300" bind:value={subject} /></div>
     <textarea
       id="c-body"
@@ -214,6 +277,16 @@
   .hint {
     margin: -4px 0 0 74px;
     font-size: 11.5px;
+  }
+  .before {
+    margin: -2px 0 0 74px;
+    font-size: 12.5px;
+  }
+  .before p {
+    margin: 0;
+  }
+  .added {
+    color: var(--notice);
   }
   textarea {
     width: 100%;

@@ -1,7 +1,8 @@
 <script lang="ts">
   import Vis from '../components/Vis.svelte';
   import OpeningsEditor from '../components/OpeningsEditor.svelte';
-  import { put, enc } from '../lib/api';
+  import { put, patch, enc } from '../lib/api';
+  import { activeOrgs, contactsFor } from '../lib/openings';
   import { store } from '../lib/store.svelte';
   import { t } from '../lib/ui.svelte';
   import { go, href } from '../lib/router.svelte';
@@ -32,6 +33,23 @@
     if (next.has(m)) next.delete(m);
     else next.add(m);
     contacts = next;
+  }
+
+  // The team's own primary contacts per linked org.
+  let pOrg = $state('');
+  let pSeat = $state('');
+  const pChoices = $derived(team && pOrg ? contactsFor(store.seats.filter((s) => team.members.includes(s.name)), pOrg) : []);
+  async function setPrimary(org: string, seat: string | null) {
+    if (!team) return;
+    msg = null;
+    error = null;
+    try {
+      await patch(`/v1/links/${enc(org)}`, { primary: seat, team: team.name });
+      await store.openingsChanged();
+      pSeat = '';
+    } catch (err) {
+      error = err instanceof Error ? err.message : String(err);
+    }
   }
 
   async function save(e: SubmitEvent) {
@@ -110,6 +128,28 @@
             {:else}
               <span class="faint">{t('team.needsContact')}</span>
             {/if}
+          </dd>
+          <dt title={t('team.primaries.long')}>{t('team.primaries')}</dt>
+          <dd data-testid="team-primaries">
+            {#each team.primaries ?? [] as p (p.org)}
+              <div class="row">
+                <a class="mono" href={href(['orgs', p.org])}>{p.org}</a>: <a class="mono" href={href(['org', p.seat])}>{p.seat}</a>
+                <button class="small ghost" onclick={() => setPrimary(p.org, null)}>{t('team.primaryClear')}</button>
+              </div>
+            {/each}
+            {#if activeOrgs(store.links).length}
+              <div class="row">
+                <select bind:value={pOrg} aria-label={t('team.primaryOrg')}>
+                  <option value="">{t('team.primaryOrg')}…</option>
+                  {#each activeOrgs(store.links) as o}<option value={o}>{o}</option>{/each}
+                </select>
+                <select bind:value={pSeat} aria-label={t('seat.team')} disabled={!pChoices.length}>
+                  <option value="">—</option>
+                  {#each pChoices as c}<option value={c}>{c}</option>{/each}
+                </select>
+                <button class="small" disabled={!pSeat} onclick={() => setPrimary(pOrg, pSeat)}>{t('peer.primarySet')}</button>
+              </div>
+            {:else if !(team.primaries ?? []).length}<span class="faint">{t('admin.none')}</span>{/if}
           </dd>
         </dl>
         <form class="card form" onsubmit={save} data-testid="team-form">

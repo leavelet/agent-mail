@@ -88,3 +88,18 @@ export async function pushPresence(): Promise<void> {
     ],
   });
 }
+
+/** Make `be-lead` acme's only contact for the linked org instead of the
+ * user seat (so that mail from the user gets be-lead added in Cc); the
+ * returned function restores the default opening of the user seat. */
+export async function contactInsteadOfUser(): Promise<() => Promise<void>> {
+  const s = state();
+  const grants = await api<{ id: number; target: string; audience: string }[]>(s.userToken, 'GET', '/grants');
+  const own = grants.find((g) => g.target === 'owner' && g.audience === 'linked');
+  if (own) await api(s.userToken, 'DELETE', `/grants/${own.id}`);
+  const added = await api<{ grant: { id: number } }>(s.userToken, 'POST', '/grants', { target: 'be-lead', audience: s.peer.org });
+  return async () => {
+    await api(s.userToken, 'DELETE', `/grants/${added.grant.id}`);
+    await api(s.userToken, 'POST', '/grants', { target: 'owner' });
+  };
+}
