@@ -207,6 +207,33 @@ impl Adapter for Claude {
         std::path::Path::new(target).exists()
     }
 
+    /// Claude Code fires no hook when a person interrupts a turn (Escape);
+    /// it records `[Request interrupted by user]` in the transcript.
+    fn finds_interrupts(&self) -> bool {
+        true
+    }
+
+    fn transcript_turn(&self, tail: &str) -> TranscriptTurn {
+        use crate::transcript::claude::{TurnMark, last_turn_mark};
+        match last_turn_mark(tail) {
+            Some(TurnMark::Interrupted { ts }) => TranscriptTurn::Interrupted(
+                ts.and_then(|t| t.parse::<jiff::Timestamp>().ok())
+                    .map(|t| t.as_millisecond()),
+            ),
+            Some(TurnMark::Other) => TranscriptTurn::Running,
+            None => TranscriptTurn::Unknown,
+        }
+    }
+
+    /// While a turn runs (model output or a tool call), Claude Code's status
+    /// line says "esc to interrupt".
+    fn screen_running(&self, screen: &str) -> Option<bool> {
+        if screen.trim().is_empty() {
+            return None;
+        }
+        Some(screen.to_lowercase().contains("esc to interrupt"))
+    }
+
     async fn wake(&self, target: &str, text: &str) -> Result<()> {
         let line = self.wake_line(text);
         let fut = async {

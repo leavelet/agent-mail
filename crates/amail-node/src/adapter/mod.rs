@@ -258,6 +258,38 @@ pub trait Adapter: Send + Sync + 'static {
     async fn last_turns(&self, _target: &str) -> Result<Vec<TurnInfo>> {
         Ok(Vec::new())
     }
+
+    /// Whether a turn can end without any hook in a way the node must find
+    /// itself (Claude Code fires no hook when a person interrupts a turn):
+    /// the node then looks at the end of the session's transcript
+    /// ([`Adapter::transcript_turn`]) and, for supervised seats, at the pane
+    /// ([`Adapter::screen_running`]) when a busy seat sends no hooks.
+    fn finds_interrupts(&self) -> bool {
+        false
+    }
+
+    /// What the end of the session's transcript (`tail`: whole JSONL lines)
+    /// says about its current turn.
+    fn transcript_turn(&self, _tail: &str) -> TranscriptTurn {
+        TranscriptTurn::Unknown
+    }
+
+    /// Whether a pane screen shows a turn running (`None`: cannot tell).
+    fn screen_running(&self, _screen: &str) -> Option<bool> {
+        None
+    }
+}
+
+/// See [`Adapter::transcript_turn`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscriptTurn {
+    /// The person interrupted the turn; the record's time (Unix ms), if the
+    /// transcript gives one.
+    Interrupted(Option<i64>),
+    /// The turn may be running.
+    Running,
+    /// Nothing to go by.
+    Unknown,
 }
 
 /// How a turn ended, as the harness reports it.
@@ -276,6 +308,8 @@ pub struct TurnInfo {
     pub status: TurnStatus,
     /// Unix seconds, if known.
     pub started_at: Option<i64>,
+    /// The harness's turn id, if known.
+    pub id: Option<String>,
 }
 
 pub fn str_field<'a>(v: &'a Value, key: &str) -> Option<&'a str> {

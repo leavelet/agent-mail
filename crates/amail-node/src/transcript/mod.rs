@@ -93,6 +93,33 @@ pub fn parser_for(h: Harness) -> Box<dyn Parser> {
     }
 }
 
+/// The last `max` bytes of the file at `path` as whole lines (a line cut by
+/// the start of that window is dropped), with its size and modification
+/// time (nanoseconds) to tell whether it changed since.
+pub fn read_tail(path: &std::path::Path, max: u64) -> std::io::Result<(String, (u64, i128))> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path)?;
+    let meta = f.metadata()?;
+    let size = meta.len();
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos() as i128);
+    let start = size.saturating_sub(max);
+    f.seek(SeekFrom::Start(start))?;
+    let mut buf = Vec::with_capacity((size - start) as usize);
+    f.take(max).read_to_end(&mut buf)?;
+    let mut text = String::from_utf8_lossy(&buf).into_owned();
+    if start > 0 {
+        text = match text.find('\n') {
+            Some(i) => text[i + 1..].to_string(),
+            None => String::new(),
+        };
+    }
+    Ok((text, (size, mtime)))
+}
+
 /// Cut `s` to at most `max` characters; true if it was cut.
 pub fn truncate(s: &str, max: usize) -> (String, bool) {
     match s.char_indices().nth(max) {

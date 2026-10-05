@@ -210,6 +210,7 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
         .map(|r| (r.seat.as_str(), r))
         .collect();
     let mut restart_needed = Vec::new();
+    let mut role_by_mail = Vec::new();
     let mut created = Vec::new();
     for s in &t.seats {
         let want = desired_seat(&t, s, &main);
@@ -235,6 +236,13 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
                 report.push(format!("updated seat {}: {}", s.name, changed.join(", ")));
                 if live.contains_key(s.name.as_str()) && changed.iter().any(|f| *f != "group") {
                     restart_needed.push(s.name.clone());
+                    // A Codex session gets its role only in its first prompt.
+                    if s.harness == "codex"
+                        && cur.harness.as_deref() == Some("codex")
+                        && changed.contains(&"role")
+                    {
+                        role_by_mail.push(s.name.clone());
+                    }
                 }
             }
         }
@@ -460,8 +468,17 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
     }
     if !restart_needed.is_empty() {
         report.push(format!(
-            "changed while running (takes effect after a restart, e.g. amail sleep + amail wake): {}",
+            "changed while running: {}; amail sleep <seat> then amail wake <seat> restarts a \
+             seat, resuming its session with the new settings (a changed harness starts a new \
+             session)",
             restart_needed.join(", ")
+        ));
+    }
+    if !role_by_mail.is_empty() {
+        report.push(format!(
+            "new role text of Codex seats {}: a resumed Codex session keeps the role from its \
+             first prompt; send the change to the seat by mail",
+            role_by_mail.join(", ")
         ));
     }
     let all = json!({
@@ -615,10 +632,19 @@ pub fn sleep(seat: &str, out: &Out) -> Result<()> {
         Duration::from_secs(60),
     )?;
     out.show(&v, || {
-        Ok(if v["asleep"].as_bool() == Some(true) {
+        let state = if v["asleep"].as_bool() == Some(true) {
             format!("{seat} is asleep")
         } else {
             format!("{seat} is still stopping")
+        };
+        let waiting = v["pending"].as_i64().unwrap_or(0);
+        Ok(if waiting > 0 {
+            format!(
+                "{state}; it stays asleep with its {waiting} waiting message(s) until new mail \
+                 arrives for it, or until amail wake {seat} or amail up"
+            )
+        } else {
+            format!("{state}; new mail for it, amail wake {seat} or amail up starts it again")
         })
     })
 }
@@ -631,6 +657,14 @@ pub fn wake(seat: &str, out: &Out) -> Result<()> {
         Duration::from_secs(10),
     )?;
     out.show(&v, || {
-        Ok(format!("{seat}: {}", v["action"].as_str().unwrap_or("?")))
+        let action = v["action"].as_str().unwrap_or("?");
+        let pending = v["pending"].as_i64().unwrap_or(0);
+        Ok(match (action, v["detail"].as_str()) {
+            ("checked: idle", Some(d)) if pending > 0 => {
+                format!("{seat}: {d}; delivering its {pending} waiting message(s)")
+            }
+            (_, Some(d)) => format!("{seat}: {d}"),
+            _ => format!("{seat}: {action}"),
+        })
     })
 }

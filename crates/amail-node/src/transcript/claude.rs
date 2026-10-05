@@ -191,9 +191,127 @@ impl ClaudeParser {
     }
 }
 
+/// What the end of a Claude Code transcript says about the session's turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnMark {
+    /// The last record that belongs to a turn is the person interrupting it
+    /// (Escape): a user message `[Request interrupted by user]` or
+    /// `[Request interrupted by user for tool use]`. Claude Code fires no
+    /// hook for an interrupted turn. `ts` is the record's `timestamp`.
+    Interrupted { ts: Option<String> },
+    /// The last such record is anything else (a prompt, a tool call or its
+    /// result, model output): the turn may still be running.
+    Other,
+}
+
+/// Prefix of the text Claude Code records when a person interrupts a turn.
+const INTERRUPT_TEXT: &str = "[request interrupted by user";
+
+fn is_interrupt_text(t: &str) -> bool {
+    let t = t.trim_start();
+    t.len() < 200 && t.to_ascii_lowercase().starts_with(INTERRUPT_TEXT)
+}
+
+/// The [`TurnMark`] of the last turn record in `tail` (whole JSONL lines;
+/// unknown records, sub-agent and meta records are skipped). `None` when
+/// no line says anything about a turn.
+pub fn last_turn_mark(tail: &str) -> Option<TurnMark> {
+    let mut mark = None;
+    let mut stats = ParseStats::default();
+    for line in tail.lines() {
+        let Some(v) = parse_object(line, &mut stats) else {
+            continue;
+        };
+        let flag = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
+        if flag("isSidechain") || flag("isMeta") {
+            continue;
+        }
+        let ts = || str_at(&v, "timestamp").map(str::to_string);
+        match str_at(&v, "type") {
+            Some("user") => {
+                let interrupted = match v.pointer("/message/content") {
+                    Some(Value::String(s)) => is_interrupt_text(s),
+                    Some(Value::Array(blocks)) => blocks.iter().any(|b| {
+                        str_at(b, "type") == Some("text")
+                            && str_at(b, "text").is_some_and(is_interrupt_text)
+                    }),
+                    _ => continue,
+                };
+                mark = Some(if interrupted {
+                    TurnMark::Interrupted { ts: ts() }
+                } else {
+                    TurnMark::Other
+                });
+            }
+            Some("assistant") => mark = Some(TurnMark::Other),
+            Some("attachment") => match v.pointer("/attachment/type").and_then(Value::as_str) {
+                Some("queued_command") | Some("hook_additional_context") => {
+                    mark = Some(TurnMark::Other)
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+    mark
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interrupt_marks() {
+        let prompt = r#"{"type":"user","message":{"role":"user","content":"Write a story."},"timestamp":"2026-10-05T02:40:58.000Z"}"#;
+        let text = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Once"}]},"timestamp":"2026-10-05T02:41:00.000Z"}"#;
+        let tool = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"sleep 100"}}]},"timestamp":"2026-10-05T02:41:01.000Z"}"#;
+        let rejected = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"The user doesn't want to proceed with this tool use.","is_error":true}]},"timestamp":"2026-10-05T02:41:02.000Z"}"#;
+        let esc = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]},"timestamp":"2026-10-05T02:41:02.500Z","newField":1}"#;
+        let esc_tool = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user for tool use]"}]},"timestamp":"2026-10-05T02:41:03.000Z"}"#;
+        let esc_str = r#"{"type":"user","message":{"role":"user","content":"[Request interrupted by user]"}}"#;
+        let noise = [
+            r#"{"type":"system","subtype":"turn_duration","timestamp":"2026-10-05T02:41:04.000Z"}"#,
+            r#"{"type":"file-history-snapshot","snapshot":{}}"#,
+            r#"{"type":"attachment","attachment":{"type":"environment"}}"#,
+            r#"{"type":"user","isMeta":true,"message":{"content":"<local-command-caveat>"}}"#,
+            r#"{"type":"assistant","isSidechain":true,"message":{"content":[{"type":"text","text":"x"}]}}"#,
+            "not json",
+        ]
+        .join("\n");
+        let join = |v: &[&str]| v.join("\n");
+        assert_eq!(last_turn_mark(""), None);
+        assert_eq!(last_turn_mark(&noise), None);
+        // A long generation and a long tool call: no interrupt.
+        assert_eq!(last_turn_mark(prompt), Some(TurnMark::Other));
+        assert_eq!(
+            last_turn_mark(&join(&[prompt, text, tool])),
+            Some(TurnMark::Other)
+        );
+        // Interrupted while the model wrote, then records that do not belong
+        // to a turn.
+        assert_eq!(
+            last_turn_mark(&join(&[prompt, text, esc, &noise])),
+            Some(TurnMark::Interrupted {
+                ts: Some("2026-10-05T02:41:02.500Z".into())
+            })
+        );
+        // Interrupted during a tool call.
+        assert!(matches!(
+            last_turn_mark(&join(&[prompt, tool, rejected, esc_tool])),
+            Some(TurnMark::Interrupted { .. })
+        ));
+        assert_eq!(
+            last_turn_mark(esc_str),
+            Some(TurnMark::Interrupted { ts: None })
+        );
+        // A new prompt after the interrupt: running again.
+        assert_eq!(last_turn_mark(&join(&[esc, prompt])), Some(TurnMark::Other));
+        let queued = r#"{"type":"attachment","attachment":{"type":"queued_command","prompt":"[amail] You have new mail (wake #4)."}}"#;
+        assert_eq!(last_turn_mark(&join(&[esc, queued])), Some(TurnMark::Other));
+        // The marker text quoted inside a longer message is not one.
+        let quoted = r#"{"type":"user","message":{"content":"[Request interrupted by user] is what Claude Code writes when you press Escape; please explain why it appears in the log file I attached, which is long enough to make this message longer than two hundred characters in total."}}"#;
+        assert_eq!(last_turn_mark(quoted), Some(TurnMark::Other));
+    }
 
     // Hand-written records shaped like Claude Code 2.1 transcripts.
     const SAMPLE: &str = r#"{"type":"permission-mode","permissionMode":"bypassPermissions","sessionId":"s1"}

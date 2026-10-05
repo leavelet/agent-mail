@@ -395,7 +395,16 @@ async fn up_is_idempotent_and_incremental(b: Backend) {
     let out = up(&h, &[]).await;
     assert!(out.contains("created seats: gw-3"), "{out}");
     assert!(out.contains("updated seat gw-1: role"), "{out}");
-    assert!(out.contains("takes effect after a restart"), "{out}");
+    assert!(
+        out.contains(
+            "changed while running: g-lead, gw-1, gw-2; amail sleep <seat> then amail wake <seat>"
+        ),
+        "{out}"
+    );
+    assert!(
+        out.contains("new role text of Codex seats g-lead: a resumed Codex session keeps"),
+        "{out}"
+    );
     assert!(out.contains("gw-1, gw-2"), "{out}");
     wait_state(&h, "gw-3", "idle").await;
     assert_eq!(launches(&h, "gw-1").len(), 1);

@@ -173,8 +173,8 @@ pub(super) fn attention_of(st: &State, name: &str) -> Option<(String, String)> {
                 )
             } else {
                 format!(
-                    "its last turn failed ({reason}); amail delivers that turn's mail again \
-                     ({} failed in a row)",
+                    "its last turn failed ({reason}); mail that turn showed, if any, is \
+                     delivered again with the next turn ({} failed in a row)",
                     t.failures
                 )
             },
@@ -400,6 +400,13 @@ impl Node {
             // Team order: parents (leads) start before their subordinates.
             let mut names: Vec<String> = st.saved.managed.keys().cloned().collect();
             names.sort_by_key(|n| st.saved.managed[n].order);
+            let limit = self.cfg.turn_fail_limit;
+            let exhausted_seats: HashSet<String> = names
+                .iter()
+                .filter(|n| st.turns_exhausted(n, limit))
+                .cloned()
+                .collect();
+            let exhausted = |n: &str| exhausted_seats.contains(n);
             for name in &names {
                 let m = st.saved.managed[name].clone();
                 let wants_mail = st
@@ -460,7 +467,10 @@ impl Node {
                 if rt.retry_at.is_some_and(|t| now < t) {
                     continue;
                 }
-                if m.dormant && !(connected && wants_mail) {
+                // A sleeping seat starts for mail, unless the person put it
+                // to sleep (until new mail) or its turns failed too often.
+                if m.dormant && (m.held.is_some() || !(connected && wants_mail) || exhausted(name))
+                {
                     continue;
                 }
                 rt.retry_at = None;
@@ -996,6 +1006,7 @@ impl Node {
                 permission_mode: None,
                 git_access: None,
                 dsh_jail: None,
+                held: None,
             });
             m.order = order as u32;
             if m.harness != p.harness {
@@ -1037,6 +1048,9 @@ impl Node {
             };
             if start {
                 m.up = true;
+                // `amail up` ends a sleep the person asked for: mail
+                // waiting for the seat starts it again.
+                m.held = None;
             }
             out.push(json!({"seat": p.seat, "action": action}));
             let name = p.seat.clone();
@@ -1112,6 +1126,7 @@ impl Node {
                 if let Some(m) = st.saved.managed.get_mut(s) {
                     m.up = false;
                     m.dormant = false;
+                    m.held = None;
                     m.failed = false;
                     m.failures = 0;
                 }
@@ -1206,43 +1221,84 @@ impl Node {
                 return json!({"error": format!("seat {seat} is down; start it with amail up or amail wake")});
             }
             st.start_queue.retain(|n| n != seat);
+            // Asked for by the person: mail already waiting does not start
+            // the seat again, new mail does.
+            let seq = st.seats.get(seat).map_or(0, |s| s.pending.seq);
+            if let Some(m) = st.saved.managed.get_mut(seat) {
+                m.held = Some(seq);
+            }
+            st.save_dirty = true;
             self.begin_stop(&mut st, seat, Intent::Sleep);
         }
         let left = self.wait_stopped(&[seat.to_string()]).await;
         self.presence_kick.notify_one();
-        json!({"seat": seat, "asleep": left.is_empty()})
+        let pending = self.lock().seats.get(seat).map_or(0, |s| s.pending.to);
+        json!({"seat": seat, "asleep": left.is_empty(), "pending": pending})
     }
 
-    pub(super) fn sup_wake(&self, seat: &str) -> Value {
+    pub(super) async fn sup_wake(&self, seat: &str) -> Value {
         if let Err(e) = self.targets(&[seat.to_string()]) {
             return json!({"error": e});
         }
+        let busy = {
+            let mut st = self.lock();
+            if let Some(m) = st.saved.managed.get_mut(seat) {
+                m.up = true;
+                m.dormant = false;
+                m.held = None;
+                m.failed = false;
+                m.failures = 0;
+            }
+            if let Some(rt) = st.sup.get_mut(seat) {
+                rt.retry_at = None;
+            }
+            st.save_dirty = true;
+            self.turns_retry(&mut st, seat);
+            let running = st.saved.managed.get(seat).is_some_and(|m| m.pid.is_some());
+            running
+                && !self.is_stuck(&st, seat)
+                && st
+                    .seats
+                    .get(seat)
+                    .is_some_and(|s| s.state == SeatState::Busy)
+        };
+        // The node may have missed the end of a busy seat's turn (one the
+        // person interrupted fires no hook in Claude Code): look again.
+        let detail = if busy {
+            Some(self.recheck_busy(seat).await)
+        } else {
+            None
+        };
         let mut st = self.lock();
         let running = st.saved.managed.get(seat).is_some_and(|m| m.pid.is_some());
-        if let Some(m) = st.saved.managed.get_mut(seat) {
-            m.up = true;
-            m.dormant = false;
-            m.failed = false;
-            m.failures = 0;
-        }
-        if let Some(rt) = st.sup.get_mut(seat) {
-            rt.retry_at = None;
-        }
-        st.save_dirty = true;
-        self.turns_retry(&mut st, seat);
+        let state = st.seats.get(seat).map(|s| s.state);
         // A seat stuck at a prompt (e.g. one answered in another pane) is
         // started again; a working one is left alone.
         let action = if running && self.is_stuck(&st, seat) {
             self.begin_stop(&mut st, seat, Intent::Restart);
             "restarting"
+        } else if detail.is_some() {
+            if state == Some(SeatState::Busy) {
+                "checked: busy"
+            } else {
+                "checked: idle"
+            }
         } else if running {
             "running"
         } else {
             "starting"
         };
+        let pending = st.seats.get(seat).map_or(0, |s| {
+            if s.wants_wake(now_ms(), st.digest_every) {
+                s.pending.total() + s.stash.len() as i64
+            } else {
+                0
+            }
+        });
         drop(st);
         self.sup_kick.notify_one();
-        json!({"seat": seat, "action": action})
+        self.wake_kick.notify_one();
+        json!({"seat": seat, "action": action, "detail": detail, "pending": pending})
     }
 
     pub(super) fn sup_ps(&self) -> Value {

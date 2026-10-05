@@ -33,7 +33,7 @@
 //! until a turn ends normally.
 
 use super::*;
-use crate::adapter::{TurnInfo, TurnStatus};
+use crate::adapter::{TranscriptTurn, TurnInfo, TurnStatus};
 use crate::persist::{Release, TurnTrack};
 use amail_proto::{NodeNotice, TurnFailure};
 
@@ -372,20 +372,59 @@ impl Node {
     }
 
     /// Ask the harness how turns ended, for adapters whose hooks do not
-    /// report failed turns (see the module docs).
+    /// report failed turns, and look for turns that ended without any hook
+    /// (see the module docs).
     pub(super) async fn turn_check_loop(self: Arc<Self>) {
         loop {
             let now = Instant::now();
             let quiet = self.cfg.turn_quiet;
             let mut next = now + quiet.min(Duration::from_secs(5));
             let mut todo: Vec<(String, Harness, String, bool)> = Vec::new();
+            let mut quiet_seats: Vec<QuietProbe> = Vec::new();
             {
                 let mut st = self.lock();
                 let now_wall = now_ms();
+                let panes: HashMap<String, (String, u32)> = st
+                    .saved
+                    .managed
+                    .iter()
+                    .filter(|(_, m)| m.pid.is_some())
+                    .filter_map(|(n, m)| Some((n.clone(), (m.mux_session.clone(), m.pane?))))
+                    .collect();
+                let transcripts: HashMap<String, PathBuf> = st
+                    .saved
+                    .transcripts
+                    .iter()
+                    .map(|(n, t)| (n.clone(), PathBuf::from(&t.path)))
+                    .collect();
                 for (name, s) in st.seats.iter_mut() {
-                    let Some(h) = s.harness.filter(|h| self.adapter(*h).checks_turns()) else {
+                    let Some(h) = s.harness else {
                         continue;
                     };
+                    let adapter = self.adapter(h);
+                    let quiet_for = (now_wall - s.last_activity).max(0) as u64;
+                    let due = s.state == SeatState::Busy
+                        && quiet_for >= quiet.as_millis() as u64
+                        && s.turn_quiet_checked.is_none_or(|t| now >= t + quiet);
+                    if adapter.finds_interrupts() {
+                        if due {
+                            s.turn_quiet_checked = Some(now);
+                            let screen_due =
+                                quiet_for >= self.cfg.screen_check_after.as_millis() as u64;
+                            quiet_seats.push(QuietProbe {
+                                seat: name.clone(),
+                                harness: h,
+                                busy_since: s.since,
+                                last_hook: s.last_activity,
+                                transcript: transcripts.get(name).cloned(),
+                                pane: panes.get(name).cloned().filter(|_| screen_due),
+                            });
+                        }
+                        continue;
+                    }
+                    if !adapter.checks_turns() {
+                        continue;
+                    }
                     let Some(target) = s.session.as_ref().and_then(|x| x.target.clone()) else {
                         continue;
                     };
@@ -398,13 +437,9 @@ impl Node {
                         continue;
                     }
                     // A busy seat without hooks for a while.
-                    if s.state == SeatState::Busy {
-                        let since = (now_wall - s.last_activity).max(0) as u64;
-                        let checked = s.turn_quiet_checked.is_some_and(|t| now < t + quiet);
-                        if since >= quiet.as_millis() as u64 && !checked {
-                            s.turn_quiet_checked = Some(now);
-                            todo.push((name.clone(), h, target, false));
-                        }
+                    if due {
+                        s.turn_quiet_checked = Some(now);
+                        todo.push((name.clone(), h, target, false));
                     }
                 }
             }
@@ -423,11 +458,252 @@ impl Node {
                     self.quiet_check(&mut st, &seat, t);
                 }
             }
+            for p in quiet_seats {
+                if let Look::Ended(why) = self.look_at_quiet_seat(&p, false).await {
+                    self.end_quiet_turn(&p, &why);
+                }
+            }
             tokio::select! {
                 _ = self.check_kick.notified() => {}
                 _ = tokio::time::sleep_until(next.into()) => {}
             }
         }
+    }
+
+    /// Look at a busy seat that sent no hooks for a while, for a harness
+    /// whose interrupted turns fire no hook (Claude Code): the end of its
+    /// transcript, then (supervised seats, after
+    /// [`Config::screen_check_after`]) its pane. Returns why its turn
+    /// counts as ended, or `None` while it may be running.
+    ///
+    /// - The transcript decides when its last turn record is the person's
+    ///   interrupt and that record is not older than the turn (so an
+    ///   interrupt of an earlier turn does not count). A long tool call or
+    ///   a long model answer leaves a tool call or the prompt last, which
+    ///   never counts.
+    /// - The pane decides only when it shows no running turn twice, at
+    ///   least [`Config::turn_quiet`] apart, with no hook in between
+    ///   (`now`: the person asked, two looks one second apart).
+    async fn look_at_quiet_seat(&self, p: &QuietProbe, now: bool) -> Look {
+        let adapter = self.adapter(p.harness).clone();
+        let mut seen = Vec::new();
+        if let Some(path) = p.transcript.clone() {
+            let read =
+                tokio::task::spawn_blocking(move || crate::transcript::read_tail(&path, 256 << 10))
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok());
+            if let Some((tail, sig)) = read {
+                let cached = {
+                    let st = self.lock();
+                    st.seats
+                        .get(&p.seat)
+                        .and_then(|s| s.quiet.transcript.clone())
+                        .filter(|(s, _)| *s == sig)
+                        .map(|(_, t)| t)
+                };
+                let turn = match cached {
+                    Some(t) => t,
+                    None => {
+                        let t = adapter.transcript_turn(&tail);
+                        tracing::debug!("seat {}: its transcript ends with {t:?}", p.seat);
+                        if let Some(s) = self.lock().seats.get_mut(&p.seat) {
+                            s.quiet.transcript = Some((sig, t.clone()));
+                        }
+                        t
+                    }
+                };
+                seen.push(match turn {
+                    TranscriptTurn::Running => "its transcript shows the turn running",
+                    TranscriptTurn::Interrupted(_) => {
+                        "its transcript ends with an earlier interrupt"
+                    }
+                    TranscriptTurn::Unknown => "its transcript says nothing about the turn",
+                });
+                if let TranscriptTurn::Interrupted(at) = turn {
+                    // Clocks of the same host; the margin covers the
+                    // transcript's write lagging behind the hook.
+                    let fresh = match at {
+                        Some(ms) => ms >= p.busy_since - 2000,
+                        None => (sig.1 / 1_000_000) as i64 >= p.busy_since,
+                    };
+                    if fresh {
+                        return Look::Ended(
+                            "the person interrupted it (its transcript says so)".into(),
+                        );
+                    }
+                }
+            }
+        }
+        let running = |seen: Vec<&str>| {
+            Look::Running(if seen.is_empty() {
+                "nothing shows it ended".to_string()
+            } else {
+                seen.join("; ")
+            })
+        };
+        let Some((session, pane)) = p.pane.clone() else {
+            return running(seen);
+        };
+        let apart = if now {
+            Duration::from_millis(1000)
+        } else {
+            self.cfg.turn_quiet
+        };
+        let looks = if now { 2 } else { 1 };
+        for i in 0..looks {
+            if i > 0 {
+                tokio::time::sleep(apart).await;
+            }
+            let Some(on_screen) = self
+                .mux
+                .screen(&session, pane)
+                .await
+                .ok()
+                .and_then(|screen| adapter.screen_running(&screen))
+            else {
+                return running(seen);
+            };
+            tracing::debug!(
+                "seat {}: its pane shows {}",
+                p.seat,
+                if on_screen {
+                    "a running turn"
+                } else {
+                    "no running turn"
+                }
+            );
+            let now_wall = now_ms();
+            let mut st = self.lock();
+            let Some(s) = st.seats.get_mut(&p.seat) else {
+                return running(seen);
+            };
+            if on_screen || s.last_activity != p.last_hook || s.state != SeatState::Busy {
+                s.quiet.screen_idle_at = None;
+                if on_screen {
+                    seen.push("its pane shows the turn running");
+                }
+                return running(seen);
+            }
+            // A look from before the seat's last hook does not count.
+            match s
+                .quiet
+                .screen_idle_at
+                .filter(|(_, hook)| *hook == p.last_hook)
+            {
+                Some((first, _)) if now_wall - first >= apart.as_millis() as i64 => {
+                    return Look::Ended(format!(
+                        "no hook for {} s and its pane shows no running turn",
+                        (now_wall - p.last_hook).max(0) / 1000
+                    ));
+                }
+                Some(_) => {}
+                None => s.quiet.screen_idle_at = Some((now_wall, p.last_hook)),
+            }
+        }
+        seen.push("its pane shows no running turn (not yet long enough)");
+        running(seen)
+    }
+
+    /// End the turn of a quiet busy seat that [`Node::look_at_quiet_seat`]
+    /// found ended: as one the person interrupted (its mail counts as
+    /// delivered), unless a hook came in the meantime.
+    fn end_quiet_turn(&self, p: &QuietProbe, why: &str) {
+        let mut st = self.lock();
+        let unchanged = st.seats.get(&p.seat).is_some_and(|s| {
+            s.state == SeatState::Busy && s.last_activity == p.last_hook && s.since == p.busy_since
+        });
+        if !unchanged {
+            return;
+        }
+        tracing::info!("seat {}: its turn ended without a hook: {why}", p.seat);
+        st.set_state(&p.seat, SeatState::Idle);
+        let shown = match st.saved.turns.get_mut(&p.seat) {
+            Some(t) => std::mem::take(&mut t.shown),
+            None => Vec::new(),
+        };
+        st.save_dirty = true;
+        self.apply_turn_end(&mut st, &p.seat, shown, TurnEnd::Person);
+        drop(st);
+        self.presence_kick.notify_one();
+        self.wake_kick.notify_one();
+    }
+
+    /// `amail wake` on a seat the node believes busy: look again at once
+    /// (as the quiet checks do, without waiting) and say what was found.
+    pub(super) async fn recheck_busy(&self, seat: &str) -> String {
+        let (h, probe, target) = {
+            let st = self.lock();
+            let Some(s) = st.seats.get(seat) else {
+                return "no session".into();
+            };
+            let Some(h) = s.harness else {
+                return "no session".into();
+            };
+            if s.state != SeatState::Busy {
+                return s.state.as_str().to_string();
+            }
+            let pane = st
+                .saved
+                .managed
+                .get(seat)
+                .filter(|m| m.pid.is_some())
+                .and_then(|m| Some((m.mux_session.clone(), m.pane?)));
+            (
+                h,
+                QuietProbe {
+                    seat: seat.to_string(),
+                    harness: h,
+                    busy_since: s.since,
+                    last_hook: s.last_activity,
+                    transcript: st
+                        .saved
+                        .transcripts
+                        .get(seat)
+                        .map(|t| PathBuf::from(&t.path)),
+                    pane,
+                },
+                s.session.as_ref().and_then(|x| x.target.clone()),
+            )
+        };
+        let quiet_s = (now_ms() - probe.last_hook).max(0) / 1000;
+        let adapter = self.adapter(h).clone();
+        if adapter.finds_interrupts() {
+            return match self.look_at_quiet_seat(&probe, true).await {
+                Look::Ended(why) => {
+                    self.end_quiet_turn(&probe, &why);
+                    format!("was busy, but its turn had ended ({why}); now idle")
+                }
+                Look::Running(what) => {
+                    format!("busy: its turn is running (last hook {quiet_s} s ago; {what})")
+                }
+            };
+        }
+        if adapter.checks_turns()
+            && let Some(target) = target
+        {
+            for i in 0..2 {
+                if i > 0 {
+                    tokio::time::sleep(Duration::from_millis(1000)).await;
+                }
+                let Ok(turns) = adapter.last_turns(&target).await else {
+                    break;
+                };
+                let Some(t) = turns.first() else {
+                    break;
+                };
+                let mut st = self.lock();
+                if self.quiet_check(&mut st, seat, t) {
+                    return format!(
+                        "was busy, but {} says its last turn had ended ({}); now idle",
+                        h.as_str(),
+                        status_word(&t.status)
+                    );
+                }
+            }
+            return format!("busy: its turn is running (last hook {quiet_s} s ago)");
+        }
+        format!("busy: its turn is running (last hook {quiet_s} s ago)")
     }
 
     /// Settle a deferred check with what the harness says.
@@ -460,21 +736,35 @@ impl Node {
     }
 
     /// A busy seat sent no hook for a while: if its last turn ended, end
-    /// it here too (Codex may end a failed turn without a hook).
-    fn quiet_check(&self, st: &mut State, seat: &str, last: &TurnInfo) {
-        if st
+    /// it here too (Codex ends a failed turn without a hook). The same
+    /// ended turn must be seen twice with no hook in between, so a turn
+    /// that has just started and is not listed yet does not count as the
+    /// end of the one before it. Returns true if the turn was ended.
+    fn quiet_check(&self, st: &mut State, seat: &str, last: &TurnInfo) -> bool {
+        let Some(s) = st
             .seats
-            .get(seat)
-            .is_none_or(|s| s.state != SeatState::Busy)
-        {
-            return;
-        }
+            .get_mut(seat)
+            .filter(|s| s.state == SeatState::Busy)
+        else {
+            return false;
+        };
         let end = match &last.status {
-            TurnStatus::InProgress => return,
+            TurnStatus::InProgress => {
+                s.quiet.verdict = None;
+                return false;
+            }
             TurnStatus::Completed => TurnEnd::Normal,
             TurnStatus::Interrupted => TurnEnd::Person,
             TurnStatus::Failed(m) => TurnEnd::Failed(m.clone()),
         };
+        let seen = (last.id.clone(), end.clone());
+        match &s.quiet.verdict {
+            Some((v, at)) if *v == seen && *at >= s.last_activity => {}
+            _ => {
+                s.quiet.verdict = Some((seen, now_ms()));
+                return false;
+            }
+        }
         tracing::info!("seat {seat}: its last turn ended without a hook ({end:?})");
         st.set_state(seat, SeatState::Idle);
         let shown = match st.saved.turns.get_mut(seat) {
@@ -485,6 +775,52 @@ impl Node {
         self.apply_turn_end(st, seat, shown, end);
         self.presence_kick.notify_one();
         self.wake_kick.notify_one();
+        true
+    }
+}
+
+/// What the node found about a quiet busy seat (reset when the seat's
+/// state changes).
+#[derive(Debug, Clone, Default)]
+pub(super) struct QuietRt {
+    /// The app-server said the seat's last turn ended: `((turn id, how),
+    /// when, Unix ms)`.
+    verdict: Option<((Option<String>, TurnEnd), i64)>,
+    /// The transcript's size and modification time at the last read, and
+    /// what it said then.
+    transcript: Option<((u64, i128), TranscriptTurn)>,
+    /// When the pane first showed no running turn, and the seat's last
+    /// hook then (Unix ms).
+    screen_idle_at: Option<(i64, i64)>,
+}
+
+/// What [`Node::look_at_quiet_seat`] found.
+enum Look {
+    /// The turn ended; why.
+    Ended(String),
+    /// It may be running; what was seen.
+    Running(String),
+}
+
+/// A quiet busy seat to look at.
+#[derive(Debug, Clone)]
+pub(super) struct QuietProbe {
+    seat: String,
+    harness: Harness,
+    /// When the seat became busy, and its last hook (Unix ms).
+    busy_since: i64,
+    last_hook: i64,
+    transcript: Option<PathBuf>,
+    /// `(zellij session, pane)` when the pane is to be looked at.
+    pane: Option<(String, u32)>,
+}
+
+fn status_word(s: &TurnStatus) -> &'static str {
+    match s {
+        TurnStatus::InProgress => "running",
+        TurnStatus::Completed => "completed",
+        TurnStatus::Interrupted => "interrupted",
+        TurnStatus::Failed(_) => "failed",
     }
 }
 

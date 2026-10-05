@@ -102,8 +102,26 @@ hook() {
 
 turn() {
     # A turn: the prompt hook, tool calls while <seat>.busy exists, then
-    # Stop (again while it blocks).
+    # Stop (again while it blocks). While <seat>.hang exists the turn sends
+    # no hooks and its screen shows Claude Code's working line (a long tool
+    # call or answer); <seat>.esc then ends it the way a person pressing
+    # Escape does: no hook, the screen shows the interrupt.
     hook "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$sid\",\"prompt\":$1}" > /dev/null
+    if [ -f "$D/$seat.hang" ]; then
+        printf '\033[2J'
+        echo "· Working… (12s · esc to interrupt)"
+        echo "> "
+        while [ -f "$D/$seat.hang" ]; do
+            if [ -f "$D/$seat.esc" ]; then
+                rm -f "$D/$seat.esc" "$D/$seat.hang"
+                printf '\033[2J'
+                echo "  ⎿  Interrupted · What should Claude do instead?"
+                echo "> "
+                return
+            fi
+            sleep 0.05
+        done
+    fi
     while [ -f "$D/$seat.busy" ]; do
         hook "{\"hook_event_name\":\"PostToolUse\",\"session_id\":\"$sid\",\"tool_name\":\"Bash\"}" > /dev/null
         sleep 0.2

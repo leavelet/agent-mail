@@ -212,6 +212,11 @@ pub struct Managed {
     /// The dsh jail setting from the team file (see `SeatPlacement`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dsh_jail: Option<bool>,
+    /// Put to sleep by the person (`amail sleep`, the web Sleep button):
+    /// pending mail does not start it; new mail, `amail wake` or `amail up`
+    /// does. The seat's mailbox sequence number at that time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

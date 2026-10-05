@@ -97,7 +97,7 @@ impl Node {
                     let r = if cmd.op == "sleep" {
                         n.sup_sleep(&cmd.seat).await
                     } else {
-                        n.sup_wake(&cmd.seat)
+                        n.sup_wake(&cmd.seat).await
                     };
                     tracing::info!("server asked to {} seat {}: {r}", cmd.op, cmd.seat);
                 });

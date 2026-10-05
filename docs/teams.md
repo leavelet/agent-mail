@@ -172,7 +172,13 @@ Seat states: `starting`, `busy`, `idle`, `awaiting` (a permission prompt),
   active idle seats when more than `max_live` run, or `amail sleep`, is put
   to sleep: its process ends; its session id and pane are kept.
 - `to` or urgent mail for a sleeping seat (or `amail wake`) starts it again
-  in its pane, resuming its session; the mail then arrives as usual. At most
+  in its pane, resuming its session; the mail then arrives as usual. A
+  seat the person put to sleep (`amail sleep`, or Sleep in the web
+  interface) stays asleep with the mail already waiting for it; mail that
+  arrives after the sleep, `amail wake` or `amail up` starts it again (this
+  survives a node restart; mail that arrives while the node is down is
+  only noticed at the next new mail). A sleeping seat whose turns failed
+  three times in a row is not started for mail either (`amail wake` does). At most
   4 sessions start at a time (`amail node --start-limit`), so mail to
   everyone does not start dozens of processes at once.
 - A process that ends without `amail down` or sleep is restarted (resuming)

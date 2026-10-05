@@ -83,10 +83,16 @@ pub struct Config {
     /// (up to `wake_backoff_max`).
     pub turn_retry_backoff: Duration,
     /// For harnesses whose hooks report no failed turns (Codex): how soon
-    /// after a turn's end the node asks how it ended, and after how long
-    /// without hooks a busy seat's turn is looked at.
+    /// after a turn's end the node asks how it ended.
     pub turn_check_delay: Duration,
+    /// A busy seat without hooks this long has its turn looked at (and
+    /// again at this interval while it stays quiet): Codex seats by asking
+    /// the app-server, Claude Code seats by reading the end of their
+    /// transcript (see [`turns`]).
     pub turn_quiet: Duration,
+    /// A busy supervised seat without hooks this long whose transcript says
+    /// nothing has its pane looked at (Claude Code: is a turn running?).
+    pub screen_check_after: Duration,
     pub heartbeat: Duration,
     pub liveness_interval: Duration,
     /// Total time of the server calls one hook waits for (claims, inbox).
@@ -180,7 +186,8 @@ impl Config {
             turn_fail_limit: 3,
             turn_retry_backoff: Duration::from_secs(30),
             turn_check_delay: Duration::from_secs(1),
-            turn_quiet: Duration::from_secs(30),
+            turn_quiet: Duration::from_secs(3),
+            screen_check_after: Duration::from_secs(60),
             heartbeat: Duration::from_secs(30),
             liveness_interval: Duration::from_secs(2),
             hook_server_timeout: crate::server::HOOK_SERVER_TIMEOUT,
@@ -265,6 +272,8 @@ struct SeatRt {
     turn_check: Option<turns::TurnCheck>,
     /// When a quiet busy seat's turn was last checked.
     turn_quiet_checked: Option<Instant>,
+    /// What the last checks of a quiet busy seat found (see [`turns`]).
+    quiet: turns::QuietRt,
 }
 
 impl SeatRt {
@@ -295,6 +304,7 @@ impl SeatRt {
             turn_retry_at: None,
             turn_check: None,
             turn_quiet_checked: None,
+            quiet: Default::default(),
         }
     }
 
@@ -430,6 +440,7 @@ impl State {
         seat.clear_wake_failure();
         seat.wake_due = None;
         seat.wake_out = None;
+        seat.quiet = Default::default();
         if s != SeatState::Busy {
             seat.stop_blocks = 0;
         }
@@ -1146,7 +1157,7 @@ impl Node {
             Request::Down { seats } => self.sup_down(seats).await,
             Request::Forget { seats } => self.sup_forget(seats).await,
             Request::Sleep { seat } => self.sup_sleep(&seat).await,
-            Request::Wake { seat } => self.sup_wake(&seat),
+            Request::Wake { seat } => self.sup_wake(&seat).await,
             Request::Ps => self.sup_ps(),
             Request::Locate { target } => self.sup_locate(&target),
         }
@@ -2104,12 +2115,27 @@ impl Node {
             }
             // New mail that could wake the seat ends a wake-up failure.
             let arrived = c.to > seat.pending.to || c.urgent > seat.pending.urgent;
+            let prev_seq = seat.pending.seq;
+            let new_seq = c.seq;
             seat.digest_since = c.digest_since.as_deref().and_then(parse_ts);
             seat.focus_until = c.focus_until.as_deref().and_then(parse_ts);
             seat.pending = c;
             if arrived && seat.wake_failed {
                 seat.clear_wake_failure();
-                st.dirty_presence.insert(name);
+                st.dirty_presence.insert(name.clone());
+            }
+            // New mail ends a sleep the person asked for. The counts it is
+            // compared with must be from after the sleep (not the empty ones
+            // of a node that just started).
+            if arrived
+                && let Some(m) = st.saved.managed.get_mut(&name)
+                && m.held
+                    .is_some_and(|held| prev_seq >= held && new_seq > held)
+            {
+                tracing::info!("seat {name}: new mail; it may be started again");
+                m.held = None;
+                st.save_dirty = true;
+                self.sup_kick.notify_one();
             }
         }
     }

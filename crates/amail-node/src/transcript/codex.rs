@@ -10,6 +10,9 @@
 //!   and the diffs;
 //! - `HookPrompt` (`fragments[].text`): a hook's continuation prompt.
 //!
+//! A `task_complete` event with an `error` (a turn that failed, e.g. the
+//! model was refused) becomes an error line; `turn_aborted` a notice.
+//!
 //! Hook context (injected mail) arrives as a `response_item` message with
 //! role `developer`; those starting with `[amail` are notices. Other
 //! `response_item` records duplicate the items above and are skipped, as are
@@ -54,9 +57,31 @@ impl Parser for CodexParser {
                     Vec::new()
                 })
             }
+            // A turn that failed (a model or API error): `task_complete`
+            // with `error.message`.
+            (Some("event_msg"), Some("task_complete")) => Some(
+                match p.get("error").filter(|e| !e.is_null()).map(|e| {
+                    str_at(e, "message")
+                        .map(str::to_string)
+                        .unwrap_or_else(|| e.to_string())
+                }) {
+                    Some(msg) => {
+                        let mut e = event(
+                            ts,
+                            R::System,
+                            K::Notice,
+                            &format!("turn failed: {msg}"),
+                            None,
+                        );
+                        e.error = true;
+                        vec![e]
+                    }
+                    None => Vec::new(),
+                },
+            ),
             // Duplicates of `item_completed` items, or bookkeeping.
             (Some("response_item"), _)
-            | (Some("event_msg"), Some("task_started" | "task_complete" | "token_count"))
+            | (Some("event_msg"), Some("task_started" | "token_count"))
             | (Some("session_meta" | "turn_context" | "world_state" | "token_usage_record"), _) => {
                 Some(Vec::new())
             }
@@ -267,6 +292,26 @@ garbage {
         assert_eq!(s.skipped, 1);
         // WebSearch item and the unknown record type.
         assert_eq!(s.ignored, 2);
+    }
+
+    /// Shaped like codex-cli 0.160 records of a turn the model refused and
+    /// of one that ended normally.
+    #[test]
+    fn codex_failed_turn_is_an_error_line() {
+        let mut p = CodexParser::default();
+        let failed = r#"{"timestamp":"2026-10-05T03:23:00.100Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","last_agent_message":null,"error":{"message":"{\"type\":\"error\",\"status\":400,\"error\":{\"message\":\"The 'gpt-bogus' model is not supported\"}}"},"newField":1}}"#;
+        let ok = r#"{"timestamp":"2026-10-05T03:23:59.000Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"t2","last_agent_message":"done","duration_ms":7365}}"#;
+        let evs = p.line(failed);
+        assert_eq!(evs.len(), 1);
+        assert!(evs[0].error);
+        assert_eq!(evs[0].kind, K::Notice);
+        assert!(
+            evs[0].text.starts_with("turn failed: ") && evs[0].text.contains("gpt-bogus"),
+            "{}",
+            evs[0].text
+        );
+        assert!(p.line(ok).is_empty());
+        assert_eq!(p.stats().ignored, 0);
     }
 
     #[test]

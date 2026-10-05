@@ -387,10 +387,66 @@ How each harness's failed turns are found:
 
 | harness | signal |
 |---|---|
-| Claude Code | the `StopFailure` hook, sent instead of `Stop` when a turn ends in an API error. Claude Code 2.1.289 sends `error` (the error type, e.g. `authentication_failed`) and `last_assistant_message` (the text shown); its documentation names `error_type` and `error_message`, which are read as well. Pressing Esc fires no hook, so an interrupted turn is seen only when the next turn starts |
-| Codex | Codex hooks have no failure event (0.160: `Stop` and `Interrupt` only). The node asks the shared app-server how the turn ended (`thread/turns/list`; status `failed` with the error message): about a second after `Stop` or `Interrupt`, and when a busy seat has sent no hook for 30 s. This path was tested only with a stand-in app-server, not with a real failing Codex session |
+| Claude Code | the `StopFailure` hook, sent instead of `Stop` when a turn ends in an API error. Claude Code 2.1.289 sends `error` (the error type, e.g. `authentication_failed`) and `last_assistant_message` (the text shown); its documentation names `error_type` and `error_message`, which are read as well. Found within about a second |
+| Codex | Codex hooks have no failure event (0.160: `Stop` and `Interrupt` only), and a turn that fails sends no hook at all. The node asks the shared app-server how the turn ended (`thread/turns/list`; status `failed` with the error message): about a second after `Stop` or `Interrupt`, and every 3 s while a busy seat sends no hooks. The same ended turn must be listed twice in a row, so a failed turn is found about 6-9 s after it started (codex-cli 0.160 with a model the account cannot use: 7 s and 9 s); until then the sender sees `read` and the seat `busy` |
 | dsh | the wrapper (`amail dsh-host`) follows the session log; a `turn/end` with reason `error` (with dsh's message) or `interrupted` (a turn whose host stopped during it) is reported as a failed turn; `aborted` (cancelled in the GUI) and other reasons count as an interruption. dsh 0.2.0-rc.2 sends no `Stop` for a failed turn |
 | all | the session process ends while the seat is busy (supervised seats: the pane's process exits other than with status 0; other seats: the process the hooks named is gone) |
+
+## Interrupted turns
+
+A person can stop a turn (Escape in Claude Code or Codex, the stop button
+in the dsh GUI). The seat becomes idle, the mail that turn showed counts as
+delivered (the person chose to stop it; it is not shown again), and later
+mail is delivered as usual.
+
+| harness | how the node learns of it |
+|---|---|
+| Claude Code | Claude Code fires no hook for an interrupted turn. It writes a user record `[Request interrupted by user]` (or `... for tool use]`) to the session's transcript. When a busy seat has sent no hook for 3 s, the node reads the end of its transcript every 3 s (only when the file changed) and ends the turn if the last record of the turn is that interrupt and is not older than the turn. Found 1-2 s after the Escape with Claude Code 2.1.289. Fallback, for supervised seats whose transcript says nothing: after 60 s without hooks the node also looks at the pane; Claude Code's status line says `esc to interrupt` while a turn runs (model output or a tool call), and the turn counts as ended only when two looks at least 3 s apart, with no hook in between, both show no such line |
+| Codex | the `Interrupt` hook (codex-cli 0.160: about 10 ms after Escape); the app-server check above also sees the status `interrupted` |
+| dsh | the wrapper reports a `turn/end` with reason `aborted` as an interruption (about 30 ms after the stop) |
+
+Neither Claude Code check can end a turn that is still running: a long
+tool call leaves the tool call last in the transcript, and a long answer
+leaves the prompt last (Claude Code writes an answer when it is complete),
+and the status line shows `esc to interrupt` throughout both (checked with
+a 96 s tool call and a 65 s answer). If a future Claude Code changed that
+line, the fallback could take a running turn for an ended one; the node
+would then wake the seat, and the wake-up message would wait in the
+session's queue until the turn's next tool call, which shows it as usual.
+
+`amail wake <seat>` (and Wake in the web interface) on a seat the node
+believes busy looks again at once (transcript and pane, or the Codex
+app-server) and says what it found, for example `c1: was busy, but its turn
+had ended (the person interrupted it (its transcript says so)); now idle;
+delivering its 1 waiting message(s)` or `c1: busy: its turn is running
+(last hook 20 s ago; its transcript shows the turn running; its pane shows
+the turn running)`.
+
+## Settings after sleep and wake
+
+`amail up` updates a running seat's settings on the server and names the
+seats that need a restart. `amail sleep <seat>` then `amail wake <seat>`
+(or `amail down --only <seat>` then `amail up --only <seat>`) starts the
+seat again, resuming its session; what the resumed session takes:
+
+| setting | Claude Code | Codex | dsh |
+|---|---|---|---|
+| model | yes (`--model` at each start) | yes (see below) | yes (the per-seat overlay is written at each start) |
+| permission mode, `git_access` | yes | yes (see below) | yes |
+| role text | yes (the system prompt is given at each start) | no: it is part of the session's first prompt only | yes (overlay) |
+| harness | a new session is started (a session cannot move to another harness) | | |
+
+Codex keeps a thread loaded in the shared app-server for a moment after
+its session ends, and a session that resumes a loaded thread keeps the
+thread's old settings and ignores `-m`. This happened when the node
+started a seat again 0.1 s after `amail sleep` (it no longer does that on
+its own, see [team files](teams.md)), or when `amail wake` follows at once.
+So when it resumes a Codex seat the node also sets the seat's model,
+approval policy and permissions profile on the thread through the
+app-server (`thread/settings/update`), at once and again 3 s and 10 s
+later (checked with codex-cli 0.160: wake 0.1 s after sleep, the next turn
+used the corrected model). A Codex seat's new role text does not reach its
+resumed session: tell the agent by mail, which `amail up` says.
 
 ## Limitations common to all harnesses
 

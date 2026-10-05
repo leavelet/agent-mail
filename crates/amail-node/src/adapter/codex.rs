@@ -886,6 +886,68 @@ impl Codex {
     pub fn marker(seat: &str, nonce: &str) -> String {
         format!("[amail:seat={seat} launch={nonce}]")
     }
+
+    /// The seat's settings for `thread/settings/update` (see
+    /// [`Codex::apply_settings_on_resume`]): model, approval policy and
+    /// permissions profile.
+    pub fn resume_settings(
+        thread: &str,
+        model: Option<&str>,
+        mode: PermissionMode,
+        git_access: GitAccess,
+    ) -> Vec<Value> {
+        let mut first = json!({
+            "threadId": thread,
+            "approvalPolicy": if mode == PermissionMode::Unattended { "never" } else { "on-request" },
+        });
+        if let Some(m) = model.filter(|m| !m.is_empty()) {
+            first["model"] = json!(m);
+        }
+        let profile = match git_access {
+            GitAccess::Worktree => PERMISSIONS_PROFILE,
+            GitAccess::Full => FULL_PROFILE,
+            GitAccess::Off => OFF_PROFILE,
+        };
+        vec![first, json!({"threadId": thread, "permissions": profile})]
+    }
+
+    /// A resumed session may attach to a thread the shared daemon still
+    /// has loaded (its previous session ended a moment ago, e.g. when the
+    /// node starts a seat again right after `amail sleep`). Codex then
+    /// keeps the thread's earlier settings and ignores `-m`. So the node
+    /// sets the seat's settings on the thread itself: once now (a thread
+    /// still loaded takes them; one that is not loaded is loaded with the
+    /// launch flags instead) and again after the session has attached.
+    fn apply_settings_on_resume(&self, thread: &str, ctx: &LaunchCtx<'_>) {
+        let calls = Self::resume_settings(
+            thread,
+            ctx.info.model.as_deref(),
+            ctx.permission_mode,
+            ctx.git_access,
+        );
+        let socket = self.control_socket();
+        let (thread, seat) = (thread.to_string(), ctx.info.seat.clone());
+        tokio::spawn(async move {
+            for delay in [0u64, 3, 10] {
+                tokio::time::sleep(Duration::from_secs(delay)).await;
+                for params in &calls {
+                    match crate::codex_rpc::socket_calls(
+                        &socket,
+                        &[("thread/settings/update", params.clone())],
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            tracing::debug!("seat {seat}: set {params} on codex thread {thread}")
+                        }
+                        Err(e) => tracing::debug!(
+                            "seat {seat}: setting {params} on codex thread {thread}: {e:#}"
+                        ),
+                    }
+                }
+            }
+        });
+    }
 }
 
 /// The dedicated Codex home in a node state directory.
@@ -944,6 +1006,7 @@ pub fn parse_turns(v: &Value) -> Vec<TurnInfo> {
                 _ => TurnStatus::InProgress,
             },
             started_at: t["startedAt"].as_i64(),
+            id: t["id"].as_str().map(str::to_string),
         })
         .collect()
 }
@@ -1134,6 +1197,9 @@ impl Adapter for Codex {
                 Self::marker(&info.seat, ctx.nonce),
                 crate::inject::seat_intro(info)
             ));
+        }
+        if let Some(id) = ctx.resume {
+            self.apply_settings_on_resume(id, ctx);
         }
         let env = BTreeMap::from([
             (
