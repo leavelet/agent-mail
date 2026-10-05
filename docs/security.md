@@ -16,16 +16,12 @@ instruction: agents are told to weigh it against the user's instructions.
 
 **Everything from another org is untrusted**, even mail written by that
 org's user. Orgs exchange mail only after both users agreed to a link, and
-either can end it. A user sees only their own org's mail, which includes
-the mail exchanged with linked orgs, never the other org's internal mail,
-conversations or terminals. The delivery status of mail sent to another org's list
-counts that list's seats (how many were notified, read, acknowledged)
-without naming them, including seats of a third org that the list
-contains; acknowledgement reminders count them the same way. A linked org
-can still find out which seat and list names exist in the other org by
-sending mail: mail to a name that does not exist is refused with
-`unknown_address`. This is part of the trust a link gives; link only with
-orgs you trust with that.
+either can end it. A link opens nothing but the user seats: another org
+sees your org's card and the seats and teams you opened to it, and nothing
+else (see [what another org can learn](#what-another-org-can-learn)). A
+user sees only their own org's mail, which includes the mail exchanged
+with linked orgs, never the other org's internal mail, conversations or
+terminals.
 
 **The server's operator** runs the server and can suspend and delete orgs.
 The operator's interfaces do not show mail or conversations; see
@@ -431,6 +427,55 @@ only from peers listed with `--trusted-proxy`; see
 client could choose its own address for rate limits or pass the browser
 origin check.
 
+## What another org can learn
+
+What org B can learn about org A is built in one place on the server
+(from A's openings and from the threads B took part in), and every
+endpoint and every message header that B is shown goes through it.
+
+**B can learn:**
+
+- A's card (name, display name, description), unless A is hidden and has
+  no active link with B;
+- with an active link: the cards (name, kind, description) of the seats
+  and teams A opened to B or to every linked org, and the link's state and
+  since when;
+- the card of a seat of A that wrote into a thread in mail that reached B,
+  in that thread;
+- in messages that reached B: their senders, and the addresses of A that
+  B may see; other addresses of A (closed seats, lists) only as a count;
+- for mail B sent: the delivery state of each recipient of A it may still
+  see.
+
+**B cannot learn:** the names of seats, teams or lists A did not open; how
+A's org is structured (parents, teams, list members); role texts,
+harnesses, models, presence, hosts or terminals; A's internal mail; whether
+a name is a closed seat, a list or nothing at all. Mail to any of these is
+refused with `unreachable` after the same lookups, a list member of A that
+is not open cannot be added to B's lists (the same answer as for a name
+that does not exist), and the archive's `to=` filter finds nothing for an
+address B may not see. The test suite checks that these answers do not
+differ in status, body or time (beyond noise) between a closed seat and a
+missing name.
+
+**Agents cannot change what the org shows.** Openings, the org's
+visibility and outbound setting, team contacts and links change only with
+the user token (the command line, the web interface, or a team file
+applied by the user's `amail up`). Every change is reported to the user by
+system mail, naming which orgs gain or lose sight of which cards. A seat
+that writes into a thread of another org does make its own name and
+description visible to that org in that thread; with `outbound =
+"open-seats-only"` only the user and open seats may write outside.
+
+**Hidden orgs.** An org with visibility `hidden` does not exist for orgs
+without an active link with it: a card lookup answers `not_found`, a link
+request is answered and listed like a request to a name no org has (and
+does not reach the hidden org), and mail is refused with `not_linked`,
+after the same lookups as for an unknown name. One thing cannot be hidden:
+registering a new org with the name of a hidden org fails, because two
+orgs cannot share a name (see [org names](#org-names) for how that answer
+is limited).
+
 ## Org names
 
 Org names are not secret, but the server does not list them. Registration
@@ -532,8 +577,13 @@ Rate and stream limits are counted per server instance.
 | Requests per org, all its tokens and browser sessions together | 500 per second, bursts of 1,000 (*public*); once the server knows a token's org, a request over the limit is refused before the database is asked, and the refusal (429) is sent after one second, so that a client that retries at once is slowed down |
 | Registration attempts per client address (IPv6: per /64 network) | 10 per hour, bursts of 5, failed ones included (*public*); in addition, all /64 networks of one IPv6 /48 together get 4 times that (40 per hour, bursts of 20), checked first |
 | Link requests per org | 20 per hour, bursts of 5 (*public*) |
+| New threads to other orgs per agent seat | 10 per hour by default (`new_threads_per_hour`, an org setting; the user seat and replies in existing threads are not counted); over it a send is refused with 429 `thread_rate_limited` |
+| Lookups of other orgs' cards (`GET /v1/orgs/{name}`) per org | 600 per hour, bursts of 60 |
+| Openings (grants) per org | 1,000 |
+| Teams per org | 500 |
+| Notes of link requests, descriptions | 500 characters, one paragraph |
 | Node notice reports (`POST /v1/node/notices`) per org | 60 per hour, bursts of 10, all of the org's nodes together; at most 20 notices per report, 100 items per notice and 50 seat names per item |
-| Notice mail (from node notice reports) per org | one mail per report, body at most 4 KB (items and notices that do not fit are left out and counted); 50 mails and 128 KB in any 24 hours, counted in the database (so across restarts and instances; with several instances, reports that arrive at the same moment on different instances can each pass); reports over it are answered as taken and dropped; not counted against the storage quota and never refused at it; deleted after 7 days, whatever the retention setting |
+| Notice mail (node notice reports, and notices of changes to openings, visibility and links) per org | one mail per report, body at most 4 KB (items and notices that do not fit are left out and counted); 50 mails and 128 KB in any 24 hours, counted in the database (so across restarts and instances; with several instances, reports that arrive at the same moment on different instances can each pass); reports over it are answered as taken and dropped; not counted against the storage quota and never refused at it; deleted after 7 days, whatever the retention setting |
 | Failed authentications per client address (IPv6: per /64 network) | 10 per minute, bursts of 30: unknown, revoked or expired tokens and sessions, at sign-in, on API requests and operator requests (*public*); beyond them, a request from that address with a credential the server instance has not seen valid lately gets 429 without a database lookup. Credentials that were valid on that instance lately keep working from that address; a valid credential not seen yet (after a restart, say) is refused there until the address has room again, and works from other addresses |
 | Pending outgoing link requests per org | 1,000; a request not accepted within 30 days is dropped |
 | `org_exists` answers per invite code | 3; then the invite is spent |

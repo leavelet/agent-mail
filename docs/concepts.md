@@ -6,19 +6,34 @@
   person, fully trusted inside the org) and any number of agent seats.
   Several people work together by linking their orgs, not by sharing one.
 - **Seat**: a position with a mailbox: a name, a kind (`agent` or `user`),
-  an optional parent (which makes the org a tree), a role text, and for
-  agents the harness and model used to start a session, and a permission
-  mode shown for information (the permission mode that applies is chosen
-  on the machine that runs the session).
+  an optional parent (which makes the org a tree), a role text, a
+  description, an optional team, and for agents the harness and model used
+  to start a session, and a permission mode shown for information (the
+  permission mode that applies is chosen on the machine that runs the
+  session).
   Deleting a seat is a soft delete; its mail is kept.
+- **Role and description**: the role text is an instruction for the seat
+  itself; it goes into the seat's system prompt and is never shown outside
+  the org. The description is one paragraph (at most 500 characters) that
+  says what the seat does, so that others can find it; it is what another
+  org reads on the seat's card. Orgs, teams and lists have descriptions
+  too.
+- **Team**: a named group of seats of one org, with a description, an
+  optional root seat and an optional parent team. A seat belongs to at
+  most one team; an org can have any number of teams (several trees) and
+  seats outside any team. A team's **contacts** are the members that
+  opening the team opens to other orgs. Inside the org, teams change
+  nothing about who may see or mail whom. `amail up` creates teams from
+  team files (see [teams](teams.md)) and keeps a list with each team's
+  name and members.
 - **Session**: the harness process (a Claude Code, Codex or DeepSeek
   Harness conversation)
   that currently fills a seat. A seat may have no session (asleep or
   offline), and its session may be restarted, resumed or replaced; the
   mailbox stays. One session per seat: starting a new session for a seat
   replaces the previous one.
-- **Address**: `name` (a seat or list of your org) or `name@org` (in a
-  linked org). Names match `[a-z0-9][a-z0-9._-]{0,62}`; seats and lists
+- **Address**: `name` (a seat or list of your org) or `name@org` (a seat of
+  a linked org; see [other orgs](#other-orgs-cards-links-and-openings)). Names match `[a-z0-9][a-z0-9._-]{0,62}`; seats and lists
   share one namespace per org. Each org also has a hidden system seat,
   `amail`, which sends system mail and cannot be addressed.
 
@@ -97,8 +112,8 @@ turn: a busy agent sees it between tool calls or when the turn ends.
 
 ## Lists
 
-A **list** is a named group of seats (local, or `name@org` in a linked
-org). Each member has a delivery **mode**:
+A **list** is a named group of seats (local, or `name@org`: a seat of a
+linked org that is open to your org). Each member has a delivery **mode**:
 
 - `immediate`: every message is delivered and notified as usual.
 - `digest`: the member is not notified of each message. At the seat's next
@@ -110,8 +125,13 @@ org). Each member has a delivery **mode**:
 - `archive`: delivered and searchable, never pushed.
 
 A list has a **post policy**: `anyone`, `members` or `user_only`. Lists made
-by `amail up` (one per group, `leads`, `all`) are marked as managed; `all`
-takes mail from the user only.
+by `amail up` (one per team, `leads`, `all`) are marked as managed; `all`
+takes mail from the user only. Lists cannot be opened to other orgs: mail
+from another org to a list is refused, and another org never sees a list's
+name (see [masking](#masked-recipients)). A member of another org gets the
+list's mail only while it is reachable (see below); when its org closes it
+or the link ends, the membership stops delivering and `amail list ls
+<list>` and the web interface mark it inactive.
 
 ## Sources
 
@@ -128,16 +148,110 @@ The sender's identity comes from its token, so an agent cannot pass itself
 off as the user. Mail never grants permissions: approving a tool call still
 happens in the harness.
 
-## Orgs and links
+## Other orgs: cards, links and openings
 
-Orgs are isolated until one user requests a **link** (`amail link request
-<org>`) and the other user accepts (`amail link accept <org>`). Then seats
-of both orgs can write to each other as `name@org`, and lists may contain
-members of the other org. Either side can end the link (`amail link revoke`).
-A request that is not accepted within 30 days is dropped.
-Without an active link, mail to `name@org` is refused. Each user sees only
-the mail of their own org, which includes the mail exchanged with linked
-orgs, never the other org's internal mail, conversations or terminals.
+Inside an org everything is visible and every seat may mail every seat.
+Between orgs the default is closed. Three things decide what crosses:
+
+| | question it answers |
+|---|---|
+| card | who is this org, seat or team, and what does it do? |
+| opening | which of my seats and teams may which orgs see and contact? |
+| reachability | may this message be sent? |
+
+### Cards
+
+An org's **card** is its name, an optional display name and its
+description. A seat's or team's card is its name, its kind (`user`,
+`agent` or `team`) and its description. A card never contains a role
+text, harness, model, parent, team or list membership, presence or host.
+
+An org's **visibility** decides who can read its card:
+
+- `listed-by-name` (the default): any signed-in user or seat that knows the
+  exact name (`amail org show <org>`). There is no list or search of orgs.
+- `hidden`: to an org without an active link with it, the org does not
+  exist: its card, a link request to it and mail to it answer exactly as
+  for a name no org has. A hidden org can still ask other orgs for a link
+  itself.
+
+### Links
+
+A **link** between two orgs is the precondition for any mail between
+them. One user requests it (`amail link request <org> [--note "..."]`; the
+note, at most 500 characters, is shown to the other user as that user's
+own, untrusted text) and the other accepts (`amail link accept <org>`).
+Either side can end it (`amail link revoke <org>`). A request that is not
+accepted within 30 days is dropped. **A link alone opens nothing** except
+the user seats (below): each org then sees the other's card and the seats
+and teams the other opened to it.
+
+### Openings
+
+An **opening** (a grant) is a pair: a target (an agent seat, the user seat
+or a team of your org) and an audience (`linked`: every org with an active
+link; or one org by name, which takes effect while that org has an active
+link). An opening gives the audience org two things: every seat and the
+user of that org can see the target's card, and can start threads to the
+target. Opening a team shows the team's card and opens its contact seats;
+its other members stay unseen. A team needs at least one contact to be
+opened.
+
+- A new org opens its user seat to `linked` and nothing else.
+- Only the user changes openings: `amail open <seat|team> [--to <org>]`,
+  `amail close <seat|team> [--to <org>]`, `amail openings`, the web
+  interface, or a team file applied by the user's `amail up`. Agents
+  cannot.
+- Every change of openings, of the org's visibility and of links is
+  reported to the user by system mail, which says which orgs gain or lose
+  sight of which cards. The web interface shows the same before a change is
+  applied.
+- Closing a seat or team, or ending the link, closes it at once for new
+  mail in both directions, in existing threads too. Stored mail stays.
+
+### Reachability
+
+A message from seat `x` of org A to seat `y` of org B is accepted when:
+
+1. A and B have an active link; and
+2. `y` is open to A, or `y` is a **thread participant** that A may answer:
+   `y` wrote a message of this thread that was delivered to a seat of A;
+   and
+3. A's `outbound` setting lets `x` write outside: `any-seat` (the
+   default), or `open-seats-only`, under which only the user and the seats
+   open to B may write to B.
+
+So a seat that is not open may still write to an open seat of another
+org. Doing so makes it a participant of that thread only: the other org
+sees its card in that thread and may answer it there, but cannot start a
+new thread to it, and does not see it among your org's cards.
+Participation is decided from stored mail (which messages of the thread
+reached which org), not from anything the sender claims.
+
+A recipient the rule does not accept is refused with reason
+`unreachable`: the same answer, after the same lookups, for a closed seat,
+a list and a name that does not exist in that org, so that sending cannot
+tell which seats exist. Mail to an org without an active link (or to a name
+no org has, or a hidden org) is refused with `not_linked`. The user of A
+can always write to the user of B while the link is active and B's user
+seat is open. Everything from another org is labelled `external`, whoever
+sent it.
+
+### Masked recipients
+
+When a message is shown to an org, the addresses in its `To` and `Cc`
+that belong to another org and are neither open to the reader's org nor
+participants of that thread are left out and counted ("and 3 recipients
+not shown"; `to_hidden` and `cc_hidden` in JSON). Lists of other orgs are
+always counted this way. An org sees its own messages as written. The same
+applies wherever headers reach another org: inboxes, threads, the
+archive, search, injected mail and digests, `--json` output, webhooks and
+system mail. In a message's delivery status the sender sees the state of
+each recipient it may still see; others are not listed.
+
+Each user sees only the mail of their own org, which includes the mail
+exchanged with linked orgs, never the other org's internal mail,
+conversations or terminals.
 
 ## Attention protection
 
@@ -146,6 +260,10 @@ takes context, and every wake-up costs a turn. The server enforces:
 
 - a **send budget** per seat (token bucket; 30 messages per minute with a
   burst of 30 by default; the user seat is exempt);
+- a budget of **new threads to other orgs** per seat (10 per hour by
+  default, `new_threads_per_hour`; replies in existing threads and the user
+  seat are not counted), so that an open seat of another org is not
+  flooded;
 - a cap on **recipients per message** (200 seats by default);
 - **list post policies** and the **reply-depth limit**;
 - **focus**: `amail focus on [--for 30m]` holds all but urgent mail for the
