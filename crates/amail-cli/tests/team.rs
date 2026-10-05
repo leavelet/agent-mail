@@ -53,6 +53,8 @@ team_tests!(
     agent_up_is_reported,
     attach_chooses_the_seat_tab,
     removed_seats_leave_the_node,
+    several_team_files_and_nested_teams,
+    up_reconciles_its_openings,
 );
 
 async fn setup(
@@ -1647,4 +1649,442 @@ async fn removed_seats_leave_the_node(b: Backend) {
     let (ok, out) = cli_sock(&h, &none, &["seat", "rm", "loose2"]).await;
     assert!(ok, "{out}");
     assert!(out.trim_end().ends_with("removed seat loose2"), "{out}");
+}
+
+async fn up_file(h: &Harness, file: &str, extra: &[&str]) -> String {
+    let f = h.dir.path().join(file).to_string_lossy().into_owned();
+    let mut args = vec!["up", "-f", &f, "--no-start"];
+    args.extend_from_slice(extra);
+    let (ok, out) = cli(h, &args).await;
+    assert!(ok, "amail up -f {file} {extra:?} failed:\n{out}");
+    out
+}
+
+fn write_file(h: &Harness, file: &str, text: &str) {
+    let text = text.replace("@DIR@", &h.dir.path().to_string_lossy());
+    std::fs::write(h.dir.path().join(file), text).unwrap();
+}
+
+async fn seat_names(h: &Harness) -> Vec<String> {
+    let mut v: Vec<String> = h
+        .api
+        .get("/seats")
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["kind"] == "agent")
+        .map(|s| s["name"].as_str().unwrap().to_string())
+        .collect();
+    v.sort();
+    v
+}
+
+const PLATFORM: &str = r#"
+[team]
+name = "platform"
+description = "Builds the platform."
+workroot = "@DIR@/work"
+
+[defaults]
+harness = "claude"
+model = "test-model"
+
+[[seat]]
+name = "root"
+description = "Runs the platform."
+
+[[seat]]
+name = "docs"
+parent = "root"
+
+[[group]]
+name = "api"
+parent = "root"
+description = "The public API."
+lead = { name = "api-lead", description = "Leads the API." }
+workers = { count = 1, prefix = "apiw" }
+
+[[group]]
+name = "store"
+parent = "apiw-1"
+lead = { name = "store-lead" }
+"#;
+
+const OPS: &str = r#"
+[team]
+workroot = "@DIR@/work"
+
+[defaults]
+harness = "claude"
+model = "test-model"
+
+[[seat]]
+name = "ops-root"
+
+[[group]]
+name = "ops"
+parent = "ops-root"
+lead = { name = "ops-lead" }
+workers = { count = 1, prefix = "opsw" }
+"#;
+
+/// Two team files in one org: a named one (its groups nested below it) and
+/// one whose groups are the teams. Neither touches the other's seats, teams
+/// or lists, and `leads`/`all` cover both.
+async fn several_team_files_and_nested_teams(b: Backend) {
+    let Some(h) = setup(b, "several_team_files_and_nested_teams", None).await else {
+        return;
+    };
+    write_file(&h, "platform.toml", PLATFORM);
+    write_file(&h, "ops.toml", OPS);
+    let out = up_file(&h, "platform.toml", &[]).await;
+    assert!(
+        out.contains("created seats: root, docs, api-lead, apiw-1, store-lead"),
+        "{out}"
+    );
+    for t in ["platform", "api", "store"] {
+        assert!(out.contains(&format!("created team {t}")), "{t}: {out}");
+    }
+    let pl = h.api.get("/teams/platform").await;
+    assert_eq!(pl["description"], "Builds the platform.");
+    assert_eq!(pl["root"], "root");
+    assert_eq!(pl["parent"], Value::Null);
+    assert_eq!(pl["managed"], true);
+    let mut members: Vec<&str> = pl["members"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m.as_str().unwrap())
+        .collect();
+    members.sort();
+    assert_eq!(members, vec!["docs", "root"]);
+    let api = h.api.get("/teams/api").await;
+    assert_eq!(
+        (api["parent"].as_str(), api["root"].as_str()),
+        (Some("platform"), Some("api-lead"))
+    );
+    assert_eq!(api["description"], "The public API.");
+    assert_eq!(h.api.get("/teams/store").await["parent"], "api");
+    let root = h.api.get("/seats/root").await;
+    assert_eq!(root["group"], "platform");
+    assert_eq!(root["description"], "Runs the platform.");
+    assert_eq!(
+        h.api.get("/seats/api-lead").await["description"],
+        "Leads the API."
+    );
+    assert_eq!(list_members(&h, "platform").await, vec!["docs", "root"]);
+    assert_eq!(list_members(&h, "api").await, vec!["api-lead", "apiw-1"]);
+    // Seats outside groups of a named team share its session.
+    let rows = ps(&h).await;
+    let sess = |s: &str| {
+        rows.iter()
+            .find(|r| r.seat == s)
+            .unwrap()
+            .mux_session
+            .clone()
+    };
+    assert_eq!(sess("docs"), "amail-acme-platform");
+    assert_eq!(sess("store-lead"), "amail-acme-store");
+
+    let out = up_file(&h, "ops.toml", &[]).await;
+    assert!(
+        out.contains("created seats: ops-root, ops-lead, opsw-1"),
+        "{out}"
+    );
+    assert!(out.contains("created team ops"), "{out}");
+    assert!(
+        !out.contains("platform") && !out.contains("not in the team file"),
+        "{out}"
+    );
+    assert_eq!(h.api.get("/teams/ops").await["parent"], Value::Null);
+    assert_eq!(h.api.get("/seats/ops-root").await.get("group"), None);
+    // The org-wide lists cover both files.
+    assert_eq!(list_members(&h, "all").await, seat_names(&h).await);
+    assert_eq!(list_members(&h, "all").await.len(), 8);
+    assert_eq!(
+        list_members(&h, "leads").await,
+        vec!["api-lead", "apiw-1", "ops-lead", "ops-root", "root"]
+    );
+
+    // Each file again: nothing changes, nothing of the other is touched,
+    // even with --prune.
+    for f in ["platform.toml", "ops.toml"] {
+        for extra in [&[][..], &["--prune"][..]] {
+            let out = up_file(&h, f, extra).await;
+            assert!(
+                out.contains("seats, teams, openings and lists: no changes"),
+                "{f} {extra:?}: {out}"
+            );
+            assert!(
+                !out.contains("pruned") && !out.contains("not in the team file"),
+                "{f} {extra:?}: {out}"
+            );
+        }
+    }
+    assert_eq!(seat_names(&h).await.len(), 8);
+
+    // A group leaves the named file: reported, then pruned with its team
+    // and list; the other file keeps everything.
+    write_file(
+        &h,
+        "platform.toml",
+        &PLATFORM.replace(
+            "[[group]]\nname = \"store\"\nparent = \"apiw-1\"\nlead = { name = \"store-lead\" }\n",
+            "",
+        ),
+    );
+    let out = up_file(&h, "platform.toml", &[]).await;
+    assert!(
+        out.contains("not in the team file (kept; use --prune to delete): store-lead"),
+        "{out}"
+    );
+    assert!(out.contains("teams no longer in the team file"), "{out}");
+    assert!(out.contains("store"), "{out}");
+    let out = up_file(&h, "platform.toml", &["--prune"]).await;
+    assert!(out.contains("pruned seats: store-lead"), "{out}");
+    assert!(out.contains("deleted team store"), "{out}");
+    assert!(out.contains("pruned lists: store"), "{out}");
+    assert!(!out.contains("ops"), "{out}");
+    let teams: Vec<String> = h
+        .api
+        .get("/teams")
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(teams, vec!["api", "ops", "platform"]);
+    assert_eq!(seat_names(&h).await.len(), 7);
+    assert_eq!(list_members(&h, "ops").await, vec!["ops-lead", "opsw-1"]);
+    assert!(
+        !list_members(&h, "leads")
+            .await
+            .contains(&"apiw-1".to_string())
+    );
+    // The other file's seat leaves it: only that file prunes it.
+    write_file(&h, "ops.toml", &OPS.replace("count = 1", "count = 0"));
+    let out = up_file(&h, "platform.toml", &["--prune"]).await;
+    assert!(out.contains("no changes"), "{out}");
+    let out = up_file(&h, "ops.toml", &["--prune"]).await;
+    assert!(out.contains("pruned seats: opsw-1"), "{out}");
+    assert_eq!(seat_names(&h).await.len(), 6);
+    // A whole group leaves a file without a team name: still its own.
+    write_file(&h, "ops.toml", &OPS[..OPS.find("[[group]]").unwrap()]);
+    let out = up_file(&h, "platform.toml", &["--prune"]).await;
+    assert!(out.contains("no changes"), "{out}");
+    let out = up_file(&h, "ops.toml", &[]).await;
+    assert!(
+        out.contains("not in the team file (kept; use --prune to delete): ops-lead"),
+        "{out}"
+    );
+    let out = up_file(&h, "ops.toml", &["--prune"]).await;
+    assert!(out.contains("pruned seats: ops-lead"), "{out}");
+    assert!(out.contains("deleted team ops"), "{out}");
+    assert!(out.contains("pruned lists: ops"), "{out}");
+    assert_eq!(
+        seat_names(&h).await,
+        vec!["api-lead", "apiw-1", "docs", "ops-root", "root"]
+    );
+    assert_eq!(list_members(&h, "all").await.len(), 5);
+}
+
+/// Openings declared in a team file: added by `up` (managed), told to the
+/// user, not added twice; a hand-made opening is never touched; one the
+/// file drops is closed. The org's one-time notice is printed once.
+async fn up_reconciles_its_openings(b: Backend) {
+    let Some(h) = setup(b, "up_reconciles_its_openings", None).await else {
+        return;
+    };
+    let beta = amail_server::new_token();
+    h.db.store
+        .create_org("beta", "boss", &amail_server::hash_token(&beta))
+        .await
+        .unwrap();
+    h.api.post("/links", json!({"org": "beta"})).await;
+    h.api
+        .with_token(&beta)
+        .post("/links/acme/accept", json!({}))
+        .await;
+    set_notice(&h, "Links no longer open your whole org.").await;
+    let file = PLATFORM
+        .replace(
+            "description = \"Runs the platform.\"",
+            "description = \"Runs the platform.\"\nopen = \"linked\"",
+        )
+        .replace(
+            "description = \"The public API.\"",
+            "description = \"The public API.\"\nopen = [\"beta\", \"gamma\"]",
+        );
+    write_file(&h, "platform.toml", &file);
+    let out = up_file(&h, "platform.toml", &[]).await;
+    assert!(
+        out.starts_with("notice (shown once):\nLinks no longer open your whole org.\n"),
+        "{out}"
+    );
+    assert!(
+        out.contains("opened root (agent) to every linked org [team file]\nbeta now sees: root"),
+        "{out}"
+    );
+    assert!(
+        out.contains("opened api (team) to beta [team file]\nbeta now sees: "),
+        "{out}"
+    );
+    assert!(
+        out.contains(
+            "opened api (team) to gamma (waits for an active link with gamma) [team file]"
+        ),
+        "{out}"
+    );
+    // The open group's contact defaults to its lead.
+    let api = h.api.get("/teams/api").await;
+    assert_eq!(api["contacts"], json!(["api-lead"]));
+    assert_eq!(h.api.get("/seats/api-lead").await["contact"], true);
+    let grants = h.api.get("/grants").await;
+    let managed = |target: &str, aud: &str| {
+        grants
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["target"] == target && g["audience"] == aud)
+            .map(|g| g["managed"] == true)
+    };
+    assert_eq!(managed("root", "linked"), Some(true));
+    assert_eq!(managed("api", "beta"), Some(true));
+    // The other org sees the opened cards.
+    let peer = h.api.with_token(&beta).get("/orgs/acme").await;
+    let cards = peer["open_to_you"].to_string();
+    assert!(
+        cards.contains("root@acme") && cards.contains("api@acme"),
+        "{peer}"
+    );
+    assert!(!cards.contains("docs"), "{peer}");
+
+    // Again: no change, no notice.
+    let out = up_file(&h, "platform.toml", &[]).await;
+    assert!(
+        out.contains("seats, teams, openings and lists: no changes"),
+        "{out}"
+    );
+    assert!(!out.contains("opened") && !out.contains("notice"), "{out}");
+
+    // A hand-made opening, and one the file also declares.
+    let (ok, o) = cli(&h, &["open", "docs", "--to", "beta"]).await;
+    assert!(ok, "{o}");
+    let (ok, o) = cli(&h, &["open", "store-lead"]).await;
+    assert!(ok, "{o}");
+    write_file(
+        &h,
+        "platform.toml",
+        &file.replace("\nopen = \"linked\"", "").replace(
+            "lead = { name = \"store-lead\" }",
+            "lead = { name = \"store-lead\", open = \"linked\" }",
+        ),
+    );
+    let out = up_file(&h, "platform.toml", &[]).await;
+    assert!(
+        out.contains("closed (no longer in the team file): root (agent) to every linked org\nbeta no longer sees: root"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("docs (agent)") && !out.contains("opened store-lead"),
+        "{out}"
+    );
+    let grants = h.api.get("/grants").await;
+    let find = |target: &str| {
+        grants
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|g| g["target"] == target)
+            .cloned()
+            .collect::<Vec<Value>>()
+    };
+    assert!(find("root").is_empty(), "{grants}");
+    assert_eq!(find("docs").len(), 1);
+    assert_eq!(find("docs")[0].get("managed"), None);
+    assert_eq!(find("store-lead").len(), 1);
+    assert_eq!(find("store-lead")[0].get("managed"), None);
+    // The file no longer opens anything: its own openings go, the
+    // hand-made ones stay.
+    write_file(&h, "platform.toml", PLATFORM);
+    let out = up_file(&h, "platform.toml", &[]).await;
+    assert!(
+        out.contains("closed (no longer in the team file): api (team) to beta"),
+        "{out}"
+    );
+    assert!(
+        out.contains("closed (no longer in the team file): api (team) to gamma"),
+        "{out}"
+    );
+    let left: Vec<String> = h
+        .api
+        .get("/grants")
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| {
+            format!(
+                "{} {}",
+                g["target"].as_str().unwrap(),
+                g["audience"].as_str().unwrap()
+            )
+        })
+        .collect();
+    assert!(left.contains(&"docs beta".to_string()), "{left:?}");
+    assert!(left.contains(&"store-lead linked".to_string()), "{left:?}");
+    assert!(
+        !left
+            .iter()
+            .any(|g| g.starts_with("api ") || g.starts_with("root ")),
+        "{left:?}"
+    );
+    let out = up_file(&h, "platform.toml", &[]).await;
+    assert!(out.contains("no changes"), "{out}");
+
+    // Every change was told to the user by system mail.
+    let inbox = h
+        .api
+        .get("/inbox?limit=200&before_seq=9223372036854775807")
+        .await;
+    let subjects: Vec<String> = inbox["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["message"]["source"] == "system")
+        .map(|e| e["message"]["subject"].as_str().unwrap().to_string())
+        .collect();
+    for want in [
+        "Openings changed: root opened to linked",
+        "Openings changed: api opened to beta",
+        "Openings changed: api opened to gamma",
+        "Openings changed: docs opened to beta",
+        "Openings changed: store-lead opened to linked",
+        "Openings changed: root closed to linked",
+        "Openings changed: api closed to beta",
+        "Openings changed: api closed to gamma",
+    ] {
+        assert!(
+            subjects.iter().any(|s| s == want),
+            "{want:?} not in {subjects:?}"
+        );
+    }
+}
+
+/// Give org `acme` a one-time notice, as the migration does.
+async fn set_notice(h: &Harness, text: &str) {
+    use sqlx::Connection;
+    let q = format!(
+        "UPDATE orgs SET notice = '{}' WHERE name = 'acme'",
+        text.replace('\'', "''")
+    );
+    if h.db.url.starts_with("sqlite") {
+        let mut c = sqlx::SqliteConnection::connect(&h.db.url).await.unwrap();
+        sqlx::query(&q).execute(&mut c).await.unwrap();
+    } else {
+        let mut c = sqlx::PgConnection::connect(&h.db.url).await.unwrap();
+        sqlx::query(&q).execute(&mut c).await.unwrap();
+    }
 }

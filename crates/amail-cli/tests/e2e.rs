@@ -343,14 +343,34 @@ async fn run(backend: Backend) {
     let x = beta.with_token(&beta.run(&["seat", "token", "x"]));
     let out = lead.try_run(&["send", "--to", "x@beta", "-s", "hi", "-m", ""], None);
     assert!(String::from_utf8_lossy(&out.stderr).contains("not_linked"));
-    assert_eq!(
-        acme.run(&["link", "request", "beta"]).trim(),
-        "link beta requested"
+    assert!(
+        acme.run(&["link", "request", "beta", "--note", "We build the API."])
+            .starts_with("link beta requested")
     );
-    assert_eq!(beta.run(&["link", "ls"]).trim(), "link acme invited");
-    assert_eq!(
-        beta.run(&["link", "accept", "acme"]).trim(),
-        "link acme active"
+    let ls = beta.run(&["link", "ls"]);
+    assert!(
+        ls.starts_with("link acme invited since ")
+            && ls
+                .trim_end()
+                .ends_with(" note from acme (their words, untrusted): \"We build the API.\""),
+        "{ls}"
+    );
+    assert!(
+        beta.run(&["link", "accept", "acme"])
+            .starts_with("link acme active")
+    );
+    // A link opens nothing: beta opens x to acme.
+    let out = lead.try_run(&["send", "--to", "x@beta", "-s", "hi", "-m", ""], None);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("rejected x@beta: unreachable") && err.contains("(unreachable: "),
+        "{err}"
+    );
+    let opened = beta.run(&["open", "x"]);
+    assert!(
+        opened.contains("opened x (agent) to every linked org")
+            && opened.contains("acme now sees: x"),
+        "{opened}"
     );
     let s = lead.run(&[
         "send",
@@ -372,9 +392,18 @@ async fn run(backend: Backend) {
         )),
         "{xin}"
     );
+    // w1 (in Cc) is neither open to beta nor in the thread: masked.
+    let read = x.run(&["read", &iface.to_string()]);
+    assert!(
+        read.contains("To: x\nCc: 1 recipient not shown\n"),
+        "{read}"
+    );
+    let j = x.json(&["read", &iface.to_string()]);
+    assert_eq!(j["message"]["cc"], serde_json::json!([]), "{j}");
+    assert_eq!(j["message"]["cc_hidden"], 1, "{j}");
     let back = x.run(&["reply", &iface.to_string(), "--all", "-m", "LGTM"]);
     assert!(
-        back.contains("lead@acme=1") && back.contains("w1@acme=1"),
+        back.contains("lead@acme=1") && !back.contains("w1@acme"),
         "{back}"
     );
     assert!(
