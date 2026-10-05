@@ -266,6 +266,13 @@ pub mod limits {
     pub const MAX_GRANTS: usize = 1_000;
     /// Teams an org may have.
     pub const MAX_TEAMS: usize = 500;
+    /// Highest `new_threads_per_hour` an org may set (new threads to other
+    /// orgs per agent seat per hour); the server uses at most this.
+    pub const MAX_NEW_THREADS_PER_HOUR: i64 = 100;
+    /// New threads to other orgs the user seat may start per hour.
+    pub const USER_NEW_THREADS_PER_HOUR: i64 = 60;
+    /// New threads one seat may receive from one other org per hour.
+    pub const NEW_THREADS_TO_SEAT_PER_HOUR: f64 = 20.0;
     /// Presence: the `attention` tag.
     pub const MAX_ATTENTION_CHARS: usize = 64;
     /// Presence: the attention hint.

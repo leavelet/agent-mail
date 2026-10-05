@@ -490,6 +490,7 @@ async fn notice_mail_has_a_daily_budget_and_no_charge(b: Backend, t: &str) {
         ack_due: None,
         storage_quota: None,
         notice: true,
+        guards: Vec::new(),
     };
     for _ in 0..NOTICE_MAILS_PER_DAY - 1 {
         store.send(&notice("x".repeat(100))).await.unwrap();
@@ -583,6 +584,7 @@ async fn old_notice_mail_is_deleted(b: Backend, t: &str) {
             ack_due: None,
             storage_quota: None,
             notice: false,
+            guards: Vec::new(),
         })
         .await
         .unwrap();
@@ -734,6 +736,7 @@ async fn turn_failures_follow_the_notice_rules(b: Backend, t: &str) {
                 ack_due: None,
                 storage_quota: None,
                 notice: true,
+                guards: Vec::new(),
             })
             .await
             .unwrap();

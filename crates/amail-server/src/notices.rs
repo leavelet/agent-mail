@@ -585,6 +585,7 @@ async fn send_notice(
             // bound it.
             storage_quota: None,
             notice: true,
+            guards: Vec::new(),
         })
         .await?;
     drop(turn);

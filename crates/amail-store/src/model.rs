@@ -230,7 +230,29 @@ pub struct NewMessage {
     /// nobody (see [`message_bytes`]) and deleted after
     /// [`amail_proto::limits::NOTICE_RETENTION_DAYS`].
     pub notice: bool,
+    /// Checked in the transaction that stores the message: when one no
+    /// longer holds (a link ended or an opening was removed meanwhile), the
+    /// message is refused with [`crate::StoreError::Conflict`]
+    /// ([`GUARD_FAILED`]).
+    pub guards: Vec<SendGuard>,
 }
+
+/// A condition a send depends on (see [`NewMessage::guards`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SendGuard {
+    /// The two orgs have an active link.
+    Link { org_id: i64, peer_id: i64 },
+    /// `seat_id` of org `org_id` is open to the org `audience` (by name):
+    /// a grant on the seat, or on its team while it is a contact.
+    Open {
+        org_id: i64,
+        seat_id: i64,
+        audience: String,
+    },
+}
+
+/// The message of the conflict a failed [`SendGuard`] gives.
+pub const GUARD_FAILED: &str = "send guard failed";
 
 /// The bytes a message counts against the storage quota without its
 /// deliveries: its subject, body, meta (a JSON object, or nothing when

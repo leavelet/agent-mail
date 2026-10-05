@@ -108,6 +108,8 @@ impl PgStore {
                 if seat_ids.len() != m.deliveries.len() {
                     return Err(StoreError::Invalid("duplicate recipient seat".into()));
                 }
+                // The link and the openings the send depends on still hold.
+                q::check_guards(c, &m.guards).await?;
                 // Lock recipient seats in id order, then advance their counters.
                 sqlx::query("SELECT id FROM seats WHERE id = ANY($1) ORDER BY id FOR NO KEY UPDATE")
                     .bind(&seat_ids)

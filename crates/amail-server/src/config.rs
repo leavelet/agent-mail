@@ -224,6 +224,13 @@ pub struct SettingMax {
 }
 
 pub const ORG_SETTING_MAX: &[SettingMax] = &[
+    // The receiving orgs are protected by it: no org may raise it above
+    // this, on any server.
+    SettingMax {
+        name: "new_threads_per_hour",
+        max: amail_proto::limits::MAX_NEW_THREADS_PER_HOUR,
+        public_only: false,
+    },
     SettingMax {
         name: "send_rate_per_min",
         max: 600,

@@ -248,6 +248,9 @@ pub struct Reach<'a> {
     parts: Option<HashMap<i64, i64>>,
     /// Contacts between two other orgs: (of, for) -> set.
     pairs: HashMap<(i64, i64), OpenSet>,
+    /// What the accepted recipients depend on, checked again in the send's
+    /// transaction (see [`amail_store::SendGuard`]).
+    pub guards: Vec<amail_store::SendGuard>,
 }
 
 impl<'a> Reach<'a> {
@@ -262,6 +265,7 @@ impl<'a> Reach<'a> {
             ours: HashMap::new(),
             parts: None,
             pairs: HashMap::new(),
+            guards: Vec::new(),
         }
     }
 
@@ -379,13 +383,30 @@ impl<'a> Reach<'a> {
         let participant = self.parts().await?.get(&id) == Some(&to.id);
         let out = self.may_write_out(to).await?;
         let closed = self.thread_closed(to).await?;
-        Ok(if seat.is_none() || !decide(contact, participant, out) {
+        let verdict = if seat.is_none() || !decide(contact, participant, out) {
             Verdict::Unreachable
         } else if closed {
             Verdict::ThreadClosed
         } else {
             Verdict::Accepted
-        })
+        };
+        if verdict == Verdict::Accepted {
+            let link = amail_store::SendGuard::Link {
+                org_id: self.org.id,
+                peer_id: to.id,
+            };
+            if !self.guards.contains(&link) {
+                self.guards.push(link);
+            }
+            if !participant {
+                self.guards.push(amail_store::SendGuard::Open {
+                    org_id: to.id,
+                    seat_id: id,
+                    audience: self.org.name.clone(),
+                });
+            }
+        }
+        Ok(verdict)
     }
 
     /// The seat of the sender's org to add in Cc for `to` when no contact of

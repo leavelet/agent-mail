@@ -182,6 +182,10 @@ impl SqliteStore {
         let rows: Vec<(i64, i64, i64, i64, i64)> = self
             .write(move |c| {
                 Box::pin(async move {
+                    // The link and the openings the send depends on still
+                    // hold (the writer is the only one: nothing changes
+                    // between this check and the send).
+                    q::check_guards(c, &m.guards).await?;
                     let rows = sqlx::query_as(SEND_SQL)
                         .bind(m.org_id)
                         .bind(m.sender_seat_id)

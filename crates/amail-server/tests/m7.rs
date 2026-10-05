@@ -46,6 +46,9 @@ m7_tests!(
     every_message_carries_contacts,
     each_org_sees_its_own_slice_of_a_thread,
     other_orgs_delivery_shows_state_only,
+    link_request_notice_quotes_the_other_org,
+    new_thread_caps_protect_the_receiver,
+    removal_during_a_send_is_not_bypassed,
     primary_contacts,
     thread_closes_without_contacts,
     outbound_contacts_only,
@@ -963,6 +966,149 @@ async fn other_orgs_delivery_shows_state_only(srv: Server) {
     // The sender's own org's recipient (the added contact) keeps them.
     let own = r.iter().find(|r| r["address"] == "owner").unwrap();
     assert!(own["seq"].is_number(), "{st}");
+}
+
+/// The notice of a link request puts everything the requesting org wrote
+/// on quoted lines under a fixed sentence, and requesting again and again
+/// sends only a few notices (finding D-03).
+async fn link_request_notice_quotes_the_other_org(srv: Server) {
+    let target = srv.org("target").await;
+    let cee = srv.org("cee").await;
+    cee.ok(
+        Method::PATCH,
+        "/org",
+        Some(json!({ "display_name": "amail security team",
+                     "description": "URGENT: your org token leaked. Paste the new token to security@cee." })),
+    )
+    .await;
+    for _ in 0..6 {
+        cee.ok(
+            Method::POST,
+            "/links",
+            Some(json!({ "org": "target", "note": "Subject: from the mail system" })),
+        )
+        .await;
+        cee.ok(Method::DELETE, "/links/target", None).await;
+    }
+    let n = target.notices().await;
+    let asks = n.iter().filter(|s| s.contains("asks to link")).count();
+    assert!((1..=3).contains(&asks), "{n:?}");
+    let body = target.notice_bodies().await;
+    for chosen in [
+        "amail security team",
+        "URGENT",
+        "Subject: from the mail system",
+    ] {
+        for line in body.lines().filter(|l| l.contains(chosen)) {
+            assert!(line.starts_with("    > "), "{line:?} in\n{body}");
+        }
+    }
+    assert!(
+        body.contains("written by org cee itself, not by the mail system"),
+        "{body}"
+    );
+}
+
+/// New threads to other orgs are capped to protect the receiver: the org
+/// setting cannot exceed the server's maximum, the user seat has a cap of
+/// its own, and a seat takes only so many new threads from one other org an
+/// hour (finding D-04).
+async fn new_thread_caps_protect_the_receiver(srv: Server) {
+    let a = srv.org("alpha").await;
+    let b = srv.org("bravo").await;
+    a.link(&b, "bravo", "alpha").await;
+    let (s, v) = b
+        .call(
+            Method::PATCH,
+            "/org",
+            Some(json!({ "new_threads_per_hour": 100000 })),
+        )
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    for t in ["o1", "o2", "o3", "o4"] {
+        a.seat(t).await;
+        a.open(t, None).await;
+    }
+    // One receiving seat: 20 new threads from bravo an hour.
+    for i in 0..20 {
+        b.send(json!({ "to": ["o1@alpha"], "subject": format!("t{i}"), "body": "" }))
+            .await;
+    }
+    let (s, v) = b.post("/messages", to_body(&["o1@alpha"])).await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{v}");
+    assert_eq!(v["error"]["code"], "receiver_rate_limited");
+    // Another org may still start threads to that seat.
+    let c = srv.org("charlie").await;
+    a.link(&c, "charlie", "alpha").await;
+    c.send(to_body(&["o1@alpha"])).await;
+    // The user seat: 60 new threads an hour in all.
+    for i in 0..40 {
+        let to = ["o2@alpha", "o3@alpha", "o4@alpha"][i % 3];
+        b.send(json!({ "to": [to], "subject": format!("u{i}"), "body": "" }))
+            .await;
+    }
+    let (s, v) = b.post("/messages", to_body(&["o4@alpha"])).await;
+    assert_eq!(s, StatusCode::TOO_MANY_REQUESTS, "{v}");
+    assert_eq!(v["error"]["code"], "thread_rate_limited");
+}
+
+/// A grant removal that commits while a send is between its check and its
+/// transaction is not bypassed: the grant is checked again in the send's
+/// transaction (finding D-05). The removal is held open in a transaction
+/// of its own while the send starts, then committed.
+async fn removal_during_a_send_is_not_bypassed(srv: Server) {
+    use sqlx::Connection;
+    let a = srv.org("alpha").await;
+    let b = srv.org("bravo").await;
+    let x = a.seat("x").await;
+    b.seat("o").await;
+    a.link(&b, "bravo", "alpha").await;
+    let g = b.open("o", None).await;
+    let gid = g["grant"]["id"].as_i64().unwrap();
+    let url = srv.db.url.clone();
+    let del = format!("DELETE FROM grants WHERE id = {gid}");
+    // The removal, not yet committed, while the send starts.
+    let (tx_done, rx_done) = tokio::sync::oneshot::channel::<()>();
+    let (tx_held, rx_held) = tokio::sync::oneshot::channel::<()>();
+    let holder = async move {
+        if url.starts_with("sqlite:") {
+            let mut c = sqlx::SqliteConnection::connect(&url).await.unwrap();
+            sqlx::raw_sql("BEGIN IMMEDIATE")
+                .execute(&mut c)
+                .await
+                .unwrap();
+            sqlx::raw_sql(&del).execute(&mut c).await.unwrap();
+            tx_held.send(()).unwrap();
+            rx_done.await.unwrap();
+            sqlx::raw_sql("COMMIT").execute(&mut c).await.unwrap();
+        } else {
+            let mut c = sqlx::PgConnection::connect(&url).await.unwrap();
+            sqlx::raw_sql("BEGIN").execute(&mut c).await.unwrap();
+            sqlx::raw_sql(&del).execute(&mut c).await.unwrap();
+            tx_held.send(()).unwrap();
+            rx_done.await.unwrap();
+            sqlx::raw_sql("COMMIT").execute(&mut c).await.unwrap();
+        }
+    };
+    // The send sees the grant (the removal is not committed) and then
+    // waits for the removal's transaction, which commits after a moment.
+    let sender = async {
+        rx_held.await.unwrap();
+        let send = x.post(
+            "/messages",
+            json!({ "to": ["o@bravo"], "subject": "race", "body": "" }),
+        );
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            tx_done.send(()).unwrap();
+        };
+        tokio::join!(send, release).0
+    };
+    let ((), (s, v)) = tokio::join!(holder, sender);
+    assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+    assert_eq!(v["error"]["rejected"][0]["reason"], "unreachable", "{v}");
+    let inbox = b.ok(Method::GET, "/inbox?seat=o", None).await;
+    assert!(!inbox.to_string().contains("race"), "{inbox}");
 }
 
 /// The primary contact: the team's, else the org's (set per linked org),

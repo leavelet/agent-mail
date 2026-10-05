@@ -134,6 +134,10 @@ impl<K: Hash + Eq + Clone> Buckets<K> {
 }
 
 /// The limiters of one server instance.
+/// Notices of link requests from one org to another per day (requesting,
+/// withdrawing and requesting again sends no more).
+pub const LINK_NOTICES_PER_DAY: f64 = 3.0;
+
 /// Lookups of other orgs' cards an org may make per hour.
 pub const CARD_LOOKUPS_PER_HOUR: f64 = 600.0;
 
@@ -151,6 +155,10 @@ pub struct Limiters {
     pub link_requests: Option<Buckets<i64>>,
     /// Lookups of other orgs' cards (`GET /v1/orgs/{name}`) per org.
     pub card_lookups: Buckets<i64>,
+    /// Notices of link requests per (requesting org, requested org).
+    pub link_notices: Buckets<(i64, i64)>,
+    /// New threads from one other org to one seat: (seat id, sender org id).
+    pub threads_to_seat: Buckets<(i64, i64)>,
     pub registrations: Option<Buckets<String>>,
     /// Registrations per IPv6 /48 network, checked before the per-address
     /// limit (see [`amail_proto::limits::REGISTRATION_NET48_FACTOR`]).
@@ -193,6 +201,11 @@ impl Limiters {
             org_requests: l.org_requests_per_sec.map(|r| Buckets::new(r, r * 2.0)),
             credential_orgs: CredentialOrgs::default(),
             card_lookups: Buckets::per_hour(CARD_LOOKUPS_PER_HOUR, CARD_LOOKUPS_PER_HOUR / 10.0),
+            link_notices: Buckets::per_hour(LINK_NOTICES_PER_DAY / 24.0, LINK_NOTICES_PER_DAY),
+            threads_to_seat: Buckets::per_hour(
+                amail_proto::limits::NEW_THREADS_TO_SEAT_PER_HOUR,
+                amail_proto::limits::NEW_THREADS_TO_SEAT_PER_HOUR,
+            ),
             link_requests: l
                 .link_requests_per_hour
                 .map(|n| Buckets::per_hour(n, (n / 4.0).max(1.0))),
@@ -244,6 +257,8 @@ impl Limiters {
             b.prune();
         }
         self.card_lookups.prune();
+        self.link_notices.prune();
+        self.threads_to_seat.prune();
         if let Some(b) = &self.registrations {
             b.prune();
         }

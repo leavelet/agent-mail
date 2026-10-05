@@ -1365,6 +1365,49 @@ macro_rules! impl_store_common {
                 Ok(n > 0)
             }
 
+            /// Check the guards of a send in its transaction (see
+            /// [`NewMessage::guards`]). On Postgres the rows found are
+            /// locked for share, so that a grant or link being removed waits
+            /// for the send to commit, and a removal that committed first is
+            /// seen here.
+            pub async fn check_guards(c: &mut Conn, guards: &[SendGuard]) -> Result<()> {
+                let lock = match DIALECT {
+                    Dialect::Postgres => " FOR SHARE",
+                    Dialect::Sqlite => "",
+                };
+                for g in guards {
+                    let ok: Option<i64> = match g {
+                        SendGuard::Link { org_id, peer_id } => {
+                            sqlx::query_scalar(&format!(
+                                "SELECT CAST(1 AS BIGINT) FROM links WHERE org_id = $1 AND peer_org_id = $2 \
+                                 AND state = 'active'{lock}"
+                            ))
+                            .bind(org_id)
+                            .bind(peer_id)
+                            .fetch_optional(&mut *c)
+                            .await?
+                        }
+                        SendGuard::Open { org_id, seat_id, audience } => {
+                            sqlx::query_scalar(&format!(
+                                "SELECT CAST(1 AS BIGINT) FROM grants g WHERE g.org_id = $1 \
+                                 AND (g.audience IS NULL OR g.audience = $3) \
+                                 AND (g.seat_id = $2 OR g.team_id IN (SELECT team_id FROM seats \
+                                      WHERE id = $2 AND contact AND deleted_at IS NULL)) LIMIT 1{lock}"
+                            ))
+                            .bind(org_id)
+                            .bind(seat_id)
+                            .bind(audience)
+                            .fetch_optional(&mut *c)
+                            .await?
+                        }
+                    };
+                    if ok.is_none() {
+                        return Err(StoreError::Conflict(GUARD_FAILED.into()));
+                    }
+                }
+                Ok(())
+            }
+
             /// Participants of these threads as `viewer` knows them (see
             /// `thread_views`), with their orgs.
             pub async fn thread_parts(c: &mut Conn, viewer: i64, thread_ids: &[i64]) -> Result<Vec<ThreadPeer>> {

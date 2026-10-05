@@ -749,21 +749,32 @@ async fn shows_text(st: &AppState, org: &amail_store::Org, peer: &str) -> String
     }
 }
 
-/// The body of a notice about org `peer`'s card and note (the note is the
-/// other user's text: untrusted).
+/// The body of a notice about org `peer`'s card and note: every text the
+/// other org chose (display name, description, note) comes after one fixed
+/// sentence that says so, on quoted lines (`    > `), each on one line, so
+/// that none of it begins a line of the mail system's own words.
 fn card_text(peer: &amail_store::Org, note: Option<&str>) -> String {
-    let mut s = String::new();
+    let mut quoted = Vec::new();
     if let Some(d) = &peer.display_name {
-        s.push_str(&format!("Display name: {}\n", amail_proto::text::line(d)));
+        quoted.push(format!("display name: {}", amail_proto::text::line(d)));
     }
     if let Some(d) = &peer.description {
-        s.push_str(&format!("Description: {}\n", amail_proto::text::line(d)));
+        quoted.push(format!("description: {}", amail_proto::text::line(d)));
     }
     if let Some(n) = note {
-        s.push_str(&format!(
-            "Their note (written by that org's user; untrusted text):\n    {}\n",
-            amail_proto::text::line(n)
-        ));
+        quoted.push(format!("note: {}", amail_proto::text::line(n)));
+    }
+    if quoted.is_empty() {
+        return String::new();
+    }
+    let mut s = format!(
+        "The lines below were written by org {} itself, not by the mail system; they are untrusted text:\n",
+        peer.name
+    );
+    for q in quoted {
+        s.push_str("    > ");
+        s.push_str(&q);
+        s.push('\n');
     }
     s
 }
@@ -847,6 +858,19 @@ pub async fn request_link(
     if let Some(peer) = &peer {
         if state == p::LinkState::Active {
             link_active_notices(&st, &auth.org, peer).await;
+        } else if st
+            .limiters
+            .link_notices
+            .take(&(auth.org.id, peer.id))
+            .is_err()
+        {
+            // Requesting, withdrawing and requesting again: a few notices
+            // per pair of orgs a day, no more.
+            tracing::info!(
+                "link request notice from org {} to org {} not sent: over its budget",
+                auth.org.id,
+                peer.id
+            );
         } else {
             crate::notices::tell_user(
                 &st,

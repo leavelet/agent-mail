@@ -65,6 +65,7 @@ conformance!(
     focus_and_digest_pending,
     search_steps_are_bounded,
     grants_and_thread_peers,
+    send_guards,
 );
 
 async fn org(s: &S, name: &str) -> (Org, Seat) {
@@ -111,6 +112,7 @@ fn msg(org_id: i64, from: i64, subject: &str, to: &[(&Seat, C)]) -> NewMessage {
         ack_due: None,
         storage_quota: None,
         notice: false,
+        guards: Vec::new(),
     }
 }
 
@@ -2013,4 +2015,74 @@ async fn grants_and_thread_peers(s: S) {
 /// The org's user seat.
 async fn ub_seat(s: &S, org_id: i64) -> Seat {
     s.user_seat(org_id).await.unwrap().unwrap()
+}
+
+/// A send whose guards no longer hold is refused in its transaction, and
+/// stores nothing.
+async fn send_guards(s: S) {
+    let (a, _) = org(&s, "alpha").await;
+    let (b, _) = org(&s, "bravo").await;
+    let x = seat(&s, a.id, "x").await;
+    let y = seat(&s, b.id, "y").await;
+    let guarded = |guards: Vec<SendGuard>| {
+        let mut m = msg(a.id, x.id, "g", &[(&y, C::To)]);
+        m.guards = guards;
+        m
+    };
+    let link = SendGuard::Link {
+        org_id: a.id,
+        peer_id: b.id,
+    };
+    let open = SendGuard::Open {
+        org_id: b.id,
+        seat_id: y.id,
+        audience: "alpha".into(),
+    };
+    let refused = |r: Result<Sent>| matches!(r, Err(StoreError::Conflict(m)) if m == GUARD_FAILED);
+    assert!(refused(s.send(&guarded(vec![link.clone()])).await));
+    s.request_link(a.id, b.id, None).await.unwrap();
+    s.accept_link(b.id, a.id).await.unwrap();
+    s.send(&guarded(vec![link.clone()])).await.unwrap();
+    assert!(refused(
+        s.send(&guarded(vec![link.clone(), open.clone()])).await
+    ));
+    let g = s
+        .add_grant(b.id, Some(y.id), None, Some("alpha"), false)
+        .await
+        .unwrap();
+    s.send(&guarded(vec![link.clone(), open.clone()]))
+        .await
+        .unwrap();
+    s.remove_grant(b.id, g).await.unwrap();
+    assert!(refused(s.send(&guarded(vec![open.clone()])).await));
+    // As a contact of an open team.
+    s.update_seat(
+        b.id,
+        "y",
+        &SeatUpdate {
+            group: Some(Some("t".into())),
+            contact: Some(true),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let t = s.put_team(b.id, "t", &TeamChange::default()).await.unwrap();
+    s.add_grant(b.id, None, Some(t.id), None, false)
+        .await
+        .unwrap();
+    s.send(&guarded(vec![open])).await.unwrap();
+    assert_eq!(
+        s.inbox(
+            y.id,
+            &InboxQuery {
+                limit: 50,
+                ..Default::default()
+            }
+        )
+        .await
+        .unwrap()
+        .len(),
+        3
+    );
 }

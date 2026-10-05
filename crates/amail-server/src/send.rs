@@ -84,7 +84,12 @@ pub async fn send(st: &AppState, auth: &Auth, req: SendRequest) -> ApiResult<Sen
             .await?
             .map_err(ApiError::rate_limited)?;
     }
-    let result = send_inner(st, auth, &sender, req).await;
+    // A link ended or an opening was removed between the check and the
+    // send's transaction: decide again (the recipient is then refused).
+    let mut result = send_inner(st, auth, &sender, req.clone()).await;
+    if matches!(&result, Err(e) if e.code == "boundary_changed") {
+        result = send_inner(st, auth, &sender, req).await;
+    }
     if result.is_err()
         && limited
         && let Err(e) = st.store.refund_send_token(sender.id, org.send_burst).await
@@ -254,20 +259,47 @@ async fn send_inner(
     }
 
     let deliveries: Vec<NewDelivery> = r.order.iter().map(|id| r.seats[id].0.clone()).collect();
-    // A new thread to another org takes from the sender's budget of them.
-    let thread_token = thread_id.is_none()
-        && sender.kind != SeatKind::User
-        && deliveries.iter().any(|d| d.org_id != org.id);
-    if thread_token {
+    // A new thread to another org takes from the sender's budget of them
+    // (the org's setting, at most the server's maximum; the user seat has
+    // a budget of its own), and from each receiving seat's budget of new
+    // threads from this org.
+    let new_cross = thread_id.is_none() && deliveries.iter().any(|d| d.org_id != org.id);
+    let per_hour = if sender.kind == SeatKind::User {
+        amail_proto::limits::USER_NEW_THREADS_PER_HOUR
+    } else {
+        org.new_threads_per_hour
+            .min(amail_proto::limits::MAX_NEW_THREADS_PER_HOUR)
+    };
+    let thread_token = new_cross;
+    if new_cross {
+        for d in deliveries
+            .iter()
+            .filter(|d| d.org_id != org.id && d.class == DeliveryClass::To)
+        {
+            if let Err(ms) = st.limiters.threads_to_seat.take(&(d.seat_id, org.id)) {
+                let name = r
+                    .seats
+                    .get(&d.seat_id)
+                    .map(|x| x.1.clone())
+                    .unwrap_or_default();
+                return Err(ApiError::too_many(
+                    "receiver_rate_limited",
+                    format!(
+                        "{name} has received {} new threads from your org in the last hour; reply in an existing thread or wait",
+                        amail_proto::limits::NEW_THREADS_TO_SEAT_PER_HOUR
+                    ),
+                    ms,
+                ));
+            }
+        }
         st.store
-            .take_thread_token(sender.id, org.new_threads_per_hour)
+            .take_thread_token(sender.id, per_hour)
             .await?
             .map_err(|ms| {
                 ApiError::too_many(
                     "thread_rate_limited",
                     format!(
-                        "this seat may start {} new threads to other orgs per hour; reply in an existing thread or wait",
-                        org.new_threads_per_hour
+                        "this seat may start {per_hour} new threads to other orgs per hour; reply in an existing thread or wait"
                     ),
                     ms,
                 )
@@ -299,21 +331,25 @@ async fn send_inner(
         ack_due,
         storage_quota: st.config.limits.org_storage_bytes,
         notice: false,
+        guards: std::mem::take(&mut r.reach.guards),
     };
     let sent = match st.store.send(&msg).await {
         Ok(s) => s,
         Err(e) => {
-            if thread_token
-                && let Err(e) = st
-                    .store
-                    .refund_thread_token(sender.id, org.new_threads_per_hour)
-                    .await
+            if thread_token && let Err(e) = st.store.refund_thread_token(sender.id, per_hour).await
             {
                 tracing::warn!("refunding a thread token: {e}");
             }
             return Err(match e {
                 amail_store::StoreError::StorageQuota(stored) => {
                     ApiError::storage_quota(stored, st.config.limits.org_storage_bytes)
+                }
+                amail_store::StoreError::Conflict(m) if m == amail_store::GUARD_FAILED => {
+                    ApiError::new(
+                        axum::http::StatusCode::CONFLICT,
+                        "boundary_changed",
+                        "a link or an opening changed while sending; try again",
+                    )
                 }
                 e => e.into(),
             });
