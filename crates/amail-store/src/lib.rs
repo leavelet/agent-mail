@@ -243,6 +243,13 @@ pub trait Store: Send + Sync + 'static {
     async fn changes(&self, seat_id: i64, since: i64, limit: i64) -> Result<Vec<Entry>>;
     /// All deliveries of a message, across orgs.
     async fn recipients(&self, message_id: i64) -> Result<Vec<DeliveryRec>>;
+    /// For each of `message_ids` that has deliveries (across orgs): how many
+    /// are in each state, counted in the most advanced one. The caller
+    /// bounds the number of ids.
+    async fn delivery_counts(
+        &self,
+        message_ids: &[i64],
+    ) -> Result<Vec<amail_proto::DeliveryCounts>>;
     /// Messages visible to the org, newest first, without bodies. The query
     /// starts from the org's own messages (or one of its seats'), never from
     /// the whole table.
@@ -291,14 +298,15 @@ pub trait Store: Send + Sync + 'static {
     /// included.
     async fn presence(&self, org_id: i64, seat: Option<&str>) -> Result<Vec<PresenceRec>>;
     /// Store a node's report (seats that are not live seats of the org are
-    /// ignored); returns the entries that changed, as stored. An entry
-    /// older than `ttl_ms` counts as absent.
+    /// ignored); returns the entries that changed, as stored, and the seats
+    /// whose turn failure the report cleared. An entry older than `ttl_ms`
+    /// counts as absent (for `changed`).
     async fn put_presence(
         &self,
         org_id: i64,
         recs: &[PresenceRec],
         ttl_ms: i64,
-    ) -> Result<Vec<PresenceRec>>;
+    ) -> Result<PresenceStored>;
     /// Take one token from the seat's send budget, or say how many
     /// milliseconds until one is available. Exact across server instances.
     async fn take_send_token(

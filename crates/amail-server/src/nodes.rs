@@ -130,11 +130,14 @@ pub async fn presence(
             u
         })
         .collect();
-    let changed = st
+    let (changed, cleared) = st
         .presence
         .update(auth.org.id, report.node.as_deref(), &seats)
         .await?;
     st.presence_changed(auth.org.id, changed);
+    if !cleared.is_empty() {
+        crate::notices::turns_recovered(&st, auth.org.id, &cleared).await;
+    }
     Ok(Json(PresenceAccepted {
         accepted: seats.len(),
     }))

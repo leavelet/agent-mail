@@ -819,6 +819,20 @@ async fn attention_overview_counts(srv: Server) {
     assert_eq!(get("c")["unread"], 0);
     let one = user.ok(Method::GET, "/counts?seat=b", None).await;
     assert_eq!(one["seats"].as_array().unwrap().len(), 1);
+    // A seat at the trust prompt is offline and counted as starting.
+    assert_eq!(o["starting"], 0);
+    node.ok(
+        Method::POST,
+        "/presence",
+        Some(json!({ "node": "h1", "seats": [
+            {"seat": "c", "state": "offline", "attention": "trust-prompt"},
+        ]})),
+    )
+    .await;
+    let o = user.ok(Method::GET, "/overview", None).await;
+    assert_eq!(o["states"]["offline"], 1);
+    assert_eq!(o["starting"], 1);
+    assert_eq!(o["needs_person"], 2);
     // User tokens only.
     for p in ["/attention", "/overview", "/counts"] {
         assert_eq!(a.get(p).await.0, StatusCode::FORBIDDEN, "{p}");
@@ -891,11 +905,49 @@ async fn sent_and_mark_read(srv: Server) {
         vec!["two", "one"]
     );
     assert_eq!(a.get("/sent?seat=b").await.0, StatusCode::FORBIDDEN);
+    // Without `delivery`, no counts.
+    assert!(s.get("delivery").is_none(), "{s}");
     // Mark read: only the caller's delivery.
     let d = b
         .ok(Method::POST, &format!("/messages/{m1}/read"), None)
         .await;
     assert!(d["delivery"]["read_at"].is_string());
+    // Delivery counts per message, each delivery in its most advanced
+    // state; for small pages only.
+    let m4 = a
+        .send(json!({ "to": ["b", "owner"], "cc": ["a"], "subject": "four", "body": "" }))
+        .await;
+    b.ok(Method::POST, &format!("/messages/{m4}/ack"), None)
+        .await;
+    let s = user
+        .ok(Method::GET, "/sent?seat=a&delivery=true", None)
+        .await;
+    assert_eq!(subjects(&s), vec!["four", "two", "one"]);
+    let counts = |id: i64| {
+        let c = s["delivery"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["message_id"] == id)
+            .unwrap()
+            .clone();
+        [&c["queued"], &c["notified"], &c["read"], &c["acked"]].map(|v| v.as_i64().unwrap())
+    };
+    assert_eq!(counts(m1), [0, 0, 1, 0]);
+    assert_eq!(counts(m4), [2, 0, 0, 1]);
+    let two = s["messages"][1]["id"].as_i64().unwrap();
+    assert_eq!(counts(two), [1, 0, 0, 0]);
+    assert_eq!(
+        a.ok(Method::GET, "/sent?delivery=true&limit=1", None).await["delivery"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        user.get("/sent?seat=a&delivery=true&limit=500").await.0,
+        StatusCode::BAD_REQUEST
+    );
     assert_eq!(
         b.ok(Method::GET, "/inbox?unread=1", None).await["entries"],
         json!([])

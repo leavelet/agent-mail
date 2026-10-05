@@ -137,6 +137,16 @@ pub async fn overview(State(st): State<AppState>, auth: Auth) -> ApiResult<Json<
     Ok(Json(out))
 }
 
+/// The node reports the seat offline while its session waits at a prompt
+/// for a person before it starts (as the web interface's
+/// `startingAtPrompt`).
+fn starting_at_prompt(p: &Presence) -> bool {
+    p.state == SeatState::Offline
+        && p.attention
+            .as_deref()
+            .is_some_and(|a| matches!(a, "trust-prompt" | "login" | "permission"))
+}
+
 /// The overview: the seats and their presence, the counters of recent mail
 /// and of the user seat, and the attention items (see
 /// [`amail_store::Store::attention`]).
@@ -158,6 +168,9 @@ async fn overview_of(st: &AppState, auth: &Auth) -> ApiResult<p::Overview> {
         let pr = presence.get(&s.name);
         let state = pr.map_or(SeatState::Offline, |p| p.state);
         *out.states.entry(state.as_str().to_string()).or_default() += 1;
+        if pr.is_some_and(starting_at_prompt) {
+            out.starting += 1;
+        }
         if pr.is_some_and(|p| p.attention.is_some()) {
             out.needs_person += 1;
         }
@@ -227,10 +240,15 @@ pub struct SentParams {
     seat: Option<String>,
     before_id: Option<i64>,
     limit: Option<i64>,
+    /// Also count the deliveries of each message per state.
+    #[serde(default)]
+    delivery: bool,
 }
 
 /// `GET /v1/sent`: messages a seat sent, newest first. User tokens may name
-/// any seat; seat tokens see their own.
+/// any seat; seat tokens see their own. With `delivery=true` (pages of at
+/// most [`p::limits::SMALL_PAGE`] messages) the answer also counts each
+/// message's deliveries per state.
 pub async fn sent(
     State(st): State<AppState>,
     auth: Auth,
@@ -241,6 +259,12 @@ pub async fn sent(
     }
     let seat = auth.mailbox(&st, q.seat.as_deref()).await?;
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    if q.delivery && limit > p::limits::SMALL_PAGE {
+        return Err(ApiError::bad_request(format!(
+            "delivery=true allows at most {} messages per page",
+            p::limits::SMALL_PAGE
+        )));
+    }
     let query = ArchiveQuery {
         from: Some((auth.org.name.clone(), seat.name.clone())),
         before_id: q.before_id,
@@ -256,7 +280,18 @@ pub async fn sent(
     } else {
         st.store.archive(auth.org.id, &query).await?
     };
-    Ok(Json(crate::mail::archive_response(page, &auth.org)))
+    let mut out = crate::mail::archive_response(page, &auth.org);
+    if q.delivery && !out.messages.is_empty() {
+        // One grouped query over the page's messages, on the index of
+        // deliveries by message.
+        let ids: Vec<i64> = out.messages.iter().map(|m| m.id).collect();
+        let store = st.store.clone();
+        out.delivery = crate::mail::limited(&st, &auth, Pool::Other, async move {
+            Ok(store.delivery_counts(&ids).await?)
+        })
+        .await?;
+    }
+    Ok(Json(out))
 }
 
 #[derive(Deserialize)]

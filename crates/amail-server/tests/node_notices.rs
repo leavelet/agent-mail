@@ -39,6 +39,7 @@ notice_tests!(
     notice_mail_has_a_daily_budget_and_no_charge,
     old_notice_mail_is_deleted,
     turn_failures_follow_the_notice_rules,
+    turn_failure_notice_is_read_once_the_seat_recovers,
 );
 
 struct Server {
@@ -752,4 +753,125 @@ async fn turn_failures_follow_the_notice_rules(b: Backend, t: &str) {
         .filter(|(s, _)| s.starts_with("Turns of seat"))
         .count();
     assert_eq!(turns, 0);
+}
+
+/// A notice about failing turns names its seats in its meta field; when a
+/// presence report clears the turn failure of its seats, the notice is
+/// marked read for the user (it leaves "needs you" and stays in the
+/// mailbox). A notice about several seats stays unread while one of them
+/// still fails; other notices are not touched.
+async fn turn_failure_notice_is_read_once_the_seat_recovers(b: Backend, t: &str) {
+    let srv = start!(b, t);
+    let acme = srv.org("acme").await;
+    for s in ["w1", "w2"] {
+        acme.ok(Method::POST, "/seats", Some(json!({ "name": s })))
+            .await;
+    }
+    let node = acme.token("node", None).await;
+    let presence = |seat: &str, failing: bool| {
+        let mut u = json!({ "seat": seat, "state": "idle", "harness": "claude" });
+        if failing {
+            u["turn_failed"] = json!({
+                "reason": "model error",
+                "at": "2026-10-05T00:00:00.000Z",
+                "count": 3,
+                "retrying": false,
+            });
+        }
+        u
+    };
+    let failures = |seat: &str| json!({ "kind": "turn_failures", "seat": seat, "count": 3, "harness": "claude", "error": "model error" });
+    node.ok(
+        Method::POST,
+        "/presence",
+        Some(json!({ "node": "box", "seats": [presence("w1", true), presence("w2", true)] })),
+    )
+    .await;
+    node.ok(Method::POST, "/node/notices", Some(settings("box")))
+        .await;
+    node.ok(
+        Method::POST,
+        "/node/notices",
+        Some(json!({ "node": "box", "notices": [failures("w1")] })),
+    )
+    .await;
+    node.ok(
+        Method::POST,
+        "/node/notices",
+        Some(json!({ "node": "box", "notices": [failures("w1"), failures("w2"), failures("intruder")] })),
+    )
+    .await;
+    let notices = || async {
+        let v = acme.ok(Method::GET, "/attention", None).await;
+        let mut out: Vec<String> = v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["kind"] == "notice")
+            .map(|i| i["message"]["subject"].as_str().unwrap().to_string())
+            .collect();
+        out.sort();
+        out
+    };
+    let one = "Turns of seat w1 are failing on host \"box\"".to_string();
+    let both = "3 notices from the amail node on host \"box\"".to_string();
+    let all = notices().await;
+    assert_eq!(all.len(), 3, "{all:?}");
+    assert!(all.contains(&one) && all.contains(&both), "{all:?}");
+    // The meta field names the org's seats only.
+    let inbox = acme.ok(Method::GET, "/inbox?limit=100", None).await;
+    let metas: Vec<Value> = inbox["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["message"]["meta"]["turn_failures"].clone())
+        .collect();
+    assert_eq!(
+        metas,
+        vec![Value::Null, json!("w1"), json!("w1 w2")],
+        "{inbox}"
+    );
+
+    // A report that keeps the failures changes nothing.
+    node.ok(
+        Method::POST,
+        "/presence",
+        Some(json!({ "node": "box", "seats": [presence("w1", true), presence("w2", true)] })),
+    )
+    .await;
+    assert_eq!(notices().await.len(), 3);
+
+    // w1 works again: its own notice is read; the one that also names the
+    // still failing w2 stays.
+    node.ok(
+        Method::POST,
+        "/presence",
+        Some(json!({ "node": "box", "seats": [presence("w1", false)] })),
+    )
+    .await;
+    let left = notices().await;
+    assert!(!left.contains(&one), "{left:?}");
+    assert!(left.contains(&both), "{left:?}");
+    assert_eq!(left.len(), 2, "{left:?}");
+
+    // w2 too: only the settings notice is left.
+    node.ok(
+        Method::POST,
+        "/presence",
+        Some(json!({ "node": "box", "seats": [presence("w2", false)] })),
+    )
+    .await;
+    let left = notices().await;
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_ne!(left[0], one);
+    assert_ne!(left[0], both);
+
+    // The mail is kept, marked read.
+    let inbox = acme.ok(Method::GET, "/inbox?limit=100", None).await;
+    let entries = inbox["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 3, "{inbox}");
+    for e in &entries[1..] {
+        assert!(e["delivery"]["read_at"].is_string(), "{e}");
+    }
+    assert!(entries[0]["delivery"]["read_at"].is_null(), "{inbox}");
 }

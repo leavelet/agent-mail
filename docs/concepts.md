@@ -58,7 +58,9 @@ node returns the deliveries that turn showed to `queued` (not notified,
 not read) and delivers them again with a later turn; acknowledged ones are
 kept. After three failed turns in a row it stops waking the seat for them,
 flags the seat (`turn failed` in `amail ps`, the web interface and the
-user's queue) and tells the user once by system mail. A turn interrupted
+user's queue) and tells the user once by system mail. When a later turn
+ends normally the flag goes, and the server marks that mail read, so that
+it leaves the user's queue. A turn interrupted
 by the person is not a failure. Details per harness are in
 [harnesses](harnesses.md#failed-turns).
 
@@ -177,8 +179,11 @@ The web interface collects what waits for the user, urgent first:
   in a thread where the user has sent nothing since (it leaves the queue
   when the user replies in the thread or marks it read);
 - unread mail from amail itself (`system`: node settings changed,
-  acknowledgements overdue), shown as a notice: it asks for no answer and
-  leaves the queue when read;
+  acknowledgements overdue, a seat's turns failing), shown as a notice: it
+  asks for no answer and leaves the queue when read. A notice that a seat's
+  turns are failing is marked read by the server once the node reports
+  that the seat's turns work again (for a notice about several seats: once
+  none of them fails); the mail stays in the Inbox and the archive;
 - seats whose node reports that they need a person: a permission prompt,
   Claude Code's directory-trust prompt, a harness that is not logged in, a
   failed seat, turns that end in an error, or wake-ups that go unanswered.
