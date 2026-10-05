@@ -786,8 +786,9 @@ async fn mirror_memory_limit(b: Backend, t: &str) {
     })
     .await;
     let mut peak = 0;
+    let mut seen = [0usize; 3];
     for i in 0..8 {
-        for seat in ["a", "b", "c"] {
+        for (k, seat) in ["a", "b", "c"].iter().enumerate() {
             node.ok(
                 Method::POST,
                 &format!("/seats/{seat}/transcript"),
@@ -795,6 +796,17 @@ async fn mirror_memory_limit(b: Backend, t: &str) {
             )
             .await;
             peak = peak.max(hub.bytes());
+            // The readers keep up, so that the stalled watchers hold the
+            // most (on a loaded machine a reader could fall further behind
+            // than a stalled watcher and be the one disconnected).
+            let tag = format!("\"text\":\"{seat}-{i}\"");
+            eventually("the reader gets the post", async || {
+                let lines = readers[k].lock().unwrap();
+                let found = lines[seen[k]..].iter().any(|l| l.contains(&tag));
+                seen[k] = lines.len().saturating_sub(1);
+                found
+            })
+            .await;
         }
     }
     assert!(peak <= LIMIT, "mirror memory peaked at {peak} bytes");
