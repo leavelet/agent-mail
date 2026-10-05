@@ -19,7 +19,10 @@ one worker with the staged-merge template).
 It is idempotent: run it again after editing the file and only the
 differences are applied. Changed seats keep running (the output names those
 that need a restart); seats that left the file are reported and deleted
-only with `--prune`. Changed `[team]` settings (`idle_sleep`, `max_live`,
+only with `--prune`. Seats the node runs that were deleted on the server
+(for example with `amail seat rm` on another host, or in the web
+interface) are stopped and dropped from the node, and the output names
+them. Changed `[team]` settings (`idle_sleep`, `max_live`,
 `restart`, `local_policy`) apply at once. The output ends with the node's
 local policy (see below). `--only g,s` starts just some groups or seats;
 `--no-start` starts nothing.
@@ -164,6 +167,18 @@ every session's system prompt, so they are short.
 The node runs each group in its own zellij session (`amail-<org>-<group>`;
 seats without a group in `amail-<org>-main`), one tab per seat, each running
 `amail run <seat>`. A pane keeps its last output when its command ends.
+
+`amail attach <seat>` attaches your terminal to the seat's session and
+shows the seat's tab. `amail attach <group>` attaches to the group's
+session on the tab its other clients show. If another terminal attached to
+the same session has been typed in, amail cannot choose the tab of the new
+one (zellij 0.45 sends tab commands to the terminal that was typed in
+last); `amail attach` then says which tab to go to (`Ctrl t`, then the
+arrow keys).
+
+`amail seat rm <seat>` deletes the seat on the server and, when the node on
+this host runs it, stops it and drops it from the node, so `amail ps`,
+`down` and `up` no longer list it.
 
 Seat states: `starting`, `busy`, `idle`, `awaiting` (a permission prompt),
 `dormant` (asleep), `offline`, `restarting`, `failed`.
