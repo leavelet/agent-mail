@@ -186,10 +186,20 @@ pub async fn status(
     let recipients = rows
         .iter()
         .map(|d| {
-            let delivery = render::delivery(d, &auth.org);
+            let mut delivery = render::delivery(d, &auth.org);
+            let state = p::delivery_state(&delivery).into();
+            // A seat of another org: its state and the read and ack times
+            // only; its mailbox counters, how and when it was notified are
+            // that org's business.
+            if d.org_id != auth.org.id {
+                delivery.seq = 0;
+                delivery.mod_seq = 0;
+                delivery.notified_at = None;
+                delivery.notified_via = None;
+            }
             p::RecipientStatus {
                 address: delivery.seat.clone(),
-                state: p::delivery_state(&delivery).into(),
+                state,
                 delivery,
                 members: None,
             }

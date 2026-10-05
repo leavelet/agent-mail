@@ -556,9 +556,13 @@ pub struct Message {
 pub struct Delivery {
     pub seat: String,
     /// Position in the seat's mailbox, assigned when the delivery is created.
+    /// Absent (0) for seats of another org (see `GET /messages/{id}/status`).
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub seq: i64,
     /// Seat sequence number of the last change to this delivery (creation,
-    /// notification, read, ack). Used as the `changes` cursor.
+    /// notification, read, ack). Used as the `changes` cursor. Absent (0)
+    /// for seats of another org.
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub mod_seq: i64,
     pub class: DeliveryClass,
     pub mode: DeliveryMode,
@@ -902,6 +906,10 @@ pub struct SeatPatch {
     /// Whether the seat is a contact of its team.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contact: Option<bool>,
+}
+
+fn is_zero_i64(n: &i64) -> bool {
+    *n == 0
 }
 
 fn double_option<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>

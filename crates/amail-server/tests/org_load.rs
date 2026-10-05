@@ -463,6 +463,8 @@ async fn invisible_thread_costs_what_a_missing_one_does(b: Backend, t: &str) {
             owner_of.org_id
         ))
         .await[0][0];
+    // As in a running server (which never runs ANALYZE).
+    srv.db.drop_stats().await;
     // The owner sees it (its newest 500 messages).
     let v = owner_of.get(&format!("/threads/{thread}")).await;
     assert_eq!(v["messages"].as_array().unwrap().len(), 500);

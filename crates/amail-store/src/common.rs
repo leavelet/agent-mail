@@ -1365,17 +1365,18 @@ macro_rules! impl_store_common {
                 Ok(n > 0)
             }
 
-            /// Participants of these threads (see `thread_parts`), with
-            /// their orgs.
-            pub async fn thread_parts(c: &mut Conn, thread_ids: &[i64]) -> Result<Vec<ThreadPeer>> {
+            /// Participants of these threads as `viewer` knows them (see
+            /// `thread_views`), with their orgs.
+            pub async fn thread_parts(c: &mut Conn, viewer: i64, thread_ids: &[i64]) -> Result<Vec<ThreadPeer>> {
                 if thread_ids.is_empty() {
                     return Ok(Vec::new());
                 }
                 let mut b = sqlx::QueryBuilder::<Db>::new(
                     "SELECT tp.thread_id, s.org_id, o.name AS org_name, s.id AS seat_id, s.name AS seat_name, \
-                     s.kind, s.description FROM thread_parts tp JOIN seats s ON s.id = tp.seat_id \
-                     JOIN orgs o ON o.id = s.org_id WHERE tp.thread_id IN (",
+                     s.kind, s.description FROM thread_views tp JOIN seats s ON s.id = tp.seat_id \
+                     JOIN orgs o ON o.id = s.org_id WHERE tp.viewer_org_id = ",
                 );
+                b.push_bind(viewer).push(" AND tp.thread_id IN (");
                 let mut l = b.separated(", ");
                 for t in thread_ids {
                     l.push_bind(*t);
@@ -3532,7 +3533,7 @@ macro_rules! impl_store_common {
                     "DELETE FROM node_streams WHERE org_id = $1",
                     "UPDATE messages SET ack_due = NULL WHERE org_id = $1 AND ack_due IS NOT NULL",
                     "DELETE FROM thread_seats WHERE org_id = $1",
-                    "DELETE FROM thread_parts WHERE org_id = $1",
+                    "DELETE FROM thread_views WHERE org_id = $1 OR viewer_org_id = $1",
                     "DELETE FROM team_primaries WHERE peer_org_id = $1 OR team_id IN (SELECT id FROM teams WHERE org_id = $1)",
                     "UPDATE links SET primary_seat_id = NULL WHERE primary_seat_id IN (SELECT id FROM seats WHERE org_id = $1)",
                     "DELETE FROM grants WHERE org_id = $1",
@@ -4334,9 +4335,9 @@ macro_rules! impl_store_common {
                 run!(self.write, |c| q::remove_grant(c, org_id, id).await)
             }
 
-            async fn thread_parts(&self, thread_ids: &[i64]) -> $crate::Result<Vec<$crate::ThreadPeer>> {
+            async fn thread_parts(&self, viewer: i64, thread_ids: &[i64]) -> $crate::Result<Vec<$crate::ThreadPeer>> {
                 let ids = thread_ids.to_vec();
-                run!(self.read, |c| q::thread_parts(c, &ids).await)
+                run!(self.read, |c| q::thread_parts(c, viewer, &ids).await)
             }
 
             async fn primaries(&self, org_id: i64) -> $crate::Result<Vec<(i64, Option<i64>, i64)>> {

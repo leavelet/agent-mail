@@ -1956,13 +1956,13 @@ async fn grants_and_thread_peers(s: S) {
         .await
         .unwrap();
     assert!(
-        s.thread_parts(&[internal.thread_id])
+        s.thread_parts(a.id, &[internal.thread_id])
             .await
             .unwrap()
             .is_empty()
     );
     let sent = s.send(&msg(a.id, x.id, "q", &[(&y, C::To)])).await.unwrap();
-    let p = s.thread_parts(&[sent.thread_id]).await.unwrap();
+    let p = s.thread_parts(b.id, &[sent.thread_id]).await.unwrap();
     let names: Vec<(&str, &str)> = p
         .iter()
         .map(|x| (x.org_name.as_str(), x.card.name.as_str()))
@@ -1971,7 +1971,18 @@ async fn grants_and_thread_peers(s: S) {
     let mut r = msg(b.id, ub.id, "a", &[(&x, C::To)]);
     r.thread_id = Some(sent.thread_id);
     s.send(&r).await.unwrap();
-    assert_eq!(s.thread_parts(&[sent.thread_id]).await.unwrap().len(), 3);
+    assert_eq!(
+        s.thread_parts(a.id, &[sent.thread_id]).await.unwrap().len(),
+        3
+    );
+    // A third org knows nothing of the thread.
+    let (c3, _) = org(&s, "charlie").await;
+    assert!(
+        s.thread_parts(c3.id, &[sent.thread_id])
+            .await
+            .unwrap()
+            .is_empty()
+    );
     // Primary contacts: per link and per team.
     s.set_primary(a.id, b.id, None, Some(x.id)).await.unwrap();
     s.set_primary(a.id, b.id, Some(team.id), Some(x.id))

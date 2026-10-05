@@ -44,6 +44,8 @@ m7_tests!(
     peer_org_view,
     contact_added_and_participants,
     every_message_carries_contacts,
+    each_org_sees_its_own_slice_of_a_thread,
+    other_orgs_delivery_shows_state_only,
     primary_contacts,
     thread_closes_without_contacts,
     outbound_contacts_only,
@@ -810,6 +812,157 @@ async fn every_message_carries_contacts(srv: Server) {
             ("owner@alpha".to_string(), "bravo".to_string()),
         ]
     );
+}
+
+/// A thread may span three orgs: each org knows only the messages its
+/// own seats sent or received. B does not see, and cannot address, the
+/// seats of A and C on a message of the thread that only went to C
+/// (finding D-01).
+async fn each_org_sees_its_own_slice_of_a_thread(srv: Server) {
+    let a = srv.org("alpha").await;
+    let b = srv.org("bravo").await;
+    let c = srv.org("charlie").await;
+    a.seat("a-secret").await;
+    a.ok(
+        Method::PATCH,
+        "/seats/a-secret",
+        Some(json!({ "description": "A internal project lead" })),
+    )
+    .await;
+    let cc = c.seat("c-contact").await;
+    c.open("c-contact", None).await;
+    a.link(&b, "bravo", "alpha").await;
+    a.link(&c, "charlie", "alpha").await;
+    let first = a
+        .sent(json!({ "to": ["owner@bravo"], "subject": "ab", "body": "hello b" }))
+        .await;
+    let second = a
+        .sent(json!({ "to": ["c-contact@charlie"], "cc": ["a-secret"], "subject": "ac", "body": "zeta-to-c",
+                       "in_reply_to": first }))
+        .await;
+    let addrs = |t: &Value| -> Vec<String> {
+        t["participants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["address"].as_str().unwrap().to_string())
+            .collect()
+    };
+    // B: only the first message and its seats.
+    let t = b.ok(Method::GET, &format!("/threads/{first}"), None).await;
+    assert_eq!(t["messages"].as_array().unwrap().len(), 1, "{t}");
+    assert_eq!(addrs(&t), vec!["owner@alpha"], "{t}");
+    assert!(
+        !t.to_string().contains("a-secret") && !t.to_string().contains("charlie"),
+        "{t}"
+    );
+    // C: only the second message and its seats.
+    let t = c.ok(Method::GET, &format!("/threads/{first}"), None).await;
+    assert_eq!(t["messages"].as_array().unwrap().len(), 1, "{t}");
+    assert_eq!(addrs(&t), vec!["a-secret@alpha", "owner@alpha"], "{t}");
+    assert!(!t.to_string().contains("bravo"), "{t}");
+    // The other paths keyed by the thread show B its own slice only.
+    let arch = b
+        .ok(
+            Method::GET,
+            &format!("/archive/messages?thread={first}"),
+            None,
+        )
+        .await;
+    assert_eq!(arch["messages"].as_array().unwrap().len(), 1, "{arch}");
+    assert!(!arch.to_string().contains("a-secret"), "{arch}");
+    let found = b.ok(Method::GET, "/archive/search?q=zeta-to-c", None).await;
+    assert_eq!(found["messages"], json!([]), "{found}");
+    for (who, id) in [(&b, second), (&c, first)] {
+        assert_eq!(
+            who.get(&format!("/messages/{id}")).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            who.get(&format!("/messages/{id}/status")).await.0,
+            StatusCode::NOT_FOUND
+        );
+    }
+    let att = b.ok(Method::GET, "/attention", None).await;
+    assert!(!att.to_string().contains("a-secret"), "{att}");
+    // B cannot address A's seat it never saw, in this thread: the same
+    // answer as for a name that does not exist.
+    for name in ["a-secret@alpha", "zzz@alpha"] {
+        let (s, v) = b
+            .post(
+                "/messages",
+                json!({ "to": [name], "subject": "probe", "body": "x", "in_reply_to": first }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{name}: {v}");
+        assert_eq!(v["error"]["rejected"][0]["reason"], "unreachable", "{name}");
+    }
+    // C may answer a-secret (it was on C's message), and the contacts
+    // added are chosen from C's slice (alpha's user, on that message).
+    let r = cc
+        .send(
+            json!({ "to": ["a-secret@alpha"], "subject": "re", "body": "", "in_reply_to": second }),
+        )
+        .await;
+    let added: Vec<&str> = r["recipients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|x| x["added"] == true)
+        .map(|x| x["address"].as_str().unwrap())
+        .collect();
+    assert_eq!(added, vec!["owner@alpha"], "{r}");
+    // B's view of the thread still does not grow.
+    let t = b.ok(Method::GET, &format!("/threads/{first}"), None).await;
+    assert_eq!(addrs(&t), vec!["owner@alpha"], "{t}");
+    // B replying in the thread gets alpha's contact from B's slice only.
+    let r = b
+        .send(json!({ "to": ["owner@alpha"], "subject": "re", "body": "", "in_reply_to": first }))
+        .await;
+    assert!(!r.to_string().contains("a-secret"), "{r}");
+}
+
+/// The delivery status of a seat of another org gives its state and the
+/// read and ack times only, not its mailbox counters or how and when it was
+/// notified (finding D-02).
+async fn other_orgs_delivery_shows_state_only(srv: Server) {
+    let a = srv.org("alpha").await;
+    let b = srv.org("bravo").await;
+    let x = a.seat("x").await;
+    let o = b.seat("o").await;
+    a.link(&b, "bravo", "alpha").await;
+    b.open("o", None).await;
+    for _ in 0..3 {
+        b.send(to_body(&["o"])).await;
+    }
+    let id = x
+        .sent(json!({ "to": ["o@bravo"], "subject": "s", "body": "b", "ack_required": true }))
+        .await;
+    o.ok(
+        Method::POST,
+        "/claim",
+        Some(json!({ "via": "hook:UserPromptSubmit" })),
+    )
+    .await;
+    o.ok(Method::POST, &format!("/messages/{id}/ack"), None)
+        .await;
+    let st = x
+        .ok(Method::GET, &format!("/messages/{id}/status"), None)
+        .await;
+    let r = st["recipients"].as_array().unwrap();
+    let theirs = r.iter().find(|r| r["address"] == "o@bravo").unwrap();
+    assert_eq!(theirs["state"], "acked", "{st}");
+    assert!(
+        theirs["read_at"].is_string() && theirs["acked_at"].is_string(),
+        "{st}"
+    );
+    for k in ["seq", "mod_seq", "notified_at", "notified_via"] {
+        assert!(theirs.get(k).is_none(), "{k}: {st}");
+    }
+    assert!(!st.to_string().contains("UserPromptSubmit"), "{st}");
+    // The sender's own org's recipient (the added contact) keeps them.
+    let own = r.iter().find(|r| r["address"] == "owner").unwrap();
+    assert!(own["seq"].is_number(), "{st}");
 }
 
 /// The primary contact: the team's, else the org's (set per linked org),

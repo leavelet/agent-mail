@@ -145,7 +145,12 @@ export interface MessageResponse {
   delivery?: Delivery;
 }
 
-export interface RecipientStatus extends Delivery {
+/** A recipient's delivery in a message's status. For a seat of another org
+ * only its state and the read and ack times are given (no `seq`,
+ * `mod_seq`, `notified_at` or `notified_via`). */
+export interface RecipientStatus extends Omit<Delivery, 'seq' | 'mod_seq'> {
+  seq?: number;
+  mod_seq?: number;
   address: string;
   state: 'queued' | 'notified' | 'read' | 'acked';
   /** Seats behind another org's list, counted without their names. */

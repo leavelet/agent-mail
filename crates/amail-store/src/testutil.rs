@@ -112,6 +112,27 @@ impl TestDb {
         }
     }
 
+    /// Forget the planner statistics that [`TestDb::exec`] gathered
+    /// (SQLite): the server never runs `ANALYZE`, and statistics of an
+    /// unusual fill (one thread of 60,000 messages) can make SQLite's
+    /// planner scan an index where it otherwise looks a row up. The schema
+    /// change at the end makes every open connection read them again.
+    pub async fn drop_stats(&self) {
+        if !self.url.starts_with("sqlite:") {
+            return;
+        }
+        let mut c = sqlx::SqliteConnection::connect(&self.url)
+            .await
+            .expect("connect");
+        for s in [
+            "DELETE FROM sqlite_stat1",
+            "CREATE TABLE amail_test_schema_bump (x INTEGER)",
+            "DROP TABLE amail_test_schema_bump",
+        ] {
+            sqlx::raw_sql(s).execute(&mut c).await.expect(s);
+        }
+    }
+
     /// Recount the pending and unread counters of the org's seats from
     /// their deliveries, and record their threads, after deliveries were
     /// inserted directly (sending keeps both; on Postgres a direct insert

@@ -499,6 +499,9 @@ struct Resolver<'a> {
     reach: Reach<'a>,
     /// A list of the sender's org was named.
     named_list: bool,
+    /// Per org on a cross-org message: the thread's participants it knew
+    /// before this message (its own slice), for the notices.
+    before: HashMap<i64, std::collections::HashSet<i64>>,
     /// (org id, name) -> seat, for names looked up by `prefetch`.
     seat_cache: HashMap<(i64, String), Option<Seat>>,
 }
@@ -518,6 +521,7 @@ impl<'a> Resolver<'a> {
             orgs: HashMap::new(),
             reach: Reach::new(st, org, sender, thread),
             named_list: false,
+            before: HashMap::new(),
             seat_cache: HashMap::new(),
         }
     }
@@ -779,7 +783,24 @@ impl<'a> Resolver<'a> {
                 orgs.push(o.clone());
             }
         }
+        // The thread as the sender's org knows it: only its own slice.
         let parts = self.reach.parts().await?.clone();
+        for o in &orgs {
+            let seen: std::collections::HashSet<i64> =
+                match (o.id == self.org.id, self.reach.thread()) {
+                    (true, _) => parts.keys().copied().collect(),
+                    (false, Some(t)) => self
+                        .st
+                        .store
+                        .thread_parts(o.id, &[t])
+                        .await?
+                        .iter()
+                        .map(|p| p.card.id)
+                        .collect(),
+                    (false, None) => Default::default(),
+                };
+            self.before.insert(o.id, seen);
+        }
         // For each pair: a contact of `o` for `p` must be on the message.
         for o in orgs.clone() {
             for p in orgs.iter().filter(|p| p.id != o.id) {
@@ -873,7 +894,7 @@ impl<'a> Resolver<'a> {
         if orgs.len() < 2 {
             return Ok(());
         }
-        let before = self.reach.parts().await?.clone();
+        let before = self.before.clone();
         let mut by_id: HashMap<i64, Org> = self
             .orgs
             .values()
@@ -893,7 +914,10 @@ impl<'a> Resolver<'a> {
             };
             let mut lines = Vec::new();
             for &(seat, so) in &on {
-                if so != o || before.contains_key(&seat) || lines.iter().any(|(s, _)| *s == seat) {
+                if so != o
+                    || before.get(&o).is_some_and(|b| b.contains(&seat))
+                    || lines.iter().any(|(s, _)| *s == seat)
+                {
                     continue;
                 }
                 if self

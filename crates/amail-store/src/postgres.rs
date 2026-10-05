@@ -217,18 +217,33 @@ impl PgStore {
                 .bind(&seats)
                 .execute(&mut *c)
                 .await?;
-                // A message that reaches another org makes its sender and
-                // all its recipients participants of the thread (see
-                // migration 0018).
+                // A message that reaches another org: every org on it (the
+                // sender's and the recipients') knows all its seats as
+                // participants of the thread (see migration 0019).
                 if orgs.iter().any(|o| *o != m.org_id) {
+                    let mut viewers: Vec<i64> = orgs.clone();
+                    viewers.push(m.org_id);
+                    viewers.sort_unstable();
+                    viewers.dedup();
+                    let on_seats = [vec![m.sender_seat_id], seats.clone()].concat();
+                    let on_orgs = [vec![m.org_id], orgs.clone()].concat();
+                    let (mut vv, mut ss, mut oo) = (vec![], vec![], vec![]);
+                    for v in &viewers {
+                        for (s, o) in on_seats.iter().zip(&on_orgs) {
+                            vv.push(*v);
+                            ss.push(*s);
+                            oo.push(*o);
+                        }
+                    }
                     sqlx::query(
-                        "INSERT INTO thread_parts (thread_id, seat_id, org_id) \
-                         SELECT $1, s, o FROM UNNEST($2::bigint[], $3::bigint[]) AS t(s, o) \
-                         ORDER BY 2 ON CONFLICT DO NOTHING",
+                        "INSERT INTO thread_views (thread_id, viewer_org_id, seat_id, org_id) \
+                         SELECT $1, v, s, o FROM UNNEST($2::bigint[], $3::bigint[], $4::bigint[]) AS t(v, s, o) \
+                         ORDER BY 2, 3 ON CONFLICT DO NOTHING",
                     )
                     .bind(thread_id)
-                    .bind([vec![m.sender_seat_id], seats.clone()].concat())
-                    .bind([vec![m.org_id], orgs.clone()].concat())
+                    .bind(&vv)
+                    .bind(&ss)
+                    .bind(&oo)
                     .execute(&mut *c)
                     .await?;
                 }

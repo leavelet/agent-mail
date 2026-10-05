@@ -322,6 +322,11 @@ impl<'a> Reach<'a> {
         Ok(&self.ours[&to.id])
     }
 
+    /// The thread the message joins, if any.
+    pub fn thread(&self) -> Option<i64> {
+        self.thread
+    }
+
     /// The thread's participants before this message (seat id -> org id).
     pub async fn parts(&mut self) -> ApiResult<&HashMap<i64, i64>> {
         if self.parts.is_none() {
@@ -329,7 +334,7 @@ impl<'a> Reach<'a> {
                 Some(t) => self
                     .st
                     .store
-                    .thread_parts(&[t])
+                    .thread_parts(self.org.id, &[t])
                     .await?
                     .into_iter()
                     .map(|p| (p.card.id, p.org_id))
@@ -454,7 +459,7 @@ pub async fn org_primary(st: &AppState, org: &Org, peer: &Org) -> ApiResult<Opti
 pub async fn participants(st: &AppState, viewer: &Org, thread: i64) -> ApiResult<Vec<p::Card>> {
     Ok(st
         .store
-        .thread_parts(&[thread])
+        .thread_parts(viewer.id, &[thread])
         .await?
         .iter()
         .filter(|p| p.org_id != viewer.id)

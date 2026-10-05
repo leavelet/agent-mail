@@ -200,9 +200,11 @@ pub trait Store: Send + Sync + 'static {
         managed: bool,
     ) -> Result<i64>;
     async fn remove_grant(&self, org_id: i64, id: i64) -> Result<bool>;
-    /// Participants of these threads: every seat of a message of the
-    /// thread that reached more than one org, with its org.
-    async fn thread_parts(&self, thread_ids: &[i64]) -> Result<Vec<ThreadPeer>>;
+    /// Participants of these threads as org `viewer` knows them: every seat
+    /// (with its org) of the thread's messages that reached more than one
+    /// org and that a seat of `viewer` sent or received. Nothing of the
+    /// messages `viewer` did not see.
+    async fn thread_parts(&self, viewer: i64, thread_ids: &[i64]) -> Result<Vec<ThreadPeer>>;
     /// The org's primary contacts: `(peer org id, team id, seat id)`; team
     /// `None` is the org's own for that peer.
     async fn primaries(&self, org_id: i64) -> Result<Vec<(i64, Option<i64>, i64)>>;
