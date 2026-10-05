@@ -3,6 +3,7 @@
 
 use crate::AppState;
 use crate::auth::Auth;
+use crate::boundary::View;
 use crate::error::{ApiError, ApiResult, Json, Path, Query};
 pub use crate::limits::Pool;
 use crate::render;
@@ -97,10 +98,8 @@ pub async fn inbox(
     } else {
         st.store.inbox(seat.id, &query).await?
     };
-    let mut entries: Vec<p::InboxEntry> = entries
-        .iter()
-        .map(|e| render::entry(e, &auth.org))
-        .collect();
+    let view = View::load(&st, &auth.org, entries.iter().map(|e| &e.message)).await?;
+    let mut entries: Vec<p::InboxEntry> = entries.iter().map(|e| view.entry(e)).collect();
     // Paging backwards, the entries next to `before_seq` (the end) stay.
     let truncated = render::fit(&mut entries, MAX_PAGE_BYTES, query.before_seq.is_some());
     Ok(Json(p::InboxResponse {
@@ -134,8 +133,9 @@ pub async fn read(
             None => None,
         }
     };
+    let view = View::load(&st, &auth.org, [&m]).await?;
     Ok(Json(p::MessageResponse {
-        message: render::message(&m, &auth.org),
+        message: view.message(&m),
         delivery: delivery.map(|d| render::delivery(&d, &auth.org)),
     }))
 }
@@ -174,112 +174,30 @@ pub async fn status(
         Ok(store.recipients(id).await?)
     })
     .await?;
-    let mut recipients: Vec<p::RecipientStatus> = Vec::new();
-    for d in &rows {
-        let delivery = render::delivery(d, &auth.org);
-        let Some(group) = external_group(&m, &rows, d) else {
-            recipients.push(p::RecipientStatus {
+    // Recipients of other orgs the caller may no longer see (their org
+    // closed them since) are left out.
+    let view = if rows.iter().any(|d| d.org_id != auth.org.id) {
+        View::for_threads(&st, &auth.org, &[m.thread_id]).await?
+    } else {
+        View::own(&auth.org)
+    };
+    let recipients = rows
+        .iter()
+        .filter(|d| view.shows_delivery(m.thread_id, d))
+        .map(|d| {
+            let delivery = render::delivery(d, &auth.org);
+            p::RecipientStatus {
                 address: delivery.seat.clone(),
                 state: p::delivery_state(&delivery).into(),
                 delivery,
                 members: None,
-            });
-            continue;
-        };
-        let i = match recipients
-            .iter()
-            .position(|r| r.members.is_some() && r.address == group)
-        {
-            Some(i) => i,
-            None => {
-                recipients.push(p::RecipientStatus {
-                    address: group.clone(),
-                    state: String::new(),
-                    delivery: p::Delivery {
-                        seat: group.clone(),
-                        seq: 0,
-                        mod_seq: 0,
-                        notified_via: None,
-                        ..delivery.clone()
-                    },
-                    members: Some(p::MemberCounts::default()),
-                });
-                recipients.len() - 1
             }
-        };
-        let r = &mut recipients[i];
-        let c = r.members.as_mut().expect("group");
-        let first = c.seats == 0;
-        c.seats += 1;
-        c.notified += i64::from(delivery.notified_at.is_some());
-        c.read += i64::from(delivery.read_at.is_some());
-        c.acked += i64::from(delivery.acked_at.is_some());
-        // A time is shown only once every seat reached that state, and
-        // then it is the latest one.
-        let agg = |have: &mut Option<String>, new: &Option<String>| {
-            *have = match (first, have.take(), new) {
-                (true, _, n) => n.clone(),
-                (false, Some(a), Some(b)) => Some(a.max(b.clone())),
-                _ => None,
-            };
-        };
-        agg(&mut r.delivery.notified_at, &delivery.notified_at);
-        agg(&mut r.delivery.read_at, &delivery.read_at);
-        agg(&mut r.delivery.acked_at, &delivery.acked_at);
-    }
-    for r in &mut recipients {
-        if r.members.is_some() {
-            r.state = p::delivery_state(&r.delivery).into();
-        }
-    }
+        })
+        .collect();
     Ok(Json(p::StatusResponse {
         message_id: id,
         recipients,
     }))
-}
-
-/// When a delivery reached a seat of another org through another org's
-/// list, the list addresses it is counted under; `None` when the seat was
-/// named itself, is in the sender's org, or came through a list of the
-/// sender's org. Which seats stand behind another org's list, and when each
-/// of them read the mail, is that org's business.
-///
-/// The list is not recorded with the delivery. A seat is counted under the
-/// named lists of its own org; failing those (a seat of a third org that a
-/// list includes), under every named list of another org. A seat of a third
-/// org that came through a list of the sender's org is then also counted,
-/// not named, when the message names another org's list as well.
-pub(crate) fn external_group(
-    m: &MessageRec,
-    all: &[amail_store::DeliveryRec],
-    d: &amail_store::DeliveryRec,
-) -> Option<String> {
-    if d.org_id == m.org_id {
-        return None;
-    }
-    let own = format!("{}@{}", d.seat_name, d.org_name);
-    let named = || m.to_addrs.iter().chain(&m.cc_addrs);
-    if named().any(|a| *a == own) {
-        return None;
-    }
-    // Addresses of other orgs that are not a seat that got the message.
-    let own_org = format!("@{}", m.org_name);
-    let lists: Vec<&str> = named()
-        .filter(|a| a.contains('@') && !a.ends_with(&own_org))
-        .filter(|a| {
-            !all.iter()
-                .any(|x| x.org_id != m.org_id && format!("{}@{}", x.seat_name, x.org_name) == **a)
-        })
-        .map(String::as_str)
-        .collect();
-    let suffix = format!("@{}", d.org_name);
-    let same_org: Vec<&str> = lists
-        .iter()
-        .copied()
-        .filter(|a| a.ends_with(&suffix))
-        .collect();
-    let lists = if same_org.is_empty() { lists } else { same_org };
-    (!lists.is_empty()).then(|| lists.join(", "))
 }
 
 pub async fn thread(
@@ -313,10 +231,16 @@ pub async fn thread(
     if truncated {
         found.remove(0);
     }
+    let view = View::load(&st, &auth.org, found.iter().map(|t| &t.message)).await?;
+    let participants = if found.iter().any(|t| t.message.org_id != auth.org.id) {
+        View::participants(&st, &auth.org, id).await?
+    } else {
+        Vec::new()
+    };
     let mut messages: Vec<p::Message> = found
-        .into_iter()
+        .iter()
         .map(|t| {
-            let mut m = render::message(&t.message, &auth.org);
+            let mut m = view.message(&t.message);
             m.body_omitted = t.body_omitted;
             m
         })
@@ -348,6 +272,7 @@ pub async fn thread(
         thread_id: id,
         truncated,
         messages,
+        participants,
     }))
 }
 
@@ -396,10 +321,11 @@ pub async fn claim(
     let (entries, bump) = st.store.claim(seat.id, &filter).await?;
     publish(&st, &seat.name, bump);
     let max = inline_max.unwrap_or(0);
+    let view = View::load(&st, &auth.org, entries.iter().map(|e| &e.message)).await?;
     let entries = entries
         .iter()
         .map(|e| {
-            let mut out = render::entry(e, &auth.org);
+            let mut out = view.entry(e);
             if max > 0 && e.message.body.chars().count() <= max {
                 out.body = Some(e.message.body.clone());
             }
@@ -465,10 +391,8 @@ pub async fn changes(
     })
     .await?;
     let full = entries.len() as i64 == limit;
-    let mut entries: Vec<p::InboxEntry> = entries
-        .iter()
-        .map(|e| render::entry(e, &auth.org))
-        .collect();
+    let view = View::load(&st, &auth.org, entries.iter().map(|e| &e.message)).await?;
+    let mut entries: Vec<p::InboxEntry> = entries.iter().map(|e| view.entry(e)).collect();
     let cut = render::fit(&mut entries, MAX_PAGE_BYTES, false);
     let next = entries.last().map(|e| e.delivery.mod_seq).unwrap_or(since);
     Ok(Json(p::ChangesResponse {
@@ -682,7 +606,22 @@ pub async fn archive(
             let a: Address = a
                 .parse()
                 .map_err(|e| ApiError::bad_request(format!("to: {e}")))?;
-            Some((a.org_or(&auth.org.name).to_string(), a.name))
+            let org = a.org_or(&auth.org.name).to_string();
+            // Another org's seat: only one the org may see (open to it, or
+            // a participant of the thread asked for). Any other name finds
+            // nothing, after the same query.
+            let visible = org == auth.org.name || {
+                let view = match q.thread {
+                    Some(t) => View::for_threads(&st, &auth.org, &[t]).await?,
+                    None => View::for_threads(&st, &auth.org, &[0]).await?,
+                };
+                view.shows(q.thread, &org, &a.name)
+            };
+            if visible {
+                Some((org, a.name))
+            } else {
+                Some((org, "-".to_string()))
+            }
         }
     };
     let limit = q.limit.unwrap_or(50).clamp(1, 500);
@@ -702,20 +641,15 @@ pub async fn archive(
         Ok(store.archive(org_id, &query).await?)
     })
     .await?;
-    Ok(Json(archive_response(page, &auth.org)))
+    let view = View::load(&st, &auth.org, &page.messages).await?;
+    Ok(Json(archive_response(page, &view)))
 }
 
 /// An archive page as sent: within [`MAX_PAGE_BYTES`], continuing after
 /// the last message kept when it was cut.
-pub fn archive_response(
-    page: amail_store::ArchivePage,
-    org: &amail_store::Org,
-) -> p::ArchiveResponse {
-    let mut messages: Vec<p::MessageHeader> = page
-        .messages
-        .iter()
-        .map(|m| render::header(m, org))
-        .collect();
+pub fn archive_response(page: amail_store::ArchivePage, view: &View) -> p::ArchiveResponse {
+    let mut messages: Vec<p::MessageHeader> =
+        page.messages.iter().map(|m| view.header(m)).collect();
     let next_before_id = if render::fit(&mut messages, MAX_PAGE_BYTES, false) {
         messages.last().map(|m| m.id)
     } else {

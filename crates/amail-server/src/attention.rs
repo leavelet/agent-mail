@@ -111,12 +111,24 @@ async fn escalate(st: &AppState, due: &AckDue, now: i64) -> amail_store::Result<
         .collect();
     let waited = due.due - due.created_at;
     let mut who = Vec::new();
-    // Seats behind another org's list are counted, not named.
-    let mut groups: Vec<(String, usize)> = Vec::new();
-    let rows = if laggards.iter().any(|l| l.org_id != due.org_id) {
-        store.recipients(due.message_id).await?
+    // Seats of other orgs that the sender's org may no longer see are
+    // counted, not named (see `crate::boundary::View`).
+    let mut hidden = 0;
+    let (rows, view) = if laggards.iter().any(|l| l.org_id != due.org_id) {
+        let org = store.org_by_id(due.org_id).await?;
+        match org {
+            Some(org) => (
+                store.recipients(due.message_id).await?,
+                Some(
+                    crate::boundary::View::for_threads(st, &org, &[msg.thread_id])
+                        .await
+                        .map_err(|e| amail_store::StoreError::Invalid(e.message))?,
+                ),
+            ),
+            None => (Vec::new(), None),
+        }
     } else {
-        Vec::new()
+        (Vec::new(), None)
     };
     for l in &laggards {
         let mut s = if l.org_id == due.org_id {
@@ -125,11 +137,11 @@ async fn escalate(st: &AppState, due: &AckDue, now: i64) -> amail_store::Result<
             let Some(d) = rows.iter().find(|d| d.seat_id == l.seat_id) else {
                 continue;
             };
-            if let Some(g) = crate::mail::external_group(&msg, &rows, d) {
-                match groups.iter_mut().find(|(x, _)| *x == g) {
-                    Some((_, n)) => *n += 1,
-                    None => groups.push((g, 1)),
-                }
+            if !view
+                .as_ref()
+                .is_some_and(|v| v.shows_delivery(msg.thread_id, d))
+            {
+                hidden += 1;
                 continue;
             }
             format!("{}@{}", l.name, d.org_name)
@@ -142,8 +154,11 @@ async fn escalate(st: &AppState, due: &AckDue, now: i64) -> amail_store::Result<
         }
         who.push(s);
     }
-    for (g, n) in groups {
-        who.push(format!("{n} seat{} of {g}", if n == 1 { "" } else { "s" }));
+    if hidden > 0 {
+        who.push(format!(
+            "{hidden} recipient{} not shown",
+            if hidden == 1 { "" } else { "s" }
+        ));
     }
     let (next_stage, next_due, body, cc) = if due.stage == 0 {
         let next = (!leads.is_empty()).then_some(now + waited.max(1000));

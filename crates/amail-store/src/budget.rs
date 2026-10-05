@@ -24,6 +24,18 @@ impl Budget {
             .map_err(|d| (d.as_millis() as u64).max(1))
     }
 
+    /// Take one token from a bucket refilled with `per_hour` tokens an hour
+    /// and holding at most as many.
+    pub fn take_hourly(&self, seat_id: i64, per_hour: i64) -> Result<(), u64> {
+        self.acquire_rate(
+            seat_id,
+            per_hour.max(0) as f64 / 3600.0,
+            per_hour,
+            Instant::now(),
+        )
+        .map_err(|d| (d.as_millis() as u64).max(1))
+    }
+
     fn try_acquire_at(
         &self,
         seat_id: i64,
@@ -31,8 +43,17 @@ impl Budget {
         burst: i64,
         now: Instant,
     ) -> Result<(), Duration> {
+        self.acquire_rate(seat_id, per_min.max(0) as f64 / 60.0, burst, now)
+    }
+
+    fn acquire_rate(
+        &self,
+        seat_id: i64,
+        rate: f64, // tokens per second
+        burst: i64,
+        now: Instant,
+    ) -> Result<(), Duration> {
         let burst = burst.max(1) as f64;
-        let rate = per_min.max(0) as f64 / 60.0; // tokens per second
         let mut buckets = self.buckets.lock().unwrap();
         let b = buckets.entry(seat_id).or_insert(Bucket {
             tokens: burst,

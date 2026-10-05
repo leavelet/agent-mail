@@ -338,6 +338,8 @@ mod tests {
                     .into_iter()
                     .collect(),
                 expired: false,
+                to_hidden: 0,
+                cc_hidden: 0,
             },
             body: body.into(),
             body_omitted: false,

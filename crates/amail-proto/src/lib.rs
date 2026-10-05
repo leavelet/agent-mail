@@ -124,6 +124,25 @@ string_enum!(
 );
 
 string_enum!(
+    /// Who outside the org can read the org's card. `listed-by-name`: any
+    /// signed-in user or seat that knows the exact name. `hidden`: only orgs
+    /// with an active link; to everyone else the org does not exist.
+    OrgVisibility { ListedByName => "listed-by-name", Hidden => "hidden" }
+);
+
+string_enum!(
+    /// Which seats of the org may write to other orgs. `any-seat`: every
+    /// seat. `open-seats-only`: the user, and seats open to the receiving
+    /// org.
+    Outbound { AnySeat => "any-seat", OpenSeatsOnly => "open-seats-only" }
+);
+
+string_enum!(
+    /// What a card describes.
+    CardKind { User => "user", Agent => "agent", Team => "team" }
+);
+
+string_enum!(
     /// Link state as seen from one side. `requested`: we asked, they have not
     /// accepted. `invited`: they asked, we can accept. `active`: both agreed.
     LinkState { Requested => "requested", Invited => "invited", Active => "active" }
@@ -236,8 +255,17 @@ pub mod limits {
     pub const MAX_MODEL_CHARS: usize = 200;
     /// A seat's harness name.
     pub const MAX_HARNESS_CHARS: usize = 64;
-    /// A list's description.
-    pub const MAX_DESCRIPTION_CHARS: usize = 1_000;
+    /// The description of an org, seat, team or list: one paragraph that
+    /// others read to find it (see [`crate::check_description`]).
+    pub const MAX_DESCRIPTION_CHARS: usize = 500;
+    /// A link request's note to the other org's user.
+    pub const MAX_LINK_NOTE_CHARS: usize = 500;
+    /// An org's display name.
+    pub const MAX_ORG_DISPLAY_NAME_CHARS: usize = 100;
+    /// Grants (openings) an org may hold.
+    pub const MAX_GRANTS: usize = 1_000;
+    /// Teams an org may have.
+    pub const MAX_TEAMS: usize = 500;
     /// Presence: the `attention` tag.
     pub const MAX_ATTENTION_CHARS: usize = 64;
     /// Presence: the attention hint.
@@ -398,6 +426,24 @@ pub mod limits {
     }
 }
 
+/// Check a description (of an org, seat, team or list) or another
+/// one-paragraph text: at most `max` characters, no line breaks and no
+/// control characters.
+pub fn check_paragraph(field: &str, s: &str, max: usize) -> Result<(), String> {
+    limits::check_chars(field, s, max)?;
+    if s.chars().any(|c| c.is_control() || text::is_line_break(c)) {
+        return Err(format!(
+            "{field} must be one paragraph without line breaks or control characters"
+        ));
+    }
+    Ok(())
+}
+
+/// [`check_paragraph`] for a description.
+pub fn check_description(s: &str) -> Result<(), String> {
+    check_paragraph("description", s, limits::MAX_DESCRIPTION_CHARS)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendResponse {
     pub id: i64,
@@ -445,8 +491,12 @@ pub struct AddressResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Rejected {
     pub address: String,
-    /// Machine-readable reason: `invalid_address`, `unknown_address`,
-    /// `not_linked`, `post_denied`.
+    /// Machine-readable reason: `invalid_address`, `unknown_address` (no
+    /// seat or list of that name in your org), `not_linked` (no active link
+    /// with that org, or no such org), `unreachable` (the other org has not
+    /// opened that seat to your org and it is not a participant of this
+    /// thread, your org lets only open seats write outside, or no seat of
+    /// that name exists there: these cases answer alike), `post_denied`.
     pub reason: String,
 }
 
@@ -472,6 +522,26 @@ pub struct MessageHeader {
     /// The retention period cleared the body (the header is kept).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub expired: bool,
+    /// Addresses of `to` the reader may not see: seats and lists of
+    /// another org that are neither open to the reader's org nor
+    /// participants of this thread. They are left out of `to` and counted
+    /// here.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub to_hidden: u32,
+    /// As `to_hidden`, for `cc`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cc_hidden: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+impl MessageHeader {
+    /// Addresses left out of `to` and `cc` together.
+    pub fn hidden(&self) -> u32 {
+        self.to_hidden + self.cc_hidden
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -576,6 +646,11 @@ pub struct MemberCounts {
 pub struct ThreadResponse {
     pub thread_id: i64,
     pub messages: Vec<Message>,
+    /// Cards of the seats of other orgs that wrote into this thread
+    /// (messages that reached the caller's org): they may be answered in
+    /// this thread, whether or not their org opened them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub participants: Vec<Card>,
     /// Older messages were left out (a thread answers at most its newest
     /// 500 messages, and headers of at most [`limits::MAX_PAGE_BYTES`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -727,9 +802,21 @@ pub struct Seat {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<PermissionMode>,
-    /// The team group the seat belongs to (for display; set by `amail up`).
+    /// The team the seat belongs to (at most one).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// What the seat does, for others to find it (shown to other orgs on
+    /// its card when the seat is open to them).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// The seat is a contact of its team: opening the team opens it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub contact: bool,
+    /// The audiences the seat is open to through grants on the seat or (as
+    /// a contact) on its team: `linked` or org names. Shown in its own org
+    /// only.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_to: Vec<String>,
     pub created_at: String,
     /// The seat's session state as last reported by a node. Absent when no
     /// node has reported the seat recently (treat as offline).
@@ -755,8 +842,13 @@ pub struct NewSeat {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_mode: Option<PermissionMode>,
+    /// The seat's team (created when there is none of that name).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub contact: bool,
 }
 
 /// PATCH body for a seat. A missing field is left unchanged; `null` clears it.
@@ -798,12 +890,22 @@ pub struct SeatPatch {
         skip_serializing_if = "Option::is_none"
     )]
     pub permission_mode: Option<Option<PermissionMode>>,
+    /// The seat's team; `null` takes it out of its team.
     #[serde(
         default,
         deserialize_with = "double_option",
         skip_serializing_if = "Option::is_none"
     )]
     pub group: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub description: Option<Option<String>>,
+    /// Whether the seat is a contact of its team.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contact: Option<bool>,
 }
 
 fn double_option<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
@@ -862,6 +964,10 @@ pub struct NewList {
 pub struct ListMember {
     pub address: String,
     pub mode: DeliveryMode,
+    /// A member of another org that gets no mail now: the link ended or
+    /// its org no longer opens it to this org.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inactive: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -874,11 +980,23 @@ pub struct PutMember {
 pub struct Link {
     pub org: String,
     pub state: LinkState,
+    /// When the link became active (state `active`), or when it was
+    /// requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// The note that came with the request (state `invited`: the other
+    /// org's note to you, untrusted text; `requested`: yours).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewLink {
     pub org: String,
+    /// A note for the other org's user, at most
+    /// [`limits::MAX_LINK_NOTE_CHARS`] characters on one line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -911,6 +1029,35 @@ pub struct OrgInfo {
     /// The server's limit on `stored_bytes`; absent when there is none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_quota_bytes: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default = "default_visibility")]
+    pub visibility: OrgVisibility,
+    #[serde(default = "default_outbound")]
+    pub outbound: Outbound,
+    /// New threads to other orgs a seat may start per hour (the user seat
+    /// is exempt).
+    #[serde(default = "default_new_threads")]
+    pub new_threads_per_hour: i64,
+    /// A one-time notice for the user (user tokens), for example that an
+    /// upgrade closed what links used to open; cleared with
+    /// `DELETE /v1/org/notice`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<String>,
+}
+
+fn default_visibility() -> OrgVisibility {
+    OrgVisibility::ListedByName
+}
+
+fn default_outbound() -> Outbound {
+    Outbound::AnySeat
+}
+
+fn default_new_threads() -> i64 {
+    10
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -936,6 +1083,186 @@ pub struct OrgPatch {
         skip_serializing_if = "Option::is_none"
     )]
     pub webhook_url: Option<Option<String>>,
+    /// `null` clears it.
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub display_name: Option<Option<String>>,
+    /// `null` clears it.
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub description: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<OrgVisibility>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outbound: Option<Outbound>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_threads_per_hour: Option<i64>,
+}
+
+// ---------------------------------------------------------------------------
+// Cards, teams and openings
+
+/// What another org may know of a seat or team: its name, kind and
+/// description, nothing else.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Card {
+    /// `name@org` (for cards of another org) or `name`.
+    pub address: String,
+    pub kind: CardKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// An org's card: what any signed-in user or seat that knows the name may
+/// read (unless the org is hidden).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrgCard {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// `GET /v1/orgs/{name}`: another org as the caller's org sees it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerOrg {
+    pub card: OrgCard,
+    /// The link between the two orgs, if any (active, requested or
+    /// invited).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link: Option<Link>,
+    /// Cards of the seats and teams that org opened to the caller's org
+    /// (active link only).
+    #[serde(default)]
+    pub open_to_you: Vec<Card>,
+    /// The caller's org's grants whose audience includes that org.
+    #[serde(default)]
+    pub you_open: Vec<Grant>,
+}
+
+/// A team: a named group of seats of one org, with an optional root seat
+/// and parent team. A seat belongs to at most one team.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Team {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// Member seats, by name.
+    #[serde(default)]
+    pub members: Vec<String>,
+    /// The members that opening the team opens.
+    #[serde(default)]
+    pub contacts: Vec<String>,
+    /// Audiences of the grants on the team (`linked` or org names).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub open_to: Vec<String>,
+    /// Created by `amail up` from a team file.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub managed: bool,
+    pub created_at: String,
+}
+
+/// `PUT /v1/teams/{name}`: create the team or change it. A missing field
+/// is unchanged (for a new team: empty); `null` clears it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TeamPut {
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub description: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub root: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub parent: Option<Option<String>>,
+    /// Replace the team's contacts (they must be members).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contacts: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed: Option<bool>,
+}
+
+/// An opening: the org shows `target` (a seat or a team) to `audience`
+/// and lets it start threads to the target (or, for a team, its
+/// contacts).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Grant {
+    pub id: i64,
+    /// A seat or team name of the granting org.
+    pub target: String,
+    /// `user`, `agent` or `team`.
+    pub kind: CardKind,
+    /// `linked` (every org with an active link) or an org name.
+    pub audience: String,
+    /// Whether the grant takes effect now: for a named org, whether the
+    /// link with it is active (otherwise the grant waits).
+    pub active: bool,
+    /// Created by `amail up` from a team file (removed by it when the file
+    /// no longer has it).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub managed: bool,
+    pub created_at: String,
+}
+
+/// `POST /v1/grants`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NewGrant {
+    pub target: String,
+    /// `linked` (default) or an org name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audience: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub managed: bool,
+}
+
+/// `POST /v1/grants/preview`: changes to try without applying them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GrantPreview {
+    #[serde(default)]
+    pub add: Vec<NewGrant>,
+    /// Grant ids to remove.
+    #[serde(default)]
+    pub remove: Vec<i64>,
+}
+
+/// What a change does to what one linked org sees: the cards it gains and
+/// loses.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SightChange {
+    pub org: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gains: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub loses: Vec<String>,
+}
+
+/// Answer of grant changes and their preview.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct GrantChange {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<Grant>,
+    /// Per linked org whose sight changes (none: nothing visible changes).
+    pub changes: Vec<SightChange>,
 }
 
 /// Response of `GET /v1/whoami`.

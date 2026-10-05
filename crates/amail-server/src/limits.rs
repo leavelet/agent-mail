@@ -134,6 +134,9 @@ impl<K: Hash + Eq + Clone> Buckets<K> {
 }
 
 /// The limiters of one server instance.
+/// Lookups of other orgs' cards an org may make per hour.
+pub const CARD_LOOKUPS_PER_HOUR: f64 = 600.0;
+
 pub struct Limiters {
     pub global_send: Option<Buckets<()>>,
     pub org_send: Option<Buckets<i64>>,
@@ -146,6 +149,8 @@ pub struct Limiters {
     /// database is asked who sent it.
     pub credential_orgs: CredentialOrgs,
     pub link_requests: Option<Buckets<i64>>,
+    /// Lookups of other orgs' cards (`GET /v1/orgs/{name}`) per org.
+    pub card_lookups: Buckets<i64>,
     pub registrations: Option<Buckets<String>>,
     /// Registrations per IPv6 /48 network, checked before the per-address
     /// limit (see [`amail_proto::limits::REGISTRATION_NET48_FACTOR`]).
@@ -187,6 +192,7 @@ impl Limiters {
             token_requests: l.token_requests_per_sec.map(|r| Buckets::new(r, r * 2.0)),
             org_requests: l.org_requests_per_sec.map(|r| Buckets::new(r, r * 2.0)),
             credential_orgs: CredentialOrgs::default(),
+            card_lookups: Buckets::per_hour(CARD_LOOKUPS_PER_HOUR, CARD_LOOKUPS_PER_HOUR / 10.0),
             link_requests: l
                 .link_requests_per_hour
                 .map(|n| Buckets::per_hour(n, (n / 4.0).max(1.0))),
@@ -237,6 +243,7 @@ impl Limiters {
         if let Some(b) = &self.link_requests {
             b.prune();
         }
+        self.card_lookups.prune();
         if let Some(b) = &self.registrations {
             b.prune();
         }

@@ -133,6 +133,8 @@ fn desired_seat(t: &Team, s: &team::SeatPlan, main: &str) -> p::NewSeat {
         model: s.model.clone(),
         permission_mode: s.permission_mode,
         group: s.group.clone(),
+        description: None,
+        contact: false,
     }
 }
 

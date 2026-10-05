@@ -477,6 +477,71 @@ pub async fn post(
     if !failing.is_empty() {
         meta.insert(TURN_FAILURES_META.to_string(), failing.join(" "));
     }
+    let sent = send_notice(&st, org, &auth.org.name, &user, subject, body, meta).await?;
+    if sent {
+        tracing::info!(
+            "org {org}: {} node notice(s) sent to the user seat in one mail",
+            report.notices.len()
+        );
+    }
+    Ok(Json(NodeNoticesAccepted {
+        sent: usize::from(sent),
+    }))
+}
+
+/// Tell the user of org `org_id` about a change by system mail (a notice:
+/// not charged to the storage quota, within the org's daily notice
+/// budget). `body` is cut to [`MAX_NOTICE_BODY_BYTES`]. Best effort: a
+/// failure is logged.
+pub async fn tell_user(st: &AppState, org_id: i64, subject: &str, body: &str) {
+    let result = async {
+        let Some(org) = st.store.org_by_id(org_id).await? else {
+            return Ok::<bool, ApiError>(false);
+        };
+        let Some(user) = st.store.user_seat(org_id).await? else {
+            return Ok(false);
+        };
+        let mut body = body.to_string();
+        if body.len() > MAX_NOTICE_BODY_BYTES {
+            let mut cut = MAX_NOTICE_BODY_BYTES - 40;
+            while !body.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            body.truncate(cut);
+            body.push_str("\n(cut: the notice was too long)\n");
+        }
+        let subject: String = subject
+            .chars()
+            .take(amail_proto::limits::MAX_SUBJECT_CHARS)
+            .collect();
+        send_notice(
+            st,
+            org_id,
+            &org.name,
+            &user,
+            subject,
+            body,
+            Default::default(),
+        )
+        .await
+    }
+    .await;
+    if let Err(e) = result {
+        tracing::warn!("org {org_id}: notice {subject:?} not sent: {}", e.message);
+    }
+}
+
+/// Send one notice mail to the user seat, within the org's daily budget;
+/// false when the budget is used up (the notice is dropped and logged).
+async fn send_notice(
+    st: &AppState,
+    org: i64,
+    org_name: &str,
+    user: &amail_store::Seat,
+    subject: String,
+    body: String,
+    meta: amail_proto::Meta,
+) -> ApiResult<bool> {
     // The org's daily budget, counted from the notice mail it holds; one
     // report at a time per instance, so that the count is not read twice
     // before a send.
@@ -486,12 +551,11 @@ pub async fn post(
     if mails >= NOTICE_MAILS_PER_DAY
         || bytes + (subject.len() + body.len()) as i64 > NOTICE_BYTES_PER_DAY
     {
-        // Answered as taken, so that the node does not send it again.
         tracing::warn!(
-            "org {org}: node notice report dropped, over the daily notice budget \
+            "org {org}: notice dropped, over the daily notice budget \
              ({mails} mails, {bytes} bytes in 24 hours)"
         );
-        return Ok(Json(NodeNoticesAccepted { sent: 0 }));
+        return Ok(false);
     }
     let system = st.store.system_seat(org).await?;
     let m = st
@@ -504,7 +568,7 @@ pub async fn post(
             depth: 0,
             subject,
             body,
-            to_addrs: vec![format!("{}@{}", user.name, auth.org.name)],
+            to_addrs: vec![format!("{}@{}", user.name, org_name)],
             cc_addrs: Vec::new(),
             priority: Priority::Normal,
             ack_required: false,
@@ -531,11 +595,7 @@ pub async fn post(
         .map(|b| (user.name.clone(), b.seq))
         .collect();
     st.bus.publish(org, &events);
-    tracing::info!(
-        "org {org}: {} node notice(s) sent to the user seat in one mail",
-        report.notices.len()
-    );
-    Ok(Json(NodeNoticesAccepted { sent: 1 }))
+    Ok(true)
 }
 
 /// A presence report cleared the turn failure of the seats `cleared`: mark

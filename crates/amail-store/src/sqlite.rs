@@ -38,6 +38,8 @@ pub struct SqliteStore {
     /// Send budgets. A SQLite database has one server process (`amail serve`
     /// refuses to share it), so the budget can live in memory.
     budget: crate::budget::Budget,
+    /// Budgets of new threads to other orgs (as `budget`).
+    thread_budget: crate::budget::Budget,
 }
 
 fn boxed_run<F>(f: F) -> RunFn
@@ -100,6 +102,7 @@ impl SqliteStore {
             read,
             jobs,
             budget: Default::default(),
+            thread_budget: Default::default(),
         })
     }
 
@@ -307,6 +310,10 @@ INSERT INTO deliveries (org_id, message_id, seat_id, class, mode, seq, mod_seq)
 SELECT json_extract(j.value, '$.o'), (SELECT MAX(id) FROM messages), s.id,
        json_extract(j.value, '$.c'), json_extract(j.value, '$.m'), s.last_seq, s.last_seq
   FROM json_each($14) j JOIN seats s ON s.id = json_extract(j.value, '$.s');
+INSERT OR IGNORE INTO thread_peers (thread_id, org_id, seat_id)
+SELECT DISTINCT m.thread_id, d.org_id, m.sender_seat_id
+  FROM deliveries d JOIN messages m ON m.id = d.message_id
+ WHERE d.message_id = (SELECT MAX(id) FROM messages) AND d.org_id <> m.org_id;
 UPDATE orgs SET stored_bytes = stored_bytes + $17
        + $19 * (SELECT COUNT(*) FROM deliveries WHERE message_id = (SELECT MAX(id) FROM messages))
  WHERE id = $1;
@@ -452,6 +459,19 @@ impl SqliteStore {
 
     async fn refund_send_token_impl(&self, seat_id: i64, burst: i64) -> Result<()> {
         self.budget.refund(seat_id, burst);
+        Ok(())
+    }
+
+    async fn take_thread_token_impl(
+        &self,
+        seat_id: i64,
+        per_hour: i64,
+    ) -> Result<std::result::Result<(), u64>> {
+        Ok(self.thread_budget.take_hourly(seat_id, per_hour))
+    }
+
+    async fn refund_thread_token_impl(&self, seat_id: i64, per_hour: i64) -> Result<()> {
+        self.thread_budget.refund(seat_id, per_hour);
         Ok(())
     }
 }

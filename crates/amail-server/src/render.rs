@@ -2,7 +2,7 @@
 
 use amail_proto as p;
 use amail_proto::{Address, SeatKind, Source};
-use amail_store::{DeliveryRec, Entry, List, MessageRec, Org, Seat};
+use amail_store::{DeliveryRec, List, MessageRec, Org, Seat};
 
 pub fn ts(ms: i64) -> String {
     jiff::Timestamp::from_millisecond(ms)
@@ -25,7 +25,8 @@ pub fn addr(name: &str, org: &str, viewer: &Org) -> String {
     }
 }
 
-fn rel(stored: &str, viewer: &Org) -> String {
+/// A stored (`name@org`) address relative to the viewer's org.
+pub fn rel(stored: &str, viewer: &Org) -> String {
     match stored.parse::<Address>() {
         Ok(a) => a.relative_to(&viewer.name),
         Err(_) => stored.to_string(),
@@ -75,33 +76,6 @@ pub fn lead(body: &str, max: usize) -> String {
         out.push('…');
     }
     out
-}
-
-pub fn header(m: &MessageRec, viewer: &Org) -> p::MessageHeader {
-    p::MessageHeader {
-        id: m.id,
-        thread_id: m.thread_id,
-        in_reply_to: m.parent_id,
-        from: addr(&m.sender_name, &m.org_name, viewer),
-        source: source(m, viewer),
-        to: m.to_addrs.iter().map(|a| rel(a, viewer)).collect(),
-        cc: m.cc_addrs.iter().map(|a| rel(a, viewer)).collect(),
-        subject: m.subject.clone(),
-        priority: m.priority,
-        ack_required: m.ack_required,
-        lines: m.lines,
-        created_at: ts(m.created_at),
-        meta: m.meta.clone(),
-        expired: m.expired_at.is_some(),
-    }
-}
-
-pub fn message(m: &MessageRec, viewer: &Org) -> p::Message {
-    p::Message {
-        header: header(m, viewer),
-        body: m.body.clone(),
-        body_omitted: false,
-    }
 }
 
 /// Size of `v` as JSON.
@@ -154,16 +128,9 @@ pub fn delivery(d: &DeliveryRec, viewer: &Org) -> p::Delivery {
     }
 }
 
-pub fn entry(e: &Entry, viewer: &Org) -> p::InboxEntry {
-    p::InboxEntry {
-        delivery: delivery(&e.delivery, viewer),
-        message: header(&e.message, viewer),
-        body: None,
-        preview: None,
-    }
-}
-
-pub fn seat(s: &Seat, presence: Option<p::Presence>) -> p::Seat {
+/// A seat of the viewer's own org. `open_to`: the audiences it is open
+/// to (see [`open_to`]).
+pub fn seat(s: &Seat, presence: Option<p::Presence>, open_to: Vec<String>) -> p::Seat {
     p::Seat {
         name: s.name.clone(),
         kind: s.kind,
@@ -175,6 +142,9 @@ pub fn seat(s: &Seat, presence: Option<p::Presence>) -> p::Seat {
         model: s.model.clone(),
         permission_mode: s.permission_mode,
         group: s.group.clone(),
+        description: s.description.clone(),
+        contact: s.contact,
+        open_to,
         created_at: ts(s.created_at),
         presence,
         focus_until: s.focus_until.filter(|t| *t > amail_store::now_ms()).map(ts),
@@ -183,8 +153,8 @@ pub fn seat(s: &Seat, presence: Option<p::Presence>) -> p::Seat {
 
 /// A seat as listed by `GET /seats`: its role cut to
 /// [`p::limits::LIST_ROLE_CHARS`] characters.
-pub fn seat_in_list(s: &Seat, presence: Option<p::Presence>) -> p::Seat {
-    let mut out = seat(s, presence);
+pub fn seat_in_list(s: &Seat, presence: Option<p::Presence>, open_to: Vec<String>) -> p::Seat {
+    let mut out = seat(s, presence, open_to);
     if let Some(r) = &mut out.role
         && let Some((i, _)) = r.char_indices().nth(p::limits::LIST_ROLE_CHARS)
     {
@@ -224,6 +194,79 @@ pub fn org(o: &Org, storage_quota: Option<i64>) -> p::OrgInfo {
         stored_bytes: o.stored_bytes,
         kept_bytes: o.kept_bytes,
         storage_quota_bytes: storage_quota,
+        display_name: o.display_name.clone(),
+        description: o.description.clone(),
+        visibility: o.visibility,
+        outbound: o.outbound,
+        new_threads_per_hour: o.new_threads_per_hour,
+        notice: o.notice.clone(),
+    }
+}
+
+/// The audience of a grant as shown: `linked` or the org's name.
+pub fn audience(a: Option<&str>) -> String {
+    a.unwrap_or("linked").to_string()
+}
+
+/// The audiences each seat of the org is open to, by seat name: from
+/// grants on the seat and on the team it is a contact of.
+pub fn open_to(grants: &[amail_store::GrantRec]) -> std::collections::HashMap<String, Vec<String>> {
+    use amail_store::GrantTarget;
+    let mut out: std::collections::HashMap<String, Vec<String>> = Default::default();
+    for g in grants {
+        let names: Vec<&str> = match &g.target {
+            GrantTarget::Seat(s) => vec![s.name.as_str()],
+            GrantTarget::Team { contacts, .. } => {
+                contacts.iter().map(|c| c.name.as_str()).collect()
+            }
+        };
+        for n in names {
+            let v = out.entry(n.to_string()).or_default();
+            let a = audience(g.audience.as_deref());
+            if !v.contains(&a) {
+                v.push(a);
+            }
+        }
+    }
+    for v in out.values_mut() {
+        v.sort();
+    }
+    out
+}
+
+/// A grant of the viewer's org. `active`: whether its audience (a named
+/// org) has an active link with the org.
+pub fn grant(g: &amail_store::GrantRec, active: bool) -> p::Grant {
+    use amail_store::GrantTarget;
+    let (target, kind) = match &g.target {
+        GrantTarget::Seat(s) => (
+            s.name.clone(),
+            if s.kind == Some(amail_proto::SeatKind::User) {
+                p::CardKind::User
+            } else {
+                p::CardKind::Agent
+            },
+        ),
+        GrantTarget::Team { team, .. } => (team.name.clone(), p::CardKind::Team),
+    };
+    p::Grant {
+        id: g.id,
+        target,
+        kind,
+        audience: audience(g.audience.as_deref()),
+        active,
+        managed: g.managed,
+        created_at: ts(g.created_at),
+    }
+}
+
+/// A link as the org sees it.
+pub fn link(l: &amail_store::Link) -> p::Link {
+    p::Link {
+        org: l.peer_name.clone(),
+        state: l.state,
+        since: Some(ts(l.since)),
+        note: l.note.clone(),
     }
 }
 

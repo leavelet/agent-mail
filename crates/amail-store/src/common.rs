@@ -32,9 +32,19 @@ macro_rules! message_bytes_sql {
 macro_rules! seat_select {
     () => {
         "SELECT s.id, s.org_id, s.name, s.kind, s.parent_id, p.name AS parent_name, \
-         s.display_name, s.role, s.harness, s.model, s.permission_mode, s.group_name, s.last_seq, \
+         s.display_name, s.role, s.harness, s.model, s.permission_mode, tm.name AS group_name, \
+         s.team_id, s.description, s.contact, s.last_seq, \
          s.created_at, s.deleted_at, s.focus_until \
-         FROM seats s LEFT JOIN seats p ON p.id = s.parent_id"
+         FROM seats s LEFT JOIN seats p ON p.id = s.parent_id LEFT JOIN teams tm ON tm.id = s.team_id"
+    };
+}
+
+macro_rules! team_select {
+    () => {
+        "SELECT t.id, t.org_id, t.name, t.description, t.root_seat_id, rs.name AS root, t.parent_id, \
+         pt.name AS parent, t.managed, t.created_at FROM teams t \
+         LEFT JOIN seats rs ON rs.id = t.root_seat_id AND rs.deleted_at IS NULL \
+         LEFT JOIN teams pt ON pt.id = t.parent_id"
     };
 }
 
@@ -148,15 +158,18 @@ macro_rules! auth_select {
     () => {
         "SELECT t.id AS token_id, t.scope, t.seat_id, o.id, o.name, o.send_rate_per_min, o.send_burst, \
          o.max_recipients, o.max_thread_depth, o.webhook_url, o.ack_timeout_min, o.focus_max_min, \
-         o.digest_interval_min, o.created_at, o.suspended_at, o.stored_bytes, o.kept_bytes, s.id AS s_id, \
+         o.digest_interval_min, o.created_at, o.suspended_at, o.stored_bytes, o.kept_bytes, \
+         o.display_name, o.description, o.visibility, o.outbound, o.new_threads_per_hour, o.notice, s.id AS s_id, \
          s.org_id AS s_org_id, s.name AS s_name, \
          s.kind AS s_kind, s.parent_id AS s_parent_id, p.name AS s_parent_name, \
          s.display_name AS s_display_name, s.role AS s_role, s.harness AS s_harness, \
-         s.model AS s_model, s.permission_mode AS s_permission_mode, s.group_name AS s_group_name, \
+         s.model AS s_model, s.permission_mode AS s_permission_mode, stm.name AS s_group_name, \
+         s.team_id AS s_team_id, s.description AS s_description, s.contact AS s_contact, \
          s.last_seq AS s_last_seq, s.created_at AS s_created_at, \
          s.deleted_at AS s_deleted_at, s.focus_until AS s_focus_until \
          FROM tokens t JOIN orgs o ON o.id = t.org_id \
-         LEFT JOIN seats s ON s.id = t.seat_id LEFT JOIN seats p ON p.id = s.parent_id"
+         LEFT JOIN seats s ON s.id = t.seat_id LEFT JOIN seats p ON p.id = s.parent_id \
+         LEFT JOIN teams stm ON stm.id = s.team_id"
     };
 }
 
@@ -404,6 +417,12 @@ pub(crate) struct OrgRow {
     suspended_at: Option<i64>,
     stored_bytes: i64,
     kept_bytes: i64,
+    display_name: Option<String>,
+    description: Option<String>,
+    visibility: String,
+    outbound: String,
+    new_threads_per_hour: i64,
+    notice: Option<String>,
 }
 
 impl From<OrgRow> for Org {
@@ -423,6 +442,16 @@ impl From<OrgRow> for Org {
             suspended_at: r.suspended_at,
             stored_bytes: r.stored_bytes,
             kept_bytes: r.kept_bytes,
+            display_name: r.display_name,
+            description: r.description,
+            // Written only from the enums' own strings.
+            visibility: r
+                .visibility
+                .parse()
+                .unwrap_or(amail_proto::OrgVisibility::ListedByName),
+            outbound: r.outbound.parse().unwrap_or(amail_proto::Outbound::AnySeat),
+            new_threads_per_hour: r.new_threads_per_hour,
+            notice: r.notice,
         }
     }
 }
@@ -441,6 +470,9 @@ pub(crate) struct SeatRow {
     model: Option<String>,
     permission_mode: Option<String>,
     group_name: Option<String>,
+    team_id: Option<i64>,
+    description: Option<String>,
+    contact: bool,
     last_seq: i64,
     created_at: i64,
     deleted_at: Option<i64>,
@@ -462,6 +494,9 @@ impl SeatRow {
             model: self.model,
             permission_mode: opt_parse::<PermissionMode>(self.permission_mode.as_deref())?,
             group: self.group_name,
+            team_id: self.team_id,
+            description: self.description,
+            contact: self.contact,
             last_seq: self.last_seq,
             created_at: self.created_at,
             deleted_at: self.deleted_at,
@@ -489,6 +524,9 @@ pub(crate) struct AuthRow {
     s_model: Option<String>,
     s_permission_mode: Option<String>,
     s_group_name: Option<String>,
+    s_team_id: Option<i64>,
+    s_description: Option<String>,
+    s_contact: Option<bool>,
     s_last_seq: Option<i64>,
     s_created_at: Option<i64>,
     s_deleted_at: Option<i64>,
@@ -513,6 +551,9 @@ impl AuthRow {
                 model: self.s_model,
                 permission_mode: opt_parse::<PermissionMode>(self.s_permission_mode.as_deref())?,
                 group: self.s_group_name,
+                team_id: self.s_team_id,
+                description: self.s_description,
+                contact: self.s_contact.unwrap_or_default(),
                 last_seq: self.s_last_seq.unwrap_or_default(),
                 created_at: self.s_created_at.unwrap_or_default(),
                 deleted_at: None,
@@ -578,6 +619,8 @@ pub(crate) struct LinkRow {
     peer_org_id: i64,
     peer_name: String,
     state: String,
+    since: i64,
+    note: Option<String>,
 }
 
 impl LinkRow {
@@ -586,6 +629,143 @@ impl LinkRow {
             peer_org_id: self.peer_org_id,
             peer_name: self.peer_name,
             state: parse::<LinkState>(&self.state)?,
+            since: self.since,
+            note: self.note,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+pub(crate) struct TeamRow {
+    id: i64,
+    org_id: i64,
+    name: String,
+    description: Option<String>,
+    root_seat_id: Option<i64>,
+    root: Option<String>,
+    parent_id: Option<i64>,
+    parent: Option<String>,
+    managed: bool,
+    created_at: i64,
+}
+
+impl From<TeamRow> for Team {
+    fn from(r: TeamRow) -> Team {
+        Team {
+            id: r.id,
+            org_id: r.org_id,
+            name: r.name,
+            description: r.description,
+            root_seat_id: r.root_seat_id,
+            root: r.root,
+            parent_id: r.parent_id,
+            parent: r.parent,
+            managed: r.managed,
+            created_at: r.created_at,
+        }
+    }
+}
+
+/// One row per grant (and, for a team, per contact seat; none without
+/// contacts): see `q::grants`.
+#[derive(sqlx::FromRow)]
+pub(crate) struct GrantRow {
+    pub(crate) id: i64,
+    org_id: i64,
+    org_name: String,
+    audience: Option<String>,
+    managed: bool,
+    created_at: i64,
+    seat_id: Option<i64>,
+    seat_name: Option<String>,
+    seat_kind: Option<String>,
+    seat_description: Option<String>,
+    team_id: Option<i64>,
+    team_name: Option<String>,
+    team_description: Option<String>,
+    contact_id: Option<i64>,
+    contact_name: Option<String>,
+    contact_kind: Option<String>,
+    contact_description: Option<String>,
+}
+
+/// Grant rows (ordered by grant id) to grants, a team's contact rows merged.
+pub(crate) fn grants_from_rows(rows: Vec<GrantRow>) -> Result<Vec<GrantRec>> {
+    let mut out: Vec<GrantRec> = Vec::new();
+    for r in rows {
+        let contact = match (r.contact_id, r.contact_name, r.contact_kind) {
+            (Some(id), Some(name), Some(kind)) => Some(CardRec {
+                id,
+                name,
+                kind: Some(parse::<SeatKind>(&kind)?),
+                description: r.contact_description,
+            }),
+            _ => None,
+        };
+        if let Some(last) = out.last_mut()
+            && last.id == r.id
+        {
+            if let (GrantTarget::Team { contacts, .. }, Some(c)) = (&mut last.target, contact) {
+                contacts.push(c);
+            }
+            continue;
+        }
+        let target = match (r.seat_id, r.team_id) {
+            (Some(id), _) => GrantTarget::Seat(CardRec {
+                id,
+                name: r.seat_name.unwrap_or_default(),
+                kind: Some(parse::<SeatKind>(
+                    r.seat_kind.as_deref().unwrap_or("agent"),
+                )?),
+                description: r.seat_description,
+            }),
+            (None, Some(id)) => GrantTarget::Team {
+                team: CardRec {
+                    id,
+                    name: r.team_name.unwrap_or_default(),
+                    kind: None,
+                    description: r.team_description,
+                },
+                contacts: contact.into_iter().collect(),
+            },
+            (None, None) => continue,
+        };
+        out.push(GrantRec {
+            id: r.id,
+            org_id: r.org_id,
+            org_name: r.org_name,
+            audience: r.audience,
+            target,
+            managed: r.managed,
+            created_at: r.created_at,
+        });
+    }
+    Ok(out)
+}
+
+#[derive(sqlx::FromRow)]
+pub(crate) struct PeerRow {
+    thread_id: i64,
+    org_id: i64,
+    org_name: String,
+    seat_id: i64,
+    seat_name: String,
+    kind: String,
+    description: Option<String>,
+}
+
+impl PeerRow {
+    pub(crate) fn into_peer(self) -> Result<ThreadPeer> {
+        Ok(ThreadPeer {
+            thread_id: self.thread_id,
+            org_id: self.org_id,
+            org_name: self.org_name,
+            card: CardRec {
+                id: self.seat_id,
+                name: self.seat_name,
+                kind: Some(parse::<SeatKind>(&self.kind)?),
+                description: self.description,
+            },
         })
     }
 }
@@ -922,9 +1102,17 @@ macro_rules! impl_store_common {
                 s: &NewSeat,
             ) -> Result<Seat> {
                 reserve_name(c, org_id, &s.name).await?;
+                if team_by_name(c, org_id, &s.name).await?.is_some() {
+                    return Err(StoreError::Conflict(format!("name {:?} is already in use (a team)", s.name)));
+                }
+                let team_id = match &s.group {
+                    Some(g) => Some(team_for(c, org_id, g).await?),
+                    None => None,
+                };
                 let id: i64 = sqlx::query_scalar(
                     "INSERT INTO seats (org_id, name, kind, parent_id, display_name, role, harness, model, \
-                     permission_mode, group_name, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
+                     permission_mode, group_name, created_at, team_id, description, contact) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
                      RETURNING id",
                 )
                 .bind(org_id)
@@ -938,9 +1126,277 @@ macro_rules! impl_store_common {
                 .bind(s.permission_mode.map(|m| m.as_str()))
                 .bind(&s.group)
                 .bind(now_ms())
+                .bind(team_id)
+                .bind(&s.description)
+                .bind(s.contact && team_id.is_some())
                 .fetch_one(&mut *c)
                 .await?;
                 seat_by_id(c, id).await?.ok_or_else(|| StoreError::NotFound("seat".into()))
+            }
+
+            pub async fn team_by_name(c: &mut Conn, org_id: i64, name: &str) -> Result<Option<Team>> {
+                let r: Option<TeamRow> = sqlx::query_as(concat!(team_select!(), " WHERE t.org_id = $1 AND t.name = $2"))
+                    .bind(org_id)
+                    .bind(name)
+                    .fetch_optional(&mut *c)
+                    .await?;
+                Ok(r.map(Team::from))
+            }
+
+            pub async fn teams(c: &mut Conn, org_id: i64) -> Result<Vec<Team>> {
+                let rows: Vec<TeamRow> = sqlx::query_as(concat!(team_select!(), " WHERE t.org_id = $1 ORDER BY t.name"))
+                    .bind(org_id)
+                    .fetch_all(&mut *c)
+                    .await?;
+                Ok(rows.into_iter().map(Team::from).collect())
+            }
+
+            /// The id of the org's team `name`, created (empty) when there is
+            /// none. A team cannot take the name of a seat.
+            pub async fn team_for(c: &mut Conn, org_id: i64, name: &str) -> Result<i64> {
+                if let Some(t) = team_by_name(c, org_id, name).await? {
+                    return Ok(t.id);
+                }
+                if seat_by_name(c, org_id, name).await?.is_some() {
+                    return Err(StoreError::Conflict(format!("name {name:?} is already in use (a seat)")));
+                }
+                let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM teams WHERE org_id = $1")
+                    .bind(org_id)
+                    .fetch_one(&mut *c)
+                    .await?;
+                if n as usize >= amail_proto::limits::MAX_TEAMS {
+                    return Err(StoreError::Invalid(format!(
+                        "an org has at most {} teams",
+                        amail_proto::limits::MAX_TEAMS
+                    )));
+                }
+                Ok(sqlx::query_scalar("INSERT INTO teams (org_id, name, created_at) VALUES ($1, $2, $3) RETURNING id")
+                    .bind(org_id)
+                    .bind(name)
+                    .bind(now_ms())
+                    .fetch_one(&mut *c)
+                    .await?)
+            }
+
+            /// Create the team or change it (see [`TeamChange`]).
+            pub async fn put_team(c: &mut Conn, org_id: i64, name: &str, ch: &TeamChange) -> Result<Team> {
+                let id = team_for(c, org_id, name).await?;
+                let team = team_by_name(c, org_id, name).await?.ok_or_else(|| StoreError::NotFound("team".into()))?;
+                let root = match &ch.root {
+                    None => team.root_seat_id,
+                    Some(None) => None,
+                    Some(Some(r)) => Some(
+                        seat_by_name(c, org_id, r)
+                            .await?
+                            .ok_or_else(|| StoreError::Invalid(format!("unknown root seat {r:?}")))?
+                            .id,
+                    ),
+                };
+                let parent = match &ch.parent {
+                    None => team.parent_id,
+                    Some(None) => None,
+                    Some(Some(p)) => {
+                        let pid = team_by_name(c, org_id, p)
+                            .await?
+                            .ok_or_else(|| StoreError::Invalid(format!("unknown parent team {p:?}")))?
+                            .id;
+                        // Walk up from the new parent; reaching the team means a cycle.
+                        let mut cur = Some(pid);
+                        let mut steps = 0;
+                        while let Some(x) = cur {
+                            if x == id || steps > amail_proto::limits::MAX_TEAMS {
+                                return Err(StoreError::Invalid("parent would create a cycle".into()));
+                            }
+                            cur = sqlx::query_scalar::<_, Option<i64>>("SELECT parent_id FROM teams WHERE id = $1")
+                                .bind(x)
+                                .fetch_optional(&mut *c)
+                                .await?
+                                .flatten();
+                            steps += 1;
+                        }
+                        Some(pid)
+                    }
+                };
+                let description = match &ch.description {
+                    None => team.description.clone(),
+                    Some(d) => d.clone(),
+                };
+                sqlx::query(
+                    "UPDATE teams SET description = $1, root_seat_id = $2, parent_id = $3, managed = $4 WHERE id = $5",
+                )
+                .bind(description)
+                .bind(root)
+                .bind(parent)
+                .bind(ch.managed.unwrap_or(team.managed))
+                .bind(id)
+                .execute(&mut *c)
+                .await?;
+                if let Some(contacts) = &ch.contacts {
+                    let members: Vec<String> = sqlx::query_scalar(
+                        "SELECT name FROM seats WHERE team_id = $1 AND deleted_at IS NULL",
+                    )
+                    .bind(id)
+                    .fetch_all(&mut *c)
+                    .await?;
+                    if let Some(x) = contacts.iter().find(|x| !members.contains(x)) {
+                        return Err(StoreError::Invalid(format!(
+                            "contact {x:?} is not a member of team {name:?}"
+                        )));
+                    }
+                    for m in &members {
+                        sqlx::query("UPDATE seats SET contact = $1 WHERE team_id = $2 AND name = $3 AND deleted_at IS NULL")
+                            .bind(contacts.contains(m))
+                            .bind(id)
+                            .bind(m)
+                            .execute(&mut *c)
+                            .await?;
+                    }
+                }
+                team_by_name(c, org_id, name).await?.ok_or_else(|| StoreError::NotFound("team".into()))
+            }
+
+            /// Delete a team: its members leave it, its sub-teams move to
+            /// its parent, its grants go.
+            pub async fn delete_team(c: &mut Conn, org_id: i64, name: &str) -> Result<bool> {
+                let Some(team) = team_by_name(c, org_id, name).await? else {
+                    return Ok(false);
+                };
+                sqlx::query("UPDATE seats SET team_id = NULL, contact = FALSE WHERE team_id = $1")
+                    .bind(team.id)
+                    .execute(&mut *c)
+                    .await?;
+                sqlx::query("UPDATE teams SET parent_id = $1 WHERE parent_id = $2")
+                    .bind(team.parent_id)
+                    .bind(team.id)
+                    .execute(&mut *c)
+                    .await?;
+                sqlx::query("DELETE FROM grants WHERE team_id = $1").bind(team.id).execute(&mut *c).await?;
+                sqlx::query("DELETE FROM teams WHERE id = $1").bind(team.id).execute(&mut *c).await?;
+                Ok(true)
+            }
+
+            /// Grants by [`GrantFilter`], ordered by id, with their targets
+            /// (a team's contacts included). Deleted seats are left out.
+            pub async fn grants(c: &mut Conn, f: &GrantFilter) -> Result<Vec<GrantRec>> {
+                let mut b = sqlx::QueryBuilder::<Db>::new(
+                    "SELECT g.id, g.org_id, o.name AS org_name, g.audience, g.managed, g.created_at, \
+                     s.id AS seat_id, s.name AS seat_name, s.kind AS seat_kind, s.description AS seat_description, \
+                     t.id AS team_id, t.name AS team_name, t.description AS team_description, \
+                     cs.id AS contact_id, cs.name AS contact_name, cs.kind AS contact_kind, \
+                     cs.description AS contact_description \
+                     FROM grants g JOIN orgs o ON o.id = g.org_id \
+                     LEFT JOIN seats s ON s.id = g.seat_id AND s.deleted_at IS NULL \
+                     LEFT JOIN teams t ON t.id = g.team_id \
+                     LEFT JOIN seats cs ON cs.team_id = t.id AND cs.contact AND cs.deleted_at IS NULL",
+                );
+                if let Some((aid, aname)) = &f.audience {
+                    // Orgs with an active link with the audience; grants to
+                    // every linked org or to the audience by name.
+                    b.push(" JOIN links l ON l.org_id = g.org_id AND l.state = 'active' AND l.peer_org_id = ")
+                        .push_bind(*aid)
+                        .push(" WHERE (g.audience IS NULL OR g.audience = ")
+                        .push_bind(aname.clone())
+                        .push(") AND o.deleted_at IS NULL AND o.suspended_at IS NULL");
+                } else {
+                    b.push(" WHERE 1 = 1");
+                }
+                if let Some(g) = f.grantor {
+                    b.push(" AND g.org_id = ").push_bind(g);
+                }
+                b.push(" AND (s.id IS NOT NULL OR t.id IS NOT NULL) ORDER BY g.id, cs.name");
+                let rows: Vec<GrantRow> = b.build_query_as().fetch_all(&mut *c).await?;
+                grants_from_rows(rows)
+            }
+
+            /// Add a grant (or, if the same one exists, keep it); returns its id.
+            pub async fn add_grant(
+                c: &mut Conn,
+                org_id: i64,
+                seat_id: Option<i64>,
+                team_id: Option<i64>,
+                audience: Option<&str>,
+                managed: bool,
+            ) -> Result<i64> {
+                let existing: Option<i64> = sqlx::query_scalar(
+                    "SELECT id FROM grants WHERE org_id = $1 AND COALESCE(seat_id, 0) = COALESCE($2, 0) \
+                     AND COALESCE(team_id, 0) = COALESCE($3, 0) AND COALESCE(audience, '') = COALESCE($4, '')",
+                )
+                .bind(org_id)
+                .bind(seat_id)
+                .bind(team_id)
+                .bind(audience)
+                .fetch_optional(&mut *c)
+                .await?;
+                if let Some(id) = existing {
+                    return Ok(id);
+                }
+                let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM grants WHERE org_id = $1")
+                    .bind(org_id)
+                    .fetch_one(&mut *c)
+                    .await?;
+                if n as usize >= amail_proto::limits::MAX_GRANTS {
+                    return Err(StoreError::Invalid(format!(
+                        "an org has at most {} grants",
+                        amail_proto::limits::MAX_GRANTS
+                    )));
+                }
+                Ok(sqlx::query_scalar(
+                    "INSERT INTO grants (org_id, seat_id, team_id, audience, managed, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+                )
+                .bind(org_id)
+                .bind(seat_id)
+                .bind(team_id)
+                .bind(audience)
+                .bind(managed)
+                .bind(now_ms())
+                .fetch_one(&mut *c)
+                .await?)
+            }
+
+            pub async fn remove_grant(c: &mut Conn, org_id: i64, id: i64) -> Result<bool> {
+                let n = sqlx::query("DELETE FROM grants WHERE org_id = $1 AND id = $2")
+                    .bind(org_id)
+                    .bind(id)
+                    .execute(&mut *c)
+                    .await?
+                    .rows_affected();
+                Ok(n > 0)
+            }
+
+            /// Seats of other orgs that wrote into these threads, in mail
+            /// that reached `org_id` (see `thread_peers`).
+            pub async fn thread_peers(c: &mut Conn, org_id: i64, thread_ids: &[i64]) -> Result<Vec<ThreadPeer>> {
+                if thread_ids.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let mut b = sqlx::QueryBuilder::<Db>::new(
+                    "SELECT tp.thread_id, s.org_id, o.name AS org_name, s.id AS seat_id, s.name AS seat_name, \
+                     s.kind, s.description FROM thread_peers tp JOIN seats s ON s.id = tp.seat_id \
+                     JOIN orgs o ON o.id = s.org_id WHERE o.deleted_at IS NULL AND tp.org_id = ",
+                );
+                b.push_bind(org_id).push(" AND tp.thread_id IN (");
+                let mut l = b.separated(", ");
+                for t in thread_ids {
+                    l.push_bind(*t);
+                }
+                b.push(") ORDER BY tp.thread_id, o.name, s.name");
+                let rows: Vec<PeerRow> = b.build_query_as().fetch_all(&mut *c).await?;
+                collect(rows, PeerRow::into_peer)
+            }
+
+            /// The seats stop being participants of the threads of `org_id`.
+            pub async fn forget_thread_peers(c: &mut Conn, org_id: i64, seat_ids: &[i64]) -> Result<u64> {
+                let mut n = 0;
+                for s in seat_ids {
+                    n += sqlx::query("DELETE FROM thread_peers WHERE seat_id = $1 AND org_id = $2")
+                        .bind(*s)
+                        .bind(org_id)
+                        .execute(&mut *c)
+                        .await?
+                        .rows_affected();
+                }
+                Ok(n)
             }
 
             pub async fn insert_token(c: &mut Conn, t: &NewToken) -> Result<()> {
@@ -982,6 +1438,8 @@ macro_rules! impl_store_common {
                     label: Some("initial user token".into()),
                 };
                 insert_token(c, &token).await?;
+                // The user seat is open to every linked org.
+                add_grant(c, id, Some(seat.id), None, None, false).await?;
                 let org = org_by_id(c, id).await?.ok_or_else(|| StoreError::NotFound("org".into()))?;
                 Ok((org, seat))
             }
@@ -994,7 +1452,11 @@ macro_rules! impl_store_common {
                      webhook_url = CASE WHEN $6 THEN $7 ELSE webhook_url END, \
                      ack_timeout_min = COALESCE($8, ack_timeout_min), \
                      focus_max_min = COALESCE($9, focus_max_min), \
-                     digest_interval_min = COALESCE($10, digest_interval_min) WHERE id = $5",
+                     digest_interval_min = COALESCE($10, digest_interval_min), \
+                     display_name = CASE WHEN $11 THEN $12 ELSE display_name END, \
+                     description = CASE WHEN $13 THEN $14 ELSE description END, \
+                     visibility = COALESCE($15, visibility), outbound = COALESCE($16, outbound), \
+                     new_threads_per_hour = COALESCE($17, new_threads_per_hour) WHERE id = $5",
                 )
                 .bind(p.send_rate_per_min)
                 .bind(p.send_burst)
@@ -1006,9 +1468,21 @@ macro_rules! impl_store_common {
                 .bind(p.ack_timeout_min)
                 .bind(p.focus_max_min)
                 .bind(p.digest_interval_min)
+                .bind(p.display_name.is_some())
+                .bind(p.display_name.clone().flatten())
+                .bind(p.description.is_some())
+                .bind(p.description.clone().flatten())
+                .bind(p.visibility.map(|v| v.as_str()))
+                .bind(p.outbound.map(|v| v.as_str()))
+                .bind(p.new_threads_per_hour)
                 .execute(&mut *c)
                 .await?;
                 org_by_id(c, org_id).await?.ok_or_else(|| StoreError::NotFound("org".into()))
+            }
+
+            pub async fn clear_org_notice(c: &mut Conn, org_id: i64) -> Result<()> {
+                sqlx::query("UPDATE orgs SET notice = NULL WHERE id = $1").bind(org_id).execute(&mut *c).await?;
+                Ok(())
             }
 
             pub async fn token_auth(c: &mut Conn, hash: &str) -> Result<Option<TokenAuth>> {
@@ -1357,9 +1831,20 @@ macro_rules! impl_store_common {
                     None => old.clone(),
                     Some(v) => v.clone(),
                 };
+                let team_id = match &p.group {
+                    None => seat.team_id,
+                    Some(None) => None,
+                    Some(Some(g)) => Some(team_for(c, org_id, g).await?),
+                };
+                // A seat that changes team is no longer a contact of the old one.
+                let contact = match p.contact {
+                    Some(v) => v && team_id.is_some(),
+                    None => seat.contact && team_id == seat.team_id,
+                };
                 sqlx::query(
                     "UPDATE seats SET parent_id = $1, display_name = $2, role = $3, harness = $4, model = $5, \
-                     permission_mode = $6, group_name = $7 WHERE id = $8",
+                     permission_mode = $6, group_name = $7, team_id = $9, description = $10, contact = $11 \
+                     WHERE id = $8",
                 )
                 .bind(parent_id)
                 .bind(pick(&p.display_name, &seat.display_name))
@@ -1372,6 +1857,9 @@ macro_rules! impl_store_common {
                 }.map(|m| m.as_str()))
                 .bind(pick(&p.group, &seat.group))
                 .bind(seat.id)
+                .bind(team_id)
+                .bind(pick(&p.description, &seat.description))
+                .bind(contact)
                 .execute(&mut *c)
                 .await?;
                 seat_by_id(c, seat.id).await?.ok_or_else(|| StoreError::NotFound("seat".into()))
@@ -1396,6 +1884,24 @@ macro_rules! impl_store_common {
                     .execute(&mut *c)
                     .await?;
                 sqlx::query("DELETE FROM list_members WHERE seat_id = $1")
+                    .bind(seat.id)
+                    .execute(&mut *c)
+                    .await?;
+                // External memberships of the seat in other orgs' lists.
+                let org_name: String = sqlx::query_scalar("SELECT name FROM orgs WHERE id = $1")
+                    .bind(org_id)
+                    .fetch_one(&mut *c)
+                    .await?;
+                sqlx::query("DELETE FROM list_members WHERE seat_id IS NULL AND address = $1")
+                    .bind(format!("{}@{}", seat.name, org_name))
+                    .execute(&mut *c)
+                    .await?;
+                sqlx::query("DELETE FROM grants WHERE seat_id = $1").bind(seat.id).execute(&mut *c).await?;
+                sqlx::query("UPDATE teams SET root_seat_id = NULL WHERE root_seat_id = $1")
+                    .bind(seat.id)
+                    .execute(&mut *c)
+                    .await?;
+                sqlx::query("UPDATE seats SET team_id = NULL, contact = FALSE WHERE id = $1")
                     .bind(seat.id)
                     .execute(&mut *c)
                     .await?;
@@ -1503,15 +2009,20 @@ macro_rules! impl_store_common {
                 s.map(|s| parse(&s)).transpose()
             }
 
-            async fn set_link(c: &mut Conn, org_id: i64, peer_id: i64, state: LinkState) -> Result<()> {
+            async fn set_link(c: &mut Conn, org_id: i64, peer_id: i64, state: LinkState, note: Option<&str>) -> Result<()> {
+                let now = now_ms();
+                let active = (state == LinkState::Active).then_some(now);
                 sqlx::query(
-                    "INSERT INTO links (org_id, peer_org_id, state, created_at) VALUES ($1, $2, $3, $4) \
-                     ON CONFLICT (org_id, peer_org_id) DO UPDATE SET state = excluded.state",
+                    "INSERT INTO links (org_id, peer_org_id, state, created_at, active_at, note) VALUES ($1, $2, $3, $4, $5, $6) \
+                     ON CONFLICT (org_id, peer_org_id) DO UPDATE SET state = excluded.state, \
+                     active_at = COALESCE(excluded.active_at, links.active_at), note = COALESCE(excluded.note, links.note)",
                 )
                 .bind(org_id)
                 .bind(peer_id)
                 .bind(state.as_str())
-                .bind(now_ms())
+                .bind(now)
+                .bind(active)
+                .bind(note)
                 .execute(&mut *c)
                 .await?;
                 Ok(())
@@ -1531,20 +2042,20 @@ macro_rules! impl_store_common {
                 Ok(())
             }
 
-            pub async fn request_link(c: &mut Conn, org_id: i64, peer_id: i64) -> Result<LinkState> {
+            pub async fn request_link(c: &mut Conn, org_id: i64, peer_id: i64, note: Option<&str>) -> Result<LinkState> {
                 if org_id == peer_id {
                     return Err(StoreError::Invalid("an org cannot link to itself".into()));
                 }
                 drop_unknown_link(c, org_id, peer_id).await?;
                 match link_state(c, org_id, peer_id).await? {
                     None => {
-                        set_link(c, org_id, peer_id, LinkState::Requested).await?;
-                        set_link(c, peer_id, org_id, LinkState::Invited).await?;
+                        set_link(c, org_id, peer_id, LinkState::Requested, note).await?;
+                        set_link(c, peer_id, org_id, LinkState::Invited, note).await?;
                         Ok(LinkState::Requested)
                     }
                     Some(LinkState::Invited) => {
-                        set_link(c, org_id, peer_id, LinkState::Active).await?;
-                        set_link(c, peer_id, org_id, LinkState::Active).await?;
+                        set_link(c, org_id, peer_id, LinkState::Active, None).await?;
+                        set_link(c, peer_id, org_id, LinkState::Active, None).await?;
                         Ok(LinkState::Active)
                     }
                     Some(s) => Ok(s),
@@ -1555,8 +2066,8 @@ macro_rules! impl_store_common {
                 match link_state(c, org_id, peer_id).await? {
                     Some(LinkState::Invited) => {
                         drop_unknown_link(c, org_id, peer_id).await?;
-                        set_link(c, org_id, peer_id, LinkState::Active).await?;
-                        set_link(c, peer_id, org_id, LinkState::Active).await
+                        set_link(c, org_id, peer_id, LinkState::Active, None).await?;
+                        set_link(c, peer_id, org_id, LinkState::Active, None).await
                     }
                     Some(LinkState::Active) => Ok(()),
                     _ => Err(StoreError::NotFound("no pending link request from that org".into())),
@@ -1572,14 +2083,25 @@ macro_rules! impl_store_common {
                 .execute(&mut *c)
                 .await?
                 .rows_affected();
+                // Neither org's seats take part in the other's threads any
+                // more (a new link starts without them).
+                sqlx::query(
+                    "DELETE FROM thread_peers WHERE (org_id = $1 AND seat_id IN (SELECT id FROM seats WHERE org_id = $2)) \
+                     OR (org_id = $2 AND seat_id IN (SELECT id FROM seats WHERE org_id = $1))",
+                )
+                .bind(org_id)
+                .bind(peer_id)
+                .execute(&mut *c)
+                .await?;
                 Ok(n > 0)
             }
 
             pub async fn links(c: &mut Conn, org_id: i64) -> Result<Vec<Link>> {
                 let rows: Vec<LinkRow> = sqlx::query_as(
-                    "SELECT l.peer_org_id, o.name AS peer_name, l.state FROM links l \
+                    "SELECT l.peer_org_id, o.name AS peer_name, l.state, \
+                     COALESCE(l.active_at, l.created_at) AS since, l.note FROM links l \
                      JOIN orgs o ON o.id = l.peer_org_id WHERE l.org_id = $1 \
-                     UNION ALL SELECT CAST(0 AS BIGINT), r.peer_name, 'requested' \
+                     UNION ALL SELECT CAST(0 AS BIGINT), r.peer_name, 'requested', r.created_at, r.note \
                      FROM link_requests r WHERE r.org_id = $1 AND NOT EXISTS (SELECT 1 FROM links l2 \
                      JOIN orgs o2 ON o2.id = l2.peer_org_id WHERE l2.org_id = $1 AND o2.name = r.peer_name) \
                      ORDER BY 2",
@@ -1590,14 +2112,15 @@ macro_rules! impl_store_common {
                 collect(rows, LinkRow::into_link)
             }
 
-            pub async fn request_unknown_link(c: &mut Conn, org_id: i64, name: &str) -> Result<()> {
+            pub async fn request_unknown_link(c: &mut Conn, org_id: i64, name: &str, note: Option<&str>) -> Result<()> {
                 sqlx::query(
-                    "INSERT INTO link_requests (org_id, peer_name, created_at) VALUES ($1, $2, $3) \
+                    "INSERT INTO link_requests (org_id, peer_name, created_at, note) VALUES ($1, $2, $3, $4) \
                      ON CONFLICT (org_id, peer_name) DO NOTHING",
                 )
                 .bind(org_id)
                 .bind(name)
                 .bind(now_ms())
+                .bind(note)
                 .execute(&mut *c)
                 .await?;
                 Ok(())
@@ -2886,6 +3409,9 @@ macro_rules! impl_store_common {
                         .collect();
                     join_addrs(&v)
                 };
+                // Grants of other orgs to this org's name stop (an org that
+                // takes the name later gets none of them).
+                sqlx::query("DELETE FROM grants WHERE audience = $1").bind(&org.name).execute(&mut *c).await?;
                 // Changes of the storage counts of other orgs (`stored_bytes`,
                 // `kept_bytes`), applied at the end (in org id order, after
                 // all changes to messages).
@@ -2957,7 +3483,7 @@ macro_rules! impl_store_common {
                 }
                 // After its deliveries are gone, the mail it sent that no
                 // other org received has no deliveries left.
-                let steps: [&str; 19] = [
+                let steps: [&str; 23] = [
                     "DELETE FROM web_sessions WHERE token_id IN (SELECT id FROM tokens WHERE org_id = $1)",
                     "DELETE FROM tokens WHERE org_id = $1",
                     "DELETE FROM claim_keys WHERE seat_id IN (SELECT id FROM seats WHERE org_id = $1)",
@@ -2967,6 +3493,10 @@ macro_rules! impl_store_common {
                     "DELETE FROM node_streams WHERE org_id = $1",
                     "UPDATE messages SET ack_due = NULL WHERE org_id = $1 AND ack_due IS NOT NULL",
                     "DELETE FROM thread_seats WHERE org_id = $1",
+                    "DELETE FROM thread_peers WHERE org_id = $1 OR seat_id IN (SELECT id FROM seats WHERE org_id = $1)",
+                    "DELETE FROM grants WHERE org_id = $1",
+                    "UPDATE seats SET team_id = NULL, contact = FALSE, description = NULL WHERE org_id = $1",
+                    "DELETE FROM teams WHERE org_id = $1",
                     "DELETE FROM org_activity WHERE org_id = $1",
                     "UPDATE messages SET parent_id = NULL WHERE parent_id IN (SELECT id FROM messages \
                      WHERE org_id = $1 AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.message_id = messages.id))",
@@ -2984,6 +3514,12 @@ macro_rules! impl_store_common {
                 ];
                 for sql in steps {
                     sqlx::query(sql).bind(org_id).execute(&mut *c).await?;
+                }
+                if DIALECT == Dialect::Postgres {
+                    sqlx::query("DELETE FROM thread_budget WHERE seat_id IN (SELECT id FROM seats WHERE org_id = $1)")
+                        .bind(org_id)
+                        .execute(&mut *c)
+                        .await?;
                 }
                 sqlx::query("UPDATE seats SET deleted_at = $1 WHERE org_id = $2 AND deleted_at IS NULL")
                     .bind(now)
@@ -3643,6 +4179,10 @@ macro_rules! impl_store_common {
                 run!(self.read, |c| q::org_by_name(c, &name).await)
             }
 
+            async fn org_by_id(&self, id: i64) -> $crate::Result<Option<$crate::Org>> {
+                run!(self.read, |c| q::org_by_id(c, id).await)
+            }
+
             async fn update_org(&self, org_id: i64, patch: &$crate::OrgSettings) -> $crate::Result<$crate::Org> {
                 let patch = patch.clone();
                 run!(self.write, |c| q::update_org(c, org_id, &patch).await)
@@ -3720,8 +4260,59 @@ macro_rules! impl_store_common {
                 run!(self.write, |c| q::remove_member(c, list_id, &address).await)
             }
 
-            async fn request_link(&self, org_id: i64, peer_id: i64) -> $crate::Result<amail_proto::LinkState> {
-                run!(self.write, |c| q::request_link(c, org_id, peer_id).await)
+            async fn request_link(&self, org_id: i64, peer_id: i64, note: Option<&str>) -> $crate::Result<amail_proto::LinkState> {
+                let note = note.map(str::to_string);
+                run!(self.write, |c| q::request_link(c, org_id, peer_id, note.as_deref()).await)
+            }
+
+            async fn teams(&self, org_id: i64) -> $crate::Result<Vec<$crate::Team>> {
+                run!(self.read, |c| q::teams(c, org_id).await)
+            }
+
+            async fn put_team(&self, org_id: i64, name: &str, change: &$crate::TeamChange) -> $crate::Result<$crate::Team> {
+                let (name, change) = (name.to_string(), change.clone());
+                run!(self.write, |c| q::put_team(c, org_id, &name, &change).await)
+            }
+
+            async fn delete_team(&self, org_id: i64, name: &str) -> $crate::Result<bool> {
+                let name = name.to_string();
+                run!(self.write, |c| q::delete_team(c, org_id, &name).await)
+            }
+
+            async fn grants(&self, filter: &$crate::GrantFilter) -> $crate::Result<Vec<$crate::GrantRec>> {
+                let filter = filter.clone();
+                run!(self.read, |c| q::grants(c, &filter).await)
+            }
+
+            async fn add_grant(&self, org_id: i64, seat_id: Option<i64>, team_id: Option<i64>, audience: Option<&str>, managed: bool) -> $crate::Result<i64> {
+                let audience = audience.map(str::to_string);
+                run!(self.write, |c| q::add_grant(c, org_id, seat_id, team_id, audience.as_deref(), managed).await)
+            }
+
+            async fn remove_grant(&self, org_id: i64, id: i64) -> $crate::Result<bool> {
+                run!(self.write, |c| q::remove_grant(c, org_id, id).await)
+            }
+
+            async fn thread_peers(&self, org_id: i64, thread_ids: &[i64]) -> $crate::Result<Vec<$crate::ThreadPeer>> {
+                let ids = thread_ids.to_vec();
+                run!(self.read, |c| q::thread_peers(c, org_id, &ids).await)
+            }
+
+            async fn forget_thread_peers(&self, org_id: i64, seat_ids: &[i64]) -> $crate::Result<u64> {
+                let ids = seat_ids.to_vec();
+                run!(self.write, |c| q::forget_thread_peers(c, org_id, &ids).await)
+            }
+
+            async fn clear_org_notice(&self, org_id: i64) -> $crate::Result<()> {
+                run!(self.write, |c| q::clear_org_notice(c, org_id).await)
+            }
+
+            async fn take_thread_token(&self, seat_id: i64, per_hour: i64) -> $crate::Result<std::result::Result<(), u64>> {
+                self.take_thread_token_impl(seat_id, per_hour).await
+            }
+
+            async fn refund_thread_token(&self, seat_id: i64, per_hour: i64) -> $crate::Result<()> {
+                self.refund_thread_token_impl(seat_id, per_hour).await
             }
 
             async fn accept_link(&self, org_id: i64, peer_id: i64) -> $crate::Result<()> {
@@ -3736,9 +4327,9 @@ macro_rules! impl_store_common {
                 run!(self.read, |c| q::links(c, org_id).await)
             }
 
-            async fn request_unknown_link(&self, org_id: i64, name: &str) -> $crate::Result<()> {
-                let name = name.to_string();
-                run!(self.write, |c| q::request_unknown_link(c, org_id, &name).await)
+            async fn request_unknown_link(&self, org_id: i64, name: &str, note: Option<&str>) -> $crate::Result<()> {
+                let (name, note) = (name.to_string(), note.map(str::to_string));
+                run!(self.write, |c| q::request_unknown_link(c, org_id, &name, note.as_deref()).await)
             }
 
             async fn revoke_unknown_link(&self, org_id: i64, name: &str) -> $crate::Result<bool> {

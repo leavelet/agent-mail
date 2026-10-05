@@ -4,6 +4,7 @@ pub mod activity;
 pub mod attention;
 pub mod auth;
 mod bodylimit;
+mod boundary;
 pub mod cluster;
 pub mod commands;
 pub mod config;
@@ -17,6 +18,7 @@ mod mail;
 pub mod netguard;
 mod nodes;
 mod notices;
+mod openings;
 mod operator;
 pub mod peer;
 pub mod presence;
@@ -253,6 +255,24 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/lists/{name}/members/{address}",
             put(d::put_member).delete(d::delete_member),
+        )
+        .route("/org/notice", axum::routing::delete(openings::clear_notice))
+        .route("/orgs/{name}", get(openings::peer_org))
+        .route("/teams", get(openings::list_teams))
+        .route(
+            "/teams/{name}",
+            get(openings::get_team)
+                .put(openings::put_team)
+                .delete(openings::delete_team),
+        )
+        .route(
+            "/grants",
+            get(openings::list_grants).post(openings::add_grant),
+        )
+        .route("/grants/preview", post(openings::preview))
+        .route(
+            "/grants/{id}",
+            axum::routing::delete(openings::delete_grant),
         )
         .route("/links", get(d::list_links).post(d::request_link))
         .route("/links/{org}/accept", post(d::accept_link))

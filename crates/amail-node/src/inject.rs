@@ -382,6 +382,8 @@ mod tests {
                 created_at: "2026-01-01T00:00:00Z".into(),
                 meta: Default::default(),
                 expired: false,
+                to_hidden: 0,
+                cc_hidden: 0,
             },
             body: body.map(str::to_string),
             preview: None,

@@ -9,17 +9,26 @@
 //!   (a `digest` or `archive` member is not notified at once). The sender
 //!   never receives its own list mail. Class `list` is no longer produced;
 //!   older deliveries may still carry it.
-//! - `name@org` for another org requires an active link. It resolves to a
-//!   seat, or to a list whose `post_policy` is `anyone`.
+//! - `name@org` for another org requires an active link (else
+//!   `not_linked`, also when there is no such org or it is hidden) and
+//!   resolves only to a seat that the reachability rule
+//!   ([`crate::boundary::Reach`]) lets the message reach. Anything else (a
+//!   closed seat, a list, a name that does not exist there) is rejected
+//!   alike with `unreachable`, after the same lookups.
 //! - List members are seats: local ones, or external `name@org` seats. An
-//!   external member is delivered only if its org is the sender's org or is
-//!   linked to the sender's org, so mail never crosses between unlinked orgs.
+//!   external member is delivered only when the reachability rule lets the
+//!   message reach it now, so mail never crosses between unlinked orgs or
+//!   to a seat its org no longer opens.
 //!   Expansion is one level deep; there are no nested lists.
+//! - A new thread that reaches another org takes a token from the sending
+//!   seat's budget of new threads to other orgs (the org's
+//!   `new_threads_per_hour`; the user seat is exempt).
 //! - A seat reached through several addresses gets one delivery with the
 //!   highest class (`to` > `cc`) and the most immediate mode.
 
 use crate::AppState;
 use crate::auth::Auth;
+use crate::boundary::Reach;
 use crate::error::{ApiError, ApiResult};
 use amail_proto::{
     Address, AddressResult, DeliveryClass, DeliveryMode, PostPolicy, Priority, RecipientNote,
@@ -178,7 +187,7 @@ async fn send_inner(
         }
     };
 
-    let mut r = Resolver::new(st, org, sender);
+    let mut r = Resolver::new(st, org, sender, thread_id);
     r.prefetch(req.to.iter().chain(&req.cc)).await?;
     for a in &req.to {
         r.resolve(a, DeliveryClass::To).await?;
@@ -204,6 +213,25 @@ async fn send_inner(
     }
 
     let deliveries: Vec<NewDelivery> = r.order.iter().map(|id| r.seats[id].0.clone()).collect();
+    // A new thread to another org takes from the sender's budget of them.
+    let thread_token = thread_id.is_none()
+        && sender.kind != SeatKind::User
+        && deliveries.iter().any(|d| d.org_id != org.id);
+    if thread_token {
+        st.store
+            .take_thread_token(sender.id, org.new_threads_per_hour)
+            .await?
+            .map_err(|ms| {
+                ApiError::too_many(
+                    "thread_rate_limited",
+                    format!(
+                        "this seat may start {} new threads to other orgs per hour; reply in an existing thread or wait",
+                        org.new_threads_per_hour
+                    ),
+                    ms,
+                )
+            })?;
+    }
     let ack_required = req.ack_required.unwrap_or(false);
     let priority = req.priority.unwrap_or(Priority::Normal);
     let ack_due = ack_required.then(|| {
@@ -231,12 +259,25 @@ async fn send_inner(
         storage_quota: st.config.limits.org_storage_bytes,
         notice: false,
     };
-    let sent = st.store.send(&msg).await.map_err(|e| match e {
-        amail_store::StoreError::StorageQuota(stored) => {
-            ApiError::storage_quota(stored, st.config.limits.org_storage_bytes)
+    let sent = match st.store.send(&msg).await {
+        Ok(s) => s,
+        Err(e) => {
+            if thread_token
+                && let Err(e) = st
+                    .store
+                    .refund_thread_token(sender.id, org.new_threads_per_hour)
+                    .await
+            {
+                tracing::warn!("refunding a thread token: {e}");
+            }
+            return Err(match e {
+                amail_store::StoreError::StorageQuota(stored) => {
+                    ApiError::storage_quota(stored, st.config.limits.org_storage_bytes)
+                }
+                e => e.into(),
+            });
         }
-        e => e.into(),
-    })?;
+    };
     st.activity
         .record(std::iter::once(org.id).chain(sent.seqs.iter().map(|b| b.org_id)));
 
@@ -358,6 +399,14 @@ async fn notify_users(
             message = st.store.message(sent.message_id).await.ok().flatten();
         }
         let Some(m) = &message else { return };
+        // The header as that org's user sees it.
+        let header = match crate::boundary::View::load(st, target, [m]).await {
+            Ok(v) => v.header(m),
+            Err(e) => {
+                tracing::warn!("webhook of org {}: {}", target.name, e.message);
+                continue;
+            }
+        };
         let Some(slot) = webhook_slot(st, org_id, org.id) else {
             tracing::warn!(
                 "webhook of org {}: notice for message {} dropped, too many in flight",
@@ -375,7 +424,7 @@ async fn notify_users(
                 event: "message",
                 org: target.name.clone(),
                 seat: user.name.clone(),
-                message: crate::render::header(m, target),
+                message: header,
             },
             st.config.webhook_private_targets,
         );
@@ -410,13 +459,14 @@ struct Resolver<'a> {
     cc_addrs: Vec<String>,
     /// Per-send caches.
     orgs: HashMap<String, Option<Org>>,
-    links: HashMap<i64, bool>,
+    /// The reachability rule, with its facts for this send.
+    reach: Reach<'a>,
     /// (org id, name) -> seat, for names looked up by `prefetch`.
     seat_cache: HashMap<(i64, String), Option<Seat>>,
 }
 
 impl<'a> Resolver<'a> {
-    fn new(st: &'a AppState, org: &'a Org, sender: &'a Seat) -> Self {
+    fn new(st: &'a AppState, org: &'a Org, sender: &'a Seat, thread: Option<i64>) -> Self {
         Resolver {
             st,
             org,
@@ -428,7 +478,7 @@ impl<'a> Resolver<'a> {
             to_addrs: Vec::new(),
             cc_addrs: Vec::new(),
             orgs: HashMap::new(),
-            links: HashMap::new(),
+            reach: Reach::new(st, org, Some(sender), thread),
             seat_cache: HashMap::new(),
         }
     }
@@ -446,7 +496,7 @@ impl<'a> Resolver<'a> {
             else {
                 continue;
             };
-            if self.reachable(org.id).await? {
+            if self.reach.linked(org.id).await? {
                 by_org.entry(org.id).or_default().push(addr.name);
             }
         }
@@ -506,6 +556,9 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    /// The org of that name, as the sender's org may know it: a suspended
+    /// org, and a hidden org it has no active link with, count as absent
+    /// (both then answer `not_linked`, like a name no org has).
     async fn org_named(&mut self, name: &str) -> ApiResult<Option<Org>> {
         if name == self.org.name {
             return Ok(Some(self.org.clone()));
@@ -513,7 +566,6 @@ impl<'a> Resolver<'a> {
         if let Some(o) = self.orgs.get(name) {
             return Ok(o.clone());
         }
-        // A suspended org cannot be reached (as if it did not exist).
         let o = self
             .st
             .store
@@ -524,36 +576,24 @@ impl<'a> Resolver<'a> {
         Ok(o)
     }
 
-    /// Whether mail from the sender's org may reach `org_id`.
-    async fn reachable(&mut self, org_id: i64) -> ApiResult<bool> {
-        if org_id == self.org.id {
-            return Ok(true);
-        }
-        if let Some(&b) = self.links.get(&org_id) {
-            return Ok(b);
-        }
-        let b = self.st.store.link_active(self.org.id, org_id).await?;
-        self.links.insert(org_id, b);
-        Ok(b)
-    }
-
     async fn resolve(&mut self, raw: &str, class: DeliveryClass) -> ApiResult<()> {
         let Ok(addr) = raw.parse::<Address>() else {
             self.reject(raw, "invalid_address");
             return Ok(());
         };
-        let Some(target) = self
+        // Do not reveal whether an unlinked org exists: the link is looked
+        // up for a name no org has too.
+        let target = self
             .org_named(addr.org_or(&self.org.name).to_string().as_str())
-            .await?
-        else {
-            // Do not reveal whether an unlinked org exists.
+            .await?;
+        let linked = self
+            .reach
+            .linked(target.as_ref().map_or(0, |o| o.id))
+            .await?;
+        let Some(target) = target.filter(|_| linked) else {
             self.reject(raw, "not_linked");
             return Ok(());
         };
-        if !self.reachable(target.id).await? {
-            self.reject(raw, "not_linked");
-            return Ok(());
-        }
         let canonical = format!("{}@{}", addr.name, target.name);
         let shown = Address {
             name: addr.name.clone(),
@@ -563,7 +603,25 @@ impl<'a> Resolver<'a> {
         let local = target.id == self.org.id;
 
         let mut wakes = None;
-        let count = if let Some(seat) = self.seat(target.id, &addr.name).await? {
+        let count = if !local {
+            // Another org: a seat the rule lets the message reach. A list
+            // (lists are never open), a closed seat and a name that does
+            // not exist there are answered alike.
+            let seat = self.seat(target.id, &addr.name).await?;
+            if !self.reach.allows(&target, seat.as_ref()).await? {
+                self.reject(raw, "unreachable");
+                return Ok(());
+            }
+            let seat = seat.expect("allowed seats exist");
+            self.add(
+                seat.id,
+                seat.org_id,
+                &seat.name,
+                class,
+                DeliveryMode::Immediate,
+            );
+            1
+        } else if let Some(seat) = self.seat(target.id, &addr.name).await? {
             self.add(
                 seat.id,
                 seat.org_id,
@@ -576,7 +634,6 @@ impl<'a> Resolver<'a> {
             let members = self.st.store.list_members(list.id).await?;
             let allowed = match list.post_policy {
                 PostPolicy::Anyone => true,
-                _ if !local => false,
                 PostPolicy::UserOnly => self.sender.kind == SeatKind::User,
                 PostPolicy::Members => {
                     self.sender.kind == SeatKind::User
@@ -633,7 +690,7 @@ impl<'a> Resolver<'a> {
     }
 
     /// Resolve an external list member (`name@org`) to a seat, if the
-    /// sender's org may reach it.
+    /// reachability rule lets the message reach it.
     async fn external_member(&mut self, address: &str) -> ApiResult<Option<Seat>> {
         let Ok(a) = address.parse::<Address>() else {
             return Ok(None);
@@ -644,9 +701,14 @@ impl<'a> Resolver<'a> {
         else {
             return Ok(None);
         };
-        if !self.reachable(org.id).await? {
-            return Ok(None);
+        if org.id == self.org.id {
+            return self.seat(org.id, &a.name).await;
         }
-        self.seat(org.id, &a.name).await
+        let seat = self.seat(org.id, &a.name).await?;
+        Ok(if self.reach.allows(&org, seat.as_ref()).await? {
+            seat
+        } else {
+            None
+        })
     }
 }

@@ -1,8 +1,8 @@
 //! Store-level records. Timestamps are milliseconds since the Unix epoch.
 
 use amail_proto::{
-    DeliveryClass, DeliveryMode, LinkState, Meta, PermissionMode, PostPolicy, Priority, SeatKind,
-    TokenScope,
+    DeliveryClass, DeliveryMode, LinkState, Meta, OrgVisibility, Outbound, PermissionMode,
+    PostPolicy, Priority, SeatKind, TokenScope,
 };
 
 pub use amail_proto::{NewList, NewSeat};
@@ -33,6 +33,13 @@ pub struct Org {
     /// Bytes of the mail of deleted orgs that the org keeps (see
     /// [`message_bytes`]); not counted against the storage quota.
     pub kept_bytes: i64,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    pub visibility: OrgVisibility,
+    pub outbound: Outbound,
+    pub new_threads_per_hour: i64,
+    /// A one-time notice for the user.
+    pub notice: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,7 +55,12 @@ pub struct Seat {
     pub harness: Option<String>,
     pub model: Option<String>,
     pub permission_mode: Option<PermissionMode>,
+    /// The name of the seat's team.
     pub group: Option<String>,
+    pub team_id: Option<i64>,
+    pub description: Option<String>,
+    /// A contact of its team.
+    pub contact: bool,
     pub last_seq: i64,
     pub created_at: i64,
     pub deleted_at: Option<i64>,
@@ -101,6 +113,93 @@ pub struct Link {
     pub peer_org_id: i64,
     pub peer_name: String,
     pub state: LinkState,
+    /// When it became active, or (not active) when it was requested.
+    pub since: i64,
+    /// The requester's note.
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Team {
+    pub id: i64,
+    pub org_id: i64,
+    pub name: String,
+    pub description: Option<String>,
+    pub root_seat_id: Option<i64>,
+    pub root: Option<String>,
+    pub parent_id: Option<i64>,
+    pub parent: Option<String>,
+    pub managed: bool,
+    pub created_at: i64,
+}
+
+/// Changes of a team (see [`crate::Store::put_team`]): a missing field is
+/// unchanged, `Some(None)` clears it.
+#[derive(Debug, Clone, Default)]
+pub struct TeamChange {
+    pub description: Option<Option<String>>,
+    /// A seat name of the org.
+    pub root: Option<Option<String>>,
+    /// A team name of the org.
+    pub parent: Option<Option<String>>,
+    /// Replace the contacts (member seat names).
+    pub contacts: Option<Vec<String>>,
+    pub managed: Option<bool>,
+}
+
+/// The visible part of a seat or team: what a card shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardRec {
+    /// Seat or team id.
+    pub id: i64,
+    pub name: String,
+    /// `None`: a team.
+    pub kind: Option<SeatKind>,
+    pub description: Option<String>,
+}
+
+/// What a grant opens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrantTarget {
+    Seat(CardRec),
+    /// A team, with its contact seats.
+    Team {
+        team: CardRec,
+        contacts: Vec<CardRec>,
+    },
+}
+
+/// A grant as stored, with its target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantRec {
+    pub id: i64,
+    pub org_id: i64,
+    pub org_name: String,
+    /// `None`: every linked org.
+    pub audience: Option<String>,
+    pub target: GrantTarget,
+    pub managed: bool,
+    pub created_at: i64,
+}
+
+/// Which grants [`crate::Store::grants`] returns.
+#[derive(Debug, Clone, Default)]
+pub struct GrantFilter {
+    /// Grants of this org.
+    pub grantor: Option<i64>,
+    /// Grants toward this org (id, name): of orgs with an active link
+    /// with it, whose audience is every linked org or this org.
+    pub audience: Option<(i64, String)>,
+}
+
+/// A seat of another org that wrote into a thread (see
+/// [`crate::Store::thread_peers`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadPeer {
+    pub thread_id: i64,
+    pub org_id: i64,
+    pub org_name: String,
+    pub card: CardRec,
 }
 
 #[derive(Debug, Clone)]

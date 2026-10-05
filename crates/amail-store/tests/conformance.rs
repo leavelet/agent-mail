@@ -192,6 +192,8 @@ async fn seats(s: S) {
                 display_name: Some("Worker 1".into()),
                 permission_mode: Some(amail_proto::PermissionMode::Unattended),
                 group: Some("backend".into()),
+                description: Some("Builds the API.".into()),
+                contact: true,
             },
         )
         .await
@@ -565,7 +567,7 @@ async fn links(s: S) {
     let (c, _) = org(&s, "c").await;
     assert!(!s.link_active(a.id, b.id).await.unwrap());
     assert_eq!(
-        s.request_link(a.id, b.id).await.unwrap(),
+        s.request_link(a.id, b.id, None).await.unwrap(),
         LinkState::Requested
     );
     assert_eq!(s.links(a.id).await.unwrap()[0].state, LinkState::Requested);
@@ -581,10 +583,13 @@ async fn links(s: S) {
     assert!(s.link_active(b.id, a.id).await.unwrap());
     // A request in the other direction counts as acceptance.
     assert_eq!(
-        s.request_link(a.id, c.id).await.unwrap(),
+        s.request_link(a.id, c.id, None).await.unwrap(),
         LinkState::Requested
     );
-    assert_eq!(s.request_link(c.id, a.id).await.unwrap(), LinkState::Active);
+    assert_eq!(
+        s.request_link(c.id, a.id, None).await.unwrap(),
+        LinkState::Active
+    );
     assert!(s.link_active(a.id, c.id).await.unwrap());
     // Either side can revoke.
     assert!(s.revoke_link(b.id, a.id).await.unwrap());
@@ -592,7 +597,7 @@ async fn links(s: S) {
     assert!(s.links(b.id).await.unwrap().is_empty());
     assert!(!s.revoke_link(b.id, a.id).await.unwrap());
     assert!(matches!(
-        s.request_link(a.id, a.id).await,
+        s.request_link(a.id, a.id, None).await,
         Err(StoreError::Invalid(_))
     ));
     // `b` and `c` were never linked.

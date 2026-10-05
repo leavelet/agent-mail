@@ -122,6 +122,7 @@ pub trait Store: Send + Sync + 'static {
         token_hash: &str,
     ) -> Result<(Org, Seat)>;
     async fn org_by_name(&self, name: &str) -> Result<Option<Org>>;
+    async fn org_by_id(&self, id: i64) -> Result<Option<Org>>;
     async fn update_org(&self, org_id: i64, patch: &OrgSettings) -> Result<Org>;
     async fn create_token(&self, token: &NewToken) -> Result<()>;
     /// Look up a live token by hash, with its org and (for user and seat
@@ -154,8 +155,14 @@ pub trait Store: Send + Sync + 'static {
 
     // --- links ---------------------------------------------------------------
 
-    /// Request a link to `peer`. If `peer` already asked us, this accepts.
-    async fn request_link(&self, org_id: i64, peer_id: i64) -> Result<amail_proto::LinkState>;
+    /// Request a link to `peer`, with a note for its user. If `peer`
+    /// already asked us, this accepts.
+    async fn request_link(
+        &self,
+        org_id: i64,
+        peer_id: i64,
+        note: Option<&str>,
+    ) -> Result<amail_proto::LinkState>;
     /// Accept a pending request from `peer`.
     async fn accept_link(&self, org_id: i64, peer_id: i64) -> Result<()>;
     /// Remove the link in both directions. Returns false if there was none.
@@ -165,10 +172,48 @@ pub trait Store: Send + Sync + 'static {
     async fn links(&self, org_id: i64) -> Result<Vec<Link>>;
     /// Record a request to a name that is not an (active) org, so that it
     /// is listed like any other request.
-    async fn request_unknown_link(&self, org_id: i64, name: &str) -> Result<()>;
+    async fn request_unknown_link(&self, org_id: i64, name: &str, note: Option<&str>)
+    -> Result<()>;
     /// Remove such a request. Returns false if there was none.
     async fn revoke_unknown_link(&self, org_id: i64, name: &str) -> Result<bool>;
     async fn link_active(&self, org_id: i64, peer_id: i64) -> Result<bool>;
+
+    // --- teams and openings ----------------------------------------------------
+
+    /// Teams of the org, by name.
+    async fn teams(&self, org_id: i64) -> Result<Vec<Team>>;
+    /// Create the team (empty) or change it.
+    async fn put_team(&self, org_id: i64, name: &str, change: &TeamChange) -> Result<Team>;
+    /// Delete a team: its members leave it, its sub-teams move to its
+    /// parent, its grants go. False if there was none.
+    async fn delete_team(&self, org_id: i64, name: &str) -> Result<bool>;
+    /// Grants by `filter` (see [`GrantFilter`]), ordered by id.
+    async fn grants(&self, filter: &GrantFilter) -> Result<Vec<GrantRec>>;
+    /// Add a grant on a seat or a team (`audience` `None`: every linked
+    /// org); if the same grant exists it is kept. Returns its id.
+    async fn add_grant(
+        &self,
+        org_id: i64,
+        seat_id: Option<i64>,
+        team_id: Option<i64>,
+        audience: Option<&str>,
+        managed: bool,
+    ) -> Result<i64>;
+    async fn remove_grant(&self, org_id: i64, id: i64) -> Result<bool>;
+    /// Seats of other orgs that wrote into these threads in mail that
+    /// reached a seat of `org_id`.
+    async fn thread_peers(&self, org_id: i64, thread_ids: &[i64]) -> Result<Vec<ThreadPeer>>;
+    /// These seats (of other orgs) stop being participants of the threads
+    /// of `org_id`.
+    async fn forget_thread_peers(&self, org_id: i64, seat_ids: &[i64]) -> Result<u64>;
+    /// Clear the org's one-time notice.
+    async fn clear_org_notice(&self, org_id: i64) -> Result<()>;
+    /// Take one token from the seat's budget of new threads to other orgs
+    /// (`per_hour` tokens an hour, as many at most), or say how many
+    /// milliseconds until one is available.
+    async fn take_thread_token(&self, seat_id: i64, per_hour: i64) -> Result<Result<(), u64>>;
+    /// Give back a token taken for a send that then failed.
+    async fn refund_thread_token(&self, seat_id: i64, per_hour: i64) -> Result<()>;
 
     // --- mail ----------------------------------------------------------------
 

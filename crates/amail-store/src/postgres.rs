@@ -217,6 +217,19 @@ impl PgStore {
                 .bind(&seats)
                 .execute(&mut *c)
                 .await?;
+                // The sender takes part in the thread for every other org
+                // that got the message (see migration 0018).
+                sqlx::query(
+                    "INSERT INTO thread_peers (thread_id, org_id, seat_id) \
+                     SELECT DISTINCT $1::bigint, o, $2::bigint FROM UNNEST($3::bigint[]) AS t(o) WHERE o <> $4 \
+                     ORDER BY 2 ON CONFLICT DO NOTHING",
+                )
+                .bind(thread_id)
+                .bind(m.sender_seat_id)
+                .bind(&orgs)
+                .bind(m.org_id)
+                .execute(&mut *c)
+                .await?;
                 // Last, so the org's row stays locked only until the commit.
                 // The message and every delivery are charged (see
                 // `message_bytes`); refused over the quota, and when the org
@@ -319,18 +332,58 @@ impl PgStore {
         per_min: i64,
         burst: i64,
     ) -> Result<std::result::Result<(), u64>> {
+        self.take_bucket(
+            "send_budget",
+            seat_id,
+            per_min.max(0) as f64 / 60_000.0,
+            burst,
+        )
+        .await
+    }
+
+    async fn refund_send_token_impl(&self, seat_id: i64, burst: i64) -> Result<()> {
+        self.refund_bucket("send_budget", seat_id, burst).await
+    }
+
+    async fn take_thread_token_impl(
+        &self,
+        seat_id: i64,
+        per_hour: i64,
+    ) -> Result<std::result::Result<(), u64>> {
+        self.take_bucket(
+            "thread_budget",
+            seat_id,
+            per_hour.max(0) as f64 / 3_600_000.0,
+            per_hour,
+        )
+        .await
+    }
+
+    async fn refund_thread_token_impl(&self, seat_id: i64, per_hour: i64) -> Result<()> {
+        self.refund_bucket("thread_budget", seat_id, per_hour).await
+    }
+
+    /// Take a token from the seat's bucket in `table` (`send_budget` or
+    /// `thread_budget`), refilled with `per_ms` tokens a millisecond and
+    /// holding at most `burst`.
+    async fn take_bucket(
+        &self,
+        table: &'static str,
+        seat_id: i64,
+        per_ms: f64,
+        burst: i64,
+    ) -> Result<std::result::Result<(), u64>> {
         let burst = burst.max(1) as f64;
-        let per_ms = per_min.max(0) as f64 / 60_000.0;
         let mut c = self.pool.acquire().await?;
-        let left: Option<f64> = sqlx::query_scalar(
-            "INSERT INTO send_budget AS b (seat_id, tokens, updated_at) \
+        let left: Option<f64> = sqlx::query_scalar(&format!(
+            "INSERT INTO {table} AS b (seat_id, tokens, updated_at) \
              SELECT $1, $2::float8 - 1, (extract(epoch FROM clock_timestamp()) * 1000)::bigint \
              ON CONFLICT (seat_id) DO UPDATE SET \
                tokens = LEAST($2::float8, b.tokens + GREATEST(0, excluded.updated_at - b.updated_at) * $3::float8) - 1, \
                updated_at = excluded.updated_at \
              WHERE LEAST($2::float8, b.tokens + GREATEST(0, excluded.updated_at - b.updated_at) * $3::float8) >= 1 \
-             RETURNING tokens",
-        )
+             RETURNING tokens"
+        ))
         .bind(seat_id)
         .bind(burst)
         .bind(per_ms)
@@ -342,10 +395,10 @@ impl PgStore {
         if per_ms == 0.0 {
             return Ok(Err(3_600_000));
         }
-        let have: f64 = sqlx::query_scalar(
+        let have: f64 = sqlx::query_scalar(&format!(
             "SELECT LEAST($2::float8, tokens + GREATEST(0, (extract(epoch FROM clock_timestamp()) * 1000)::bigint \
-             - updated_at) * $3::float8) FROM send_budget WHERE seat_id = $1",
-        )
+             - updated_at) * $3::float8) FROM {table} WHERE seat_id = $1"
+        ))
         .bind(seat_id)
         .bind(burst)
         .bind(per_ms)
@@ -355,10 +408,10 @@ impl PgStore {
         Ok(Err((((1.0 - have) / per_ms).ceil() as u64).max(1)))
     }
 
-    async fn refund_send_token_impl(&self, seat_id: i64, burst: i64) -> Result<()> {
-        sqlx::query(
-            "UPDATE send_budget SET tokens = LEAST($2::float8, tokens + 1) WHERE seat_id = $1",
-        )
+    async fn refund_bucket(&self, table: &'static str, seat_id: i64, burst: i64) -> Result<()> {
+        sqlx::query(&format!(
+            "UPDATE {table} SET tokens = LEAST($2::float8, tokens + 1) WHERE seat_id = $1"
+        ))
         .bind(seat_id)
         .bind(burst.max(1) as f64)
         .execute(&self.pool)
