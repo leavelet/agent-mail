@@ -1159,7 +1159,13 @@ async fn org_deletion_keeps_received_mail(b: Backend, t: &str) {
     );
     let marked = " (deleted org)".len() as i64;
     let org = acme.get("/org").await.1;
-    assert_eq!(org["stored_bytes"], stored - PER_DELIVERY + marked, "{org}");
+    // acme's reply reached x and beta's contact in the thread (owner, added
+    // in Cc): both deliveries go, both addresses are marked.
+    assert_eq!(
+        org["stored_bytes"],
+        stored - 2 * PER_DELIVERY + 2 * marked,
+        "{org}"
+    );
     assert_eq!(org["kept_bytes"], kept, "{org}");
     counts_consistent(&srv, "beta deleted").await;
     assert_eq!(acme.ok(Method::GET, "/links", None).await, json!([]));
