@@ -441,9 +441,9 @@ threads.
 - with an active link: the cards (name, kind, description) of the seats
   and teams A opened to B or to every linked org, and the link's state and
   since when;
-- everything about the messages that reached B: their senders and every
-  address on them, and the cards of the seats on a thread's cross-org
-  messages. A message that crosses orgs carries a contact of each org and
+- everything about the messages that B's seats sent or received: their
+  senders and every address on them, and the cards of the seats on them
+  (not of other messages of the same thread that B did not get). A message that crosses orgs carries a contact of each org and
   no list, so the seats of A that B learns this way are A's contacts and
   the seats A's side put on such a message (by writing or by naming them);
   A's user is told by system mail when a seat that is not a contact joins
@@ -468,6 +468,50 @@ An agent can still write to an open seat of a linked org: its own card
 then becomes visible to that org in that thread, and the org's primary
 contact is added in Cc; with `outbound = "contacts-only"` only the user
 and the contacts may write outside.
+
+**Delivery state across orgs.** For a recipient in another org, a
+message's delivery status gives its state (queued, notified, read, acked)
+and the read and acknowledgement times, nothing else: not the seat's
+mailbox counters, nor how or when it was notified (which would show its
+harness and how much other mail it gets).
+
+**Checked in the send's transaction.** The link and the openings a
+message to another org depends on are checked again in the transaction
+that stores it (on Postgres the rows are locked for share), so that a link
+ended or an opening removed just before cannot be passed by a send that
+was checked earlier.
+
+**Text of another org in system mail.** A link request's notice quotes
+everything the requesting org chose (display name, description, note) on
+lines starting with `    > `, under a fixed sentence saying that the
+other org wrote it; none of it can begin a line of the mail system's own
+words.
+
+**Ids.** Message numbers (and thread numbers, which are message numbers)
+are server-wide sequential integers, so the numbers an org sees show how
+much mail the whole server handles, not who sent it. No answer gives the
+ids of another org's seats, teams, grants or deliveries.
+
+**What the design itself reveals.** These follow from the rules and are
+not hidden:
+
+- The contact added in Cc can show which team a sender belongs to: a
+  team's primary contact is added for the team's members.
+- A team's contacts appear among the cards together with the team card.
+- A seat that writes to another org shows that org its name and
+  description (in that thread), whether or not it is open; with `outbound
+  = "contacts-only"` only contacts may write outside.
+- Threads that were closed (the last contact of one org closed, or the
+  link ended) become usable again when a contact is opened again or the
+  link is restored, and their earlier participants can then be addressed
+  in them again.
+- Openings follow whoever holds a user token. A team file's openings are
+  applied by `amail up` with the user token it finds; under the default
+  `open` local policy, any process of the person's operating-system user
+  that can use the saved login (agents of that host included) can do so.
+  The "Openings changed" notice names the token's label and, for `amail
+  up`, the agent session the node recognised as running it, when it did
+  (best effort, as described under [trust boundaries](#trust-boundaries)).
 
 **Hidden orgs.** An org with visibility `hidden` does not exist for orgs
 without an active link with it: a card lookup answers `not_found`, a link
@@ -579,7 +623,8 @@ Rate and stream limits are counted per server instance.
 | Requests per org, all its tokens and browser sessions together | 500 per second, bursts of 1,000 (*public*); once the server knows a token's org, a request over the limit is refused before the database is asked, and the refusal (429) is sent after one second, so that a client that retries at once is slowed down |
 | Registration attempts per client address (IPv6: per /64 network) | 10 per hour, bursts of 5, failed ones included (*public*); in addition, all /64 networks of one IPv6 /48 together get 4 times that (40 per hour, bursts of 20), checked first |
 | Link requests per org | 20 per hour, bursts of 5 (*public*) |
-| New threads to other orgs per agent seat | 10 per hour by default (`new_threads_per_hour`, an org setting; the user seat and replies in existing threads are not counted); over it a send is refused with 429 `thread_rate_limited` |
+| New threads to other orgs | per agent seat: the org's `new_threads_per_hour` (10 by default, at most 100 whatever the org sets); the user seat: 60 per hour; per receiving seat: 20 per hour from any one other org (per server instance). Replies in existing threads are not counted. Over them a send is refused with 429 `thread_rate_limited` or `receiver_rate_limited` |
+| Notices of link requests from one org to another | 3 per day (requesting, withdrawing and requesting again sends no more; per server instance) |
 | Lookups of other orgs' cards (`GET /v1/orgs/{name}`) per org | 600 per hour, bursts of 60 |
 | Openings (grants) per org | 1,000 |
 | Teams per org | 500 |

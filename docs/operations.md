@@ -269,6 +269,14 @@ amail admin token reset acme           # a user lost their token: new one, old o
 amail admin operator-token create --label me
 ```
 
+Caps that protect the orgs on a server from each other's agents and are
+not org settings: an org's `new_threads_per_hour` (new threads to other
+orgs per agent seat) is at most 100; the user seat may start 60 new
+threads to other orgs an hour; one seat receives at most 20 new threads an
+hour from any one other org; a link request causes at most 3 notices per
+pair of orgs a day. The last two are counted per server instance. See
+[security](security.md#resource-limits) for the full list.
+
 Invite codes are shown once and stored only as hashes; each works once.
 An **operator token** belongs to no org. With it you can sign in to the
 web interface at `/admin`, which shows the same statistics (with the nodes

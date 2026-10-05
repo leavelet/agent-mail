@@ -1088,22 +1088,49 @@ impl Node {
                 }
                 return;
             }
-            Ok(req) => match &caller {
-                None => self.handle(req).await,
-                Some(c) if !restricted => self.handle(self.authorize_open(c, req)).await,
-                Some(c) => match self.authorize(c, req) {
-                    Ok(req) => self.handle(req).await,
-                    Err(e) => {
-                        tracing::warn!("refused a request from process {}: {e}", c.pid);
-                        json!({"error": e})
-                    }
-                },
-            },
+            Ok(req) => {
+                let up = matches!(req, Request::Up { .. } | Request::Ps | Request::Status);
+                let mut v = self.handle_from(&caller, restricted, req).await;
+                // Best effort (see `caller`): say which agent session asks
+                // (`amail up` asks `ps` first), so that what it changes on
+                // the server can name it.
+                if up
+                    && let Some(c) = &caller
+                    && c.is_session()
+                    && let Some(o) = v.as_object_mut()
+                {
+                    let who = match &c.session {
+                        Some((seat, _)) => format!("seat {seat}"),
+                        None => "a Codex session".to_string(),
+                    };
+                    o.insert("caller_session".into(), json!(who));
+                }
+                v
+            }
             Err(e) => json!({"error": format!("bad request: {e}")}),
         };
         let mut out = resp.to_string();
         out.push('\n');
         let _ = w.write_all(out.as_bytes()).await;
+    }
+
+    async fn handle_from(
+        &self,
+        caller: &Option<caller::Caller>,
+        restricted: bool,
+        req: Request,
+    ) -> Value {
+        match caller {
+            None => self.handle(req).await,
+            Some(c) if !restricted => self.handle(self.authorize_open(c, req)).await,
+            Some(c) => match self.authorize(c, req) {
+                Ok(req) => self.handle(req).await,
+                Err(e) => {
+                    tracing::warn!("refused a request from process {}: {e}", c.pid);
+                    json!({"error": e})
+                }
+            },
+        }
     }
 
     pub async fn handle(&self, req: Request) -> Value {

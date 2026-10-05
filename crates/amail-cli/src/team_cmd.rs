@@ -88,8 +88,24 @@ pub fn forget_deleted(c: &Client, seat: &str) -> Result<bool> {
 }
 
 fn ps_rows() -> Result<Vec<PsRow>> {
+    Ok(ps_answer()?.0)
+}
+
+/// The node's seats, and the agent session this command runs in when the
+/// node recognised one (best effort: see the node's `caller`).
+fn ps_answer() -> Result<(Vec<PsRow>, Option<String>)> {
     let v = node(&Request::Ps, Duration::from_secs(10))?;
-    Ok(serde_json::from_value(v["seats"].clone())?)
+    let session = v["caller_session"].as_str().map(str::to_string);
+    Ok((serde_json::from_value(v["seats"].clone())?, session))
+}
+
+/// The query that tells the server who applies the team file's openings:
+/// the agent session the node recognised, if any.
+fn run_by(session: &Option<String>) -> String {
+    match session {
+        Some(s) => format!("?up=1&session={}", enc(s)),
+        None => "?up=1".to_string(),
+    }
 }
 
 /// Seats of supervised groups or seats named in `only` (all when empty).
@@ -349,7 +365,7 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
     // 1. Everything that can fail without changing anything.
     let t = team::load(&o.file).map_err(|e| anyhow::anyhow!("{e}"))?;
     let selected = t.select(&o.only).map_err(|e| anyhow::anyhow!("{e}"))?;
-    let rows = ps_rows()?;
+    let (rows, session) = ps_answer()?;
     let me: p::WhoAmI = c.get("/whoami").await?;
     if me.scope != TokenScope::User {
         bail!(
@@ -591,7 +607,11 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
             continue;
         }
         let v = c
-            .raw(Method::DELETE, &format!("/grants/{}", g.id), None)
+            .raw(
+                Method::DELETE,
+                &format!("/grants/{}{}", g.id, run_by(&session)),
+                None,
+            )
             .await
             .with_context(|| format!("closing {} to {}", g.target, g.audience))?;
         let ch: p::GrantChange = serde_json::from_value(v.clone())?;
@@ -638,7 +658,11 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
             "managed": true,
         });
         let v = c
-            .raw(Method::POST, "/grants", Some(&body))
+            .raw(
+                Method::POST,
+                &format!("/grants{}", run_by(&session)),
+                Some(&body),
+            )
             .await
             .with_context(|| format!("opening {target} to {aud}"))?;
         let ch: p::GrantChange = serde_json::from_value(v.clone())?;

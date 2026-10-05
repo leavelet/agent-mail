@@ -49,6 +49,7 @@ m7_tests!(
     link_request_notice_quotes_the_other_org,
     new_thread_caps_protect_the_receiver,
     removal_during_a_send_is_not_bypassed,
+    no_ids_of_other_orgs_objects,
     primary_contacts,
     thread_closes_without_contacts,
     outbound_contacts_only,
@@ -1111,6 +1112,70 @@ async fn removal_during_a_send_is_not_bypassed(srv: Server) {
     assert!(!inbox.to_string().contains("race"), "{inbox}");
 }
 
+/// No answer gives another org's grant, seat, team or delivery ids (only
+/// message ids, which are server-wide; finding D-06).
+async fn no_ids_of_other_orgs_objects(srv: Server) {
+    let a = srv.org("alpha").await;
+    let b = srv.org("bravo").await;
+    let x = a.seat("x").await;
+    a.ok(
+        Method::POST,
+        "/seats",
+        Some(json!({ "name": "lead", "group": "core", "contact": true })),
+    )
+    .await;
+    a.open("core", None).await;
+    a.open("x", None).await;
+    a.link(&b, "bravo", "alpha").await;
+    let o = b.seat("o").await;
+    b.open("o", None).await;
+    let id = x.sent(to_body(&["o@bravo"])).await;
+    let own: Vec<i64> = b
+        .ok(Method::GET, "/grants", None)
+        .await
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["id"].as_i64().unwrap())
+        .collect();
+    fn ids(v: &Value, path: &str, out: &mut Vec<(String, i64)>) {
+        match v {
+            Value::Object(m) => {
+                for (k, x) in m {
+                    let p = format!("{path}.{k}");
+                    if k.ends_with("id")
+                        && let Some(n) = x.as_i64()
+                    {
+                        out.push((p.clone(), n));
+                    }
+                    ids(x, &p, out);
+                }
+            }
+            Value::Array(a) => a.iter().for_each(|x| ids(x, path, out)),
+            _ => {}
+        }
+    }
+    for path in [
+        "/orgs/alpha".to_string(),
+        format!("/threads/{id}"),
+        format!("/messages/{id}"),
+        "/links".to_string(),
+        "/inbox?seat=o".to_string(),
+    ] {
+        let v = b.ok(Method::GET, &path, None).await;
+        let mut found = Vec::new();
+        ids(&v, "", &mut found);
+        for (k, n) in found {
+            let ok = k.ends_with(".you_open.id") && own.contains(&n)
+                || k.ends_with("message_id")
+                || (k.ends_with(".id") || k.ends_with("thread_id") || k.ends_with("in_reply_to"))
+                    && n >= id;
+            assert!(ok, "{path}: {k} = {n} in {v}");
+        }
+    }
+    let _ = o;
+}
+
 /// The primary contact: the team's, else the org's (set per linked org),
 /// else the user seat if open, else the seat opened first. With no contact
 /// at all the send is refused with a reason that says so.
@@ -1543,6 +1608,25 @@ async fn notices_for_every_change(srv: Server) {
             .contains(&"Openings changed: x opened to linked".to_string())
     );
     assert!(a.notice_bodies().await.contains("bravo now sees: x"));
+    // The notice says what made the change.
+    assert!(
+        a.notice_bodies()
+            .await
+            .contains("Made by: the user token \"initial user token\"."),
+        "{}",
+        a.notice_bodies().await
+    );
+    a.ok(
+        Method::POST,
+        "/grants?up=1&session=seat%20x",
+        Some(json!({ "target": "owner", "audience": "bravo", "managed": true })),
+    )
+    .await;
+    let body = a.notice_bodies().await;
+    assert!(
+        body.contains("Made by: a team file applied with `amail up`, with the user token \"initial user token\"; the node on that host recognised the command as run from the agent session of seat x"),
+        "{body}"
+    );
     a.close(&g).await;
     assert!(
         a.notices()

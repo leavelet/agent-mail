@@ -47,6 +47,14 @@ The first public version.
   that is not a contact joins a thread with another org. `amail send
   --dry-run` and `POST /v1/messages/preview` show the added contact before
   sending.
+- What an org knows of a thread is only the messages its own seats sent or
+  received (participants, the reply check and the contacts added come from
+  them). A delivery status shows another org's recipients' state and read
+  and acknowledgement times only. The link and openings a cross-org send
+  depends on are checked again in its transaction. New threads to other
+  orgs are capped by the server (per seat, for the user seat, and per
+  receiving seat). Link-request notices quote the other org's text; the
+  "Openings changed" notice says what made the change.
 - Teams: several team trees per org (`amail team`, the web interface's
   Teams view), created by team files (`[team] name`, `[[group]]`, nested
   as written) with descriptions, contacts and openings; several team files

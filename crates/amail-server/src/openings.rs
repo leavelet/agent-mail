@@ -5,7 +5,7 @@
 use crate::AppState;
 use crate::auth::Auth;
 use crate::boundary::{self, OpenSet};
-use crate::error::{ApiError, ApiResult, Json, Path};
+use crate::error::{ApiError, ApiResult, Json, Path, Query};
 use crate::render;
 use amail_proto::{self as p, LinkState, OrgVisibility, valid_name};
 use amail_store::{CardRec, GrantFilter, GrantRec, GrantTarget, Org, TeamChange};
@@ -91,15 +91,61 @@ async fn openings_text(st: &AppState, org: &Org) -> ApiResult<String> {
     Ok(s)
 }
 
-/// Tell the org's user about a change of its openings.
-pub async fn tell_openings(st: &AppState, org: &Org, what: &str, changes: &[p::SightChange]) {
+/// Who made a change, for the notice: the credential (a token's label, or
+/// the web interface), and for openings of a team file, `amail up` and the
+/// agent session the node recognised (best effort).
+pub async fn made_by(st: &AppState, auth: &Auth, by: &ByParams) -> String {
+    let label = st
+        .store
+        .tokens(auth.org.id)
+        .await
+        .ok()
+        .and_then(|t| t.into_iter().find(|t| t.id == auth.token_id))
+        .and_then(|t| t.label)
+        .map(|l| format!("\"{}\"", amail_proto::text::line(&l).replace('"', "'")))
+        .unwrap_or_else(|| "(no label)".into());
+    let credential = if auth.session.is_some() {
+        format!("the web interface, signed in with the user token {label}")
+    } else {
+        format!("the user token {label}")
+    };
+    if by.up.is_some() {
+        let mut s = format!("a team file applied with `amail up`, with {credential}");
+        if let Some(seat) = by.session.as_deref().filter(|x| !x.is_empty()) {
+            let seat: String = amail_proto::text::line(seat).chars().take(80).collect();
+            s.push_str(&format!(
+                "; the node on that host recognised the command as run from the agent session of {seat} (best effort: see docs/security.md)"
+            ));
+        }
+        s
+    } else {
+        credential
+    }
+}
+
+/// `?up=1&session=...` on grant changes: `amail up` applies a team file
+/// (from the agent session the node named, if any).
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct ByParams {
+    pub up: Option<String>,
+    pub session: Option<String>,
+}
+
+/// Tell the org's user about a change of its openings, and who made it.
+pub async fn tell_openings(
+    st: &AppState,
+    org: &Org,
+    what: &str,
+    by: &str,
+    changes: &[p::SightChange],
+) {
     let rest = openings_text(st, org).await.unwrap_or_default();
     crate::notices::tell_user(
         st,
         org.id,
         &format!("Openings changed: {what}"),
         &format!(
-            "{what}.\n\nWhat other orgs see changes as follows:\n{}\n{rest}\nOpenings are listed with `amail openings` and in the web interface (Other orgs).\n",
+            "{what}.\nMade by: {by}.\n\nWhat other orgs see changes as follows:\n{}\n{rest}\nOpenings are listed with `amail openings` and in the web interface (Other orgs).\n",
             changes_text(changes)
         ),
     )
@@ -221,10 +267,12 @@ pub async fn put_team(
     .await?;
     st.directory_changed(auth.org.id, "team", &name, "updated");
     if !changes.is_empty() {
+        let by_text = made_by(&st, &auth, &ByParams::default()).await;
         tell_openings(
             &st,
             &auth.org,
             &format!("the contacts of team {name} changed"),
+            &by_text,
             &changes,
         )
         .await;
@@ -248,10 +296,12 @@ pub async fn delete_team(
     }
     st.directory_changed(auth.org.id, "team", &name, "deleted");
     if !changes.is_empty() {
+        let by_text = made_by(&st, &auth, &ByParams::default()).await;
         tell_openings(
             &st,
             &auth.org,
             &format!("team {name} was deleted"),
+            &by_text,
             &changes,
         )
         .await;
@@ -343,6 +393,7 @@ fn target_ids(t: &GrantTarget) -> (Option<i64>, Option<i64>) {
 pub async fn add_grant(
     State(st): State<AppState>,
     auth: Auth,
+    Query(by): Query<ByParams>,
     Json(req): Json<p::NewGrant>,
 ) -> ApiResult<(StatusCode, Json<p::GrantChange>)> {
     auth.require_user()?;
@@ -368,10 +419,12 @@ pub async fn add_grant(
         .into_iter()
         .find(|g| g.id == id);
     if let Some(g) = &grant {
+        let by_text = made_by(&st, &auth, &by).await;
         tell_openings(
             &st,
             &auth.org,
             &format!("{} opened to {}", g.target, g.audience),
+            &by_text,
             &changes,
         )
         .await;
@@ -386,6 +439,7 @@ pub async fn delete_grant(
     State(st): State<AppState>,
     auth: Auth,
     Path(id): Path<i64>,
+    Query(by): Query<ByParams>,
 ) -> ApiResult<Json<p::GrantChange>> {
     auth.require_user()?;
     let grants = own_grants(&st, &auth.org).await?;
@@ -398,10 +452,12 @@ pub async fn delete_grant(
         Ok(st.store.remove_grant(auth.org.id, id).await?)
     })
     .await?;
+    let by_text = made_by(&st, &auth, &by).await;
     tell_openings(
         &st,
         &auth.org,
         &format!("{} closed to {}", shown.target, shown.audience),
+        &by_text,
         &changes,
     )
     .await;

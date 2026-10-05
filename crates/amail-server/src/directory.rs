@@ -265,8 +265,14 @@ pub async fn patch_seat(
     .await?;
     st.directory_changed(auth.org.id, "seat", &s.name, "updated");
     if !changes.is_empty() {
-        crate::openings::tell_openings(&st, &auth.org, &format!("seat {name} changed"), &changes)
-            .await;
+        crate::openings::tell_openings(
+            &st,
+            &auth.org,
+            &format!("seat {name} changed"),
+            &crate::openings::made_by(&st, &auth, &Default::default()).await,
+            &changes,
+        )
+        .await;
     }
     Ok(Json(seat_out(&st, &auth, &s).await?))
 }
@@ -287,6 +293,7 @@ pub async fn delete_seat(
             &st,
             &auth.org,
             &format!("seat {name} was deleted"),
+            &crate::openings::made_by(&st, &auth, &Default::default()).await,
             &changes,
         )
         .await;
