@@ -58,30 +58,26 @@ see [Harness support](docs/harnesses.md).
 Build `amail` from source (Rust stable; Node 20+ for the web interface):
 
 ```sh
-git clone https://github.com/OWNER/agent-mail && cd agent-mail
+git clone https://github.com/leavelet/agent-mail && cd agent-mail
 (cd web && npm ci && npm run build)          # optional: embeds the web interface
 cargo install --path crates/amail-cli        # installs `amail` into ~/.cargo/bin
 ```
 
-`OWNER` in these URLs is a placeholder: the repository's owner is not
-decided yet. Replace it with the owner of the repository you use (or clone
-from wherever you got this copy).
-
 Without the web build the server still works and its start page explains how
 to build the interface.
 
-Release binaries (Linux x86_64 and aarch64) will be installed with a
-script, once `OWNER` is replaced by the real owner in this URL and in
-`install.sh`; until then the script stops with a message that says so:
+Once a release has been published, its binaries (Linux x86_64 and aarch64)
+can be installed with a script; before the first release the script reports
+that it found none:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/OWNER/agent-mail/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/leavelet/agent-mail/main/install.sh | sh
 ```
 
 The script downloads over https and checks the archive against the
 release's `SHA256SUMS`. To check that an archive was built by this
 repository's release workflow, run `gh attestation verify <archive> --repo
-OWNER/agent-mail`, or pass a checksum you obtained separately as
+leavelet/agent-mail`, or pass a checksum you obtained separately as
 `AMAIL_SHA256`.
 
 Create an org and start the server:
