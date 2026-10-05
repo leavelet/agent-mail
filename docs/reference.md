@@ -140,7 +140,7 @@ from it with a credential the server has not seen valid lately get 429
 | `GET /changes` | `since` (a sequence number): deliveries created or changed since (`limit` ≤ 5000, at most 2 MiB); continue from `next` while `more` is true. Takes one of the org's query slots |
 | `GET /events` | server-sent events: `mailbox` `{"seat","seq"}` per mailbox change (supports `Last-Event-ID`), `presence` (with `node_connected` as in `GET /seats`), for user tokens `directory` (`{kind: "seat"\|"list", name, change: "created"\|"updated"\|"deleted"}`) and `nodes` (`{connected}`: open node streams, sent at once and on change), and for node tokens `command` (`{op: "transcript"\|"sleep"\|"wake", seat, lease_ms?, backfill?, node?}`) |
 | `PUT /focus`, `DELETE /focus` | `seat=` (user tokens; seat tokens: their own): focus `{for_s?, until?}`, or end it |
-| `GET /sent` | `seat`, `before_id`, `limit` (≤ 500): messages a seat sent, newest first; paged like the archive |
+| `GET /sent` | `seat`, `before_id`, `limit` (≤ 500), `delivery`: messages a seat sent, newest first; paged like the archive. With `delivery=true` (`limit` ≤ 100) the answer also has `delivery: [{message_id, queued, notified, read, acked}]`, how many deliveries of each listed message are in each state (each delivery counted in its most advanced state, across orgs, as in `/messages/{id}/status`) |
 | `GET /archive/messages` | `since`, `until`, `from`, `to`, `thread`, `before_id`, `limit` (≤ 500) (user tokens): below |
 | `GET /archive/search` | `q`, `before_id`, `limit` (≤ 200) (user tokens): search, below |
 
@@ -164,12 +164,12 @@ from it with a credential the server has not seen valid lately get 429
 | | |
 |---|---|
 | `POST /session`; `DELETE /session` | sign a browser in with `{token}` (user or operator tokens; needs `X-Amail-Csrf: 1`) / out |
-| `GET /overview` | user tokens: agent seats per state, seats needing a person, messages the org sent or received in the last hour and day (counted per minute, so a window starts at the beginning of its first minute; another server instance's counts appear within about a second), the user's unread count, the size of the attention queue |
+| `GET /overview` | user tokens: agent seats per state, `starting` (seats counted as offline whose session waits at a trust, login or permission prompt), seats needing a person, messages the org sent or received in the last hour and day (counted per minute, so a window starts at the beginning of its first minute; another server instance's counts appear within about a second), the user's unread count, the size of the attention queue |
 | `GET /counts` | user tokens: per seat (or `seat=`), `unread` and `pending` |
 | `GET /attention` | user tokens: what waits for the user ([concepts](concepts.md#the-users-queue-needs-you)), among the user seat's newest 5,000 deliveries |
 | `GET /pending` | node and user tokens: per seat, pending deliveries by class, urgent count, digest counts, `focus_until`, the seat's counter |
-| `POST /node/notices` | node tokens: `{node?, notices: [{kind: "settings", changes: [{seat?, setting, old?, new}]} \| {kind: "agent_actions", seat?, actions: [{op, targets, count}]} \| {kind: "turn_failures", seat, count, harness?, error}]}`; `setting` is `local_policy`, `permission_mode` or `git_access` with one of its values; `op` is `up`, `down`, `forget`, `run`, `wake`, `sleep`, `credentials` or `hook`. Each report becomes one `system` mail to the org's user seat, written by the server (at most 4 KB; what does not fit is counted); answers `{sent}` (1, or 0 when the org is over its daily notice budget and the report was dropped). Limits in [security](security.md#resource-limits) |
-| `POST /presence` | node tokens: `{node?, seats: [{seat, state, wake_failed?, harness?, since?, attention?, attention_hint?, terminal_url?, turn_failed?}]}`; `turn_failed` is `{reason, at, count, retrying}` (the seat's last `count` turns failed; `retrying: false` once the node stopped delivering their mail again) (at most 5,000 seats); valid for 90 s |
+| `POST /node/notices` | node tokens: `{node?, notices: [{kind: "settings", changes: [{seat?, setting, old?, new}]} \| {kind: "agent_actions", seat?, actions: [{op, targets, count}]} \| {kind: "turn_failures", seat, count, harness?, error}]}` (the mail of a report with `turn_failures` names their seats of the org in its meta field `turn_failures`, separated by spaces); `setting` is `local_policy`, `permission_mode` or `git_access` with one of its values; `op` is `up`, `down`, `forget`, `run`, `wake`, `sleep`, `credentials` or `hook`. Each report becomes one `system` mail to the org's user seat, written by the server (at most 4 KB; what does not fit is counted); answers `{sent}` (1, or 0 when the org is over its daily notice budget and the report was dropped). Limits in [security](security.md#resource-limits) |
+| `POST /presence` | node tokens: `{node?, seats: [{seat, state, wake_failed?, harness?, since?, attention?, attention_hint?, terminal_url?, turn_failed?}]}`; `turn_failed` is `{reason, at, count, retrying}` (the seat's last `count` turns failed; `retrying: false` once the node stopped delivering their mail again) (at most 5,000 seats); valid for 90 s. A report without `turn_failed` for a seat whose stored entry had one marks read the user's unread `turn_failures` notices that name the seat, once no seat they name has a turn failure (among the user's newest 200 unread deliveries) |
 | `GET /seats/{name}/launch` | node and user tokens: harness, model, role, parent, permission mode (informational; the node does not use it) and a new seat token; the token of the seat's previous launch is revoked |
 | `POST /seats/{name}/sleep`, `POST /seats/{name}/wake` | user tokens: ask the node hosting the seat; 202, or 409 `node_offline` |
 | `GET /seats/{name}/transcript` | user tokens: the seat's conversation as server-sent events: `status`, `reset`, `events`. The stream ends when the watcher falls too far behind (reconnect to start again); HTTP 503 `mirror_full` when the server has no room for another watcher |
@@ -221,8 +221,8 @@ slots (see [below](#limits-on-expensive-requests)).
 Requests whose database cost depends on the data take a query slot of
 one of three pools: search and `GET /archive/messages` (search pool);
 `GET /threads/{id}` (after the check that the caller sees the thread),
-`/messages/{id}/status`, `/changes`, and `/inbox` and `/sent` pages of more
-than 100 (other pool); `/attention`, `/overview`, `/lists` and
+`/messages/{id}/status`, `/changes`, `/inbox` and `/sent` pages of more
+than 100, and the delivery counts of a `/sent` page (other pool); `/attention`, `/overview`, `/lists` and
 `/lists/{name}` (light pool). On a public server an org has 1 slot in each
 pool, and the search and other pools have 8 slots each over all orgs
 (`--max-org-queries`, `--max-queries`); the light pool has no limit over

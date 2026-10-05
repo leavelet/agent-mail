@@ -685,6 +685,23 @@ pub struct ArchiveResponse {
     /// Pass as `before_id` to get the next (older) page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_before_id: Option<i64>,
+    /// `GET /sent?delivery=true`: how many recipients' deliveries of each
+    /// listed message are in each state (one entry per message that has
+    /// deliveries).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delivery: Vec<DeliveryCounts>,
+}
+
+/// How many deliveries of one message are in each state. The states are
+/// those of [`delivery_state`]; each delivery counts once, in its most
+/// advanced state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveryCounts {
+    pub message_id: i64,
+    pub queued: i64,
+    pub notified: i64,
+    pub read: i64,
+    pub acked: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1254,6 +1271,11 @@ pub struct Overview {
     /// Agent seats per state (`busy`, `idle`, `awaiting`, `dormant`,
     /// `offline`); seats no node reports count as offline.
     pub states: std::collections::BTreeMap<String, i64>,
+    /// Seats counted as `offline` in `states` whose session waits at a
+    /// prompt for a person before it starts (attention `trust-prompt`,
+    /// `login` or `permission`); the web interface shows them as starting.
+    #[serde(default)]
+    pub starting: i64,
     /// Seats whose presence carries an `attention` tag.
     pub needs_person: i64,
     pub wake_failed: i64,

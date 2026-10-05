@@ -13,6 +13,7 @@
     <li>{t('data.notStored')}</li>
     <li>{t('data.operator')}</li>
     <li>{days !== undefined ? t('data.retention', { days }) : t('data.noRetention')}</li>
+    <li>{t('data.deleteMail')}</li>
     <li>{t('data.delete')}</li>
   </ul>
 </section>

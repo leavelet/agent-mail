@@ -6,19 +6,9 @@
   import { t, ui } from '../lib/ui.svelte';
   import { href, go } from '../lib/router.svelte';
   import { get, qs, ApiError } from '../lib/api';
-  import {
-    KNOWN_ATTENTION,
-    attentionTag,
-    effectiveState,
-    focusUntil,
-    freshPresence,
-    startingAtPrompt,
-    stateAge,
-    nodeOpBlock,
-    terminalHref,
-  } from '../lib/presence';
+  import { KNOWN_ATTENTION, focusUntil, seatStatus, stateLongKey, nodeOpBlock, terminalHref } from '../lib/presence';
   import { duration, shortTime } from '../lib/time';
-  import { fromEntry, fromHeader, newestFirst, type MailRow } from '../lib/mailrows';
+  import { fromEntry, fromSent, newestFirst, type MailRow } from '../lib/mailrows';
   import type { ArchiveResponse, InboxResponse } from '../lib/types';
   import StateBadge from './StateBadge.svelte';
   import Transcript from './Transcript.svelte';
@@ -36,9 +26,11 @@
 
   const seat = $derived(store.seatMap.get(name));
   const now = $derived(ui.now);
-  const p = $derived(seat ? freshPresence(seat.presence, now) : undefined);
-  const seatState = $derived(seat ? effectiveState(seat, now) : 'offline');
-  const age = $derived(seat ? stateAge(seat, now) : undefined);
+  // The same status as the seat's row on the org page.
+  const status = $derived(seat ? seatStatus(seat, now) : undefined);
+  const p = $derived(status?.presence);
+  const seatState = $derived(status?.state ?? 'offline');
+  const age = $derived(status?.age);
   const focus = $derived(seat ? focusUntil(seat, now) : undefined);
   const children = $derived(store.seats.filter((s) => s.parent === name).map((s) => s.name));
   const block = $derived(seat ? nodeOpBlock(seat, now) : 'noPresence');
@@ -56,7 +48,7 @@
         ? get<InboxResponse>(`/v1/inbox${qs({ seat: name, before_seq: Number.MAX_SAFE_INTEGER, limit: 100 })}`).then((r) =>
             newestFirst(r.entries.map((e) => fromEntry(e, isList))),
           )
-        : get<ArchiveResponse>(`/v1/sent${qs({ seat: name, limit: 100 })}`).then((r) => r.messages.map(fromHeader));
+        : get<ArchiveResponse>(`/v1/sent${qs({ seat: name, limit: 100, delivery: 'true' })}`).then(fromSent);
     load
       .then((r) => {
         if (tab === which) rows = r;
@@ -88,12 +80,12 @@
   }
 
   const blockReason = $derived(block ? t(`seat.disabled.${block}`) : '');
-  const tag = $derived(attentionTag(p));
+  const tag = $derived(status?.tag);
   const attnText = $derived.by(() => {
     if (!tag) return null;
     return KNOWN_ATTENTION.includes(tag) ? t(`attn.${tag}` as 'attn.login') : tag;
   });
-  const starting = $derived(startingAtPrompt(p));
+  const starting = $derived(!!status?.starting);
   const tf = $derived(p?.turn_failed);
   const terminal = $derived(terminalHref(p?.terminal_url));
 </script>
@@ -155,7 +147,7 @@
       </dd>
       {#if seat.kind === 'agent'}
         <dt>{t('seat.state')}</dt>
-        <dd>{starting ? t('state.starting.long') : t(`state.${seatState}.long`)}{#if age !== undefined} · {t('seat.for', { d: duration(age, ui.lang) })}{/if}</dd>
+        <dd data-testid="seat-state">{t(stateLongKey({ state: seatState, starting }))}{#if age !== undefined} · {t('seat.for', { d: duration(age, ui.lang) })}{/if}</dd>
         <dt>{t('seat.harness')}</dt>
         <dd><Vis text={[seat.harness ?? p?.harness, seat.model].filter(Boolean).join(' · ') || '—'} />{#if seat.permission_mode} · <span class="faint">{seat.permission_mode}</span>{/if}</dd>
         <dt>{t('seat.node')}</dt>

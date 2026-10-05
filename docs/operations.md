@@ -359,7 +359,8 @@ each query is cancelled after 10 seconds):
 
 - the search pool: `/archive/search` and `/archive/messages`;
 - the other pool: `GET /threads/{id}`, `/messages/{id}/status`,
-  `/changes`, and `/inbox` and `/sent` pages of more than 100 entries;
+  `/changes`, `/inbox` and `/sent` pages of more than 100 entries, and the
+  delivery counts of a `/sent` page;
 - the light pool: `/overview`, `/attention`, `/lists` and `/lists/{name}`,
   whose cost has a fixed upper bound (the user seat's newest 5,000
   deliveries, the org's seats, at most 500 lists of 1,000 members).

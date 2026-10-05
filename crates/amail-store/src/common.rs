@@ -1908,6 +1908,32 @@ macro_rules! impl_store_common {
                 collect(rows, DelivRow::into_delivery)
             }
 
+            pub async fn delivery_counts(c: &mut Conn, ids: &[i64]) -> Result<Vec<amail_proto::DeliveryCounts>> {
+                if ids.is_empty() {
+                    return Ok(Vec::new());
+                }
+                let sql = format!(
+                    "SELECT message_id, \
+                     CAST(SUM(CASE WHEN acked_at IS NULL AND read_at IS NULL AND notified_at IS NULL THEN 1 ELSE 0 END) AS BIGINT), \
+                     CAST(SUM(CASE WHEN acked_at IS NULL AND read_at IS NULL AND notified_at IS NOT NULL THEN 1 ELSE 0 END) AS BIGINT), \
+                     CAST(SUM(CASE WHEN acked_at IS NULL AND read_at IS NOT NULL THEN 1 ELSE 0 END) AS BIGINT), \
+                     CAST(SUM(CASE WHEN acked_at IS NOT NULL THEN 1 ELSE 0 END) AS BIGINT) \
+                     FROM deliveries WHERE message_id IN ({}) GROUP BY message_id ORDER BY message_id",
+                    placeholders(1, ids.len())
+                );
+                let mut q = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(&sql);
+                for id in ids {
+                    q = q.bind(*id);
+                }
+                Ok(q.fetch_all(&mut *c)
+                    .await?
+                    .into_iter()
+                    .map(|(message_id, queued, notified, read, acked)| amail_proto::DeliveryCounts {
+                        message_id, queued, notified, read, acked,
+                    })
+                    .collect())
+            }
+
             /// Ids of the org's seats called `name` (a deleted seat's name
             /// can be taken again).
             async fn own_seat_ids(c: &mut Conn, org_id: i64, name: &str) -> Result<Vec<i64>> {
@@ -2216,7 +2242,7 @@ macro_rules! impl_store_common {
             /// Store reports (`since` of an unchanged state is kept); returns
             /// the entries whose state changed or that were absent (no row,
             /// or older than `ttl_ms`), as stored.
-            pub async fn put_presence(c: &mut Conn, org_id: i64, recs: &[PresenceRec], ttl_ms: i64) -> Result<Vec<PresenceRec>> {
+            pub async fn put_presence(c: &mut Conn, org_id: i64, recs: &[PresenceRec], ttl_ms: i64) -> Result<PresenceStored> {
                 let now = now_ms();
                 let names: Vec<String> = recs.iter().map(|r| r.seat.clone()).collect();
                 let ids: std::collections::HashMap<String, i64> = seats_by_names(c, org_id, &names)
@@ -2225,7 +2251,7 @@ macro_rules! impl_store_common {
                     .map(|s| (s.name, s.id))
                     .collect();
                 if ids.is_empty() {
-                    return Ok(Vec::new());
+                    return Ok(PresenceStored::default());
                 }
                 let prev: std::collections::HashMap<String, PresenceRec> = presence(c, org_id, None)
                     .await?
@@ -2235,8 +2261,12 @@ macro_rules! impl_store_common {
                     .collect();
                 let mut stored = Vec::new();
                 let mut changed = Vec::new();
+                let mut turn_failures_cleared = Vec::new();
                 for r in recs {
                     let Some(&seat_id) = ids.get(&r.seat) else { continue };
+                    if r.turn_failed.is_none() && prev.get(&r.seat).is_some_and(|p| p.turn_failed.is_some()) {
+                        turn_failures_cleared.push(r.seat.clone());
+                    }
                     let old = prev.get(&r.seat).filter(|p| now - p.updated_at <= ttl_ms);
                     let mut rec = r.clone();
                     rec.updated_at = now;
@@ -2279,7 +2309,7 @@ macro_rules! impl_store_common {
                     }
                     q.execute(&mut *c).await?;
                 }
-                Ok(changed)
+                Ok(PresenceStored { changed, turn_failures_cleared })
             }
 
             // --- instances ---------------------------------------------------
@@ -3811,6 +3841,11 @@ macro_rules! impl_store_common {
                 run!(self.read_query, |c| q::recipients(c, message_id).await)
             }
 
+            async fn delivery_counts(&self, message_ids: &[i64]) -> $crate::Result<Vec<amail_proto::DeliveryCounts>> {
+                let ids = message_ids.to_vec();
+                run!(self.read_query, |c| q::delivery_counts(c, &ids).await)
+            }
+
             async fn archive(&self, org_id: i64, query: &$crate::ArchiveQuery) -> $crate::Result<$crate::ArchivePage> {
                 let query = query.clone();
                 run!(self.read_query, |c| q::archive(c, org_id, &query).await)
@@ -3882,7 +3917,7 @@ macro_rules! impl_store_common {
                 run!(self.read, |c| q::presence(c, org_id, seat.as_deref()).await)
             }
 
-            async fn put_presence(&self, org_id: i64, recs: &[$crate::PresenceRec], ttl_ms: i64) -> $crate::Result<Vec<$crate::PresenceRec>> {
+            async fn put_presence(&self, org_id: i64, recs: &[$crate::PresenceRec], ttl_ms: i64) -> $crate::Result<$crate::PresenceStored> {
                 let recs = recs.to_vec();
                 run!(self.write, |c| q::put_presence(c, org_id, &recs, ttl_ms).await)
             }

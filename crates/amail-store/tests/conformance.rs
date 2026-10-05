@@ -1618,14 +1618,16 @@ async fn presence_store(s: S) {
             90_000,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .changed;
     assert_eq!(changed.len(), 1);
     assert_eq!(changed[0].since, now - 5000);
     // Same state again: no change, `since` kept, `updated_at` refreshed.
     let changed = s
         .put_presence(o.id, &[rec("a", SeatState::Busy, now)], 90_000)
         .await
-        .unwrap();
+        .unwrap()
+        .changed;
     assert!(changed.is_empty());
     let p = s.presence(o.id, Some("a")).await.unwrap();
     assert_eq!(p.len(), 1);
@@ -1634,13 +1636,15 @@ async fn presence_store(s: S) {
     let changed = s
         .put_presence(o.id, &[rec("a", SeatState::Idle, now)], 90_000)
         .await
-        .unwrap();
+        .unwrap()
+        .changed;
     assert_eq!(changed[0].state, SeatState::Idle);
     // A stale entry counts as absent: the same state is a change again.
     let changed = s
         .put_presence(o.id, &[rec("a", SeatState::Idle, now)], -1)
         .await
-        .unwrap();
+        .unwrap()
+        .changed;
     assert_eq!(changed.len(), 1);
     // A turn failure is stored and is a change.
     let mut failed = rec("a", SeatState::Idle, now);
@@ -1653,10 +1657,28 @@ async fn presence_store(s: S) {
     let changed = s
         .put_presence(o.id, &[failed.clone()], 90_000)
         .await
-        .unwrap();
+        .unwrap()
+        .changed;
     assert_eq!(changed.len(), 1);
     let p = s.presence(o.id, Some("a")).await.unwrap();
     assert_eq!(p[0].turn_failed, failed.turn_failed);
+    // A report without the failure clears it, also after the entry went
+    // stale; a report that keeps it, or a seat that never failed, does not.
+    let stored = s
+        .put_presence(o.id, &[failed.clone()], 90_000)
+        .await
+        .unwrap();
+    assert!(stored.turn_failures_cleared.is_empty());
+    let stored = s
+        .put_presence(o.id, &[rec("a", SeatState::Busy, now)], -1)
+        .await
+        .unwrap();
+    assert_eq!(stored.turn_failures_cleared, vec!["a".to_string()]);
+    let stored = s
+        .put_presence(o.id, &[rec("a", SeatState::Idle, now)], 90_000)
+        .await
+        .unwrap();
+    assert!(stored.turn_failures_cleared.is_empty());
     // Deleted seats have no presence; the system seat never shows.
     s.delete_seat(o.id, "a").await.unwrap();
     assert!(s.presence(o.id, None).await.unwrap().is_empty());

@@ -724,6 +724,7 @@ pub fn archive_response(
     p::ArchiveResponse {
         messages,
         next_before_id,
+        delivery: Vec::new(),
     }
 }
 

@@ -3,7 +3,7 @@
   import type { Row } from '../lib/tree';
   import type { Seat, SeatCounts, SeatState } from '../lib/types';
   import { SEAT_STATES } from '../lib/types';
-  import { KNOWN_ATTENTION, attentionTag, effectiveState, focusUntil, freshPresence, startingAtPrompt, stateAge } from '../lib/presence';
+  import { KNOWN_ATTENTION, focusUntil, seatStatus } from '../lib/presence';
   import { shortTime } from '../lib/time';
   import { t, ui } from '../lib/ui.svelte';
   import StateBadge from './StateBadge.svelte';
@@ -32,13 +32,14 @@
     onselect?: (name: string) => void;
   } = $props();
 
-  const seatState: SeatState = $derived(effectiveState(seat, now));
-  const p = $derived(freshPresence(seat.presence, now));
-  const age = $derived(stateAge(seat, now));
+  const status = $derived(seatStatus(seat, now));
+  const seatState: SeatState = $derived(status.state);
+  const p = $derived(status.presence);
+  const age = $derived(status.age);
   const isUser = $derived(seat.kind === 'user');
   const focus = $derived(focusUntil(seat, now));
   const hm = $derived([seat.harness ?? p?.harness, seat.model].filter(Boolean).join(' · '));
-  const tag = $derived(attentionTag(p));
+  const tag = $derived(status.tag);
   const attnLabel = $derived.by(() => {
     if (!tag) return null;
     return KNOWN_ATTENTION.includes(tag) ? t(`attn.${tag}` as 'attn.login') : tag;
@@ -46,8 +47,8 @@
   const attnTitle = $derived(
     p?.attention_hint ?? (p?.turn_failed ? t('flag.turnFailed.long', { reason: p.turn_failed.reason, n: p.turn_failed.count }) : t('flag.attention')),
   );
-  const failing = $derived(!!p?.turn_failed);
-  const starting = $derived(startingAtPrompt(p));
+  const failing = $derived(status.failing);
+  const starting = $derived(status.starting);
 </script>
 
 <div

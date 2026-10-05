@@ -326,6 +326,17 @@ pub struct PendingRec {
     pub focus_until: Option<i64>,
 }
 
+/// What storing a node's presence report changed (see
+/// [`crate::Store::put_presence`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PresenceStored {
+    /// The entries that changed or were absent, as stored.
+    pub changed: Vec<PresenceRec>,
+    /// Seats whose stored entry (stale or not) had a turn failure that the
+    /// report no longer has.
+    pub turn_failures_cleared: Vec<String>,
+}
+
 /// A seat's presence as reported by a node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PresenceRec {

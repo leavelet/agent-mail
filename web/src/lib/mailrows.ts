@@ -1,7 +1,7 @@
 // Rows of message lists, from the different list endpoints.
 
 import { reachedBy } from './delivery';
-import type { InboxEntry, MessageHeader, Priority, SearchHit, Source } from './types';
+import type { ArchiveResponse, DeliveryCounts, InboxEntry, MessageHeader, Priority, SearchHit, Source } from './types';
 
 export interface MailRow {
   id: number;
@@ -22,10 +22,19 @@ export interface MailRow {
   cls?: 'to' | 'cc';
   via?: string;
   snippet?: string;
+  /** Sent mail: how many of its deliveries are in each state. */
+  delivery?: DeliveryCounts;
 }
 
 export function fromHeader(m: MessageHeader): MailRow {
   return { ...m };
+}
+
+/** Rows of a page of sent mail, with the delivery counts the server sent
+ * (`GET /v1/sent?delivery=true`). */
+export function fromSent(r: ArchiveResponse): MailRow[] {
+  const counts = new Map((r.delivery ?? []).map((c) => [c.message_id, c]));
+  return r.messages.map((m) => ({ ...m, delivery: counts.get(m.id) }));
 }
 
 export function fromEntry(e: InboxEntry, isList: (address: string) => boolean = () => false): MailRow {

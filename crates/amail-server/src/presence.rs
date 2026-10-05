@@ -11,7 +11,7 @@
 //! announces the change, and through [`crate::cluster`] so do the others.
 
 use amail_proto::{Presence, PresenceEvent, PresenceUpdate};
-use amail_store::{PresenceRec, Store};
+use amail_store::{PresenceRec, PresenceStored, Store};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -56,14 +56,20 @@ fn fresh(r: &PresenceRec, now: i64) -> bool {
 }
 
 /// Merge reports into `prev` (seat -> entry); returns the entries that
-/// changed or were absent, as stored. The same rule as the store's.
+/// changed or were absent, as stored, and the seats whose turn failure the
+/// report cleared. The same rule as the store's.
 fn merge(
     prev: &mut HashMap<String, PresenceRec>,
     recs: Vec<PresenceRec>,
     now: i64,
-) -> Vec<PresenceRec> {
+) -> PresenceStored {
     let mut changed = Vec::new();
+    let mut turn_failures_cleared = Vec::new();
     for mut rec in recs {
+        if rec.turn_failed.is_none() && prev.get(&rec.seat).is_some_and(|p| p.turn_failed.is_some())
+        {
+            turn_failures_cleared.push(rec.seat.clone());
+        }
         let old = prev.get(&rec.seat).filter(|p| fresh(p, now));
         rec.updated_at = now;
         rec.since = match old {
@@ -75,7 +81,10 @@ fn merge(
         }
         prev.insert(rec.seat.clone(), rec);
     }
-    changed
+    PresenceStored {
+        changed,
+        turn_failures_cleared,
+    }
 }
 
 impl PresenceBoard {
@@ -123,14 +132,15 @@ impl PresenceBoard {
     }
 
     /// Apply a node's report (seats that are not live seats of the org are
-    /// dropped). Returns the seats whose presence changed; they have been
-    /// announced to this instance's subscribers.
+    /// dropped). Returns the seats whose presence changed (they have been
+    /// announced to this instance's subscribers) and the seats whose turn
+    /// failure the report cleared.
     pub async fn update(
         &self,
         org_id: i64,
         node: Option<&str>,
         updates: &[PresenceUpdate],
-    ) -> amail_store::Result<Vec<String>> {
+    ) -> amail_store::Result<(Vec<String>, Vec<String>)> {
         let now = amail_store::now_ms();
         let recs: Vec<PresenceRec> = updates
             .iter()
@@ -153,7 +163,7 @@ impl PresenceBoard {
                 turn_failed: u.turn_failed.clone(),
             })
             .collect();
-        let changed = if self.shared {
+        let stored = if self.shared {
             self.store.put_presence(org_id, &recs, ttl_ms()).await?
         } else {
             merge(
@@ -162,8 +172,11 @@ impl PresenceBoard {
                 now,
             )
         };
-        self.announce(org_id, &changed);
-        Ok(changed.into_iter().map(|r| r.seat).collect())
+        self.announce(org_id, &stored.changed);
+        Ok((
+            stored.changed.into_iter().map(|r| r.seat).collect(),
+            stored.turn_failures_cleared,
+        ))
     }
 
     fn announce(&self, org_id: i64, recs: &[PresenceRec]) {

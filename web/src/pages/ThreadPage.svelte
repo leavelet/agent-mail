@@ -1,8 +1,10 @@
 <script lang="ts">
   import Vis from '../components/Vis.svelte';
-  import { tick } from 'svelte';
+  import { onDestroy, tick } from 'svelte';
   import { get, del, enc } from '../lib/api';
-  import { t } from '../lib/ui.svelte';
+  import { t, ui } from '../lib/ui.svelte';
+  import { store } from '../lib/store.svelte';
+  import { threadFolder } from '../lib/nav';
   import { go, href } from '../lib/router.svelte';
   import type { DeleteMailResponse, ThreadResponse } from '../lib/types';
   import MessageCard from '../components/MessageCard.svelte';
@@ -13,15 +15,19 @@
   let note = $state<string | null>(null);
   let reload = $state(0);
   let deleting = $state(false);
+  /** Every message of the thread was deleted: there is nothing to load. */
+  let gone = $state(false);
 
   $effect(() => {
     const tid = id;
     void reload;
     data = null;
     error = null;
+    gone = false;
     get<ThreadResponse>(`/v1/threads/${enc(String(tid))}`)
       .then(async (r) => {
         data = r;
+        ui.thread = { id: tid, folder: threadFolder(r.messages, store.me?.seat, focus) };
         await tick();
         if (focus) document.querySelector(`article[data-msg="${focus}"]`)?.scrollIntoView({ block: 'center' });
       })
@@ -41,7 +47,13 @@
         deleted += r.deleted;
       } while (r.more);
       note = r.kept > 0 ? t('thread.deletedKept', { deleted, kept: r.kept }) : t('thread.deleted', { deleted });
-      reload++;
+      // Messages that stay are shown again; with none left the thread is
+      // gone and is not asked for again.
+      if (r.kept > 0) reload++;
+      else {
+        data = null;
+        gone = true;
+      }
     } catch (e) {
       note = e instanceof Error ? e.message : String(e);
     } finally {
@@ -49,12 +61,18 @@
     }
   }
 
+  onDestroy(() => {
+    if (ui.thread?.id === id) ui.thread = null;
+  });
+
   const participants = $derived(data ? [...new Set(data.messages.map((m) => m.from))] : []);
 </script>
 
 <div class="page thread">
   {#if note}<p class="faint">{note}</p>{/if}
-  {#if error}
+  {#if gone}
+    <p><a href={href(['archive'])}>{t('thread.toArchive')}</a></p>
+  {:else if error}
     <p class="error">{t('thread.notFound')} ({error})</p>
   {:else if !data}
     <p class="faint">{t('app.loading')}</p>

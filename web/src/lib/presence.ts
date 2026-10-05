@@ -60,6 +60,39 @@ export function startingAtPrompt(p: Presence | undefined): boolean {
   return !!p && p.state === 'offline' && !!p.attention && START_PROMPTS.includes(p.attention);
 }
 
+/** What the interface shows of a seat's state, in one place: the org row,
+ * the seat panel and the "needs you" seat card all take it from here. */
+export interface SeatStatus {
+  /** The node's report, if it is still valid. */
+  presence?: Presence;
+  state: SeatState;
+  /** Milliseconds in that state, if known. */
+  age?: number;
+  /** Offline at a prompt for a person: shown as starting. */
+  starting: boolean;
+  /** Its turns fail. */
+  failing: boolean;
+  /** The attention tag (see `attentionTag`). */
+  tag?: string;
+}
+
+export function seatStatus(seat: Seat, now: number): SeatStatus {
+  const p = freshPresence(seat.presence, now);
+  return {
+    presence: p,
+    state: p?.state ?? 'offline',
+    age: stateAge(seat, now),
+    starting: startingAtPrompt(p),
+    failing: !!p?.turn_failed,
+    tag: attentionTag(p),
+  };
+}
+
+/** The `.long` text of a status: what the state means. */
+export function stateLongKey(s: Pick<SeatStatus, 'state' | 'starting'>): `state.${SeatState | 'starting'}.long` {
+  return s.starting ? 'state.starting.long' : `state.${s.state}.long`;
+}
+
 /** Why node operations (sleep, wake) are unavailable, or null if they are. */
 export function nodeOpBlock(seat: Seat, now: number): 'user' | 'noPresence' | 'noNode' | null {
   if (seat.kind === 'user') return 'user';

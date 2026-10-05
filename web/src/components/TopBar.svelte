@@ -2,11 +2,15 @@
   import { store } from '../lib/store.svelte';
   import { t, ui } from '../lib/ui.svelte';
   import { href } from '../lib/router.svelte';
-  import { SEAT_STATES } from '../lib/types';
+  import { SEAT_STATES, type SeatState } from '../lib/types';
   import LangTheme from './LangTheme.svelte';
 
   const ov = $derived(store.overview);
   const needs = $derived(store.attention.length);
+  // Seats at a start prompt are offline for the server; they are shown as
+  // starting, as on their rows.
+  const starting = $derived(ov?.starting ?? 0);
+  const count = (s: SeatState) => (ov?.states[s] ?? 0) - (s === 'offline' ? starting : 0);
 </script>
 
 <header class="top">
@@ -16,10 +20,16 @@
     {#if ov}
       {#each SEAT_STATES as s}
         <a class="stat st-{s}" href={href(['org'], { state: s })} title={t(`state.${s}.long`)}>
-          <span class="dot" aria-hidden="true"></span><span class="num">{ov.states[s] ?? 0}</span>
+          <span class="dot" aria-hidden="true"></span><span class="num">{count(s)}</span>
           <span class="lbl">{t(`state.${s}`)}</span>
         </a>
       {/each}
+      {#if starting}
+        <a class="stat st-starting" href={href(['org'], { state: 'needs' })} title={t('state.starting.long')} data-testid="top-starting">
+          <span class="dot" aria-hidden="true"></span><span class="num">{starting}</span>
+          <span class="lbl">{t('state.starting')}</span>
+        </a>
+      {/if}
       {#if ov.turn_failed}
         <a class="stat failing" href={href(['org'], { state: 'needs' })} title={t('top.turnFailed.long')} data-testid="top-turn-failed">
           <span class="num">⚠ {ov.turn_failed}</span><span class="lbl">{t('top.turnFailed')}</span>
@@ -129,6 +139,9 @@
   }
   .st-dormant {
     --c: var(--st-dormant);
+  }
+  .st-starting {
+    --c: var(--st-awaiting);
   }
   .st-offline {
     --c: var(--st-offline);

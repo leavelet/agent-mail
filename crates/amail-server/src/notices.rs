@@ -16,6 +16,12 @@
 //! mails and [`NOTICE_BYTES_PER_DAY`] bytes of them in 24 hours (counted in
 //! the database), further reports are dropped, and notice mail is deleted
 //! after [`amail_proto::limits::NOTICE_RETENTION_DAYS`].
+//!
+//! A notice about failing turns names its seats in the mail's meta field
+//! [`TURN_FAILURES_META`]. When a presence report clears a seat's turn
+//! failure, [`turns_recovered`] marks such notices read for the user once
+//! none of their seats fails any more, so that they leave "needs you"; the
+//! mail stays in the mailbox and the archive.
 
 use crate::AppState;
 use crate::auth::Auth;
@@ -33,6 +39,18 @@ use amail_store::{NewDelivery, NewMessage};
 use axum::extract::State;
 use std::collections::HashSet;
 use std::str::FromStr;
+
+/// Meta field of a notice mail about failing turns: the names of the
+/// seats (of the org) it is about, separated by spaces.
+pub const TURN_FAILURES_META: &str = "turn_failures";
+
+/// Bytes of seat names kept in [`TURN_FAILURES_META`] (the whole meta of a
+/// message is at most [`amail_proto::limits::MAX_META_BYTES`]).
+const TURN_FAILURES_META_BYTES: usize = 2048;
+
+/// How many of the user's newest unread deliveries [`turns_recovered`]
+/// looks at.
+const RECOVERED_SCAN: i64 = 200;
 
 /// Values of a Codex seat's `git_access`.
 const GIT_ACCESS: &[&str] = &["worktree", "full", "off"];
@@ -444,6 +462,21 @@ pub async fn post(
         .map(|n| render(n, &host, &seats))
         .collect();
     let (subject, body) = compose(&sections, &host);
+    let mut meta = amail_proto::Meta::new();
+    let mut failing: Vec<&str> = Vec::new();
+    for n in &report.notices {
+        if let NodeNotice::TurnFailures { seat, .. } = n
+            && seats.contains(seat)
+            && !failing.contains(&seat.as_str())
+            && failing.iter().map(|s| s.len() + 1).sum::<usize>() + seat.len()
+                <= TURN_FAILURES_META_BYTES
+        {
+            failing.push(seat);
+        }
+    }
+    if !failing.is_empty() {
+        meta.insert(TURN_FAILURES_META.to_string(), failing.join(" "));
+    }
     // The org's daily budget, counted from the notice mail it holds; one
     // report at a time per instance, so that the count is not read twice
     // before a send.
@@ -475,7 +508,7 @@ pub async fn post(
             cc_addrs: Vec::new(),
             priority: Priority::Normal,
             ack_required: false,
-            meta: Default::default(),
+            meta,
             deliveries: vec![NewDelivery {
                 seat_id: user.id,
                 org_id: org,
@@ -503,6 +536,82 @@ pub async fn post(
         report.notices.len()
     );
     Ok(Json(NodeNoticesAccepted { sent: 1 }))
+}
+
+/// A presence report cleared the turn failure of the seats `cleared`: mark
+/// read the user's unread notices about failing turns (among its newest
+/// [`RECOVERED_SCAN`] unread deliveries) that name one of them, once no seat
+/// they name has a turn failure. Best effort: errors are logged.
+pub async fn turns_recovered(st: &AppState, org_id: i64, cleared: &[String]) {
+    if let Err(e) = mark_recovered(st, org_id, cleared).await {
+        tracing::warn!("org {org_id}: marking turn-failure notices read: {e}");
+    }
+}
+
+async fn mark_recovered(st: &AppState, org_id: i64, cleared: &[String]) -> amail_store::Result<()> {
+    if cleared.is_empty() {
+        return Ok(());
+    }
+    let Some(user) = st.store.user_seat(org_id).await? else {
+        return Ok(());
+    };
+    let entries = st
+        .store
+        .inbox(
+            user.id,
+            &amail_store::InboxQuery {
+                unread_only: true,
+                after_seq: None,
+                before_seq: Some(i64::MAX),
+                limit: RECOVERED_SCAN,
+            },
+        )
+        .await?;
+    let notices: Vec<(i64, Vec<&str>)> = entries
+        .iter()
+        .filter(|e| e.message.sender_kind == SeatKind::System)
+        .filter_map(|e| {
+            let names: Vec<&str> = e
+                .message
+                .meta
+                .get(TURN_FAILURES_META)?
+                .split_whitespace()
+                .collect();
+            names
+                .iter()
+                .any(|n| cleared.iter().any(|c| c == n))
+                .then_some((e.message.id, names))
+        })
+        .collect();
+    if notices.is_empty() {
+        return Ok(());
+    }
+    // Seats of a notice that still fail keep it unread.
+    let failing: HashSet<String> = st
+        .presence
+        .snapshot(org_id)
+        .await?
+        .into_iter()
+        .filter(|(_, p)| p.turn_failed.is_some())
+        .map(|(n, _)| n)
+        .collect();
+    let mut events = Vec::new();
+    for (id, names) in notices {
+        if names.iter().any(|n| failing.contains(*n)) {
+            continue;
+        }
+        if let Some((_, Some(bump))) = st.store.mark_read(id, user.id).await? {
+            events.push((user.name.clone(), bump.seq));
+        }
+    }
+    if !events.is_empty() {
+        tracing::info!(
+            "org {org_id}: {} turn-failure notice(s) marked read: the seats' turns work again",
+            events.len()
+        );
+        st.bus.publish(org_id, &events);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

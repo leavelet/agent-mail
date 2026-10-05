@@ -20,6 +20,7 @@ const en = {
   'nav.needs': 'Needs you',
   'nav.org': 'Org',
   'nav.inbox': 'Inbox',
+  'nav.sent': 'Sent',
   'nav.archive': 'Archive',
   'nav.compose': 'Compose',
   'nav.admin': 'Admin',
@@ -221,6 +222,7 @@ const en = {
   'dlv.read.long': "The full body was put into the agent's context (shown inline or fetched with amail read). This does not mean the agent handled it.",
   'dlv.acked.long': 'The agent acknowledged it (amail ack).',
   'dlv.queued.long': 'Delivered to the mailbox, not yet shown to the agent.',
+  'mail.dsum.long': "Delivery state of this message: how many recipients' copies are acked, read, notified or queued. Open the message and press Delivery for each recipient.",
 
   'meta.title': 'Fields',
   'meta.commit': 'commit',
@@ -234,6 +236,7 @@ const en = {
   'thread.confirmDelete':
     'Delete this thread for your org? This deletes mail from orgs that no longer exist and mail your org sent that no other org received. Mail exchanged with orgs that still exist stays.',
   'thread.deleted': 'Deleted {deleted} messages.',
+  'thread.toArchive': 'Go to the archive',
   'thread.deletedKept': 'Deleted {deleted} messages; {kept} stay (mail exchanged with orgs that still exist cannot be deleted).',
 
   'archive.title': 'Archive',
@@ -396,7 +399,9 @@ const en = {
   'data.notStored': "Not stored: agents' conversations in the seat view are relayed from your machine while you watch and kept only in memory. Agents run on your machines, not here.",
   'data.operator': "The server's operator sees org names, seat counts, mail volume and activity times, not mail or conversations, and can suspend or delete orgs.",
   'data.retention': 'Mail bodies older than {days} days are removed; headers stay for the threads.',
-  'data.noRetention': "Mail is kept until the org is deleted (by you or by the server's operator). Single messages cannot be deleted.",
+  'data.noRetention': "Mail is kept until you delete it or the org is deleted (by you or by the server's operator).",
+  'data.deleteMail':
+    "You can delete mail a thread at a time (Delete on the thread's page): the thread's mail that stayed inside your org, and mail from orgs that no longer exist. Mail exchanged with orgs that still exist cannot be deleted by either side. Single messages cannot be deleted.",
   'data.delete': 'You can delete your org with all its data at any time (Admin → Settings).',
 
   'settings.token': 'Your token',
@@ -476,6 +481,7 @@ const zh: Record<Key, string> = {
   'nav.needs': '等待你处理',
   'nav.org': '组织',
   'nav.inbox': '收件箱',
+  'nav.sent': '已发送',
   'nav.archive': '归档',
   'nav.compose': '写信',
   'nav.admin': '管理',
@@ -677,6 +683,7 @@ const zh: Record<Key, string> = {
   'dlv.read.long': '完整正文已进入 agent 的上下文（直接附带显示，或用 amail read 读取）。这不表示 agent 已经处理。',
   'dlv.acked.long': 'agent 已确认收到（amail ack）。',
   'dlv.queued.long': '已投递到邮箱，尚未显示给 agent。',
+  'mail.dsum.long': '这封邮件的投递状态：各收件席位的副本中，已确认、已读、已通知、已排队的数量。打开邮件并点“投递状态”可以看每个收件席位。',
 
   'meta.title': '字段',
   'meta.commit': '提交',
@@ -690,6 +697,7 @@ const zh: Record<Key, string> = {
   'thread.confirmDelete':
     '为本组织删除这个线程？会删除来自已不存在组织的邮件，以及本组织发出、没有其他组织收到的邮件。与仍存在的组织往来的邮件会保留。',
   'thread.deleted': '已删除 {deleted} 封邮件。',
+  'thread.toArchive': '前往归档',
   'thread.deletedKept': '已删除 {deleted} 封邮件；{kept} 封保留（与仍存在的组织往来的邮件不能删除）。',
 
   'archive.title': '归档',
@@ -852,7 +860,9 @@ const zh: Record<Key, string> = {
   'data.notStored': '不会保存：席位页面里 agent 的对话只在你查看时从你的机器转发，只放在内存里。agent 运行在你自己的机器上，不在这里。',
   'data.operator': '服务器运营者能看到组织名、席位数、邮件量和最近活动时间，看不到邮件和对话；运营者可以停用或删除组织。',
   'data.retention': '超过 {days} 天的邮件正文会被清除；邮件头保留，用于线程结构。',
-  'data.noRetention': '邮件会一直保留，直到 org 被删除（由你或服务器管理员删除）。不能删除单封邮件。',
+  'data.noRetention': '邮件会一直保留，直到你删除它，或 org 被删除（由你或服务器管理员删除）。',
+  'data.deleteMail':
+    '你可以按线程删除邮件（线程页面上的“删除”）：线程中只在本组织内部往来的邮件，以及来自已不存在的组织的邮件。与仍存在的组织往来的邮件双方都不能删除。不能删除单封邮件。',
   'data.delete': '你随时可以删除自己的组织及其全部数据（管理 → 设置）。',
 
   'settings.token': '你的令牌',
