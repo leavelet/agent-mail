@@ -57,11 +57,11 @@
     <thead>
       <tr>
         <th>{t('admin.org')}</th><th>{t('admin.state')}</th><th>{t('others.since')}</th>
-        <th title={t('others.openToYou.long')}>{t('others.openToYou')}</th><th title={t('others.youOpen.long')}>{t('others.youOpen')}</th><th></th>
+        <th title={t('others.openToYou.long')}>{t('others.openToYou')}</th><th title={t('others.youOpen.long')}>{t('others.youOpen')}</th><th>{t('others.primary')}</th><th></th>
       </tr>
     </thead>
     <tbody>
-      {#if store.links.length === 0}<tr><td colspan="6" class="faint">{t('others.none')}</td></tr>{/if}
+      {#if store.links.length === 0}<tr><td colspan="7" class="faint">{t('others.none')}</td></tr>{/if}
       {#each store.links as l (l.org)}
         <tr data-org={l.org}>
           <td>
@@ -72,6 +72,7 @@
           <td class="faint">{l.since ? shortTime(l.since, ui.now, ui.lang) : ''}</td>
           <td class="num">{#if l.state === 'active'}{store.peerCards.get(l.org)?.length ?? '…'}{:else}<span class="faint">—</span>{/if}</td>
           <td class="num">{#if l.state === 'active'}{youOpen(l.org)}{:else}<span class="faint">—</span>{/if}</td>
+          <td class="mono">{#if l.primary}{l.primary}{:else}<span class="faint">—</span>{/if}</td>
           <td class="acts">
             {#if l.state === 'invited'}<button class="small primary" onclick={() => act(() => post(`/v1/links/${enc(l.org)}/accept`))}>{t('admin.accept')}</button>{/if}
             <button class="small danger" onclick={() => end(l)}>{t(l.state === 'active' ? 'others.end' : l.state === 'invited' ? 'others.decline' : 'others.withdraw')}</button>

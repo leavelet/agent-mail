@@ -152,7 +152,7 @@
       <label><span>{t('settings.outbound')}</span>
         <select bind:value={outbound}>
           <option value="any-seat">{t('settings.outbound.any')}</option>
-          <option value="open-seats-only">{t('settings.outbound.open')}</option>
+          <option value="contacts-only">{t('settings.outbound.open')}</option>
         </select></label>
       <p class="faint hint">{t(outbound === 'any-seat' ? 'settings.outbound.any.long' : 'settings.outbound.open.long')}</p>
       <label><span>{t('settings.newThreads')}</span><input type="number" min="0" bind:value={newThreads} /></label>

@@ -4,7 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { expect, test, type Page } from '@playwright/test';
-import { api, login, pushPresence, SCREENSHOTS, state } from './env';
+import { api, contactInsteadOfUser, login, pushPresence, SCREENSHOTS, state } from './env';
 
 test.describe.configure({ mode: 'serial' });
 
@@ -98,7 +98,7 @@ for (const { theme, lang } of combos) {
 
     await page.goto(`${s.base}/#/orgs/${s.peer.org}`);
     await expect(page.getByTestId('open-to-you').locator('tr[data-card]').first()).toBeVisible();
-    await page.getByTestId('you-open').locator('select').selectOption('be-lead');
+    await page.getByTestId('you-open').locator('.add select').selectOption('be-lead');
     await page.getByTestId('you-open').getByTestId('open-add').click();
     await expect(page.getByTestId('preview-lines')).toBeVisible();
     await shot(page, 'peer-org', theme, lang);
@@ -120,11 +120,29 @@ for (const { theme, lang } of combos) {
     await expect(editor.getByTestId('preview-lines')).toBeVisible();
     await shot(page, 'seat-openings', theme, lang);
 
-    const masked = await api<{ entries: { message: { id: number; thread_id: number; subject: string } }[] }>(s.userToken, 'GET', '/inbox?seat=owner&limit=200');
-    const mm = masked.entries.map((e) => e.message).find((x) => x.subject === 'Billing API questions')!;
+    const inbox = await api<{ entries: { message: { id: number; thread_id: number; subject: string } }[] }>(s.userToken, 'GET', '/inbox?seat=owner&limit=200');
+    const mm = inbox.entries.map((e) => e.message).find((x) => x.subject === 'Billing API questions')!;
     await page.goto(`${s.base}/#/thread/${mm.thread_id}?m=${mm.id}`);
-    await expect(page.getByTestId('to-hidden')).toBeVisible();
-    await shot(page, 'thread-masked', theme, lang);
+    await expect(page.locator('.rcpt').first()).toContainText('quiet@globex');
+    await shot(page, 'thread-cross-org', theme, lang);
+
+    // Compose to another org while the user seat is not a contact: the
+    // contact the server will add is named before sending.
+    const restore = await contactInsteadOfUser();
+    try {
+      await page.goto(`${s.base}/#/compose?to=help%40globex`);
+      await page.locator('#c-subj').fill(lang === 'zh' ? '货币字段' : 'Currency fields');
+      await page.locator('#c-body').fill(lang === 'zh' ? '金额和币种，ISO 4217。' : 'amount and currency, ISO 4217.');
+      await expect(page.getByTestId('added-contact')).toBeVisible();
+      await page.waitForTimeout(800);
+      await expect(page.getByTestId('added-contact')).toBeVisible();
+      await shot(page, 'compose-added-contact', theme, lang);
+      await page.goto(`${s.base}/#/orgs/${s.peer.org}`);
+      await expect(page.getByTestId('primary-now')).toHaveText('be-lead');
+      await shot(page, 'peer-org-primary', theme, lang);
+    } finally {
+      await restore();
+    }
 
     for (const a of ['seats', 'lists', 'openings', 'tokens', 'settings']) {
       await page.goto(`${s.base}/#/admin/${a}`);

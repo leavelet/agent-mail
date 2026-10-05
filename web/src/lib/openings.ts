@@ -34,20 +34,6 @@ export function changeLines(changes: SightChange[]): ChangeLine[] {
   return out;
 }
 
-/** The number of addresses left out of To and Cc (null when none). */
-export function hiddenCount(m: { to_hidden?: number; cc_hidden?: number }, which: 'to' | 'cc' | 'all' = 'all'): number {
-  const to = m.to_hidden ?? 0;
-  const cc = m.cc_hidden ?? 0;
-  return which === 'to' ? to : which === 'cc' ? cc : to + cc;
-}
-
-/** The dictionary key of the masked-recipients text: `more` when some
- * addresses of the same field are shown ("and 3 recipients not shown"). */
-export function maskedKey(n: number, more: boolean): 'mail.hidden' | 'mail.hidden.more' | 'mail.hidden1' | 'mail.hidden1.more' {
-  if (n === 1) return more ? 'mail.hidden1.more' : 'mail.hidden1';
-  return more ? 'mail.hidden.more' : 'mail.hidden';
-}
-
 /** Orgs with an active link. */
 export function activeOrgs(links: Link[]): string[] {
   return links.filter((l) => l.state === 'active').map((l) => l.org);
@@ -91,4 +77,34 @@ export function orgOf(address: string): string | undefined {
  * waits for it). */
 export function audiences(links: Link[]): string[] {
   return ['linked', ...links.map((l) => l.org).sort()];
+}
+
+/** The orgs other than this one that a list of addresses reaches. */
+export function otherOrgs(addresses: string[]): string[] {
+  const out: string[] = [];
+  for (const a of addresses) {
+    const o = orgOf(a);
+    if (o && !out.includes(o)) out.push(o);
+  }
+  return out;
+}
+
+/** What a send preview says the server will add: each contact of this org
+ * added in Cc, with the other orgs on the message it stands for. */
+export function addedContacts(recipients: { address: string; added?: boolean }[], addresses: string[]): { seat: string; orgs: string[] }[] {
+  const orgs = otherOrgs(addresses);
+  return recipients.filter((r) => r.added).map((r) => ({ seat: r.address, orgs }));
+}
+
+/** The dictionary key explaining a send refused as a whole (by error code). */
+export function sendErrorKey(code: string): 'compose.err.listCrossOrg' | 'compose.err.noContact' | null {
+  if (code === 'list_on_cross_org') return 'compose.err.listCrossOrg';
+  if (code === 'no_contact') return 'compose.err.noContact';
+  return null;
+}
+
+/** Seats that are contacts of this org for `org`: open to it directly, to
+ * every linked org, or as contacts of an opened team. */
+export function contactsFor(seats: { name: string; open_to?: string[] }[], org: string): string[] {
+  return seats.filter((s) => (s.open_to ?? []).some((a) => a === 'linked' || a === org)).map((s) => s.name);
 }
