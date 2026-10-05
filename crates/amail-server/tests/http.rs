@@ -2065,8 +2065,10 @@ async fn ack_escalation(srv: Server) {
     let s = user.seat("s").await;
     let v = s
         .send(
+            // (3 s, and the step after it 3 s later: room for the checks
+            // between them on a loaded machine.)
             json!({ "to": ["w1", "w2"], "subject": "Please confirm", "body": "x",
-                      "ack_required": true, "ack_timeout_s": 1 }),
+                      "ack_required": true, "ack_timeout_s": 3 }),
         )
         .await;
     let id = v["id"].as_i64().unwrap();
@@ -2119,12 +2121,12 @@ async fn ack_escalation(srv: Server) {
     // Acknowledged in time: nothing is sent.
     let v = s
         .send(json!({ "to": ["w1"], "subject": "quick", "body": "x",
-                      "ack_required": true, "ack_timeout_s": 1 }))
+                      "ack_required": true, "ack_timeout_s": 3 }))
         .await;
     let id2 = v["id"].as_i64().unwrap();
     w1.ok(Method::POST, &format!("/messages/{id2}/ack"), None)
         .await;
-    tokio::time::sleep(Duration::from_millis(1800)).await;
+    tokio::time::sleep(Duration::from_millis(3800)).await;
     assert_eq!(s.inbox("").await.len(), 2);
     // A user sender with no lead in sight gets one notice; agents have no
     // budget for system mail (the sender's budget is untouched).
