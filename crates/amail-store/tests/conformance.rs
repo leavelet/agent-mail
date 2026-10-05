@@ -64,6 +64,7 @@ conformance!(
     system_seat_hidden,
     focus_and_digest_pending,
     search_steps_are_bounded,
+    grants_and_thread_peers,
 );
 
 async fn org(s: &S, name: &str) -> (Org, Seat) {
@@ -1892,4 +1893,105 @@ async fn search_steps_are_bounded(s: S) {
         .unwrap();
     assert_eq!(r.hits.len(), n);
     assert!(r.next_before_id.is_none());
+}
+
+/// Grants toward an org count only with an active link; a send records its
+/// sender as a participant for the other orgs that got it; ending the link
+/// forgets the participants of both orgs; teams open their contacts.
+async fn grants_and_thread_peers(s: S) {
+    use amail_store::{GrantFilter, GrantTarget, TeamChange};
+    let (a, _) = org(&s, "alpha").await;
+    let (b, ub) = org(&s, "bravo").await;
+    let x = seat(&s, a.id, "x").await;
+    let y = seat(&s, b.id, "y").await;
+    let toward_b = GrantFilter {
+        grantor: None,
+        audience: Some((b.id, "bravo".into())),
+    };
+    // The user seat's grant exists from the start, but not linked: none.
+    assert!(s.grants(&toward_b).await.unwrap().is_empty());
+    s.request_link(a.id, b.id, Some("hi")).await.unwrap();
+    assert!(s.grants(&toward_b).await.unwrap().is_empty());
+    s.accept_link(b.id, a.id).await.unwrap();
+    let g = s.grants(&toward_b).await.unwrap();
+    assert_eq!(g.len(), 1);
+    assert!(matches!(&g[0].target, GrantTarget::Seat(c) if c.name == "owner"));
+    // A named audience; a team with a contact.
+    s.add_grant(a.id, Some(x.id), None, Some("charlie"), false)
+        .await
+        .unwrap();
+    assert_eq!(s.grants(&toward_b).await.unwrap().len(), 1);
+    s.update_seat(
+        a.id,
+        "x",
+        &amail_store::SeatUpdate {
+            group: Some(Some("core".into())),
+            contact: Some(true),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let team = s
+        .put_team(a.id, "core", &TeamChange::default())
+        .await
+        .unwrap();
+    s.add_grant(a.id, None, Some(team.id), None, true)
+        .await
+        .unwrap();
+    let g = s.grants(&toward_b).await.unwrap();
+    assert_eq!(g.len(), 2);
+    match &g[1].target {
+        GrantTarget::Team { team, contacts } => {
+            assert_eq!(team.name, "core");
+            assert_eq!(contacts.len(), 1);
+            assert_eq!(contacts[0].name, "x");
+        }
+        t => panic!("{t:?}"),
+    }
+    assert!(g[1].managed);
+    // Participants.
+    let sent = s.send(&msg(a.id, x.id, "q", &[(&y, C::To)])).await.unwrap();
+    let p = s.thread_peers(b.id, &[sent.thread_id]).await.unwrap();
+    assert_eq!(p.len(), 1);
+    assert_eq!(p[0].card.name, "x");
+    assert_eq!(p[0].org_name, "alpha");
+    assert!(
+        s.thread_peers(a.id, &[sent.thread_id])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let mut r = msg(b.id, ub.id, "a", &[(&x, C::To)]);
+    r.thread_id = Some(sent.thread_id);
+    s.send(&r).await.unwrap();
+    assert_eq!(
+        s.thread_peers(a.id, &[sent.thread_id]).await.unwrap().len(),
+        1
+    );
+    assert_eq!(s.forget_thread_peers(b.id, &[x.id]).await.unwrap(), 1);
+    assert!(
+        s.thread_peers(b.id, &[sent.thread_id])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    s.revoke_link(a.id, b.id).await.unwrap();
+    assert!(
+        s.thread_peers(a.id, &[sent.thread_id])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(s.grants(&toward_b).await.unwrap().is_empty());
+    // Deleting the team removes its grant and the membership.
+    assert!(s.delete_team(a.id, "core").await.unwrap());
+    assert!(
+        s.seat_by_name(a.id, "x")
+            .await
+            .unwrap()
+            .unwrap()
+            .team_id
+            .is_none()
+    );
 }
