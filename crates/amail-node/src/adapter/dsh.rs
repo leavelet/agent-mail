@@ -297,6 +297,15 @@ impl Api {
             .context("dsh session/create returned no session id")
     }
 
+    /// Make `session` use `provider`'s `model` from its next request (dsh
+    /// refuses a model it does not offer).
+    pub async fn select_model(&self, session: &str, provider: &str, model: &str) -> Result<()> {
+        let req = json!({"sessionId": session, "provider": provider, "model": model});
+        self.call("session/selectModel", json!({"request": req}))
+            .await
+            .map(drop)
+    }
+
     /// Queue `text` for `session` (it starts a turn when the session is idle).
     pub async fn prompt(&self, session: &str, text: &str) -> Result<()> {
         let req = json!({
@@ -309,6 +318,12 @@ impl Api {
             .await
             .map(drop)
     }
+}
+
+/// A seat's dsh model `provider/model`; a bare name is a model of the
+/// DeepSeek API (`deepseek-official`).
+pub fn split_model(m: &str) -> (&str, &str) {
+    m.split_once('/').unwrap_or(("deepseek-official", m))
 }
 
 /// The paths of a seat's jail (see [`Dsh::jail_paths`]).
@@ -524,7 +539,7 @@ impl Dsh {
             "personaSuffix": suffix,
         }})];
         if let Some(m) = info.model.as_deref().filter(|m| !m.is_empty()) {
-            let (provider, model) = m.split_once('/').unwrap_or(("deepseek-official", m));
+            let (provider, model) = split_model(m);
             patch.push(json!({"id": "agent-default-model", "config": {
                 "provider": provider, "model": model,
             }}));
@@ -749,6 +764,9 @@ impl Adapter for Dsh {
                     args.extend([flag.to_string(), p]);
                 }
             }
+        }
+        if let Some(m) = info.model.as_deref().filter(|m| !m.is_empty()) {
+            args.extend(["--model".into(), m.to_string()]);
         }
         match ctx.resume {
             Some(id) => args.extend(["--resume".into(), id.to_string()]),

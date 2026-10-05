@@ -431,9 +431,9 @@ seat again, resuming its session; what the resumed session takes:
 
 | setting | Claude Code | Codex | dsh |
 |---|---|---|---|
-| model | yes (`--model` at each start) | yes (see below) | yes (the per-seat overlay is written at each start) |
+| model | yes (`--model` at each start) | yes (see below) | yes: a resumed dsh session keeps the model it had, so the wrapper selects the seat's model for it (`session/selectModel`; checked with dsh 0.2.0-rc.2). dsh refuses a model it does not offer; the session then keeps its model and the pane says so |
 | permission mode, `git_access` | yes | yes (see below) | yes |
-| role text | yes (the system prompt is given at each start) | no: it is part of the session's first prompt only | yes (overlay) |
+| role text | yes (the system prompt is given at each start) | no: it is part of the session's first prompt only | the overlay is written at each start (not checked with a resumed session) |
 | harness | a new session is started (a session cannot move to another harness) | | |
 
 Codex keeps a thread loaded in the shared app-server for a moment after

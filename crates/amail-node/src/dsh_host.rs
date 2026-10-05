@@ -32,6 +32,10 @@ pub struct HostArgs {
     pub resume: Option<String>,
     /// The first prompt of a new session.
     pub prompt: Option<String>,
+    /// The seat's model, `provider/model` (a bare name is a DeepSeek model):
+    /// selected for a resumed session (a new one takes it from the
+    /// overlay; a resumed one keeps the model it had).
+    pub model: Option<String>,
     /// The host command (`dsh web ...`).
     pub command: Vec<String>,
     /// Run the host in a bwrap jail (unattended seats).
@@ -442,6 +446,16 @@ async fn attach(a: &HostArgs, cwd: &str, origin: &str, token: &str) -> Result<St
     };
     ep.session = Some(session.clone());
     ep.write(&a.endpoint)?;
+    if a.resume.is_some()
+        && let Some(m) = a.model.as_deref().filter(|m| !m.is_empty())
+    {
+        let (provider, model) = crate::adapter::dsh::split_model(m);
+        if let Err(e) = api.select_model(&session, provider, model).await {
+            eprintln!(
+                "amail: the resumed session keeps its earlier model; selecting {m} failed: {e:#}"
+            );
+        }
+    }
     if a.resume.is_none()
         && let Some(p) = a.prompt.as_deref().filter(|p| !p.is_empty())
     {

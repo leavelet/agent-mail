@@ -214,6 +214,10 @@ enum Cmd {
         resume: Option<String>,
         #[arg(long)]
         prompt: Option<String>,
+        /// The seat's model (`provider/model`, or a DeepSeek model):
+        /// selected for a resumed session, which keeps its own otherwise.
+        #[arg(long)]
+        model: Option<String>,
         /// Run the host in a bwrap jail.
         #[arg(long)]
         jail: bool,
@@ -850,6 +854,7 @@ fn main() -> ExitCode {
         endpoint,
         resume,
         prompt,
+        model,
         jail,
         rw,
         ro,
@@ -863,6 +868,7 @@ fn main() -> ExitCode {
             endpoint: endpoint.clone(),
             resume: resume.clone(),
             prompt: prompt.clone(),
+            model: model.clone(),
             command: command.clone(),
             jail: *jail,
             rw: rw.clone(),
