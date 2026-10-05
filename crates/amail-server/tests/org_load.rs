@@ -466,6 +466,14 @@ async fn invisible_thread_costs_what_a_missing_one_does(b: Backend, t: &str) {
     // The owner sees it (its newest 500 messages).
     let v = owner_of.get(&format!("/threads/{thread}")).await;
     assert_eq!(v["messages"].as_array().unwrap().len(), 500);
+    // Both once first, so that neither is measured with cold caches (each
+    // SQLite connection of the read pool has its own page cache).
+    for path in [
+        format!("/threads/{thread}"),
+        "/threads/999999999".to_string(),
+    ] {
+        other.time(&path, StatusCode::NOT_FOUND).await;
+    }
     let hidden = other
         .time(&format!("/threads/{thread}"), StatusCode::NOT_FOUND)
         .await;
