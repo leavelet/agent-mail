@@ -241,6 +241,8 @@ export interface AddressResult {
   wakes?: number;
   /** Added by the server in Cc: this org's primary contact for another org on the message. */
   added?: boolean;
+  added_for?: string;
+  note?: string;
 }
 
 /** `POST /v1/messages/preview`: what sending would do; nothing is sent. */

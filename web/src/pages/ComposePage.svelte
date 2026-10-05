@@ -43,7 +43,7 @@
   // Before sending mail to another org: ask the server what it would do
   // (POST /v1/messages/preview), to say which contact of this org it adds
   // in Cc and which addresses it would refuse.
-  let preview = $state.raw<{ added: { seat: string; orgs: string[] }[]; rejected: SendPreview['rejected'] } | null>(null);
+  let preview = $state.raw<{ added: { seat: string; owner?: string; orgs: string[] }[]; rejected: SendPreview['rejected'] } | null>(null);
   let previewError = $state<string | null>(null);
   $effect(() => {
     const req = { to: parseAddresses(to), cc: parseAddresses(cc), subject: '', body: '', in_reply_to: replyTo?.id };
@@ -193,7 +193,7 @@
     {#if preview?.added.length || preview?.rejected.length || previewError}
       <div class="before" data-testid="send-preview">
         {#each preview?.added ?? [] as a}
-          <p class="added" data-testid="added-contact">{t('compose.added', { seat: a.seat, org: a.orgs.join(', ') })}</p>
+          <p class="added" data-testid="added-contact">{a.owner ? t('compose.addedTheirs', { seat: a.seat, owner: a.owner, org: a.orgs.join(', ') }) : t('compose.added', { seat: a.seat, org: a.orgs.join(', ') })}</p>
         {/each}
         {#each preview?.rejected ?? [] as r}
           <p class="error" data-rejected={r.address}>{t('compose.willReject', { address: r.address })} {reasonText(r.reason)}</p>

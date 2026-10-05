@@ -246,6 +246,8 @@ pub struct Reach<'a> {
     ours: HashMap<i64, OpenSet>,
     /// The thread's participants before this message: seat id -> org id.
     parts: Option<HashMap<i64, i64>>,
+    /// Contacts between two other orgs: (of, for) -> set.
+    pairs: HashMap<(i64, i64), OpenSet>,
 }
 
 impl<'a> Reach<'a> {
@@ -259,6 +261,7 @@ impl<'a> Reach<'a> {
             theirs: HashMap::new(),
             ours: HashMap::new(),
             parts: None,
+            pairs: HashMap::new(),
         }
     }
 
@@ -274,6 +277,25 @@ impl<'a> Reach<'a> {
         let b = self.st.store.link_active(self.org.id, org_id).await?;
         self.links.insert(org_id, b);
         Ok(b)
+    }
+
+    /// The contacts of `o` for `p` (what `o` opens to `p`).
+    pub async fn contacts_of(&mut self, o: &Org, p: &Org) -> ApiResult<&OpenSet> {
+        if o.id == self.org.id {
+            return self.ours(p).await;
+        }
+        if p.id == self.org.id {
+            return self.theirs(o).await;
+        }
+        let key = (o.id, p.id);
+        if !self.pairs.contains_key(&key) {
+            let set = sight(self.st, p, Some(o))
+                .await?
+                .remove(&o.name)
+                .unwrap_or_default();
+            self.pairs.insert(key, set);
+        }
+        Ok(&self.pairs[&key])
     }
 
     /// The contacts of `to` for the sender's org.

@@ -387,7 +387,7 @@ async fn run(backend: Backend) {
         "--urgent",
     ]);
     assert!(
-        s.contains("\ncc: owner (added: your org's contact for beta;"),
+        s.contains("\ncc: owner (added acme's contact owner: every message between acme and beta carries one of each)"),
         "{s}"
     );
     let iface = first_id(&s);

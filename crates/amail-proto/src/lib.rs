@@ -486,11 +486,20 @@ pub struct AddressResult {
     /// `archive` mode are not).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wakes: Option<u32>,
-    /// The server added this address (in `cc`): the sender's org's primary
-    /// contact for another org on the message, because no contact of the
-    /// sender's org was on it.
+    /// The server added this address (in `cc`): a contact of one org on the
+    /// message for another org on it, because none was on it (a contact
+    /// already in the thread, or the sender's org's primary contact).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub added: bool,
+    /// With `added`: the other org on the message this contact was added
+    /// for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added_for: Option<String>,
+    /// With `added`: why, in a sentence (for example "added acme's contact
+    /// liaison: every message between acme and globex carries one of
+    /// each").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

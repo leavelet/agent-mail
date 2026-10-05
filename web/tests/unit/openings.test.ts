@@ -31,9 +31,11 @@ describe('openings', () => {
   it('says before sending which contact the server adds', () => {
     const addrs = ['help@beta', 'docs', 'x@gamma', 'y@beta'];
     expect(otherOrgs(addrs)).toEqual(['beta', 'gamma']);
-    expect(addedContacts([{ address: 'help@beta' }, { address: 'lead', added: true }], addrs)).toEqual([{ seat: 'lead', orgs: ['beta', 'gamma'] }]);
+    expect(addedContacts([{ address: 'help@beta' }, { address: 'lead', added: true }], addrs)).toEqual([{ seat: 'lead', owner: undefined, orgs: ['beta', 'gamma'] }]);
+    // A contact of the other org already in the thread, added for this org.
+    expect(addedContacts([{ address: 'liaison@beta', added: true, added_for: 'acme' }], addrs)).toEqual([{ seat: 'liaison', owner: 'beta', orgs: ['acme'] }]);
     expect(addedContacts([{ address: 'help@beta' }], addrs)).toEqual([]);
-    expect(translate('en', 'compose.added', { seat: 'lead', org: 'beta' })).toBe("Your org's contact lead will be added in Cc for beta.");
+    expect(translate('en', 'compose.added', { seat: 'lead', org: 'beta' })).toBe("Your org's contact lead will be added in Cc: every message to beta carries a contact of each org.");
     expect(sendErrorKey('list_on_cross_org')).toBe('compose.err.listCrossOrg');
     expect(sendErrorKey('no_contact')).toBe('compose.err.noContact');
     expect(sendErrorKey('other')).toBeNull();

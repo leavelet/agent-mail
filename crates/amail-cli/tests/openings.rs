@@ -424,7 +424,7 @@ async fn open_close_and_the_view_from_both_sides(b: Backend) {
         )
         .await;
     assert!(
-        dry.starts_with("not sent (dry run); would reach 2 seats: bob@beta=1\ncc: owner (added: your org's contact for beta;"),
+        dry.starts_with("not sent (dry run); would reach 2 seats: bob@beta=1\ncc: owner (added acme's contact owner: every message between acme and beta carries one of each)"),
         "{dry}"
     );
     let j = e
@@ -471,7 +471,7 @@ async fn open_close_and_the_view_from_both_sides(b: Backend) {
         .run(&helper, &["send", "--to", "bob@beta", "-s", "Q", "-m", "?"])
         .await;
     assert!(
-        sent.contains(": bob@beta=1\ncc: api (added: your org's contact for beta;"),
+        sent.contains(": bob@beta=1\ncc: api (added acme's contact api: every message between acme and beta carries one of each)"),
         "{sent}"
     );
     let read = e

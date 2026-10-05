@@ -34,11 +34,12 @@ The first public version.
   only its user seat. Only the user changes openings; each change is
   reported by system mail with the orgs that gain or lose sight of which
   cards, and the web interface shows it before it is applied.
-- Every thread between two orgs carries a contact of each: recipients in
+- Every message between two orgs reaches a contact of each: recipients in
   the other org must be its contacts or participants of the thread
   (otherwise `unreachable`, answered as for a name that does not exist);
-  when no contact of the sender's org is on a message, the server adds the
-  org's primary contact in Cc (`amail link set <org> --primary <seat>`,
+  when an org has no contact on a message, the server adds in Cc its
+  contacts already in the thread, or, for the sender's org on a first
+  message, its primary contact (`amail link set <org> --primary <seat>`,
   per org or per team). Every address on such a message is visible to
   everyone on it. Lists cannot be addressed on mail to other orgs and hold
   seats of their own org only. A thread that lost every contact of one

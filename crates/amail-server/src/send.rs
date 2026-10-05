@@ -38,7 +38,7 @@ use amail_proto::{
     self as p, Address, AddressResult, DeliveryClass, DeliveryMode, PostPolicy, Priority,
     RecipientNote, Rejected, SeatKind, SeatState, SendRequest, SendResponse,
 };
-use amail_store::{NewDelivery, NewMessage, Org, Seat};
+use amail_store::{CardRec, NewDelivery, NewMessage, Org, Seat};
 use std::collections::HashMap;
 
 pub async fn send(st: &AppState, auth: &Auth, req: SendRequest) -> ApiResult<SendResponse> {
@@ -733,6 +733,8 @@ impl<'a> Resolver<'a> {
                 seats: count,
                 wakes,
                 added: false,
+                added_for: None,
+                note: None,
             });
         }
         Ok(())
@@ -770,41 +772,76 @@ impl<'a> Resolver<'a> {
                 "lists cannot be addressed on mail to other orgs: name the seats instead",
             ));
         }
-        for b in others {
-            let Some(peer) = self.orgs.values().flatten().find(|o| o.id == b).cloned() else {
-                continue;
-            };
-            let ours = self.reach.ours(&peer).await?.clone();
-            let on = ours.has_seat_id(self.sender.id)
-                || self.seats.keys().any(|id| ours.has_seat_id(*id));
-            if on {
-                continue;
+        // Every org on the message, the sender's first.
+        let mut orgs = vec![self.org.clone()];
+        for b in &others {
+            if let Some(o) = self.orgs.values().flatten().find(|o| o.id == *b) {
+                orgs.push(o.clone());
             }
-            let Some(c) = self.reach.primary(&peer).await? else {
-                return Err(ApiError::unprocessable(
-                    "no_contact",
-                    format!(
-                        "your org has no contact for {0}: mail to {0} must carry one of your org's seats that is open to it; the user can open one (amail open <seat> --to {0})",
-                        peer.name
-                    ),
-                ));
-            };
-            self.add(
-                c.id,
-                self.org.id,
-                &c.name,
-                DeliveryClass::Cc,
-                DeliveryMode::Immediate,
-            );
-            let canonical = format!("{}@{}", c.name, self.org.name);
-            if !self.cc_addrs.contains(&canonical) && !self.to_addrs.contains(&canonical) {
-                self.cc_addrs.push(canonical);
-                self.results.push(AddressResult {
-                    address: c.name.clone(),
-                    seats: 1,
-                    wakes: None,
-                    added: true,
-                });
+        }
+        let parts = self.reach.parts().await?.clone();
+        // For each pair: a contact of `o` for `p` must be on the message.
+        for o in orgs.clone() {
+            for p in orgs.iter().filter(|p| p.id != o.id) {
+                let contacts = self.reach.contacts_of(&o, p).await?.clone();
+                let on = (o.id == self.org.id && contacts.has_seat_id(self.sender.id))
+                    || self.seats.keys().any(|id| contacts.has_seat_id(*id));
+                if on {
+                    continue;
+                }
+                // Its contacts that already take part in the thread (all of
+                // them: they joined it to be on it), else, for the sender's
+                // org, its primary contact for `p`.
+                let mut add: Vec<CardRec> = contacts
+                    .seats
+                    .values()
+                    .filter(|c| parts.get(&c.id) == Some(&o.id))
+                    .cloned()
+                    .collect();
+                if add.is_empty() && o.id == self.org.id {
+                    match self.reach.primary(p).await? {
+                        Some(c) => add.push(c),
+                        None => {
+                            return Err(ApiError::unprocessable(
+                                "no_contact",
+                                format!(
+                                    "your org has no contact for {0}: mail to {0} must carry one of your org's seats that is open to it; the user can open one (amail open <seat> --to {0})",
+                                    p.name
+                                ),
+                            ));
+                        }
+                    }
+                }
+                for c in add {
+                    self.add(
+                        c.id,
+                        o.id,
+                        &c.name,
+                        DeliveryClass::Cc,
+                        DeliveryMode::Immediate,
+                    );
+                    let canonical = format!("{}@{}", c.name, o.name);
+                    if self.cc_addrs.contains(&canonical) || self.to_addrs.contains(&canonical) {
+                        continue;
+                    }
+                    self.cc_addrs.push(canonical);
+                    let address = Address {
+                        name: c.name.clone(),
+                        org: Some(o.name.clone()),
+                    }
+                    .relative_to(&self.org.name);
+                    self.results.push(AddressResult {
+                        note: Some(format!(
+                            "added {}'s contact {}: every message between {} and {} carries one of each",
+                            o.name, c.name, o.name, p.name
+                        )),
+                        address,
+                        seats: 1,
+                        wakes: None,
+                        added: true,
+                        added_for: Some(p.name.clone()),
+                    });
+                }
             }
         }
         Ok(())

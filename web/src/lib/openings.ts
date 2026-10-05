@@ -91,9 +91,22 @@ export function otherOrgs(addresses: string[]): string[] {
 
 /** What a send preview says the server will add: each contact of this org
  * added in Cc, with the other orgs on the message it stands for. */
-export function addedContacts(recipients: { address: string; added?: boolean }[], addresses: string[]): { seat: string; orgs: string[] }[] {
+export function addedContacts(
+  recipients: { address: string; added?: boolean; added_for?: string }[],
+  addresses: string[],
+): { seat: string; owner?: string; orgs: string[] }[] {
   const orgs = otherOrgs(addresses);
-  return recipients.filter((r) => r.added).map((r) => ({ seat: r.address, orgs }));
+  return recipients
+    .filter((r) => r.added)
+    .map((r) => {
+      const at = r.address.indexOf('@');
+      return {
+        seat: at < 0 ? r.address : r.address.slice(0, at),
+        // The org the added contact belongs to (undefined: your own).
+        owner: at < 0 ? undefined : r.address.slice(at + 1),
+        orgs: r.added_for ? [r.added_for] : orgs,
+      };
+    });
 }
 
 /** The dictionary key explaining a send refused as a whole (by error code). */

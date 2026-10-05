@@ -315,27 +315,28 @@ your primary contact for acme: owner (added in Cc when a seat that is not a cont
 ```
 
 A seat of globex that is not one of globex's contacts writes to `api`. Every
-thread between two orgs carries a contact of each, so the server adds
+message between two orgs reaches a contact of each, so the server adds
 globex's primary contact (by default its user seat, when it is open) in
 Cc; `--dry-run` shows it before sending:
 
 ```console
 [globex support] $ amail send --to api@acme -s "Parser limits" -m "What is the largest input the parser takes?"
 sent #5 thread 5 to 2 seats: api@acme=1
-cc: owner (added: your org's contact for acme; mail to another org always carries one)
+cc: owner (added globex's contact owner: every message between globex and acme carries one of each)
 [globex support] $ amail send --to dev@acme -s "Hi" -m "?"
 error: no_recipients: no recipient could be resolved
 rejected dev@acme: unreachable
 ```
 
 `dev` is not open: the answer is the same as for a name that does not
-exist. `api` answers everyone on the message; `support` is now a
-participant of that thread, so `api` may answer it there, but cannot start
-a new thread to it:
+exist. `support` is now a participant of that thread, so `api` may answer
+it there, but cannot start a new thread to it. When `api` answers only
+`support`, globex's contact in the thread is added again:
 
 ```console
-[acme api] $ amail reply 5 --all -m "16 MB per file."
-sent #8 thread 5 to 2 seats: support@globex=1 owner@globex=1
+[acme api] $ amail reply 5 -m "16 MB per file."
+sent #8 thread 5 to 2 seats: support@globex=1
+cc: owner@globex (added globex's contact owner: every message between globex and acme carries one of each)
 [acme api] $ amail send --to support@globex -s "New thread" -m "?"
 rejected support@globex: unreachable
 ```

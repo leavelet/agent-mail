@@ -43,6 +43,7 @@ m7_tests!(
     descriptions_and_cards,
     peer_org_view,
     contact_added_and_participants,
+    every_message_carries_contacts,
     primary_contacts,
     thread_closes_without_contacts,
     outbound_contacts_only,
@@ -698,6 +699,119 @@ async fn contact_added_and_participants(srv: Server) {
     assert!(!b.notices().await.iter().any(|s| s.contains("takes part")));
 }
 
+/// The invariant holds per message: a reply that names only a
+/// non-contact of the other org gets that org's contacts already in the
+/// thread added in Cc (all of them), in both directions, and the answer
+/// says for which other org (`added_for`) and why.
+async fn every_message_carries_contacts(srv: Server) {
+    let a = srv.org("alpha").await;
+    let b = srv.org("bravo").await;
+    let x = a.seat("x").await;
+    a.seat("c2").await;
+    let o = b.seat("o").await;
+    let q = b.seat("q").await;
+    a.link(&b, "bravo", "alpha").await;
+    b.open("o", None).await;
+    a.open("c2", None).await;
+    let added = |v: &Value| {
+        let mut out: Vec<(String, String)> = v["recipients"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["added"] == true)
+            .map(|r| {
+                (
+                    r["address"].as_str().unwrap().to_string(),
+                    r["added_for"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    };
+    // x (no contact) writes to o: alpha's primary contact (the user seat).
+    let first = x
+        .send(json!({ "to": ["o@bravo"], "subject": "q", "body": "" }))
+        .await;
+    assert_eq!(
+        added(&first),
+        vec![("owner".to_string(), "bravo".to_string())]
+    );
+    let first = first["id"].as_i64().unwrap();
+    // o answers x only: alpha's contact in the thread (owner) is added.
+    let r = o
+        .send(json!({ "to": ["x@alpha"], "subject": "a", "body": "", "in_reply_to": first }))
+        .await;
+    assert_eq!(
+        added(&r),
+        vec![("owner@alpha".to_string(), "bravo".to_string())]
+    );
+    assert!(
+        r.to_string().contains(
+            "added alpha's contact owner: every message between alpha and bravo carries one of each"
+        ),
+        "{r}"
+    );
+    let h = x
+        .ok(Method::GET, &format!("/messages/{}", r["id"]), None)
+        .await["message"]
+        .clone();
+    assert_eq!(h["cc"], json!(["owner"]), "{h}");
+    // The preview says the same before sending.
+    let pv = o
+        .ok(
+            Method::POST,
+            "/messages/preview",
+            Some(json!({ "to": ["x@alpha"], "subject": "a", "body": "", "in_reply_to": first })),
+        )
+        .await;
+    assert_eq!(
+        added(&pv),
+        vec![("owner@alpha".to_string(), "bravo".to_string())]
+    );
+    // o introduces its colleague q; x answers q only: bravo's contact o is
+    // added for alpha, and alpha's for bravo.
+    let intro = o
+        .sent(json!({ "to": ["x@alpha"], "cc": ["q", "owner@alpha"], "subject": "b", "body": "", "in_reply_to": r["id"] }))
+        .await;
+    let r2 = x
+        .send(json!({ "to": ["q@bravo"], "subject": "c", "body": "", "in_reply_to": intro }))
+        .await;
+    assert_eq!(
+        added(&r2),
+        vec![
+            ("o@bravo".to_string(), "alpha".to_string()),
+            ("owner".to_string(), "bravo".to_string()),
+        ]
+    );
+    // q answers x only: alpha's contact in the thread is added, and q
+    // being no contact of bravo, bravo's contact o too.
+    let r3 = q
+        .send(json!({ "to": ["x@alpha"], "subject": "d", "body": "", "in_reply_to": r2["id"] }))
+        .await;
+    assert_eq!(
+        added(&r3),
+        vec![
+            ("o".to_string(), "alpha".to_string()),
+            ("owner@alpha".to_string(), "bravo".to_string()),
+        ]
+    );
+    // Two contacts of alpha on a thread: both are added.
+    let t2 = x
+        .sent(json!({ "to": ["o@bravo"], "cc": ["c2", "owner"], "subject": "t2", "body": "" }))
+        .await;
+    let r4 = o
+        .send(json!({ "to": ["x@alpha"], "subject": "e", "body": "", "in_reply_to": t2 }))
+        .await;
+    assert_eq!(
+        added(&r4),
+        vec![
+            ("c2@alpha".to_string(), "bravo".to_string()),
+            ("owner@alpha".to_string(), "bravo".to_string()),
+        ]
+    );
+}
+
 /// The primary contact: the team's, else the org's (set per linked org),
 /// else the user seat if open, else the seat opened first. With no contact
 /// at all the send is refused with a reason that says so.
@@ -852,6 +966,11 @@ async fn thread_closes_without_contacts(srv: Server) {
         assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
         assert_eq!(v["error"]["rejected"][0]["reason"], "not_linked");
     }
+    // Linked again: the thread goes on (each org still has a contact on
+    // it: alpha's user seat, added on the first message, and o).
+    a.link(&b, "bravo", "alpha").await;
+    x.send(json!({ "to": ["o@bravo"], "subject": "again", "body": "", "in_reply_to": r }))
+        .await;
 }
 
 /// `outbound = contacts-only`: only the user and the org's contacts for the

@@ -117,7 +117,7 @@ test('compose says before sending which contact of your org is added in Cc', asy
     await login(page, s.userToken, { lang: 'en' });
     await page.goto(`${s.base}/#/compose`);
     await page.locator('#c-to').fill('help@globex');
-    await expect(page.getByTestId('added-contact')).toHaveText("Your org's contact be-lead will be added in Cc for globex.");
+    await expect(page.getByTestId('added-contact')).toHaveText("Your org's contact be-lead will be added in Cc: every message to globex carries a contact of each org.");
     // A list on mail to another org is refused, before sending too.
     await page.locator('#c-cc').fill('leads');
     await expect(page.getByTestId('send-preview')).toContainText('Lists cannot be addressed on mail to other orgs; name the seats instead.');
@@ -127,7 +127,8 @@ test('compose says before sending which contact of your org is added in Cc', asy
     await page.locator('#c-body').fill('amount and currency, ISO 4217.');
     await page.getByRole('button', { name: /^Send/ }).click();
     const receipt = page.getByTestId('send-receipt');
-    await expect(receipt.locator('li[data-address="be-lead"]')).toContainText('added: your contact');
+    await expect(receipt.locator('li[data-address="be-lead"]')).toContainText('added');
+    await expect(receipt.getByTestId('added-note')).toContainText("added acme's contact be-lead: every message between acme and globex carries one of each");
     // Nothing is added when the user seat is itself a contact again.
   } finally {
     await restore();

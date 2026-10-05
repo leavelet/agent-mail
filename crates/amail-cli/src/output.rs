@@ -473,10 +473,13 @@ fn recipient_notes(recipients: &[p::AddressResult], rejected: &[p::Rejected]) ->
         _ => "for the other org".to_string(),
     };
     for a in recipients.iter().filter(|a| a.added) {
-        out.push_str(&format!(
-            "\ncc: {} (added: your org's contact {whom}; mail to another org always carries one)",
-            l(&a.address)
-        ));
+        match &a.note {
+            Some(n) => out.push_str(&format!("\ncc: {} ({})", l(&a.address), l(n))),
+            None => out.push_str(&format!(
+                "\ncc: {} (added: your org's contact {whom}; mail to another org always carries one)",
+                l(&a.address)
+            )),
+        }
     }
     for rej in rejected {
         out.push_str(&format!(

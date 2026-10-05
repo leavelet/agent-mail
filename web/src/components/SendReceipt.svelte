@@ -21,7 +21,7 @@
   <ul class="addrs">
     {#each r.recipients as a}
       <li data-address={a.address}>
-        <span class="mono"><Vis text={a.address} /></span>{#if a.added} <span class="chip neutral" data-testid="added" title={t('compose.receipt.added.long')}>{t('compose.receipt.added')}</span>{/if}:
+        <span class="mono"><Vis text={a.address} /></span>{#if a.added} <span class="chip neutral" data-testid="added" title={a.note ?? t('compose.receipt.added.long')}>{t('compose.receipt.added')}</span>{#if a.note} <span class="muted" data-testid="added-note">{a.note}</span>{/if}{/if}:
         {#if a.wakes !== undefined}
           <span title={t('compose.receipt.listWakes.long')}>{t('compose.receipt.listWakes', { n: a.seats, w: a.wakes })}</span>
         {:else}

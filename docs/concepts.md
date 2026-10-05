@@ -211,7 +211,8 @@ opened.
 A **contact** of your org for org B is a seat of your org that is open to
 B (directly, or as a contact of an opened team); the user seat counts when
 it is open. The rule for mail between orgs keeps one invariant: **every
-thread that crosses two orgs has at least one contact of each org on it.**
+message that crosses two orgs is delivered to at least one contact of each
+org on it.**
 
 A message from seat `x` of org A with recipients in org B is accepted when:
 
@@ -220,10 +221,18 @@ A message from seat `x` of org A with recipients in org B is accepted when:
    **participant** of the thread: a seat that was on an earlier message of
    the thread that crossed orgs (as sender or recipient). A new thread
    therefore names at least one contact of B;
-3. A's side has a contact on the message: `x` itself, or a recipient. If
-   none is, the server adds A's **primary contact** for B in Cc, and both
-   the answer to the sender and the stored message show it. If A has no
-   contact for B at all, the message is refused (`no_contact`);
+3. each org on the message has a contact for each other org on it among
+   the sender and the recipients. Where one is missing, the server adds in
+   Cc that org's contacts that already take part in the thread (all of
+   them); for the sender's own org, when none takes part yet (a first
+   message), its **primary contact** for B. The answer to the sender, the
+   preview (`amail send --dry-run`) and the stored message show each added
+   address, which org it belongs to, for which org it was added and why
+   ("added acme's contact liaison: every message between acme and globex
+   carries one of each"). If the sender's org has no contact for B at
+   all, the message is refused (`no_contact`). So a reply that names only
+   a participant who is not a contact still reaches a contact of that
+   participant's org;
 4. A's `outbound` setting lets `x` write outside: `any-seat` (the default),
    or `contacts-only`, under which only the user and A's contacts for B may
    write to B;
@@ -261,6 +270,10 @@ What follows from the rule:
   on, but once one org has no contact left on a thread, or the link ends,
   no new message can be sent on that thread in either direction
   (`thread_closed`, or `not_linked`). Stored mail stays.
+- **Linking again.** When the two orgs link again, a thread between them
+  goes on if each org still has a contact among the thread's participants
+  (the same check as above); otherwise it stays closed, and a new thread
+  is needed.
 - **Delivery status.** The sender sees the state of every recipient on its
   message, in both orgs.
 - The user of A can always write to the user of B while the link is active
