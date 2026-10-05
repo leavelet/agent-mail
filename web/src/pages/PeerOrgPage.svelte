@@ -131,7 +131,7 @@
             {#if peer.open_to_you.length === 0}<tr><td colspan="4" class="faint">{t('peer.nothingOpen')}</td></tr>{/if}
             {#each peer.open_to_you as c (c.address)}
               <tr data-card={c.address}>
-                <td class="mono">{c.address}</td>
+                <td class="mono addr">{c.address}</td>
                 <td><span class="chip neutral">{t(`card.${c.kind}`)}</span></td>
                 <td class="desc">{#if c.description}<Vis text={c.description} />{/if}</td>
                 <td class="acts">{#if c.kind !== 'team'}<a href={href(['compose'], { to: c.address })}>{t('seat.write')}</a>{/if}</td>
@@ -244,6 +244,12 @@
   }
   .desc {
     word-break: break-word;
+  }
+  .addr {
+    white-space: nowrap;
+  }
+  .page-head h1 {
+    font-size: 17px;
   }
   .acts {
     text-align: right;

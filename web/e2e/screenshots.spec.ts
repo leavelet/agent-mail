@@ -91,7 +91,42 @@ for (const { theme, lang } of combos) {
     await page.locator('#c-cc').focus();
     await shot(page, 'compose', theme, lang);
 
-    for (const a of ['seats', 'lists', 'links', 'tokens', 'settings']) {
+    // Other orgs, openings, teams, masked recipients.
+    await page.goto(`${s.base}/#/orgs`);
+    await expect(page.locator(`[data-testid="links-table"] tr[data-org="${s.peer.org}"]`)).toBeVisible();
+    await shot(page, 'others', theme, lang);
+
+    await page.goto(`${s.base}/#/orgs/${s.peer.org}`);
+    await expect(page.getByTestId('open-to-you').locator('tr[data-card]').first()).toBeVisible();
+    await page.getByTestId('you-open').locator('select').selectOption('be-lead');
+    await page.getByTestId('you-open').getByTestId('open-add').click();
+    await expect(page.getByTestId('preview-lines')).toBeVisible();
+    await shot(page, 'peer-org', theme, lang);
+
+    await page.goto(`${s.base}/#/admin/openings`);
+    await page.getByTestId('grant-target').selectOption('backend');
+    await page.getByTestId('open-add').click();
+    await expect(page.getByTestId('preview-lines')).toBeVisible();
+    await shot(page, 'openings-preview', theme, lang);
+
+    await page.goto(`${s.base}/#/teams/backend`);
+    await expect(page.getByTestId('team-form')).toBeVisible();
+    await shot(page, 'teams', theme, lang);
+
+    await page.goto(`${s.base}/#/org/be-lead`);
+    const editor = page.locator('[data-testid="openings-editor"][data-target="be-lead"]');
+    await editor.getByRole('combobox').selectOption(s.peer.org);
+    await editor.getByTestId('open-add').click();
+    await expect(editor.getByTestId('preview-lines')).toBeVisible();
+    await shot(page, 'seat-openings', theme, lang);
+
+    const masked = await api<{ entries: { message: { id: number; thread_id: number; subject: string } }[] }>(s.userToken, 'GET', '/inbox?seat=owner&limit=200');
+    const mm = masked.entries.map((e) => e.message).find((x) => x.subject === 'Billing API questions')!;
+    await page.goto(`${s.base}/#/thread/${mm.thread_id}?m=${mm.id}`);
+    await expect(page.getByTestId('to-hidden')).toBeVisible();
+    await shot(page, 'thread-masked', theme, lang);
+
+    for (const a of ['seats', 'lists', 'openings', 'tokens', 'settings']) {
       await page.goto(`${s.base}/#/admin/${a}`);
       await page.waitForTimeout(300);
       await shot(page, `admin-${a}`, theme, lang);

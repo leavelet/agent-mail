@@ -143,6 +143,8 @@
     overflow: hidden;
   }
   .seatname {
+    flex: none;
+    max-width: 70%;
     font-size: 12.5px;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -244,6 +246,9 @@
     --bgc: var(--accent-weak);
   }
   @container tree (max-width: 720px) {
+    .desc {
+      display: none;
+    }
     .trow {
       grid-template-columns: minmax(140px, 1fr) 118px minmax(0, 150px) 60px;
     }

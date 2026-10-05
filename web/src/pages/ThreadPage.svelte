@@ -5,6 +5,7 @@
   import { t, ui } from '../lib/ui.svelte';
   import { store } from '../lib/store.svelte';
   import { threadFolder } from '../lib/nav';
+  import { visible } from '../lib/visible';
   import { go, href } from '../lib/router.svelte';
   import type { DeleteMailResponse, ThreadResponse } from '../lib/types';
   import MessageCard from '../components/MessageCard.svelte';
@@ -65,6 +66,11 @@
     if (ui.thread?.id === id) ui.thread = null;
   });
 
+  // Descriptions of the other org's seats that wrote here (their cards).
+  const cardOf = (a: string) => {
+    const d = data?.participants?.find((c) => c.address === a)?.description;
+    return d ? visible(d) : undefined;
+  };
   const participants = $derived(data ? [...new Set(data.messages.map((m) => m.from))] : []);
 </script>
 
@@ -81,7 +87,7 @@
       <h1>{#if data.messages[0]?.subject}<Vis text={data.messages[0].subject} />{:else}{t('mail.noSubject')}{/if}</h1>
       <span class="faint">{t('thread.title', { id: data.thread_id })} · {t('thread.messages', { n: data.messages.length })}</span>
       <span class="spacer"></span>
-      <span class="parts">{#each participants as p}<a class="mono chip neutral" href={p.includes('@') ? undefined : href(['org', p])}>{p}</a>{/each}</span>
+      <span class="parts">{#each participants as p}<a class="mono chip neutral" title={cardOf(p)} href={p.includes('@') ? undefined : href(['org', p])}>{p}</a>{/each}</span>
       <button class="small danger" disabled={deleting} onclick={remove}>{t('thread.delete')}</button>
     </div>
     <div class="msgs">
