@@ -279,12 +279,16 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
     let in_file: BTreeSet<&str> = t.seats.iter().map(|s| s.name.as_str()).collect();
     // Supervised seats that were deleted on the server (e.g. with `amail
     // seat rm` on another host): the node stops them and drops them.
-    let gone: Vec<String> = rows
+    let mut gone: Vec<String> = rows
         .iter()
         .filter(|r| !in_file.contains(r.seat.as_str()) && !by_name.contains_key(r.seat.as_str()))
         .map(|r| r.seat.clone())
         .collect();
-    if !gone.is_empty() && node_serves(c) {
+    // A node that works for another server keeps its seats.
+    if !gone.is_empty() && !node_serves(c) {
+        gone.clear();
+    }
+    if !gone.is_empty() {
         node(
             &Request::Forget {
                 seats: gone.clone(),
