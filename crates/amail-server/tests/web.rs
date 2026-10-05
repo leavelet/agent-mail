@@ -648,12 +648,22 @@ async fn webhook_on_user_mail(srv: Server) {
     acme.ok(Method::POST, "/links", Some(json!({ "org": "beta" })))
         .await;
     beta.ok(Method::POST, "/links/acme/accept", None).await;
-    x.send(json!({ "to": ["owner@acme"], "subject": "hello from beta", "body": "" }))
+    // (A seat of beta that is not open to acme is counted, not named.)
+    beta.ok(
+        Method::POST,
+        "/seats",
+        Some(json!({ "name": "y-internal" })),
+    )
+    .await;
+    x.send(json!({ "to": ["owner@acme"], "cc": ["y-internal"], "subject": "hello from beta", "body": "" }))
         .await;
     let v = wait_for(&got, 2).await;
     assert_eq!(v.len(), 2);
     assert_eq!(v[1]["message"]["from"], "x@beta");
     assert_eq!(v[1]["message"]["source"], "external");
+    assert_eq!(v[1]["message"]["cc"], json!([]), "{:?}", v[1]);
+    assert_eq!(v[1]["message"]["cc_hidden"], 1, "{:?}", v[1]);
+    assert!(!v[1].to_string().contains("y-internal"), "{:?}", v[1]);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(got.lock().unwrap().len(), 2);
     // Cleared: no more notices.
