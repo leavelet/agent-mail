@@ -51,6 +51,7 @@ node_tests!(
     transcript_paths_are_checked,
     open_policy_serves_sessions_and_reports_them,
     setting_changes_are_reported_once,
+    lost_mailbox_event_is_recovered_at_turn_end,
 );
 
 use amail_store::testutil::Backend;
@@ -2303,4 +2304,66 @@ async fn setting_changes_are_reported_once(b: Backend) {
         "{st}"
     );
     assert_eq!(st["local_policy_source"], "default", "{st}");
+}
+
+/// An event bus that loses every mailbox event of seat `lost` (like a
+/// dropped stream, or another server instance that died before passing its
+/// events on).
+struct LossyBus(amail_server::events::Hub);
+
+impl amail_server::events::EventBus for LossyBus {
+    fn publish(&self, org_id: i64, events: &[(String, i64)]) {
+        let kept: Vec<(String, i64)> = events
+            .iter()
+            .filter(|(seat, _)| seat != "lost")
+            .cloned()
+            .collect();
+        self.0.publish(org_id, &kept);
+    }
+    fn subscribe(
+        &self,
+        org_id: i64,
+        last_event_id: Option<&str>,
+    ) -> amail_server::events::Subscription {
+        self.0.subscribe(org_id, last_event_id)
+    }
+    fn close_org(&self, org_id: i64) {
+        self.0.close_org(org_id)
+    }
+}
+
+/// A seat's mailbox event is lost. When the seat's turn ends (Stop) the node
+/// asks the server for the seat's pending count again and wakes it, instead
+/// of noticing the mail at the next full resync (30 s later).
+async fn lost_mailbox_event_is_recovered_at_turn_end(b: Backend) {
+    let opts = Opts {
+        wake_window: Duration::from_millis(100),
+        server_tweak: Some(|s| s.bus = Arc::new(LossyBus(amail_server::events::Hub::new()))),
+        ..Default::default()
+    };
+    let Some(h) = setup(b, "lost_mailbox_event_is_recovered_at_turn_end", opts).await else {
+        return;
+    };
+    h.seat("lost", "claude").await;
+    let inbox = FakeInbox::start(h.dir.path().join("cc.sock"), None);
+    let env = claude_env("lost", &inbox.path);
+    // (No SessionStart: it makes the node look at the seat's count too.)
+    h.hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    // Mail arrives during the turn; its event never reaches the node.
+    h.api.send(&["lost"], &[], "while busy", false).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(h.seat_status("lost").await["pending"]["to"], 0);
+    // The turn ends: the node looks again and wakes the seat for the mail.
+    h.hook("claude", env.clone(), claude("Stop")).await;
+    let t0 = Instant::now();
+    while inbox.count() == 0 {
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "no wake-up after the turn ended; node status: {}",
+            h.status().await
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(h.seat_status("lost").await["pending"]["to"], 1);
 }

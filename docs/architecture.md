@@ -35,7 +35,9 @@ server (so it works behind NAT), keeps one event stream open for the whole
 org, and serves the local hook clients over a Unix socket. It:
 
 - keeps per-seat counts of pending mail in memory, refreshed from mailbox
-  events (and fully every 30 seconds), so most hooks are answered without a
+  events (and fully every 30 seconds; a seat's count also when its session
+  starts and when a turn ends with nothing to show, so that a lost event
+  delays its mail only until then), so most hooks are answered without a
   server call;
 - claims mail on the server when a hook can show it;
 - wakes idle sessions through the harness's own interface;

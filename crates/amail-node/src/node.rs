@@ -1551,12 +1551,21 @@ impl Node {
             }
             let mut plan = Plan::default();
             let now = now_ms();
+            // When a session starts or a turn ends with nothing to show, the
+            // seat's pending count is fetched again: a mailbox event lost on
+            // the way (a dropped stream, another server instance that died
+            // before telling the others) would otherwise leave the seat's
+            // mail unnoticed until the next full resync, 30 s later. The
+            // seat is woken when the answer shows mail.
+            let mut recheck = false;
             match &hook.event {
                 Event::SessionStart { source } => {
                     if let Some(s) = adapter.session_start_state(source) {
                         st.set_state(seat, s);
                     }
                     plan.summary = connected;
+                    // Ask the server again (see `recheck_pending`).
+                    recheck = true;
                 }
                 Event::UserPromptSubmit { .. } => {
                     st.set_state(seat, SeatState::Busy);
@@ -1605,6 +1614,7 @@ impl Node {
                     } else {
                         st.set_state(seat, SeatState::Idle);
                         self.turn_ended(&mut st, seat, turns::TurnEnd::Normal);
+                        recheck = true;
                     }
                 }
                 Event::Interrupt => {
@@ -1628,6 +1638,10 @@ impl Node {
                 st.record_stash(seat);
             }
             st.record_live(seat);
+            if recheck && connected {
+                st.dirty_pending.insert(seat.to_string());
+                self.refresh_kick.notify_one();
+            }
             plan
         };
         self.presence_kick.notify_one();
