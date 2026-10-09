@@ -15,7 +15,7 @@ The binary also contains SQLite, compiled from the source bundled with the
 - Unicode License v3 (19)
 - ISC License (18)
 - BSD 3-Clause "New" or "Revised" License (2)
-- Community Data License Agreement Permissive 2.0 (1)
+- Community Data License Agreement Permissive 2.0 (2)
 - zlib License (1)
 
 ## Rust crates
@@ -6290,6 +6290,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 Used by:
 
+- [webpki-roots 0.26.11](https://github.com/rustls/webpki-roots)
 - [webpki-roots 1.0.9](https://github.com/rustls/webpki-roots)
 
 ```

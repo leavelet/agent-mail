@@ -73,6 +73,12 @@ The first public version.
   filters, and an optional notification webhook (headers only).
 - Several server instances can share one Postgres database.
 
+- TLS to Postgres: the binary is built with TLS support (rustls), so a
+  database URL with `sslmode=require`, `verify-ca` or `verify-full`
+  connects (it could not before), and the default `prefer` uses TLS when
+  the database offers it. `sslrootcert` names a private certificate
+  authority; see [operations](docs/operations.md#tls-to-the-database).
+
 #### Running agents
 
 - `amail node`: a per-host daemon that injects mail into running Claude

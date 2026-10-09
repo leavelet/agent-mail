@@ -79,6 +79,43 @@ owner may create it); search no longer uses it. With Postgres the server
 always runs in its multi-instance mode (`LISTEN`/`NOTIFY`, presence in the
 database), also as a single instance.
 
+### TLS to the database
+
+The server connects to Postgres with TLS (rustls) when the URL asks for
+it with `sslmode`, as libpq does. It applies to every connection the server
+opens, including the one that listens for `NOTIFY`:
+
+| `sslmode` | connection |
+|---|---|
+| `disable` | without TLS |
+| `prefer` (the default) | TLS when the server offers it, else without |
+| `require` | TLS or no connection; the server's certificate is not checked |
+| `verify-ca` | TLS with a certificate signed by a trusted authority |
+| `verify-full` | as `verify-ca`, and the certificate must name the host of the URL |
+
+To require TLS and check the certificate, name the authority that signed
+it with `sslrootcert`:
+
+```sh
+amail serve --db 'postgres://amail:PASSWORD@db.internal/amail?sslmode=verify-full&sslrootcert=/etc/amail/db-ca.pem'
+```
+
+Without `sslrootcert`, `verify-ca` and `verify-full` trust only the
+public certificate authorities built into the binary (the Mozilla list of
+the `webpki-roots` crate), not the operating system's certificate store,
+so a database whose certificate comes from a private authority needs
+`sslrootcert`. Client certificates are given with `sslcert` and `sslkey`.
+The environment variables `PGSSLMODE` and `PGSSLROOTCERT` are used when
+the URL does not set these parameters.
+To make sure no connection runs without TLS, also have Postgres refuse
+them (`hostssl` lines and a `hostnossl ... reject` line in `pg_hba.conf`).
+Quote the URL in a shell: `&` separates commands there.
+
+Before this version the binary was built without TLS support: with
+`sslmode=require` or stronger it could not connect at all, and with the
+default `prefer` it connected without TLS. Now `prefer` uses TLS whenever
+the database offers it.
+
 ## Docker Compose (server and Postgres)
 
 The repository has a `Dockerfile` (it builds the web interface, then the
