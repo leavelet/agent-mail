@@ -295,10 +295,13 @@ example.com {
 
 Caddy answers paths that no `handle` matches with an empty `200` response.
 
-These four configurations were run with nginx 1.27 and Caddy 2 in front of
-`amail serve --trusted-proxy 127.0.0.1`: a browser signed in, received new
-mail over the event stream and opened a route given as a path; the CLI
-logged in and sent mail; a node connected and received events. The
+These four configurations were run with nginx 1.27 and Caddy 2.11 in front
+of `amail serve --trusted-proxy 127.0.0.1` (way 2 under `/mail` instead of
+`/amail`, so that both ways ran side by side on one proxy): a browser signed
+in, received new mail over the event stream and opened a route given as a
+path; a write with the session cookie passed the Origin check and one from
+another origin was refused; the CLI logged in and sent mail; a node
+connected and received events. The
 container's health check needs no change in either way.
 
 In Docker Compose, set `AMAIL_BASE_PATH=/amail` in the env file for way 1;
