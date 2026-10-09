@@ -128,6 +128,14 @@ export interface Delivery {
   notified_via?: string;
   read_at?: string;
   acked_at?: string;
+  /** The sender (or the org's user) withdrew it before it was shown; its mode is then `archive`. */
+  withdrawn_at?: string;
+}
+
+export interface WithdrawResponse {
+  delivery: Delivery;
+  /** False when it had been withdrawn before. */
+  changed: boolean;
 }
 
 export interface InboxEntry {
@@ -197,6 +205,7 @@ export interface DeliveryCounts {
   notified: number;
   read: number;
   acked: number;
+  withdrawn?: number;
 }
 
 export interface SearchHit extends MessageHeader {

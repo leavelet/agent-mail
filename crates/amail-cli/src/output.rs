@@ -33,11 +33,15 @@ pub fn entry_line(e: &InboxEntry) -> String {
     let m = &e.message;
     let d = &e.delivery;
     let mut tags = vec![d.class.as_str()];
-    if d.mode != DeliveryMode::Immediate {
-        tags.push(d.mode.as_str());
-    }
-    if d.read_at.is_none() {
-        tags.push("unread");
+    if d.withdrawn_at.is_some() {
+        tags.push("withdrawn");
+    } else {
+        if d.mode != DeliveryMode::Immediate {
+            tags.push(d.mode.as_str());
+        }
+        if d.read_at.is_none() {
+            tags.push("unread");
+        }
     }
     tags.extend(header_tags(m));
     if m.ack_required && d.acked_at.is_some() {
@@ -132,13 +136,14 @@ fn subject_header(h: &MessageHeader) -> String {
 /// What the delivery states mean, printed under `amail status`.
 pub const STATE_LEGEND: &str = "(notified: the header was shown to the agent; read: the whole body was \
 put into the agent's context, inline or by amail read, which does not mean it was acted on; \
-acked: the recipient acknowledged it)";
+acked: the recipient acknowledged it; withdrawn: withdrawn before it was shown, never pushed to \
+the recipient)";
 
 /// `a read [to] notified 10:00 via hook, read 10:01`
 pub fn status_line(r: &p::RecipientStatus) -> String {
     let d: &Delivery = &r.delivery;
     let mut kind = d.class.as_str().to_string();
-    if d.mode != DeliveryMode::Immediate {
+    if d.mode != DeliveryMode::Immediate && d.withdrawn_at.is_none() {
         kind.push(' ');
         kind.push_str(d.mode.as_str());
     }
@@ -156,6 +161,9 @@ pub fn status_line(r: &p::RecipientStatus) -> String {
     }
     if let Some(t) = &d.acked_at {
         parts.push(format!("acked {}", short_time(t)));
+    }
+    if let Some(t) = &d.withdrawn_at {
+        parts.insert(0, format!("withdrawn {}", short_time(t)));
     }
     if let Some(c) = &r.members {
         parts.insert(

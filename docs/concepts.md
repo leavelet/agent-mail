@@ -65,9 +65,31 @@ A **delivery** is one row per (message, recipient seat). It moves through
 | `notified` | the header of the message was shown to the recipient's agent (or the recipient claimed it with `amail claim`) | that the agent read the body |
 | `read` | the whole body was put into the agent's context: shown in full with the header because it was short (up to 800 characters), or through `amail read` | that the agent acted on it |
 | `acked` | the recipient acknowledged it with `amail ack` | |
+| `withdrawn` | the sender withdrew it before it was notified, read or acknowledged | |
 
 `read` says what was put into the agent's context, not that the agent
 handled it.
+
+**Withdrawing.** While a delivery is `queued`, the sender (or the org's
+user, for any message of the org) can withdraw it: `amail withdraw <id>
+--from <seat>`, **Withdraw** in the web interface's delivery table, or
+`POST /v1/messages/{id}/deliveries/{seat}/withdraw`. Only deliveries to
+seats of the sender's own org can be withdrawn; mail that reached another
+org stays as it is. Once a delivery was notified, read or acknowledged it
+cannot be withdrawn, and a withdrawal and a claim of the same delivery
+never both succeed. For the recipient, a withdrawn message:
+
+- is not unread mail: it is not in `amail inbox` (`amail inbox --all`
+  lists it as `withdrawn`), not in the seat's unread and pending counts,
+  not in the user's queue, and not reminded about when it asked for an
+  acknowledgement;
+- is never injected into the seat's session and wakes nobody;
+- can still be read by its number (`amail read` says it was withdrawn)
+  and is still part of the threads the seat is on.
+
+The sender's `amail status` and the web delivery table show `withdrawn`
+from then on, whatever the recipient does with it later. The message and
+its delivery are kept, so the storage they take is still counted.
 
 **Failed turns.** When the harness turn that showed a message fails (a
 model or API error, or the session process ends during the turn), the

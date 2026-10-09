@@ -148,9 +148,13 @@ string_enum!(
     LinkState { Requested => "requested", Invited => "invited", Active => "active" }
 );
 
-/// Delivery state derived from the timestamps, for display.
+/// Delivery state derived from the timestamps, for display. `withdrawn`:
+/// the sender withdrew it before the recipient saw it (whatever happened
+/// afterwards).
 pub fn delivery_state(d: &Delivery) -> &'static str {
-    if d.acked_at.is_some() {
+    if d.withdrawn_at.is_some() {
+        "withdrawn"
+    } else if d.acked_at.is_some() {
         "acked"
     } else if d.read_at.is_some() {
         "read"
@@ -619,6 +623,10 @@ pub struct Delivery {
     pub read_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acked_at: Option<String>,
+    /// The sender (or its org's user) withdrew this delivery before it was
+    /// notified, read or acknowledged; its `mode` is then `archive`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub withdrawn_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -817,7 +825,7 @@ pub struct ArchiveResponse {
 
 /// How many deliveries of one message are in each state. The states are
 /// those of [`delivery_state`]; each delivery counts once, in its most
-/// advanced state.
+/// advanced state (a withdrawn one as `withdrawn`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeliveryCounts {
     pub message_id: i64,
@@ -825,6 +833,16 @@ pub struct DeliveryCounts {
     pub notified: i64,
     pub read: i64,
     pub acked: i64,
+    #[serde(default)]
+    pub withdrawn: i64,
+}
+
+/// Answer of `POST /v1/messages/{id}/deliveries/{seat}/withdraw`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WithdrawResponse {
+    pub delivery: Delivery,
+    /// False when the delivery had been withdrawn before.
+    pub changed: bool,
 }
 
 // ---------------------------------------------------------------------------

@@ -2,24 +2,34 @@
 
 import type { Delivery, DeliveryCounts } from './types';
 
-export type DeliveryState = 'queued' | 'notified' | 'read' | 'acked';
+export type DeliveryState = 'queued' | 'notified' | 'read' | 'acked' | 'withdrawn';
 
-export function deliveryState(d: Pick<Delivery, 'notified_at' | 'read_at' | 'acked_at'>): DeliveryState {
+/** As the server's `delivery_state`: a withdrawn delivery stays `withdrawn`. */
+export function deliveryState(d: Pick<Delivery, 'notified_at' | 'read_at' | 'acked_at' | 'withdrawn_at'>): DeliveryState {
+  if (d.withdrawn_at) return 'withdrawn';
   if (d.acked_at) return 'acked';
   if (d.read_at) return 'read';
   if (d.notified_at) return 'notified';
   return 'queued';
 }
 
-/** Steps reached, for a progress display: queued(0) .. acked(3). */
+/** Steps reached, for a progress display: queued(0) .. acked(3); none (-1) for withdrawn. */
 export function deliveryStep(s: DeliveryState): number {
   return ['queued', 'notified', 'read', 'acked'].indexOf(s);
 }
 
 /** The states a message's deliveries are in, most advanced first, with
  * how many deliveries are in each (states without any left out). */
-export function deliverySummary(c: Pick<DeliveryCounts, DeliveryState>): { state: DeliveryState; n: number }[] {
-  return (['acked', 'read', 'notified', 'queued'] as const).map((state) => ({ state, n: c[state] ?? 0 })).filter((x) => x.n > 0);
+export function deliverySummary(
+  c: Pick<DeliveryCounts, 'queued' | 'notified' | 'read' | 'acked'> & { withdrawn?: number },
+): { state: DeliveryState; n: number }[] {
+  return (['acked', 'read', 'notified', 'queued', 'withdrawn'] as const).map((state) => ({ state, n: c[state] ?? 0 })).filter((x) => x.n > 0);
+}
+
+/** Whether the web user (the org's user) may withdraw this delivery of the
+ * org's own message: a seat of the org that has not been shown it. */
+export function canWithdraw(address: string, d: Pick<Delivery, 'notified_at' | 'read_at' | 'acked_at' | 'withdrawn_at'>): boolean {
+  return !address.includes('@') && deliveryState(d) === 'queued';
 }
 
 /** A readable notification path: `hook:PostToolUse` -> `PostToolUse hook`. */

@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { get, enc } from '../lib/api';
-  import type { StatusResponse } from '../lib/types';
-  import { deliveryState, deliveryStep, reachedBy, viaLabel } from '../lib/delivery';
+  import { get, post, enc } from '../lib/api';
+  import type { StatusResponse, WithdrawResponse } from '../lib/types';
+  import { canWithdraw, deliveryState, deliveryStep, reachedBy, viaLabel } from '../lib/delivery';
   import { store } from '../lib/store.svelte';
   import { t, ui } from '../lib/ui.svelte';
   import { shortTime } from '../lib/time';
@@ -11,20 +11,35 @@
   let data = $state.raw<StatusResponse | null>(null);
   let error = $state<string | null>(null);
 
-  $effect(() => {
-    const mid = id;
+  function load(mid: number) {
     get<StatusResponse>(`/v1/messages/${enc(String(mid))}/status`)
       .then((r) => (data = r))
       .catch((e) => (error = e instanceof Error ? e.message : String(e)));
-  });
+  }
+  $effect(() => load(id));
+
+  let busy = $state<string | null>(null);
+  async function withdraw(seat: string) {
+    busy = seat;
+    error = null;
+    try {
+      await post<WithdrawResponse>(`/v1/messages/${enc(String(id))}/deliveries/${enc(seat)}/withdraw`);
+    } catch (e) {
+      error = e instanceof Error ? e.message : String(e);
+    } finally {
+      busy = null;
+      load(id);
+    }
+  }
 </script>
 
 <div class="dlv" data-testid="delivery">
   {#if error}
-    <p class="error">{error}</p>
-  {:else if !data}
+    <p class="error" role="alert">{error}</p>
+  {/if}
+  {#if !data && !error}
     <p class="faint">{t('app.loading')}</p>
-  {:else}
+  {:else if data}
     <table>
       <thead><tr><th>{t('dlv.recipient')}</th><th>{t('dlv.class')}</th><th>{t('dlv.state')}</th><th>{t('dlv.times')}</th></tr></thead>
       <tbody>
@@ -33,7 +48,7 @@
           {@const reach = reachedBy(r.address, r.class, message ?? { to: [], cc: [] }, isList)}
           <tr>
             <td class="mono">{r.address}</td>
-            <td class="faint">{reach.cls}{reach.via ? ` · ${t('mail.viaList', { list: reach.via })}` : ''}{r.mode !== 'immediate' ? ` · ${r.mode}` : ''}</td>
+            <td class="faint">{reach.cls}{reach.via ? ` · ${t('mail.viaList', { list: reach.via })}` : ''}{r.mode !== 'immediate' && !r.withdrawn_at ? ` · ${r.mode}` : ''}</td>
             <td>
               <span class="steps" aria-label={t(`dlv.${st}`)}>
                 {#each [0, 1, 2, 3] as i}<span class="step" class:on={i <= deliveryStep(st)}></span>{/each}
@@ -45,13 +60,15 @@
               {#if r.notified_at}<span>{t('dlv.notified')} {shortTime(r.notified_at, ui.now, ui.lang)}{#if r.notified_via} · {t('dlv.via', { via: viaLabel(r.notified_via) })}{/if}</span>{/if}
               {#if r.read_at}<span>{t('dlv.read')} {shortTime(r.read_at, ui.now, ui.lang)}</span>{/if}
               {#if r.acked_at}<span>{t('dlv.acked')} {shortTime(r.acked_at, ui.now, ui.lang)}</span>{/if}
+              {#if r.withdrawn_at}<span>{t('dlv.withdrawn')} {shortTime(r.withdrawn_at, ui.now, ui.lang)}</span>{/if}
+              {#if canWithdraw(r.address, r)}<button class="small" data-testid="withdraw" disabled={busy !== null} title={t('dlv.withdraw.long')} onclick={() => withdraw(r.address)}>{t('dlv.withdraw')}</button>{/if}
             </div></td>
           </tr>
         {/each}
       </tbody>
     </table>
     <dl class="legend" data-testid="dlv-legend">
-      {#each ['notified', 'read', 'acked'] as const as k}
+      {#each ['notified', 'read', 'acked', 'withdrawn'] as const as k}
         <div><dt>{t(`dlv.${k}`)}</dt><dd>{t(`dlv.${k}.long`)}</dd></div>
       {/each}
     </dl>
@@ -91,7 +108,8 @@
   .st-acked {
     color: var(--ok);
   }
-  .st-queued {
+  .st-queued,
+  .st-withdrawn {
     color: var(--faint);
   }
   .times {
@@ -119,7 +137,7 @@
   }
   .legend dt {
     font-weight: 600;
-    min-width: 58px;
+    min-width: 72px;
   }
   .legend dd {
     margin: 0;

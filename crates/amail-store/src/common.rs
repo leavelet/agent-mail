@@ -77,7 +77,7 @@ macro_rules! deliv_cols {
     () => {
         "d.id AS d_id, d.org_id AS d_org_id, dorg.name AS d_org_name, d.message_id, d.seat_id, \
          ds.name AS seat_name, d.class, d.mode, d.seq, d.mod_seq, d.notified_at, \
-         d.notified_via, d.read_at, d.acked_at"
+         d.notified_via, d.read_at, d.acked_at, d.withdrawn_at"
     };
 }
 
@@ -846,6 +846,7 @@ pub(crate) struct DelivRow {
     notified_via: Option<String>,
     read_at: Option<i64>,
     acked_at: Option<i64>,
+    withdrawn_at: Option<i64>,
 }
 
 impl DelivRow {
@@ -865,6 +866,7 @@ impl DelivRow {
             notified_via: self.notified_via,
             read_at: self.read_at,
             acked_at: self.acked_at,
+            withdrawn_at: self.withdrawn_at,
         })
     }
 }
@@ -2349,7 +2351,8 @@ macro_rules! impl_store_common {
             /// that it reads the `deliveries_unread` index and its cost
             /// follows the page size, not the seat's read mail.
             pub async fn inbox(c: &mut Conn, seat_id: i64, q: &InboxQuery) -> Result<Vec<Entry>> {
-                let unread = if q.unread_only { " AND d.read_at IS NULL" } else { "" };
+                // A withdrawn delivery is not unread mail.
+                let unread = if q.unread_only { " AND d.read_at IS NULL AND d.withdrawn_at IS NULL" } else { "" };
                 let rows: Vec<EntryRow> = if let Some(before) = q.before_seq {
                     let sql = format!("{} WHERE d.seat_id = $1 AND d.seq < $2{unread} ORDER BY d.seq DESC LIMIT $3", entry_select!());
                     let mut rows: Vec<EntryRow> = sqlx::query_as(&sql)
@@ -2495,6 +2498,23 @@ macro_rules! impl_store_common {
                 .await
             }
 
+            /// Withdraw a delivery that was not notified, read or acknowledged:
+            /// mode `archive` (the counter triggers drop it from the pending
+            /// and unread counts) and `withdrawn_at`. The UPDATE's own
+            /// condition decides a race with a claim. Returns the delivery
+            /// whether or not it changed.
+            pub async fn withdraw(c: &mut Conn, message_id: i64, seat_id: i64) -> Result<Option<(DeliveryRec, Option<SeqBump>)>> {
+                touch(
+                    c,
+                    "UPDATE deliveries SET mode = 'archive', withdrawn_at = $1 WHERE message_id = $2 \
+                     AND seat_id = $3 AND withdrawn_at IS NULL AND notified_at IS NULL \
+                     AND read_at IS NULL AND acked_at IS NULL RETURNING id",
+                    message_id,
+                    seat_id,
+                )
+                .await
+            }
+
             pub async fn changes(c: &mut Conn, seat_id: i64, since: i64, limit: i64) -> Result<Vec<Entry>> {
                 let rows: Vec<EntryRow> =
                     sqlx::query_as(concat!(entry_select!(), " WHERE d.seat_id = $1 AND d.mod_seq > $2 ORDER BY d.mod_seq LIMIT $3"))
@@ -2523,22 +2543,23 @@ macro_rules! impl_store_common {
                 }
                 let sql = format!(
                     "SELECT message_id, \
-                     CAST(SUM(CASE WHEN acked_at IS NULL AND read_at IS NULL AND notified_at IS NULL THEN 1 ELSE 0 END) AS BIGINT), \
-                     CAST(SUM(CASE WHEN acked_at IS NULL AND read_at IS NULL AND notified_at IS NOT NULL THEN 1 ELSE 0 END) AS BIGINT), \
-                     CAST(SUM(CASE WHEN acked_at IS NULL AND read_at IS NOT NULL THEN 1 ELSE 0 END) AS BIGINT), \
-                     CAST(SUM(CASE WHEN acked_at IS NOT NULL THEN 1 ELSE 0 END) AS BIGINT) \
+                     CAST(SUM(CASE WHEN withdrawn_at IS NULL AND acked_at IS NULL AND read_at IS NULL AND notified_at IS NULL THEN 1 ELSE 0 END) AS BIGINT), \
+                     CAST(SUM(CASE WHEN withdrawn_at IS NULL AND acked_at IS NULL AND read_at IS NULL AND notified_at IS NOT NULL THEN 1 ELSE 0 END) AS BIGINT), \
+                     CAST(SUM(CASE WHEN withdrawn_at IS NULL AND acked_at IS NULL AND read_at IS NOT NULL THEN 1 ELSE 0 END) AS BIGINT), \
+                     CAST(SUM(CASE WHEN withdrawn_at IS NULL AND acked_at IS NOT NULL THEN 1 ELSE 0 END) AS BIGINT), \
+                     CAST(SUM(CASE WHEN withdrawn_at IS NOT NULL THEN 1 ELSE 0 END) AS BIGINT) \
                      FROM deliveries WHERE message_id IN ({}) GROUP BY message_id ORDER BY message_id",
                     placeholders(1, ids.len())
                 );
-                let mut q = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(&sql);
+                let mut q = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64)>(&sql);
                 for id in ids {
                     q = q.bind(*id);
                 }
                 Ok(q.fetch_all(&mut *c)
                     .await?
                     .into_iter()
-                    .map(|(message_id, queued, notified, read, acked)| amail_proto::DeliveryCounts {
-                        message_id, queued, notified, read, acked,
+                    .map(|(message_id, queued, notified, read, acked, withdrawn)| amail_proto::DeliveryCounts {
+                        message_id, queued, notified, read, acked, withdrawn,
                     })
                     .collect())
             }
@@ -4487,6 +4508,10 @@ macro_rules! impl_store_common {
 
             async fn ack(&self, message_id: i64, seat_id: i64) -> $crate::Result<Option<($crate::DeliveryRec, Option<$crate::SeqBump>)>> {
                 run!(self.write, |c| q::ack(c, message_id, seat_id).await)
+            }
+
+            async fn withdraw(&self, message_id: i64, seat_id: i64) -> $crate::Result<Option<($crate::DeliveryRec, Option<$crate::SeqBump>)>> {
+                run!(self.write, |c| q::withdraw(c, message_id, seat_id).await)
             }
 
             async fn claim(&self, seat_id: i64, f: &$crate::ClaimFilter) -> $crate::Result<(Vec<$crate::Entry>, Option<$crate::SeqBump>)> {

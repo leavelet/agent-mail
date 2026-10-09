@@ -20,6 +20,8 @@ export interface MailRow {
   written_by?: string;
   unread?: boolean;
   acked?: boolean;
+  /** The sender withdrew it from this mailbox before it was shown. */
+  withdrawn?: boolean;
   /** How the mail reached the mailbox's seat. */
   cls?: 'to' | 'cc';
   via?: string;
@@ -43,8 +45,9 @@ export function fromEntry(e: InboxEntry, isList: (address: string) => boolean = 
   const reach = reachedBy(e.delivery.seat, e.delivery.class, e.message, isList);
   return {
     ...e.message,
-    unread: !e.delivery.read_at,
+    unread: !e.delivery.read_at && !e.delivery.withdrawn_at,
     acked: !!e.delivery.acked_at,
+    withdrawn: !!e.delivery.withdrawn_at,
     cls: reach.cls,
     via: reach.via,
   };

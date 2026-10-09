@@ -345,6 +345,9 @@ pub struct DeliveryRec {
     pub notified_via: Option<String>,
     pub read_at: Option<i64>,
     pub acked_at: Option<i64>,
+    /// When the sender (or the org's user) withdrew the delivery (its mode
+    /// is then `archive`).
+    pub withdrawn_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]

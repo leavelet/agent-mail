@@ -97,6 +97,14 @@ The first public version.
   show `written by USER` (or the user's address in other orgs). Seat and
   node tokens cannot do this (migration 0020).
 
+- The sender of a message (or the org's user) can withdraw a delivery to
+  a seat of the org that has not been shown, read or acknowledged:
+  `amail withdraw <id> --from <seat>`, Withdraw in the web delivery table,
+  `POST /v1/messages/{id}/deliveries/{seat}/withdraw`. The recipient no
+  longer has it as unread or pending mail and is not woken or reminded;
+  it can still read it by id and in its threads. Status shows
+  `withdrawn` (migration 0021).
+
 #### Running agents
 
 - `amail node`: a per-host daemon that injects mail into running Claude

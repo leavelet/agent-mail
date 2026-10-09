@@ -370,6 +370,7 @@ mod tests {
                 notified_via: None,
                 read_at: None,
                 acked_at: None,
+                withdrawn_at: None,
             },
             message: MessageHeader {
                 id,

@@ -275,6 +275,17 @@ pub trait Store: Send + Sync + 'static {
         message_id: i64,
         seat_id: i64,
     ) -> Result<Option<(DeliveryRec, Option<SeqBump>)>>;
+    /// Withdraw the seat's delivery of a message while it has not been
+    /// notified, read or acknowledged: mode `archive` and `withdrawn_at`
+    /// (pending and unread counts drop it; it is never claimed). Decided
+    /// atomically against a concurrent claim. Returns the delivery as it is
+    /// afterwards, with a bump only when it changed; `None` when the seat
+    /// has no delivery of the message.
+    async fn withdraw(
+        &self,
+        message_id: i64,
+        seat_id: i64,
+    ) -> Result<Option<(DeliveryRec, Option<SeqBump>)>>;
     /// Atomically mark matching unnotified deliveries as notified and return
     /// them with bodies. Concurrent claims never return the same delivery.
     ///

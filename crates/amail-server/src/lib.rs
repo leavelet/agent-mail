@@ -200,6 +200,10 @@ pub fn router(state: AppState) -> Router {
         .route("/messages/preview", post(mail::preview))
         .route("/messages/{id}", get(mail::read))
         .route("/messages/{id}/ack", post(mail::ack))
+        .route(
+            "/messages/{id}/deliveries/{seat}/withdraw",
+            post(mail::withdraw),
+        )
         .route("/messages/{id}/status", get(mail::status))
         .route("/messages/{id}/read", post(ui::mark_read))
         .route("/messages/{id}/unread", post(ui::mark_unread))

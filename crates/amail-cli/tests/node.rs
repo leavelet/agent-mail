@@ -52,6 +52,7 @@ node_tests!(
     open_policy_serves_sessions_and_reports_them,
     setting_changes_are_reported_once,
     lost_mailbox_event_is_recovered_at_turn_end,
+    withdrawn_mail_neither_wakes_nor_is_injected,
 );
 
 use amail_store::testutil::Backend;
@@ -2366,4 +2367,40 @@ async fn lost_mailbox_event_is_recovered_at_turn_end(b: Backend) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(h.seat_status("lost").await["pending"]["to"], 1);
+}
+
+/// Mail withdrawn during the wake-up window does not wake the idle seat
+/// (the node refreshes its pending counts from the mailbox event), and a
+/// later turn does not show it; mail that stays is shown as usual.
+async fn withdrawn_mail_neither_wakes_nor_is_injected(b: Backend) {
+    let opts = Opts {
+        wake_window: Duration::from_millis(1500),
+        wake_confirm: Duration::from_secs(10),
+        ..Default::default()
+    };
+    let Some(h) = setup(b, "withdrawn_mail_neither_wakes_nor_is_injected", opts).await else {
+        return;
+    };
+    h.seat("w1", "claude").await;
+    let inbox = FakeInbox::start(h.dir.path().join("cc.sock"), None);
+    let env = claude_env("w1", &inbox.path);
+    h.hook("claude", env.clone(), claude("SessionStart")).await;
+    assert_eq!(h.state("w1").await, "idle");
+
+    let id = h.api.send(&["w1"], &[], "never mind", false).await;
+    h.wait_pending("w1", 1, 0, 0).await;
+    h.api
+        .post(&format!("/messages/{id}/deliveries/w1/withdraw"), json!({}))
+        .await;
+    h.wait_pending("w1", 0, 0, 0).await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(inbox.count(), 0, "withdrawn mail must not wake");
+
+    // The next mail wakes the seat; its turn shows only that mail.
+    let kept = h.api.send(&["w1"], &[], "still on", false).await;
+    h.wait("wake-up", || async { inbox.count() == 1 }).await;
+    let v = h
+        .hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    assert_eq!(injected_ids(&hook_text(&v).unwrap()), vec![kept]);
 }

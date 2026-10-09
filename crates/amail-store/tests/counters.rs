@@ -200,6 +200,29 @@ async fn counters_follow_deliveries(db: TestDb) {
     s.claim(b.id, &f).await.unwrap();
     s.claim(b.id, &f).await.unwrap();
     check(&db).await;
+    // Withdrawing, twice each: c's deliveries of three messages (one of
+    // each mode) and a's and b's (claimed, so
+    // they stay as they are).
+    let stored = db.storage_counts().await;
+    let mut withdrawn = 0;
+    for id in &ids[6..9] {
+        for seat in [a, b, c] {
+            let (d, bump) = s.withdraw(*id, seat.id).await.unwrap().unwrap();
+            withdrawn += i64::from(bump.is_some());
+            assert_eq!(bump.is_some(), d.withdrawn_at.is_some());
+            let (_, again) = s.withdraw(*id, seat.id).await.unwrap().unwrap();
+            assert!(again.is_none());
+        }
+        check(&db).await;
+    }
+    assert!(withdrawn > 0);
+    assert!(s.withdraw(ids[0], other_owner.id).await.unwrap().is_none());
+    // Storage is not given back: the deliveries stay.
+    let after = db.storage_counts().await;
+    assert_eq!(
+        stored.iter().map(|c| c.stored_bytes).collect::<Vec<_>>(),
+        after.iter().map(|c| c.stored_bytes).collect::<Vec<_>>()
+    );
     // Reading and acknowledging, twice each.
     for id in &ids[..5] {
         s.mark_read(*id, b.id).await.unwrap();

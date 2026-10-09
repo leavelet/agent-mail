@@ -283,6 +283,37 @@ async fn run(backend: Backend) {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("forbidden"));
 
+    // Withdrawing an unseen delivery: it leaves the recipient's unread
+    // mail; the sender's status says so; the recipient can still read it.
+    let draft = first_id(&acme.run(&["send", "--to", "w2", "-s", "Draft", "-m", "never mind"]));
+    let d = draft.to_string();
+    assert_eq!(
+        acme.run(&["withdraw", &d, "--from", "w2"]).trim(),
+        format!("withdrew #{d} from w2")
+    );
+    assert_eq!(
+        acme.run(&["withdraw", &d, "--from", "w2"]).trim(),
+        format!("#{d} was already withdrawn from w2")
+    );
+    assert!(!w2.run(&["inbox"]).contains("Draft"));
+    let all = w2.run(&["inbox", "--all"]);
+    assert!(
+        all.contains(&format!("#{d} [to withdrawn] owner (USER): Draft")),
+        "{all}"
+    );
+    let status = acme.run(&["status", &d]);
+    assert!(
+        status.starts_with("w2 withdrawn [to] withdrawn "),
+        "{status}"
+    );
+    let r = w2.run(&["read", &d]);
+    assert!(
+        r.contains("never mind") && r.contains("(withdrawn by the sender "),
+        "{r}"
+    );
+    let out = w2.try_run(&["withdraw", &kickoff.to_string(), "--from", "w1"], None);
+    assert!(!out.status.success());
+
     // Thread: by thread id or by any message id in it.
     let t = w1.run(&["thread", &reply_id.to_string()]);
     assert_eq!(t.matches("\n---\n").count(), 2, "{t}");

@@ -47,6 +47,7 @@
       </div>
       <div class="subj">
         {#if r.priority === 'urgent'}<span class="chip urgent">{t('mail.urgent')}</span>{/if}
+        {#if r.withdrawn}<span class="chip neutral" data-testid="withdrawn" title={t('dlv.withdrawn.inbox')}>{t('dlv.withdrawn')}</span>{/if}
         {#if r.ack_required}<span class="chip {r.acked ? 'ok' : 'ack'}">{r.acked ? t('mail.acked') : t('mail.ackReq')}</span>{/if}
         {#if r.via}<span class="chip neutral" title={t('mail.viaList.long', { list: r.via })}>{r.cls === 'cc' ? 'cc · ' : ''}{t('mail.viaList', { list: r.via })}</span>{:else if r.cls === 'cc'}<span class="chip neutral">cc</span>{/if}
         <span class="s">{#if r.subject}<Vis text={shortSubject(r.subject)} />{:else}{t('mail.noSubject')}{/if}</span>

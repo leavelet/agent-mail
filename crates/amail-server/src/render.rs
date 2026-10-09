@@ -152,6 +152,7 @@ pub fn delivery(d: &DeliveryRec, viewer: &Org) -> p::Delivery {
         notified_via: d.notified_via.clone(),
         read_at: d.read_at.map(ts),
         acked_at: d.acked_at.map(ts),
+        withdrawn_at: d.withdrawn_at.map(ts),
     }
 }
 

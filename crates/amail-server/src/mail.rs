@@ -175,6 +175,65 @@ pub async fn ack(
     }))
 }
 
+/// `POST /v1/messages/{id}/deliveries/{seat}/withdraw`: the sender of a
+/// message, or its org's user, withdraws the delivery to a seat of the
+/// org that has not been notified, read or acknowledged. The delivery
+/// stays (the recipient can still read the message by id and in its
+/// threads) but leaves the recipient's unread mail and pending counts, so
+/// it is never injected and wakes nobody. Withdrawing a withdrawn delivery
+/// again answers `changed: false`.
+pub async fn withdraw(
+    State(st): State<AppState>,
+    auth: Auth,
+    Path((id, name)): Path<(i64, String)>,
+) -> ApiResult<Json<p::WithdrawResponse>> {
+    let m = readable_message(&st, &auth, id).await?;
+    let seat = auth.mail_seat()?;
+    let allowed = m.org_id == auth.org.id && (m.sender_seat_id == seat.id || auth.is_user());
+    if !allowed {
+        return Err(ApiError::forbidden(
+            "only the sender and the sender org's user can withdraw a delivery",
+        ));
+    }
+    if name.contains('@') {
+        return Err(ApiError::unprocessable(
+            "not_local",
+            "only deliveries to seats of your own org can be withdrawn",
+        ));
+    }
+    let recipient = st
+        .store
+        .seat_by_name(auth.org.id, &name)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("no seat {name:?}")))?;
+    let (d, bump) =
+        st.store.withdraw(id, recipient.id).await?.ok_or_else(|| {
+            ApiError::not_found(format!("message {id} was not delivered to {name}"))
+        })?;
+    if d.withdrawn_at.is_none() {
+        return Err(ApiError::new(
+            axum::http::StatusCode::CONFLICT,
+            "delivery_seen",
+            format!("{name} was already shown, has read or has acknowledged message {id}"),
+        ));
+    }
+    let changed = bump.is_some();
+    publish(&st, &recipient.name, bump);
+    if changed {
+        tracing::info!(
+            org_id = auth.org.id,
+            token_id = auth.token_id,
+            message_id = id,
+            seat = %recipient.name,
+            "delivery withdrawn"
+        );
+    }
+    Ok(Json(p::WithdrawResponse {
+        delivery: render::delivery(&d, &auth.org),
+        changed,
+    }))
+}
+
 pub async fn status(
     State(st): State<AppState>,
     auth: Auth,

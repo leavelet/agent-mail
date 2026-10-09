@@ -217,3 +217,32 @@ test('the register page says what a person can delete', async ({ browser }) => {
     await ctx.close();
   }
 });
+
+test('the delivery table withdraws an unseen delivery; mail written for a seat says who wrote it', async ({ page }) => {
+  const s = state();
+  // Seats without a session, so nothing is shown to them meanwhile.
+  for (const name of ['fx-wd1', 'fx-wd2']) await api(s.userToken, 'POST', '/seats', { name });
+  const sent = await api<{ id: number; thread_id: number }>(s.userToken, 'POST', '/messages', { to: ['fx-wd1', 'fx-wd2'], subject: 'Withdraw check', body: 'one' });
+  await login(page, s.userToken, { lang: 'en', theme: 'light' });
+  await page.goto(`${s.base}/#/thread/${sent.thread_id}`);
+  const card = page.locator(`article[data-msg="${sent.id}"]`);
+  await card.getByRole('button', { name: 'Delivery' }).click();
+  const table = card.getByTestId('delivery');
+  const row = table.locator('tbody tr', { hasText: 'fx-wd1' });
+  await expect(row.locator('[data-dstate]')).toHaveText('queued');
+  await row.getByTestId('withdraw').click();
+  await expect(row.locator('[data-dstate]')).toHaveText('withdrawn');
+  await expect(row.getByTestId('withdraw')).toHaveCount(0);
+  await expect(table.locator('tbody tr', { hasText: 'fx-wd2' }).getByTestId('withdraw')).toBeVisible();
+  // The seat no longer has it as unread mail; it can still read it.
+  const counts = await api<{ seats: { unread: number }[] }>(s.userToken, 'GET', '/counts?seat=fx-wd1');
+  expect(counts.seats[0].unread).toBe(0);
+  await shot(page, 'web-delivery-withdrawn');
+
+  // A message the user writes in root's name shows who wrote it.
+  const w = await api<{ id: number; thread_id: number }>(s.userToken, 'POST', '/seats/root/messages', { to: ['owner'], subject: 'Written for root', body: 'two' });
+  await page.goto(`${s.base}/#/thread/${w.thread_id}`);
+  await expect(page.locator(`article[data-msg="${w.id}"]`).getByTestId('written-by')).toHaveText('written by owner');
+  await page.goto(`${s.base}/#/inbox`);
+  await expect(page.locator('.mrow', { hasText: 'Written for root' }).locator('.who')).toContainText('written by owner');
+});

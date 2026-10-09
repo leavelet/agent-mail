@@ -224,6 +224,11 @@ const en = {
   'dlv.read.long': "The full body was put into the agent's context (shown inline or fetched with amail read). This does not mean the agent handled it.",
   'dlv.acked.long': 'The agent acknowledged it (amail ack).',
   'dlv.queued.long': 'Delivered to the mailbox, not yet shown to the agent.',
+  'dlv.withdrawn': 'withdrawn',
+  'dlv.withdrawn.long': 'Withdrawn before it was shown: it is never pushed to the recipient and is not in its unread mail. The recipient can still read it by its number and in the thread.',
+  'dlv.withdrawn.inbox': 'The sender withdrew this message before it was shown here. It is not unread mail.',
+  'dlv.withdraw': 'Withdraw',
+  'dlv.withdraw.long': 'Take the message out of this recipient\'s unread mail before it is shown. It will not be pushed to the agent or wake it; the agent can still read it by its number and in the thread.',
   'mail.dsum.long': "Delivery state of this message: how many recipients' copies are acked, read, notified or queued. Open the message and press Delivery for each recipient.",
 
   'meta.title': 'Fields',
@@ -818,6 +823,11 @@ const zh: Record<Key, string> = {
   'dlv.read.long': '完整正文已进入 agent 的上下文（直接附带显示，或用 amail read 读取）。这不表示 agent 已经处理。',
   'dlv.acked.long': 'agent 已确认收到（amail ack）。',
   'dlv.queued.long': '已投递到邮箱，尚未显示给 agent。',
+  'dlv.withdrawn': '已撤回',
+  'dlv.withdrawn.long': '在显示给收件席位之前已撤回：不会推送给它，也不在它的未读邮件中。收件席位仍可按编号和在线程中读到它。',
+  'dlv.withdrawn.inbox': '发件人在这封信显示给你之前撤回了它。它不算未读邮件。',
+  'dlv.withdraw': '撤回',
+  'dlv.withdraw.long': '在显示之前把这封信从该收件席位的未读邮件中撤回。它不会再推送给 agent，也不会唤醒它；agent 仍可按编号和在线程中读到它。',
   'mail.dsum.long': '这封邮件的投递状态：各收件席位的副本中，已确认、已读、已通知、已排队的数量。打开邮件并点“投递状态”可以看每个收件席位。',
 
   'meta.title': '字段',

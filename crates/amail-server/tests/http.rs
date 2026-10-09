@@ -72,6 +72,10 @@ http_tests!(
     long_subject_in_system_mail,
     ack_without_reminder,
     written_for_an_agent,
+    withdraw_unseen_delivery,
+    withdraw_seen_delivery_conflicts,
+    withdraw_competes_with_claim,
+    withdrawn_mail_leaves_the_users_queue,
 );
 
 struct Server {
@@ -2372,6 +2376,298 @@ async fn written_for_an_agent(srv: Server) {
         user.post("/seats/c/messages", json!({"to": ["a"]})).await.0,
         StatusCode::NOT_FOUND
     );
+}
+
+/// One seat's pending counts.
+async fn pending_of(user: &Client, seat: &str) -> Value {
+    user.ok(Method::GET, &format!("/pending?seat={seat}"), None)
+        .await["seats"][0]
+        .clone()
+}
+
+/// One seat's counters (`GET /counts`).
+async fn counts_of(user: &Client, seat: &str) -> Value {
+    user.ok(Method::GET, &format!("/counts?seat={seat}"), None)
+        .await["seats"][0]
+        .clone()
+}
+
+/// The sender (or the org's user) withdraws a delivery nobody was shown:
+/// it leaves the recipient's unread mail and every count that pushes or
+/// wakes, and the sender's status says `withdrawn`; the recipient can still
+/// read the message by id and in its thread.
+async fn withdraw_unseen_delivery(srv: Server) {
+    let user = srv.org("acme").await;
+    let a = user.seat("a").await;
+    let b = user.seat("b").await;
+    let c = user.seat("c").await;
+    let d = user.seat("d").await;
+    user.list("news", "anyone", &[("d", "digest")]).await;
+    let node = node_token(&user).await;
+    let other = srv.org("other").await;
+    let sent = a
+        .send(json!({"to": ["b", "c"], "cc": ["news"], "subject": "reminder", "body": "keep me", "priority": "urgent"}))
+        .await;
+    let id = sent["id"].as_i64().unwrap();
+    let path = |seat: &str| format!("/messages/{id}/deliveries/{seat}/withdraw");
+    // Only the sender and the org's user; another org does not see it.
+    for caller in [&b, &c, &node] {
+        assert_eq!(
+            caller.post(&path("b"), json!({})).await.0,
+            StatusCode::FORBIDDEN
+        );
+    }
+    assert_eq!(
+        other.post(&path("b"), json!({})).await.0,
+        StatusCode::NOT_FOUND
+    );
+    let (st, v) = a.post(&path("x@other"), json!({})).await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+    assert_eq!(v["error"]["code"], "not_local");
+    assert_eq!(
+        a.post(&path("nobody"), json!({})).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        a.post(&path("owner"), json!({})).await.0,
+        StatusCode::NOT_FOUND
+    );
+
+    let before = b.inbox("").await[0]["delivery"].clone();
+    assert_eq!(pending_of(&user, "b").await["to"], 1);
+    assert_eq!(pending_of(&user, "b").await["urgent"], 1);
+    assert_eq!(pending_of(&user, "d").await["digest"], 1);
+    let stored = user.get("/org").await.1["stored_bytes"].clone();
+    let sub_b = common::open_stream(
+        common::stream_client()
+            .get(format!("{}/v1/events", srv.base))
+            .bearer_auth(&b.token),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let w = a.ok(Method::POST, &path("b"), Some(json!({}))).await;
+    assert_eq!(w["changed"], true);
+    assert!(w["delivery"]["withdrawn_at"].is_string(), "{w}");
+    assert_eq!(w["delivery"]["mode"], "archive");
+    for field in ["notified_at", "read_at", "acked_at"] {
+        assert!(w["delivery"][field].is_null(), "{field}: {w}");
+    }
+    assert_eq!(w["delivery"]["seq"], before["seq"]);
+    assert!(w["delivery"]["mod_seq"].as_i64() > before["mod_seq"].as_i64());
+    // The recipient's stream gets a mailbox event (the node refreshes its
+    // pending counts from it).
+    let ev = sse_collect(sub_b, 1).await;
+    assert_eq!(ev[0].1["seat"], "b");
+    assert_eq!(ev[0].1["seq"], w["delivery"]["mod_seq"]);
+    // Again: nothing changes.
+    let again = user.ok(Method::POST, &path("b"), Some(json!({}))).await;
+    assert_eq!(again["changed"], false);
+    assert_eq!(again["delivery"], w["delivery"]);
+    // The user withdraws the digest delivery of the list member.
+    user.ok(Method::POST, &path("d"), Some(json!({}))).await;
+
+    // Pending, counts and claims: b and d have nothing; c is unchanged.
+    let pb = pending_of(&user, "b").await;
+    assert_eq!(
+        (pb["to"].as_i64(), pb["urgent"].as_i64()),
+        (Some(0), Some(0)),
+        "{pb}"
+    );
+    assert_eq!(pb["seq"], w["delivery"]["mod_seq"]);
+    assert_eq!(pending_of(&user, "d").await["digest"], 0);
+    assert_eq!(pending_of(&user, "c").await["to"], 1);
+    let cb = counts_of(&user, "b").await;
+    assert_eq!(
+        (cb["unread"].as_i64(), cb["pending"].as_i64()),
+        (Some(0), Some(0)),
+        "{cb}"
+    );
+    assert_eq!(counts_of(&user, "c").await["unread"], 1);
+    let claim = b
+        .ok(
+            Method::POST,
+            "/claim",
+            Some(json!({"via": "test", "include_digest": true})),
+        )
+        .await;
+    assert!(claim["entries"].as_array().unwrap().is_empty(), "{claim}");
+    let claim = d
+        .ok(
+            Method::POST,
+            "/claim",
+            Some(json!({"via": "test", "include_digest": true})),
+        )
+        .await;
+    assert!(claim["entries"].as_array().unwrap().is_empty(), "{claim}");
+    // Not unread mail; listed with all mail, marked withdrawn.
+    assert!(b.inbox("unread=1").await.is_empty());
+    let all = b.inbox("").await;
+    assert_eq!(all.len(), 1);
+    assert!(all[0]["delivery"]["withdrawn_at"].is_string());
+    // Still readable by id and in the thread.
+    let got = b
+        .ok(Method::GET, &format!("/messages/{id}?peek=1"), None)
+        .await;
+    assert_eq!(got["message"]["body"], "keep me");
+    assert!(got["delivery"]["withdrawn_at"].is_string());
+    let thread = b.get(&format!("/threads/{}", sent["thread_id"])).await;
+    assert_eq!(thread.0, StatusCode::OK);
+    assert_eq!(thread.1["messages"][0]["id"], id);
+    // The change is in the recipient's change feed.
+    let changes = b
+        .ok(
+            Method::GET,
+            &format!("/changes?since={}", before["mod_seq"]),
+            None,
+        )
+        .await;
+    assert!(changes["entries"][0]["delivery"]["withdrawn_at"].is_string());
+    // The sender's status and sent list say withdrawn; storage is unchanged.
+    let status = a.get(&format!("/messages/{id}/status")).await.1;
+    let state = |seat: &str| {
+        status["recipients"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["address"] == seat)
+            .unwrap()["state"]
+            .clone()
+    };
+    assert_eq!(state("b"), "withdrawn");
+    assert_eq!(state("c"), "queued");
+    assert_eq!(state("d"), "withdrawn");
+    let sent_page = a.get("/sent?seat=a&delivery=true").await.1;
+    let counts = &sent_page["delivery"][0];
+    assert_eq!(
+        (counts["queued"].as_i64(), counts["withdrawn"].as_i64()),
+        (Some(1), Some(2)),
+        "{sent_page}"
+    );
+    assert_eq!(user.get("/org").await.1["stored_bytes"], stored);
+    // Reading it later does not make it unread mail or change its state.
+    b.ok(Method::GET, &format!("/messages/{id}"), None).await;
+    assert_eq!(counts_of(&user, "b").await["unread"], 0);
+    let status = a.get(&format!("/messages/{id}/status")).await.1;
+    assert_eq!(status["recipients"][0]["state"], "withdrawn");
+}
+
+/// A delivery that was shown (claimed), read or acknowledged cannot be
+/// withdrawn, and the attempt changes nothing.
+async fn withdraw_seen_delivery_conflicts(srv: Server) {
+    let user = srv.org("acme").await;
+    let a = user.seat("a").await;
+    let b = user.seat("b").await;
+    for action in ["read", "ack", "claim"] {
+        let next = a.send(json!({"to": ["b"], "body": "seen"})).await;
+        let mid = next["id"].as_i64().unwrap();
+        if action == "claim" {
+            b.ok(
+                Method::POST,
+                "/claim",
+                Some(json!({"via": "test", "mark_inlined_read": false})),
+            )
+            .await;
+        } else {
+            b.ok(
+                Method::POST,
+                &format!("/messages/{mid}/{action}"),
+                Some(json!({})),
+            )
+            .await;
+        }
+        let before = b
+            .ok(Method::GET, &format!("/messages/{mid}?peek=1"), None)
+            .await;
+        let (status, err) = a
+            .post(&format!("/messages/{mid}/deliveries/b/withdraw"), json!({}))
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{action}: {err}");
+        assert_eq!(err["error"]["code"], "delivery_seen");
+        let after = b
+            .ok(Method::GET, &format!("/messages/{mid}?peek=1"), None)
+            .await;
+        assert_eq!(before, after, "{action}");
+    }
+}
+
+/// Withdrawing and claiming the same delivery at once: exactly one wins.
+async fn withdraw_competes_with_claim(srv: Server) {
+    let user = srv.org("acme").await;
+    let b = user.seat("b").await;
+    for _ in 0..12 {
+        let sent = user.send(json!({"to": ["b"], "body": "race"})).await;
+        let id = sent["id"].as_i64().unwrap();
+        let path = format!("/messages/{id}/deliveries/b/withdraw");
+        let (withdraw, claim) = tokio::join!(
+            user.post(&path, json!({})),
+            b.post("/claim", json!({"via": "test", "mark_inlined_read": false})),
+        );
+        assert_eq!(claim.0, StatusCode::OK);
+        let entries = claim.1["entries"].as_array().unwrap();
+        match withdraw.0 {
+            StatusCode::OK => assert!(entries.is_empty(), "a withdrawn delivery was claimed"),
+            StatusCode::CONFLICT => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0]["message"]["id"], id);
+            }
+            status => panic!("withdraw -> {status}: {}", withdraw.1),
+        }
+        assert_eq!(pending_of(&user, "b").await["to"], 0);
+    }
+}
+
+/// Mail to the user that the sender withdraws leaves the user's queue and
+/// unread count, and a withdrawn recipient is not reminded to acknowledge.
+async fn withdrawn_mail_leaves_the_users_queue(srv: Server) {
+    let user = srv.org("acme").await;
+    let a = user.seat("a").await;
+    let _b = user.seat("b").await;
+    let m = a
+        .send(json!({"to": ["owner"], "subject": "please confirm", "ack_required": true, "ack_timeout_s": 0}))
+        .await;
+    let id = m["id"].as_i64().unwrap();
+    let overview = user.get("/overview").await.1;
+    assert_eq!(overview["user_unread"], 1, "{overview}");
+    assert_eq!(overview["attention"], 1, "{overview}");
+    let att = user.get("/attention").await.1;
+    assert_eq!(att["items"][0]["message"]["id"], id, "{att}");
+    a.ok(
+        Method::POST,
+        &format!("/messages/{id}/deliveries/owner/withdraw"),
+        Some(json!({})),
+    )
+    .await;
+    let overview = user.get("/overview").await.1;
+    assert_eq!(overview["user_unread"], 0, "{overview}");
+    assert_eq!(overview["attention"], 0, "{overview}");
+    assert!(
+        user.get("/attention").await.1["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    // Acknowledgement reminders leave out withdrawn recipients: b is
+    // withdrawn, c acknowledges, so nobody is reminded.
+    let c = user.seat("c").await;
+    let m = a
+        .send(json!({"to": ["b", "c"], "subject": "confirm", "ack_required": true, "ack_timeout_s": 1}))
+        .await;
+    let id = m["id"].as_i64().unwrap();
+    a.ok(
+        Method::POST,
+        &format!("/messages/{id}/deliveries/b/withdraw"),
+        Some(json!({})),
+    )
+    .await;
+    c.ok(
+        Method::POST,
+        &format!("/messages/{id}/ack"),
+        Some(json!({})),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(3000)).await;
+    assert!(a.inbox("").await.is_empty(), "{:?}", a.inbox("").await);
 }
 
 async fn system_mail_cannot_be_forged(srv: Server) {

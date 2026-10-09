@@ -153,6 +153,16 @@ enum Cmd {
     },
     /// Acknowledge a message.
     Ack { id: i64 },
+    /// Withdraw a message you sent from a recipient of your org that has
+    /// not been shown it yet: it leaves that seat's unread mail and is
+    /// never injected (the seat can still read it by id). The org's user
+    /// can withdraw any message of the org.
+    Withdraw {
+        id: i64,
+        /// The recipient seat.
+        #[arg(long = "from", value_name = "SEAT")]
+        from: String,
+    },
     /// Delivery state of each recipient of a message you sent.
     Status { id: i64 },
     /// Show a thread (by thread id or the id of any message in it), or
@@ -1358,7 +1368,14 @@ async fn run(cli: Cli) -> Result<()> {
             let v = c.raw(Method::GET, &path, None).await?;
             out.show(&v, || {
                 let r: p::MessageResponse = parse(&v)?;
-                Ok(output::message(&r.message).trim_end().to_string())
+                let mut text = output::message(&r.message).trim_end().to_string();
+                if let Some(t) = r.delivery.as_ref().and_then(|d| d.withdrawn_at.as_deref()) {
+                    text.push_str(&format!(
+                        "\n(withdrawn by the sender {}, before it was shown to you)",
+                        output::short_time(t)
+                    ));
+                }
+                Ok(text)
             })
         }
         Cmd::Reply { id, all, opts } => {
@@ -1393,6 +1410,23 @@ async fn run(cli: Cli) -> Result<()> {
                 .raw(Method::POST, &format!("/messages/{id}/ack"), None)
                 .await?;
             out.show(&v, || Ok(format!("acked #{id}")))
+        }
+        Cmd::Withdraw { id, from } => {
+            let v = c
+                .raw(
+                    Method::POST,
+                    &format!("/messages/{id}/deliveries/{}/withdraw", enc(&from)),
+                    None,
+                )
+                .await?;
+            out.show(&v, || {
+                let r: p::WithdrawResponse = parse(&v)?;
+                Ok(if r.changed {
+                    format!("withdrew #{id} from {}", output::l(&from))
+                } else {
+                    format!("#{id} was already withdrawn from {}", output::l(&from))
+                })
+            })
         }
         Cmd::Status { id } => {
             let v = c

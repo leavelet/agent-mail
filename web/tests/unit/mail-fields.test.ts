@@ -37,3 +37,31 @@ describe('written by', () => {
     expect(describeItem(item, t).title).toBe('from be-lead (written by owner)');
   });
 });
+
+import { canWithdraw, deliveryState, deliveryStep, deliverySummary } from '../../src/lib/delivery';
+import { fromEntry } from '../../src/lib/mailrows';
+
+describe('withdrawn deliveries', () => {
+  it('have a state of their own and can be withdrawn only while queued', () => {
+    expect(deliveryState({ withdrawn_at: 'w' })).toBe('withdrawn');
+    expect(deliveryState({ withdrawn_at: 'w', read_at: 'r' })).toBe('withdrawn');
+    expect(deliveryStep('withdrawn')).toBe(-1);
+    expect(deliverySummary({ queued: 1, notified: 0, read: 0, acked: 0, withdrawn: 2 })).toEqual([
+      { state: 'queued', n: 1 },
+      { state: 'withdrawn', n: 2 },
+    ]);
+    expect(canWithdraw('b', {})).toBe(true);
+    expect(canWithdraw('b', { notified_at: 'n' })).toBe(false);
+    expect(canWithdraw('b', { withdrawn_at: 'w' })).toBe(false);
+    expect(canWithdraw('x@beta', {})).toBe(false);
+  });
+  it('are not unread in a mailbox', () => {
+    const e = {
+      delivery: { seat: 'owner', seq: 1, mod_seq: 2, class: 'to', mode: 'archive', withdrawn_at: 'w' },
+      message: { id: 1, thread_id: 1, from: 'a', source: 'agent', to: ['owner'], cc: [], subject: 's', priority: 'normal', ack_required: false, lines: 1, created_at: 't' },
+    } as unknown as Parameters<typeof fromEntry>[0];
+    const row = fromEntry(e);
+    expect(row.unread).toBe(false);
+    expect(row.withdrawn).toBe(true);
+  });
+});
