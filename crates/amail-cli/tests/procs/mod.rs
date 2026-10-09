@@ -69,8 +69,11 @@ pub fn free_port() -> u16 {
 /// An `amail serve` process. Killed (SIGKILL) when dropped.
 pub struct ServerProc {
     pub port: u16,
+    /// The server's URL, with its path prefix if it has one.
     pub base: String,
     db: String,
+    /// `--base-path`, or empty.
+    base_path: String,
     child: Option<Child>,
     pub log: PathBuf,
     _dir: tempfile::TempDir,
@@ -78,12 +81,19 @@ pub struct ServerProc {
 
 impl ServerProc {
     pub async fn start(db: &str, port: Option<u16>) -> ServerProc {
+        Self::start_under(db, port, "").await
+    }
+
+    /// Start with `--base-path base_path` (none when empty).
+    #[allow(dead_code)]
+    pub async fn start_under(db: &str, port: Option<u16>, base_path: &str) -> ServerProc {
         let dir = tempfile::tempdir().unwrap();
         let port = port.unwrap_or_else(free_port);
         let mut s = ServerProc {
             port,
-            base: format!("http://127.0.0.1:{port}"),
+            base: format!("http://127.0.0.1:{port}{base_path}"),
             db: db.to_string(),
+            base_path: base_path.to_string(),
             child: None,
             log: dir.path().join("server.log"),
             _dir: dir,
@@ -110,6 +120,11 @@ impl ServerProc {
                 "--max-connections",
                 "8",
             ])
+            .args(if self.base_path.is_empty() {
+                vec![]
+            } else {
+                vec!["--base-path", self.base_path.as_str()]
+            })
             .env("RUST_LOG", "info,sqlx=warn")
             .stdin(Stdio::null())
             .stdout(log.try_clone().unwrap())
