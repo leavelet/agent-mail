@@ -174,6 +174,65 @@ async fn two_instances_share_state_body() {
         .expect("command on the surviving instance");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_instances_under_a_path_prefix() {
+    deadline(
+        "two_instances_under_a_path_prefix",
+        two_instances_under_a_path_prefix_body(),
+    )
+    .await;
+}
+
+/// Two instances with `--base-path /amail` and the default advertise URL
+/// (which carries the prefix): a conversation mirror watched on A gets
+/// what a node posts to B, relayed from B to A below the prefix.
+async fn two_instances_under_a_path_prefix_body() {
+    let Some(db) = Db::new(Backend::Postgres, "two_instances_under_a_path_prefix").await else {
+        return;
+    };
+    let user_token = db.create_org("acme").await;
+    let a = ServerProc::start_under(&db.url, None, "/amail").await;
+    let b = ServerProc::start_under(&db.url, None, "/amail").await;
+    assert!(a.base.ends_with("/amail"));
+    let ua = Api::new(&a.base, &user_token);
+    ua.ok(Method::POST, "/seats", Some(json!({ "name": "w1" })))
+        .await;
+    let node_token = ua
+        .ok(Method::POST, "/tokens", Some(json!({ "scope": "node" })))
+        .await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let nb = Api::new(&b.base, &node_token);
+    let mut node_b = Sse::open(&nb, "/events").await;
+    let mut watch = Sse::open(&ua, "/seats/w1/transcript").await;
+    node_b
+        .next_of("command", |d| d["op"] == "transcript" && d["seat"] == "w1")
+        .await
+        .expect("lease command reaches the node on the other instance");
+    let mut subscribers = 0;
+    for _ in 0..50 {
+        let r = nb
+            .ok(
+                Method::POST,
+                "/seats/w1/transcript",
+                Some(json!({ "node": "host1", "reset": false,
+                             "events": [{ "role": "assistant", "kind": "text", "text": "below the prefix" }] })),
+            )
+            .await;
+        subscribers = r["subscribers"].as_u64().unwrap();
+        if subscribers > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(subscribers, 1, "{}", b.log_text());
+    watch
+        .next_of("events", |d| d["events"][0]["text"] == "below the prefix")
+        .await
+        .expect("transcript events relayed to the watching instance");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sqlite_refuses_a_second_instance() {
     deadline(

@@ -398,7 +398,8 @@ The server stores only their SHA-256 hashes. Each token is shown once.
 - Only user tokens (and operator tokens, for `/admin`) can sign in. Signing
   in exchanges the token for a session cookie: `HttpOnly`,
   `SameSite=Strict`, valid for 30 days (operator sessions: one day),
-  `Secure` when the request came over HTTPS and always in public mode.
+  `Secure` when the request came over HTTPS and always in public mode,
+  with `Path` set to the server's path prefix (`/` at the root).
   Revoking or rotating the token ends its sessions. A token has at most 20
   sessions; signing in once more ends the oldest.
 - Signing in counts against the token's request rate in public mode, like
@@ -436,11 +437,14 @@ told otherwise (`--webhook-private-targets allow|deny`).
 
 ## Reverse proxies
 
-`X-Forwarded-For`, `X-Forwarded-Host` and `X-Forwarded-Proto` are believed
-only from peers listed with `--trusted-proxy`; see
+`X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto` and
+`X-Forwarded-Prefix` are believed only from peers listed with
+`--trusted-proxy`; see
 [operations](operations.md#behind-a-reverse-proxy-or-a-tunnel). Otherwise a
 client could choose its own address for rate limits or pass the browser
-origin check.
+origin check. A path prefix (from `--base-path` or `X-Forwarded-Prefix`) is
+checked against a fixed set of characters before it is written into the
+page, a redirect or a cookie.
 
 ## What another org can learn
 

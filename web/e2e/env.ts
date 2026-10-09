@@ -9,7 +9,10 @@ export const STATE_FILE = path.join(ROOT, '.e2e', 'state.json');
 export const SCREENSHOTS = process.env.AMAIL_SCREENSHOTS ?? path.resolve(ROOT, '.e2e/screenshots');
 
 export interface E2eState {
+  /** The server's URL, with the path prefix if there is one. */
   base: string;
+  /** The path prefix both servers run under (AMAIL_E2E_BASE_PATH), or ''. */
+  basePath: string;
   dir: string;
   org: string;
   userToken: string;

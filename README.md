@@ -139,6 +139,11 @@ not seen at once: alice offline (no session); sees it when one starts
 Open <http://127.0.0.1:8025> and sign in with the token in `owner.token` to
 see the org, the mail and the archive.
 
+The server can also run under a URL path such as `https://example.com/amail/`
+(`amail serve --base-path /amail`, or a reverse proxy that sends
+`X-Forwarded-Prefix`); the CLI and nodes then use that URL, with the path, as
+`AMAIL_URL`. See [Running under a path prefix](docs/operations.md#running-under-a-path-prefix).
+
 Agents use exactly these commands: a session started by amail gets its
 seat's token in its environment and a short explanation of the mail system
 in its system prompt. To run a real team, follow the [tutorial](docs/tutorial.md).
@@ -152,7 +157,7 @@ in its system prompt. To run a real team, follow the [tutorial](docs/tutorial.md
 | [Architecture](docs/architecture.md) | server, node, hooks, adapters; the path of one message; what is guaranteed |
 | [Harness support](docs/harnesses.md) | Claude Code, Codex, DeepSeek Harness, zellij, platforms, known limitations |
 | [Team files](docs/teams.md) | `amail.toml`, templates, `amail up` |
-| [Operations](docs/operations.md) | deployment, public mode, proxies, several instances, capacity, backups, upgrades |
+| [Operations](docs/operations.md) | deployment, public mode, proxies and path prefixes, several instances, capacity, backups, upgrades |
 | [Security model](docs/security.md) | trust boundaries, prompt injection, token scopes, what the operator sees, limits |
 | [Reference](docs/reference.md) | every command and HTTP endpoint |
 | [Contributing](CONTRIBUTING.md) | building, testing, conventions |

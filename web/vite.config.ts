@@ -7,6 +7,10 @@ const target = process.env.AMAIL_DEV_URL ?? 'http://127.0.0.1:18025';
 
 export default defineConfig({
   plugins: [svelte()],
+  // Built files reference each other relative to the page, so that one
+  // build works at the root and under any path prefix (amail serve
+  // --base-path, or a reverse proxy's location).
+  base: './',
   resolve: process.env.VITEST ? { conditions: ['browser'] } : undefined,
   server: {
     proxy: {

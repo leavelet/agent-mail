@@ -1952,6 +1952,12 @@ pub struct ServerInfo {
     /// Message bodies older than this many days are cleared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention_days: Option<u32>,
+    /// The URL path prefix under which this request reached the server:
+    /// `/` or e.g. `/amail` (`amail serve --base-path`, and the prefix a
+    /// trusted reverse proxy removed, `X-Forwarded-Prefix`). Absent from
+    /// servers older than this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_path: Option<String>,
 }
 
 /// Body of `POST /v1/register`.

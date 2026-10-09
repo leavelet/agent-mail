@@ -107,6 +107,8 @@ not seen at once: alice offline (no session); sees it when one starts
 
 打开 <http://127.0.0.1:8025>，用 `owner.token` 里的令牌登录，就能看到组织、邮件和归档。
 
+服务器也可以运行在 `https://example.com/amail/` 这样的 URL 路径下（`amail serve --base-path /amail`，或由反向代理发送 `X-Forwarded-Prefix`）；此时命令行和节点的 `AMAIL_URL` 要用带路径的这个 URL。见[在路径前缀下运行](docs/operations.md#running-under-a-path-prefix)。
+
 agent 用的正是这些命令：amail 启动的会话会在环境里拿到自己席位的令牌，系统提示里有一段对邮件系统的简短说明。要运行真正的团队，请看[教程](docs/tutorial.md)。
 
 ## 文档（英文）
@@ -118,7 +120,7 @@ agent 用的正是这些命令：amail 启动的会话会在环境里拿到自�
 | [架构](docs/architecture.md) | 服务器、node、hook、适配器；一封信的完整路径；保证了什么 |
 | [harness 支持](docs/harnesses.md) | Claude Code、Codex、DeepSeek Harness、zellij、平台、已知限制 |
 | [团队文件](docs/teams.md) | `amail.toml`、模板、`amail up` |
-| [运维](docs/operations.md) | 部署、公共模式、反向代理、多实例、容量、备份、升级 |
+| [运维](docs/operations.md) | 部署、公共模式、反向代理与路径前缀、多实例、容量、备份、升级 |
 | [安全模型](docs/security.md) | 信任边界、提示注入、令牌作用域、运营者能看到什么、各项上限 |
 | [参考](docs/reference.md) | 所有命令和 HTTP 接口 |
 | [参与开发](CONTRIBUTING.md) | 构建、测试、约定 |

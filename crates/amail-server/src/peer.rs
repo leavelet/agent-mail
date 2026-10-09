@@ -1,7 +1,8 @@
 //! Who is on the other end of a request: the client address (for rate
 //! limits) and whether the request came through a trusted reverse proxy.
 //!
-//! `X-Forwarded-For`, `X-Forwarded-Host` and `X-Forwarded-Proto` are
+//! `X-Forwarded-For`, `X-Forwarded-Host`, `X-Forwarded-Proto` and
+//! `X-Forwarded-Prefix` (see [`crate::web::external_base`]) are
 //! believed only when the direct peer is one of the configured trusted
 //! proxies (`amail serve --trusted-proxy`). Then the client is the
 //! right-most address in `X-Forwarded-For` that is not itself a trusted

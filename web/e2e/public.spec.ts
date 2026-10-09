@@ -44,7 +44,7 @@ test('register with an invite code, then the first mail', async ({ browser }) =>
       localStorage.setItem('amail.theme', t);
     }, [lang, theme]);
     await page.goto(`${s.pub.base}/`);
-    await expect(page.locator('a[href="/register"]')).toBeVisible();
+    await expect(page.locator(`a[href="${s.basePath}/register"]`)).toBeVisible();
     await page.goto(`${s.pub.base}/register`);
     await page.locator('#r-invite').fill(s.pub.invites[0]);
     await page.locator('#r-org').fill('webco');
@@ -69,6 +69,8 @@ test('register with an invite code, then the first mail', async ({ browser }) =>
   await expect(page.locator('[data-testid=reg-done]')).toContainText('webco');
   // The next steps: init, then edit the team file, then up.
   await expect(page.locator('.steps li')).toHaveText([/amail login/, /amail node start/, /amail init/, /Edit amail\.toml/, /amail up/]);
+  // The login step names the server's URL with its path prefix.
+  await expect(page.locator('.steps li').first()).toContainText(`amail login ${s.pub.base}`);
   await shot(page, 'register-done-light-en');
 
   // Sign in with it; a seat (played through the API) answers the first mail.

@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { store } from './lib/store.svelte';
   import { router, go } from './lib/router.svelte';
+  import { currentPage } from './lib/base';
   import { applyLang, applyTheme, startClock, t, ui } from './lib/ui.svelte';
   import { typing } from './lib/keys';
   import Login from './components/Login.svelte';
@@ -25,7 +26,7 @@
   import RegisterPage from './pages/RegisterPage.svelte';
   import OperatorPage from './pages/OperatorPage.svelte';
 
-  const registering = globalThis.location?.pathname === '/register';
+  const registering = currentPage() === 'register';
 
   onMount(() => {
     applyTheme(ui.theme);

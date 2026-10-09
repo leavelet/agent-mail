@@ -183,6 +183,9 @@ pub struct Opts {
     /// Send node notices (off by default: they would add system mail to the
     /// user's inbox in tests about other things).
     pub notices: bool,
+    /// Serve under this URL path prefix (`--base-path`); the API client and
+    /// the node use the URL with it.
+    pub base_path: &'static str,
 }
 
 impl Default for Opts {
@@ -199,6 +202,7 @@ impl Default for Opts {
             check_callers: None,
             local_policy: None,
             notices: false,
+            base_path: "",
         }
     }
 }
@@ -209,8 +213,18 @@ impl Harness {
     pub async fn start(backend: Backend, test: &str, opts: Opts) -> Option<Harness> {
         let db = amail_store::testutil::open(backend, test).await?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
+        let base = format!(
+            "http://{}{}",
+            listener.local_addr().unwrap(),
+            opts.base_path
+        );
         let mut state = AppState::new(db.store.clone());
+        if !opts.base_path.is_empty() {
+            state.set_config(amail_server::config::Config {
+                base_path: opts.base_path.into(),
+                ..amail_server::config::Config::default()
+            });
+        }
         if let Some(t) = opts.server_tweak {
             t(&mut state);
         }

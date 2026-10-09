@@ -118,6 +118,12 @@ impl Env {
         String::from_utf8_lossy(&o.stderr).into_owned()
     }
 
+    fn fails_stdin(&self, args: &[&str], stdin: &str) -> String {
+        let o = self.run_with(args, &[], Some(stdin));
+        assert!(!o.status.success(), "amail {} should fail", args.join(" "));
+        String::from_utf8_lossy(&o.stderr).into_owned()
+    }
+
     fn json(&self, args: &[&str], env: &[(&str, &str)]) -> Value {
         let mut a = vec!["--json"];
         a.extend_from_slice(args);
@@ -165,6 +171,96 @@ fn serve(env: &Env, db: &str, extra: &[&str], log: &Path) -> (Proc, String) {
     let p = Proc(child);
     wait_healthy(&url);
     (p, url)
+}
+
+#[test]
+fn path_prefix_sqlite() {
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(path_prefix(Backend::Sqlite));
+}
+
+#[test]
+fn path_prefix_postgres() {
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(path_prefix(Backend::Postgres));
+}
+
+/// A server under a path prefix (`AMAIL_BASE_PATH=/amail`): the container
+/// health check at the root, `amail login` and later commands with the
+/// prefix in the URL, a login without it explained, `amail doctor` with
+/// and without it, and invalid prefixes refused at start.
+async fn path_prefix(backend: Backend) {
+    let Some((db, _guard)) = fresh_url(backend, "cli_path_prefix").await else {
+        return;
+    };
+    let env = Env::new();
+    for bad in ["amail", "/amail/", "/a/../b", "/a?x"] {
+        let err = env.fails(&["serve", "--db", &db, "--base-path", bad], &[]);
+        assert!(err.contains("--base-path"), "{bad}: {err}");
+    }
+    let created = env.json(&["admin", "create-org", "acme", "--db", &db], &[]);
+    let token = created["token"].as_str().unwrap().to_string();
+    let log = env.dir.path().join("serve.log");
+    let port = free_port();
+    let root = format!("http://127.0.0.1:{port}");
+    let listen = format!("127.0.0.1:{port}");
+    let child = env
+        .cmd(&["serve", "--db", &db, "--listen", &listen])
+        .env("AMAIL_BASE_PATH", "/amail")
+        .stdout(std::fs::File::create(&log).unwrap())
+        .stderr(std::fs::File::create(env.dir.path().join("serve.err")).unwrap())
+        .spawn()
+        .unwrap();
+    let _server = Proc(child);
+    // `amail healthcheck` (the image's health check) asks the root.
+    wait_healthy(&root);
+    let url = format!("{root}/amail");
+
+    // Without the prefix, the API is not found, and login says why.
+    let err = env.fails_stdin(&["login", &root], &format!("{token}\n"));
+    assert!(err.contains("path prefix"), "{err}");
+    // With it (a trailing slash is fine), login and later commands work.
+    let out = env.ok(
+        &["login", &format!("{url}/")],
+        &[],
+        Some(&format!("{token}\n")),
+    );
+    assert!(out.contains(&format!("logged in to {url} ")), "{out}");
+    let org = env.json(&["org", "show"], &[]);
+    assert_eq!(org["name"], "acme");
+    env.ok(&["seat", "add", "w1", "--role", "worker"], &[], None);
+    env.ok(
+        &["send", "--to", "w1", "-s", "under a prefix", "-m", "hi"],
+        &[],
+        None,
+    );
+
+    // doctor: the URL with the prefix is right; without it, the health
+    // check at the root answers but the API does not.
+    let o = env.run_with(
+        &["doctor"],
+        &[("AMAIL_URL", &url), ("AMAIL_TOKEN", &token)],
+        None,
+    );
+    let text = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(
+        text.contains(&format!("ok   server: {url} answers")),
+        "{text}"
+    );
+    assert!(!text.contains("path prefix"), "{text}");
+    let o = env.run_with(
+        &["doctor"],
+        &[("AMAIL_URL", &root), ("AMAIL_TOKEN", &token)],
+        None,
+    );
+    assert!(!o.status.success());
+    let text = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(
+        text.contains("FAIL server:") && text.contains("path prefix"),
+        "{text}"
+    );
 }
 
 #[test]

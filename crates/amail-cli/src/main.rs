@@ -51,8 +51,9 @@ enum Cmd {
         #[arg(long, default_value_t = 32)]
         max_connections: u32,
         /// Postgres with several instances: the URL at which the other
-        /// instances reach this one (for conversation mirrors). Default:
-        /// `http://<listen address>` unless it is a wildcard address.
+        /// instances reach this one (for conversation mirrors), with the
+        /// --base-path if one is set. Default: `http://<listen
+        /// address><base path>` unless it is a wildcard address.
         #[arg(long, env = "AMAIL_ADVERTISE_URL")]
         advertise_url: Option<String>,
         #[command(flatten)]
@@ -393,7 +394,7 @@ struct ServeOpts {
     /// no webhooks to private addresses.
     #[arg(long, env = "AMAIL_PUBLIC")]
     public: bool,
-    /// Believe X-Forwarded-For/-Host/-Proto from these peers (addresses or
+    /// Believe X-Forwarded-For/-Host/-Proto/-Prefix from these peers (addresses or
     /// CIDR ranges; repeat or separate with commas), e.g. 127.0.0.1 for a
     /// proxy or tunnel on the same host.
     #[arg(
@@ -467,6 +468,12 @@ struct ServeOpts {
     /// limit).
     #[arg(long, env = "AMAIL_MAX_AUTH_FAILURES_PER_MIN")]
     max_auth_failures_per_min: Option<f64>,
+    /// URL path prefix to serve under, e.g. /amail for
+    /// https://example.com/amail/ (a leading slash, no trailing slash).
+    /// Behind a proxy that removes the prefix, leave this at / and have the
+    /// proxy send X-Forwarded-Prefix instead (see --trusted-proxy).
+    #[arg(long, env = "AMAIL_BASE_PATH", default_value = "/")]
+    base_path: String,
 }
 
 impl ServeOpts {
@@ -493,6 +500,8 @@ impl ServeOpts {
             };
         }
         c.retention_days = self.retention_days;
+        c.base_path = amail_server::config::parse_base_path(&self.base_path)
+            .map_err(|e| anyhow::anyhow!("--base-path: {e}"))?;
         let l = &mut c.limits;
         let pos_f = |v: f64| (v > 0.0).then_some(v);
         if let Some(v) = self.max_seats_per_org {
@@ -2143,8 +2152,9 @@ async fn serve(
         .with_context(|| format!("binding {listen}"))?;
     let addr = listener.local_addr()?;
     let mut state = if store.backend() == "postgres" {
-        let url = advertise_url
-            .or_else(|| (!addr.ip().is_unspecified()).then(|| format!("http://{addr}")));
+        let url = advertise_url.or_else(|| {
+            (!addr.ip().is_unspecified()).then(|| format!("http://{addr}{}", config.base_path))
+        });
         if url.is_none() {
             tracing::warn!(
                 "no --advertise-url: other instances cannot forward conversation mirrors here"
@@ -2157,7 +2167,8 @@ async fn serve(
     let public = config.public;
     state.set_config(config);
     tracing::info!(
-        "amail listening on http://{addr} ({} backend{}{})",
+        "amail listening on http://{addr}{}/ ({} backend{}{})",
+        state.config.base_path,
         state.store.backend(),
         if public { ", public mode" } else { "" },
         state
