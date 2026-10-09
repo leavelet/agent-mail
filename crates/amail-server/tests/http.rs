@@ -71,6 +71,7 @@ http_tests!(
     terminal_url_schemes,
     long_subject_in_system_mail,
     ack_without_reminder,
+    written_for_an_agent,
 );
 
 struct Server {
@@ -2241,6 +2242,136 @@ async fn ack_without_reminder(srv: Server) {
     assert!(ack["delivery"]["acked_at"].is_string());
     let st = a.get(&format!("/messages/{id}/status")).await;
     assert_eq!(st.1["recipients"][0]["state"], "acked", "{:?}", st.1);
+}
+
+/// `POST /seats/{name}/messages`: the org's user writes a message in the
+/// name of an agent seat. It is the seat's message for everything that
+/// decides what it may do, and every reader is told the user wrote it.
+async fn written_for_an_agent(srv: Server) {
+    let user = srv.org("acme").await;
+    let a = user.seat("a").await;
+    let b = user.seat("b").await;
+    let c = user.seat("c").await;
+    let node = node_token(&user).await;
+    let other = srv.org("other").await;
+    let parent = a
+        .send(json!({"to": ["b"], "subject": "original", "body": "context"}))
+        .await;
+    let req =
+        json!({"to": ["a"], "subject": "answer", "body": "from c", "in_reply_to": parent["id"]});
+    // c itself cannot see the parent; only the user can write for a seat,
+    // and only for an agent seat.
+    assert_eq!(
+        c.post("/messages", req.clone()).await.0,
+        StatusCode::NOT_FOUND
+    );
+    for caller in [&a, &c, &node] {
+        assert_eq!(
+            caller.post("/seats/c/messages", req.clone()).await.0,
+            StatusCode::FORBIDDEN
+        );
+    }
+    assert_eq!(
+        other.post("/seats/c/messages", req.clone()).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        user.post("/seats/owner/messages", req.clone()).await.0,
+        StatusCode::FORBIDDEN
+    );
+    let sent = user.ok(Method::POST, "/seats/c/messages", Some(req)).await;
+    let id = sent["id"].as_i64().unwrap();
+    let got = a
+        .ok(Method::GET, &format!("/messages/{id}?peek=1"), None)
+        .await;
+    let m = &got["message"];
+    assert_eq!(m["from"], "c");
+    assert_eq!(m["source"], "agent");
+    assert_eq!(m["written_by"], "owner");
+    assert_eq!(m["thread_id"], parent["thread_id"]);
+    assert_eq!(m["in_reply_to"], parent["id"]);
+    assert_eq!(m["body"], "from c");
+    // The mark is on every view of the message: inbox, thread, sent mail,
+    // the archive and the status.
+    let inbox = a.inbox("").await;
+    let e = inbox.iter().find(|e| e["message"]["id"] == id).unwrap();
+    assert_eq!(e["message"]["written_by"], "owner");
+    let thread = a.get(&format!("/threads/{}", parent["thread_id"])).await.1;
+    let t = thread["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["id"] == id)
+        .unwrap();
+    assert_eq!(t["written_by"], "owner");
+    let sent_page = c.get("/sent?seat=c").await.1;
+    assert_eq!(
+        sent_page["messages"][0]["written_by"], "owner",
+        "{sent_page}"
+    );
+    let archive = user.get("/archive/messages?from=c").await.1;
+    assert_eq!(archive["messages"][0]["written_by"], "owner", "{archive}");
+    let status = c.get(&format!("/messages/{id}/status")).await;
+    assert!(status.0.is_success());
+    assert_eq!(status.1["written_by"], "owner");
+    assert_eq!(
+        b.get(&format!("/messages/{id}/status")).await.0,
+        StatusCode::FORBIDDEN
+    );
+    // A message c sent itself carries no mark.
+    let own = c.send(json!({"to": ["a"], "subject": "mine"})).await;
+    let got = a
+        .ok(
+            Method::GET,
+            &format!("/messages/{}?peek=1", own["id"]),
+            None,
+        )
+        .await;
+    assert!(got["message"].get("written_by").is_none(), "{got}");
+    // The user's access does not reach another org's mail, and the seat's
+    // send budget applies.
+    let hidden = other
+        .send(json!({"to": ["owner"], "subject": "private"}))
+        .await;
+    assert_eq!(
+        user.post(
+            "/seats/c/messages",
+            json!({"to": ["a"], "in_reply_to": hidden["id"]})
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    user.ok(
+        Method::PATCH,
+        "/org",
+        Some(json!({"send_burst": 1, "send_rate_per_min": 1})),
+    )
+    .await;
+    let limited = user.seat("limited").await;
+    user.ok(
+        Method::POST,
+        "/seats/limited/messages",
+        Some(json!({"to": ["a"]})),
+    )
+    .await;
+    assert_eq!(
+        limited.post("/messages", json!({"to": ["a"]})).await.0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    assert_eq!(
+        user.post("/seats/limited/messages", json!({"to": ["a"]}))
+            .await
+            .0,
+        StatusCode::TOO_MANY_REQUESTS
+    );
+    // The user's own sends are not limited.
+    user.send(json!({"to": ["a"]})).await;
+    user.ok(Method::DELETE, "/seats/c", None).await;
+    assert_eq!(
+        user.post("/seats/c/messages", json!({"to": ["a"]})).await.0,
+        StatusCode::NOT_FOUND
+    );
 }
 
 async fn system_mail_cannot_be_forged(srv: Server) {

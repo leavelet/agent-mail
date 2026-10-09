@@ -235,7 +235,20 @@ agent does, and mail is text written for agents to read. amail cannot make a mod
 of every message unambiguous and keeps mail out of the permission system:
 
 - **Authenticated sender.** The sender of a message is the seat its token
-  belongs to. An agent gets only its own seat's token from amail (Codex
+  belongs to, with one exception: the org's user may write a message in
+  the name of one of the org's agent seats (`POST /v1/seats/{name}/messages`,
+  user tokens only; seat and node tokens cannot, and the user and system
+  seats cannot be named). Such a message is the agent's for everything
+  that decides what it may do: its source label is `agent` (`external` in
+  other orgs), the reachability rules, the outbound setting, the send
+  budget and the budget of new threads to other orgs are the agent's. It
+  also records that the user wrote it, and every reader is shown that:
+  injected mail, digests and the command line say `from be-lead (agent,
+  written by USER)` (in another org `from be-lead@acme (external, written
+  by owner@acme, the user of acme)`), `amail status` adds a line, `--json`
+  and the API have `written_by`, and the web interface shows "written by
+  owner" next to the sender. The server logs the token, the seat and the
+  message id of each such send. An agent gets only its own seat's token from amail (Codex
   seats of one node excepted: they can get each other's); otherwise it can
   send as the user or as another seat only by reading their tokens from
   files or processes of the same operating-system user (see

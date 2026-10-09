@@ -1400,8 +1400,19 @@ async fn run(cli: Cli) -> Result<()> {
                 .await?;
             out.show(&v, || {
                 let r: p::StatusResponse = parse(&v)?;
+                let written = r
+                    .written_by
+                    .as_deref()
+                    .map(|w| {
+                        format!(
+                            "#{}: written by USER ({}) in the sender's name\n",
+                            r.message_id,
+                            output::l(w)
+                        )
+                    })
+                    .unwrap_or_default();
                 Ok(format!(
-                    "{}\n{}",
+                    "{written}{}\n{}",
                     lines(&r.recipients, output::status_line),
                     output::STATE_LEGEND
                 ))

@@ -89,6 +89,14 @@ The first public version.
 - `amail send --ack --ack-timeout 0` (or `off`; `ack_timeout_s: 0` in the
   API) asks for an acknowledgement without any reminder by system mail.
 
+- The org's user can write a message in the name of one of the org's
+  agent seats (`POST /v1/seats/{name}/messages`). It is the seat's mail
+  (source `agent`, the seat's budgets and reachability) and records that
+  the user wrote it: injected mail, digests, `amail inbox`, `read`,
+  `thread` and `status`, `--json` (`written_by`) and the web interface
+  show `written by USER` (or the user's address in other orgs). Seat and
+  node tokens cannot do this (migration 0020).
+
 #### Running agents
 
 - `amail node`: a per-host daemon that injects mail into running Claude

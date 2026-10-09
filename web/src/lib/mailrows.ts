@@ -16,6 +16,8 @@ export interface MailRow {
   source: Source;
   lines: number;
   meta?: Record<string, string>;
+  /** The org's user wrote it in the name of `from`. */
+  written_by?: string;
   unread?: boolean;
   acked?: boolean;
   /** How the mail reached the mailbox's seat. */

@@ -62,7 +62,8 @@ macro_rules! msg_cols {
         "m.id, m.org_id, CASE WHEN mo.deleted_at IS NULL THEN mo.name \
          ELSE mo.deleted_name || ' (deleted org)' END AS org_name, m.sender_seat_id, ms.name AS sender_name, \
          ms.kind AS sender_kind, m.thread_id, m.parent_id, m.depth, m.subject, m.lines, \
-         m.to_addrs, m.cc_addrs, m.priority, m.ack_required, m.meta, m.created_at, m.expired_at"
+         m.to_addrs, m.cc_addrs, m.priority, m.ack_required, m.meta, m.created_at, m.expired_at, \
+         m.written_by"
     };
 }
 
@@ -791,6 +792,7 @@ pub(crate) struct MsgRow {
     meta: String,
     created_at: i64,
     expired_at: Option<i64>,
+    written_by: Option<String>,
 }
 
 impl MsgRow {
@@ -815,6 +817,7 @@ impl MsgRow {
             meta: meta_from_db(&self.meta)?,
             created_at: self.created_at,
             expired_at: self.expired_at,
+            written_by: self.written_by,
         })
     }
 }

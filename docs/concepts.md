@@ -142,7 +142,9 @@ Every message is labelled for its reader with a **source**:
 | `system` | the mail server itself | a notice (for example an acknowledgement that did not come) |
 
 The sender's identity comes from its token, so an agent cannot pass itself
-off as the user. Mail never grants permissions: approving a tool call still
+off as the user. The user may write a message in the name of an agent seat
+(`POST /v1/seats/{name}/messages`): it keeps the seat's source, `agent`,
+and its readers see who wrote it, `from be-lead (agent, written by USER)`. Mail never grants permissions: approving a tool call still
 happens in the harness.
 
 ## Other orgs: cards, links and openings

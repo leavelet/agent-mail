@@ -161,8 +161,8 @@ impl PgStore {
                 let thread_id = m.thread_id.unwrap_or(id);
                 sqlx::query(
                     "INSERT INTO messages (id, org_id, sender_seat_id, thread_id, parent_id, depth, subject, body, \
-                     lines, to_addrs, cc_addrs, priority, ack_required, created_at, meta, ack_due, notice) \
-                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+                     lines, to_addrs, cc_addrs, priority, ack_required, created_at, meta, ack_due, notice, written_by) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
                 )
                 .bind(id)
                 .bind(m.org_id)
@@ -181,6 +181,7 @@ impl PgStore {
                 .bind(&meta)
                 .bind(m.ack_due)
                 .bind(m.notice)
+                .bind(&m.written_by)
                 .execute(&mut *c)
                 .await?;
 

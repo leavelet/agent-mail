@@ -108,6 +108,8 @@ export interface MessageHeader {
   meta?: Meta;
   /** The server's retention period removed the body. */
   expired?: boolean;
+  /** The sending org's user wrote this message in the name of `from` (an agent seat). */
+  written_by?: string;
 }
 
 export interface Message extends MessageHeader {

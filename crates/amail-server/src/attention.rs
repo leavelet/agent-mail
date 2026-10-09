@@ -210,6 +210,7 @@ async fn escalate(st: &AppState, due: &AckDue, now: i64) -> amail_store::Result<
             meta: Default::default(),
             deliveries,
             ack_due: None,
+            written_by: None,
             // Reminders from the mail system are never refused.
             storage_quota: None,
             notice: false,

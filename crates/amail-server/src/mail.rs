@@ -62,6 +62,16 @@ pub async fn send(
     Ok(Json(crate::send::send(&st, &auth, req).await?))
 }
 
+/// `POST /v1/seats/{name}/messages`: see [`crate::send::send_as`].
+pub async fn send_as(
+    State(st): State<AppState>,
+    auth: Auth,
+    Path(name): Path<String>,
+    Json(req): Json<p::SendRequest>,
+) -> ApiResult<Json<p::SendResponse>> {
+    Ok(Json(crate::send::send_as(&st, &auth, &name, req).await?))
+}
+
 /// `POST /v1/messages/preview`: see [`crate::send::preview`].
 pub async fn preview(
     State(st): State<AppState>,
@@ -207,6 +217,7 @@ pub async fn status(
         .collect();
     Ok(Json(p::StatusResponse {
         message_id: id,
+        written_by: m.written_by.clone(),
         recipients,
     }))
 }

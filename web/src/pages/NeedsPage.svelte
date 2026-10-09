@@ -110,6 +110,7 @@
                 {:else if it.message}
                   {#if it.message.priority === 'urgent'}<span class="chip urgent">{t('mail.urgent')}</span>{/if}
                   {#if it.message.source === 'external' || it.message.source === 'system'}<span class="chip neutral" title={t(`mail.source.${it.message.source}.long`)}>{t(`mail.source.${it.message.source}`)}</span>{/if}
+                  {#if it.message.written_by}<span class="chip neutral" title={t('mail.writtenBy.long')}>{it.message.from} · {t('mail.writtenBy', { user: it.message.written_by })}</span>{/if}
                   <span class="subj">{#if it.message.subject}<Vis text={shortSubject(it.message.subject)} />{:else}{t('mail.noSubject')}{/if}</span>
                 {/if}
               </div>

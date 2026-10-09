@@ -580,6 +580,7 @@ async fn send_notice(
                 mode: DeliveryMode::Immediate,
             }],
             ack_due: None,
+            written_by: None,
             // Notice mail is never refused at the storage quota and is not
             // charged to it; the daily budget above and its own retention
             // bound it.

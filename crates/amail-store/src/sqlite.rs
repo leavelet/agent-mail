@@ -207,6 +207,7 @@ impl SqliteStore {
                         .bind(m.storage_quota)
                         .bind(per_delivery)
                         .bind(m.notice)
+                        .bind(&m.written_by)
                         .fetch_all(&mut *c)
                         .await;
                     match rows {
@@ -296,7 +297,8 @@ impl SqliteStore {
 /// $12 ack_required, $13 now, $14 deliveries JSON, $15 meta, $16 ack_due,
 /// $17 the message's bytes without its deliveries (see `message_bytes`),
 /// $18 the org's storage quota (NULL: none), $19 the bytes per delivery,
-/// $20 whether it is notice mail.
+/// $20 whether it is notice mail, $21 the user seat that wrote it in the
+/// sender's name (NULL: the sender did).
 /// The org's `stored_bytes` grows by $17 plus $19 per delivery created; the
 /// message is refused when that would exceed $18, and also when the org was
 /// deleted meanwhile.
@@ -305,8 +307,8 @@ const SEND_SQL: &str = "
 UPDATE temp.send_quota SET fits = COALESCE((SELECT deleted_at IS NULL
        AND ($18 IS NULL OR stored_bytes + $17 + $19 * json_array_length($14) <= $18) FROM orgs WHERE id = $1), FALSE);
 INSERT INTO messages (org_id, sender_seat_id, thread_id, parent_id, depth, subject, body, lines,
-                      to_addrs, cc_addrs, priority, ack_required, created_at, meta, ack_due, notice)
-VALUES ($1, $2, COALESCE($3, 0), $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $15, $16, $20);
+                      to_addrs, cc_addrs, priority, ack_required, created_at, meta, ack_due, notice, written_by)
+VALUES ($1, $2, COALESCE($3, 0), $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $15, $16, $20, $21);
 UPDATE messages SET thread_id = id WHERE id = last_insert_rowid() AND $3 IS NULL;
 UPDATE seats SET last_seq = last_seq + 1
  WHERE id IN (SELECT json_extract(value, '$.s') FROM json_each($14));

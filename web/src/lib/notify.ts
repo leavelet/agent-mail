@@ -51,11 +51,12 @@ export async function requestPermission(): Promise<boolean> {
 /** Title and body of the notification for an item. */
 export function describe(
   i: AttentionItem,
-  t: (k: 'notify.ack' | 'notify.reply' | 'notify.seat' | 'notify.notice', p?: Record<string, string>) => string,
+  t: (k: 'notify.ack' | 'notify.reply' | 'notify.seat' | 'notify.notice' | 'mail.writtenBy', p?: Record<string, string>) => string,
 ): { title: string; body: string } {
   if (i.kind === 'seat') return { title: t('notify.seat', { seat: i.seat ?? '' }), body: i.hint ?? i.attention ?? '' };
   const m = i.message;
-  const title = t(i.kind === 'ack' ? 'notify.ack' : i.kind === 'notice' ? 'notify.notice' : 'notify.reply', { from: m?.from ?? '' });
+  const from = m?.written_by ? `${m.from} (${t('mail.writtenBy', { user: m.written_by })})` : (m?.from ?? '');
+  const title = t(i.kind === 'ack' ? 'notify.ack' : i.kind === 'notice' ? 'notify.notice' : 'notify.reply', { from });
   return { title, body: shortSubject(m?.subject ?? '') };
 }
 

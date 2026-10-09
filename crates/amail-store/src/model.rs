@@ -223,6 +223,9 @@ pub struct NewMessage {
     /// With `ack_required`: when the sender is told about recipients that
     /// have not acknowledged.
     pub ack_due: Option<i64>,
+    /// The name of the org's user seat when the user wrote the message in
+    /// the name of `sender_seat_id` (an agent seat).
+    pub written_by: Option<String>,
     /// Refuse the message ([`crate::StoreError::StorageQuota`]) if the
     /// org's stored bytes would then exceed this.
     pub storage_quota: Option<i64>,
@@ -321,6 +324,9 @@ pub struct MessageRec {
     pub created_at: i64,
     /// When the retention period cleared the body.
     pub expired_at: Option<i64>,
+    /// The org's user wrote this message in the name of the sender (an
+    /// agent seat): the user seat's name.
+    pub written_by: Option<String>,
 }
 
 #[derive(Debug, Clone)]

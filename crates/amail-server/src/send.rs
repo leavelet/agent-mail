@@ -43,6 +43,55 @@ use std::collections::HashMap;
 
 pub async fn send(st: &AppState, auth: &Auth, req: SendRequest) -> ApiResult<SendResponse> {
     let sender = auth.mail_seat()?.clone();
+    send_from(st, auth, &sender, None, req).await
+}
+
+/// `POST /v1/seats/{name}/messages`: the org's user writes a message in the
+/// name of one of the org's agent seats. The message is the seat's in every
+/// respect that decides what it may do (its source is `agent`; recipients,
+/// the reachability rule, the send budget and the budget of new threads to
+/// other orgs are the seat's), and it records that the user wrote it
+/// (`written_by`), which every reader is shown. The user's own access
+/// decides whether `in_reply_to` may be named, as for the user's own mail.
+/// Only user tokens may do this, and only for agent seats.
+pub async fn send_as(
+    st: &AppState,
+    auth: &Auth,
+    name: &str,
+    req: SendRequest,
+) -> ApiResult<SendResponse> {
+    auth.require_user()?;
+    let user = auth.mail_seat()?.name.clone();
+    let sender = st
+        .store
+        .seat_by_name(auth.org.id, name)
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("no seat {name:?}")))?;
+    if sender.kind != SeatKind::Agent {
+        return Err(ApiError::forbidden(
+            "only agent seats can be written for; the user sends as itself",
+        ));
+    }
+    let result = send_from(st, auth, &sender, Some(user), req).await?;
+    tracing::info!(
+        org_id = auth.org.id,
+        token_id = auth.token_id,
+        seat = %sender.name,
+        message_id = result.id,
+        "message written by the user in the name of a seat"
+    );
+    Ok(result)
+}
+
+/// Send `req` as `sender`; `written_by`: the user seat that wrote it in the
+/// sender's name.
+async fn send_from(
+    st: &AppState,
+    auth: &Auth,
+    sender: &Seat,
+    written_by: Option<String>,
+    req: SendRequest,
+) -> ApiResult<SendResponse> {
     let org = &auth.org;
     if req.to.is_empty() && req.cc.is_empty() {
         return Err(ApiError::bad_request("at least one recipient is required"));
@@ -86,9 +135,9 @@ pub async fn send(st: &AppState, auth: &Auth, req: SendRequest) -> ApiResult<Sen
     }
     // A link ended or an opening was removed between the check and the
     // send's transaction: decide again (the recipient is then refused).
-    let mut result = send_inner(st, auth, &sender, req.clone()).await;
+    let mut result = send_inner(st, auth, sender, written_by.clone(), req.clone()).await;
     if matches!(&result, Err(e) if e.code == "boundary_changed") {
-        result = send_inner(st, auth, &sender, req).await;
+        result = send_inner(st, auth, sender, written_by, req).await;
     }
     if result.is_err()
         && limited
@@ -238,6 +287,7 @@ async fn send_inner(
     st: &AppState,
     auth: &Auth,
     sender: &Seat,
+    written_by: Option<String>,
     req: SendRequest,
 ) -> ApiResult<SendResponse> {
     let org = &auth.org;
@@ -331,6 +381,7 @@ async fn send_inner(
         meta: req.meta,
         deliveries,
         ack_due,
+        written_by,
         storage_quota: st.config.limits.org_storage_bytes,
         notice: false,
         guards: std::mem::take(&mut r.reach.guards),

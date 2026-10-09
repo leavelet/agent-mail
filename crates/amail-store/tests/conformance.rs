@@ -110,6 +110,7 @@ fn msg(org_id: i64, from: i64, subject: &str, to: &[(&Seat, C)]) -> NewMessage {
             })
             .collect(),
         ack_due: None,
+        written_by: None,
         storage_quota: None,
         notice: false,
         guards: Vec::new(),

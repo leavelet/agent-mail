@@ -39,9 +39,10 @@
         if (e.key === 'Enter') onopen?.(r);
       }}
     >
-      <div class="who mono" title={showTo ? r.to.join(', ') : r.from}>
+      <div class="who mono" title={showTo ? r.to.join(', ') : r.written_by ? `${r.from} (${t('mail.writtenBy', { user: r.written_by })})` : r.from}>
         {#if r.unread}<span class="udot" aria-label={t('mail.unread')}></span>{/if}
         {showTo ? `→ ${r.to.join(', ')}` : r.from}
+        {#if !showTo && r.written_by}<span class="wb" title={t('mail.writtenBy.long')}>({t('mail.writtenBy', { user: r.written_by })})</span>{/if}
         {#if !showTo && r.source !== 'agent'}<span class="src src-{r.source}" title={t(`mail.source.${r.source}.long`)}>{t(`mail.source.${r.source}`)}</span>{/if}
       </div>
       <div class="subj">
@@ -87,6 +88,10 @@
   .mrow.sel {
     background: var(--accent-weak);
     box-shadow: inset 3px 0 0 var(--accent);
+  }
+  .wb {
+    font-family: var(--font);
+    color: var(--muted);
   }
   .who {
     display: flex;

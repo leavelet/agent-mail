@@ -11,7 +11,7 @@
 
 use amail_proto::{
     self as p, Delivery, DeliveryClass, DeliveryMode, InboxEntry, Message, MessageHeader, Priority,
-    Source, text,
+    text,
 };
 use std::borrow::Cow;
 
@@ -25,15 +25,6 @@ pub fn short_time(ts: &str) -> String {
     match (ts.get(0..10), ts.get(11..16)) {
         (Some(d), Some(t)) => format!("{}Z", l(&format!("{d} {t}"))),
         _ => l(ts).into_owned(),
-    }
-}
-
-fn source(s: Source) -> &'static str {
-    match s {
-        Source::User => "USER",
-        Source::Agent => "agent",
-        Source::External => "external",
-        Source::System => "system",
     }
 }
 
@@ -57,7 +48,7 @@ pub fn entry_line(e: &InboxEntry) -> String {
         m.id,
         tags.join(" "),
         l(&m.from),
-        source(m.source),
+        p::sender_label(m),
         text::subject(&m.subject),
         m.lines,
         if m.lines == 1 { "" } else { "s" },
@@ -93,7 +84,7 @@ pub fn message(m: &Message) -> String {
         h.id,
         h.thread_id,
         l(&h.from),
-        source(h.source),
+        p::sender_label(h),
         short_time(&h.created_at)
     );
     if let Some(to) = addresses(&h.to) {
@@ -564,6 +555,7 @@ pub fn token_line(t: &p::TokenInfo) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use amail_proto::Source;
     use amail_proto::{Message, MessageHeader};
 
     fn msg(source: Source, subject: &str, body: &str) -> Message {
@@ -585,6 +577,7 @@ mod tests {
                     .into_iter()
                     .collect(),
                 expired: false,
+                written_by: None,
             },
             body: body.into(),
             body_omitted: false,
@@ -656,6 +649,32 @@ mod tests {
         let exact = "é".repeat(p::limits::SUBJECT_SHOWN_CHARS);
         let t = message(&msg(Source::Agent, &exact, "b"));
         assert_eq!(t.lines().nth(2).unwrap(), format!("Subject: {exact}"));
+    }
+
+    #[test]
+    fn written_by_the_user() {
+        let mut m = msg(Source::Agent, "Plan", "b");
+        m.header.from = "be-lead".into();
+        m.header.written_by = Some("owner".into());
+        assert!(
+            message(&m).starts_with("#7 thread 1 from be-lead (agent, written by USER) "),
+            "{}",
+            message(&m)
+        );
+        let e = InboxEntry {
+            delivery: serde_json::from_value(serde_json::json!({
+                "seat": "w1", "class": "to", "mode": "immediate"
+            }))
+            .unwrap(),
+            message: m.header.clone(),
+            body: None,
+            preview: None,
+        };
+        assert!(
+            entry_line(&e).contains("] be-lead (agent, written by USER): Plan | "),
+            "{}",
+            entry_line(&e)
+        );
     }
 
     #[test]

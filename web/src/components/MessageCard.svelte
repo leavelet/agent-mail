@@ -47,6 +47,7 @@
       {:else}
         <span class="from mono">{message.from}</span>
       {/if}
+      {#if message.written_by}<span class="chip neutral" data-testid="written-by" title={t('mail.writtenBy.long')}>{t('mail.writtenBy', { user: message.written_by })}</span>{/if}
       {#if message.priority === 'urgent'}<span class="chip urgent">{t('mail.urgent')}</span>{/if}
       {#if message.ack_required}<span class="chip ack">{t('mail.ackReq')}</span>{/if}
       <span class="spacer"></span>

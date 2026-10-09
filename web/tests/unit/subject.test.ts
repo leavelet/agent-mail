@@ -29,3 +29,11 @@ describe('subjects', () => {
     expect(describeItem(item, (k) => k).body).toBe(`${'界'.repeat(200)}…`);
   });
 });
+
+describe('written by', () => {
+  it('notifications name the user who wrote a message in an agent\'s name', () => {
+    const item = { kind: 'reply', message: { from: 'be-lead', written_by: 'owner', subject: 's' } } as unknown as Parameters<typeof describeItem>[0];
+    const t = (k: string, p?: Record<string, string>) => (k === 'mail.writtenBy' ? `written by ${p?.user}` : `from ${p?.from}`);
+    expect(describeItem(item, t).title).toBe('from be-lead (written by owner)');
+  });
+});

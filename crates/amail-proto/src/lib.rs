@@ -553,6 +553,36 @@ pub struct MessageHeader {
     /// The retention period cleared the body (the header is kept).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub expired: bool,
+    /// The sender's org's user wrote this message in the name of `from`
+    /// (an agent seat; `source` stays that of `from`): the user's address,
+    /// relative to the reader's org.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_by: Option<String>,
+}
+
+/// How the sender of a message is labelled on one line, for agents and
+/// people: `agent`, `USER`, `external`, `system`, followed by who wrote it
+/// when the org's user wrote it in an agent's name (`agent, written by
+/// USER`; for another org's reader `external, written by owner@acme, the
+/// user of acme`).
+pub fn sender_label(h: &MessageHeader) -> String {
+    let source = match h.source {
+        Source::User => "USER",
+        Source::Agent => "agent",
+        Source::External => "external",
+        Source::System => "system",
+    };
+    match &h.written_by {
+        None => source.to_string(),
+        Some(w) => match w.split_once('@') {
+            None => format!("{source}, written by USER"),
+            Some((_, org)) => format!(
+                "{source}, written by {}, the user of {}",
+                text::line(w),
+                text::line(org)
+            ),
+        },
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -631,6 +661,9 @@ pub struct AckResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub message_id: i64,
+    /// The org's user wrote the message in the sender's name: the user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_by: Option<String>,
     pub recipients: Vec<RecipientStatus>,
 }
 

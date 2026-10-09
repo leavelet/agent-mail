@@ -196,6 +196,7 @@ pub fn router(state: AppState) -> Router {
             axum::routing::delete(operator::delete_org),
         )
         .route("/messages", post(mail::send))
+        .route("/seats/{name}/messages", post(mail::send_as))
         .route("/messages/preview", post(mail::preview))
         .route("/messages/{id}", get(mail::read))
         .route("/messages/{id}/ack", post(mail::ack))
