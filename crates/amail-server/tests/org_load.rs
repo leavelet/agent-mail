@@ -169,17 +169,32 @@ async fn org_request_limit_counts_all_tokens(b: Backend, t: &str) {
             } else {
                 second.clone()
             };
-            tokio::spawn(async move { c.call(Method::GET, "/whoami", None).await })
+            tokio::spawn(async move {
+                let r = c.call(Method::GET, "/whoami", None).await;
+                (r, started.elapsed())
+            })
         })
         .collect();
     let mut codes = Vec::new();
+    let mut last_ok = std::time::Duration::ZERO;
     for t in tasks {
-        codes.push(t.await.unwrap());
+        let (r, at) = t.await.unwrap();
+        if r.0.is_success() {
+            last_ok = last_ok.max(at);
+        }
+        codes.push(r);
     }
     // Refusals come late (a client that retries at once is slowed down).
     assert!(started.elapsed().as_secs_f64() >= 0.9);
     let ok = codes.iter().filter(|(s, _)| s.is_success()).count();
-    assert!((9..=12).contains(&ok), "{ok} of 24 served");
+    // The burst of ten, plus what refilled (5 per second) while the served
+    // requests were still being answered: on a slow machine that is more
+    // than on a fast one.
+    let refilled = (5.0 * last_ok.as_secs_f64()).ceil() as usize;
+    assert!(
+        (9..=10 + refilled + 1).contains(&ok),
+        "{ok} of 24 served; the last success came after {last_ok:?}"
+    );
     let limited = codes
         .iter()
         .filter(|(s, v)| {
