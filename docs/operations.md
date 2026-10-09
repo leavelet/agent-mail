@@ -15,11 +15,13 @@ Settings of `amail serve` come from flags or the environment
 | `--advertise-url` | `AMAIL_ADVERTISE_URL` | several instances only, see below |
 | `--public` | `AMAIL_PUBLIC` | off, see [public mode](#public-mode) |
 | `--trusted-proxy` | `AMAIL_TRUSTED_PROXIES` | none, see [behind a proxy](#behind-a-reverse-proxy-or-a-tunnel) |
+| `--base-path` | `AMAIL_BASE_PATH` | `/`, see [path prefix](#running-under-a-path-prefix) |
 | `--retention-days` | `AMAIL_RETENTION_DAYS` | off, see [retention](#retention-and-deleting-data) |
 
 Logging goes to stderr and follows `RUST_LOG` (default `info`). Logs name
 orgs and counts; they never contain tokens, invite codes or message bodies.
-`GET /healthz` answers `ok` without authentication, for health checks.
+`GET /healthz` answers `ok` without authentication, for health checks (at
+the root, and also below the path prefix when `--base-path` is set).
 
 ## A single host with SQLite
 
@@ -119,16 +121,19 @@ Run the server on a loopback or private address and let a reverse proxy
 (nginx, Caddy, a load balancer) or a tunnel (for example Cloudflare
 Tunnel's `cloudflared`) terminate TLS.
 
-The server believes `X-Forwarded-For`, `X-Forwarded-Host` and
-`X-Forwarded-Proto` **only from peers listed with `--trusted-proxy`**
-(addresses or CIDR ranges, comma-separated or repeated). From those peers:
+The server believes `X-Forwarded-For`, `X-Forwarded-Host`,
+`X-Forwarded-Proto` and `X-Forwarded-Prefix` **only from peers listed with
+`--trusted-proxy`** (addresses or CIDR ranges, comma-separated or repeated).
+From those peers:
 
 - the client address used for rate limits is the right-most address in
   `X-Forwarded-For` that is not itself a trusted proxy;
 - `X-Forwarded-Host` may name the host when the browser's `Origin` is
   checked on cookie-authenticated requests;
 - `X-Forwarded-Proto: https` makes session cookies `Secure` (in public mode
-  they always are).
+  they always are);
+- `X-Forwarded-Prefix` names a path prefix that the proxy removed (see
+  [running under a path prefix](#running-under-a-path-prefix)).
 
 From any other peer these headers are ignored. Without a trusted proxy,
 the proxy must pass the original `Host` header, and every client appears
@@ -164,6 +169,141 @@ location / {
 Each node keeps about a dozen HTTP connections to the server (an event
 stream plus pooled connections): plan the proxy's connection and file
 descriptor limits as roughly 12 × the number of nodes.
+
+## Running under a path prefix
+
+The server can answer below a URL path, for example
+`https://example.com/amail/`, so that it shares a host name with other
+services. There are two ways to set this up. Use one of them.
+
+**1. The server knows the prefix (`--base-path`).** Start the server with
+`--base-path /amail` (or `AMAIL_BASE_PATH=/amail`). It then answers only
+below `/amail/`: the API at `/amail/v1/...`, the web interface at `/amail/`,
+its files at `/amail/assets/...`. `/amail` without the trailing slash
+redirects to `/amail/`. Requests to other paths get 404, except
+`/healthz`, which answers at the root and at `/amail/healthz` (the
+container image's health check, `amail healthcheck http://127.0.0.1:8025`,
+asks the root). The proxy passes the path on unchanged. Without a proxy,
+the server is reached at `http://127.0.0.1:8025/amail/`.
+
+**2. The proxy removes the prefix (`X-Forwarded-Prefix`).** The server runs
+at the root (no `--base-path`). The proxy removes `/amail` from the path
+before it passes the request on, and sends the header
+`X-Forwarded-Prefix: /amail` to say what it removed. The server believes the
+header only from a peer listed with `--trusted-proxy`; from other peers it
+is ignored. Without the header the server cannot know the prefix, and the
+links in the web interface and the session cookie would point at the root.
+
+In both cases the web interface needs no rebuild: the server writes the
+prefix into the page it serves (`<meta name="amail-base" content="/amail/">`),
+and the app sends its API requests and event streams and builds its links
+below it. The session cookie gets `Path=/amail`, so two servers under
+different prefixes on one host keep separate sign-ins. `GET /v1/info`
+reports the prefix as the server sees it (`"base_path": "/amail"`).
+
+The rules for a prefix: it starts with `/`, has no trailing `/`, and its
+segments contain only letters, digits and `-._~` (no `.` or `..` segment,
+no query, no `//`). `amail serve` refuses other values. An
+`X-Forwarded-Prefix` value that breaks these rules is ignored; a trailing
+`/` in it is removed. If the proxy sends several values separated by
+commas, the first counts. Both ways can be combined: with
+`--base-path /amail` and `X-Forwarded-Prefix: /tools`, the server is at
+`/tools/amail/`.
+
+**The CLI and nodes.** They take the server's URL with the prefix:
+`amail login https://example.com/amail`, `AMAIL_URL=https://example.com/amail`,
+`amail node --url https://example.com/amail`. They append `/v1/...` to that
+URL, and the node passes the same URL to the agent sessions it starts. A
+URL without the prefix fails: `amail login` and `amail doctor` then say that
+the prefix may be missing. `amail doctor` also warns when the URL's path and
+the prefix the server reports differ (for example, when the proxy removes
+the prefix but does not send `X-Forwarded-Prefix`).
+
+With several instances (Postgres) and `--base-path`, `--advertise-url` must
+include the prefix (`http://10.0.0.5:8025/amail`); the default does.
+
+### nginx
+
+The Origin check on cookie-authenticated requests compares the browser's
+`Origin` with `Host` (or, from a trusted proxy, `X-Forwarded-Host`), so pass
+`$http_host`, which keeps a non-default port. Both blocks below go into one
+`server` block; the server is started with `--trusted-proxy 127.0.0.1`.
+
+Way 1, `amail serve --base-path /amail --listen 127.0.0.1:8025`
+(`proxy_pass` without a path passes the request path on unchanged):
+
+```nginx
+location /amail/ {
+    proxy_pass http://127.0.0.1:8025;
+    proxy_http_version 1.1;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_buffering off;
+    proxy_read_timeout 1h;
+}
+```
+
+Way 2, `amail serve --listen 127.0.0.1:8025` at the root (`proxy_pass`
+with the path `/` replaces `/amail/` with `/`):
+
+```nginx
+location /amail/ {
+    proxy_pass http://127.0.0.1:8025/;
+    proxy_http_version 1.1;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Prefix /amail;
+    proxy_buffering off;
+    proxy_read_timeout 1h;
+}
+```
+
+For a `location` that ends in `/` and uses `proxy_pass`, nginx redirects
+`/amail` to `/amail/` itself.
+
+### Caddy
+
+Caddy passes the `Host` header on and sets `X-Forwarded-For`,
+`X-Forwarded-Proto` and `X-Forwarded-Host` by default, and does not buffer
+event streams.
+
+Way 1, `amail serve --base-path /amail`:
+
+```caddyfile
+example.com {
+    redir /amail /amail/
+    handle /amail/* {
+        reverse_proxy 127.0.0.1:8025
+    }
+}
+```
+
+Way 2, `amail serve` at the root (`handle_path` removes the prefix):
+
+```caddyfile
+example.com {
+    redir /amail /amail/
+    handle_path /amail/* {
+        reverse_proxy 127.0.0.1:8025 {
+            header_up X-Forwarded-Prefix /amail
+        }
+    }
+}
+```
+
+Caddy answers paths that no `handle` matches with an empty `200` response.
+
+These four configurations were run with nginx 1.27 and Caddy 2 in front of
+`amail serve --trusted-proxy 127.0.0.1`: a browser signed in, received new
+mail over the event stream and opened a route given as a path; the CLI
+logged in and sent mail; a node connected and received events. The
+container's health check needs no change in either way.
+
+In Docker Compose, set `AMAIL_BASE_PATH=/amail` in the env file for way 1;
+for way 2, set `AMAIL_TRUSTED_PROXIES` to the proxy's address as described
+above.
 
 ## Public mode
 

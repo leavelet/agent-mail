@@ -27,7 +27,8 @@
 **Server (`amail serve`).** The only source of truth: orgs, seats, lists,
 links, messages, deliveries, tokens, settings. An axum HTTP API under `/v1`
 with JSON bodies and server-sent event streams, plus the embedded web
-interface. Storage is SQLite (one process per database file) or Postgres
+interface, at the root or below a URL path prefix (`--base-path`, or
+`X-Forwarded-Prefix` from a trusted proxy). Storage is SQLite (one process per database file) or Postgres
 (any number of processes on one database). Migrations run on start.
 
 **Node (`amail node`).** One per host and user. It connects outward to the

@@ -103,7 +103,7 @@ node uses `AMAIL_URL`, then `node.toml`, then the current saved login's URL.
 
 | command | |
 |---|---|
-| `amail serve --db <url> [--listen addr] [--max-connections n] [--advertise-url url] [--public] [--trusted-proxy cidr,...] [--retention-days n] [--webhook-private-targets allow\|deny] [limits]` | run the server ([operations](operations.md)) |
+| `amail serve --db <url> [--listen addr] [--max-connections n] [--advertise-url url] [--public] [--trusted-proxy cidr,...] [--base-path /prefix] [--retention-days n] [--webhook-private-targets allow\|deny] [limits]` | run the server ([operations](operations.md)) |
 | `amail admin create-org <org> [--user-name owner]` | create an org with its user seat; prints the user token |
 | `amail admin invite create [--count n] [--note text] [--expires 7d]` / `ls` / `revoke <id>` | invite codes |
 | `amail admin operator-token create [--label l]` / `ls` / `revoke <id>` | operator tokens |
@@ -125,6 +125,24 @@ After too many failed authentications from one client address, requests
 from it with a credential the server has not seen valid lately get 429
 `rate_limited` (see [security](security.md#resource-limits)).
 `GET /healthz` (outside `/v1`) answers `ok`.
+
+Under a path prefix, every path here is below it: with
+`amail serve --base-path /amail` (`AMAIL_BASE_PATH`), the API is at
+`/amail/v1/...` and the web interface at `/amail/`; `/healthz` answers at
+the root and at `/amail/healthz`; other paths get 404. A reverse proxy that
+removes a prefix before passing a request on sends
+`X-Forwarded-Prefix: /amail` instead; the header counts only from a peer
+listed with `--trusted-proxy`, must follow the same rules as `--base-path`
+(a leading `/`; segments of letters, digits and `-._~`; no `.` or `..`
+segment, query or `//`; a trailing `/` is removed), and comes before the
+`--base-path` if both are set. The prefix sets the session cookie's `Path`
+and is written into the web interface's page as
+`<meta name="amail-base" content="/amail/">`. A browser request
+(`Accept: text/html`) for a path below the prefix that is not a file, the
+API or an asset, such as `/amail/org/root`, is redirected to the web
+interface's route `/amail/#/org/root`. Clients put the prefix in the server
+URL (`AMAIL_URL=https://example.com/amail`). See
+[operations](operations.md#running-under-a-path-prefix).
 
 ### Mail
 
@@ -166,7 +184,7 @@ from it with a credential the server has not seen valid lately get 429
 | `GET, POST /tokens`; `DELETE /tokens/{id}` | tokens |
 | `POST /tokens/rotate` | user tokens, `{label?}`: a new user token (answered once); the calling token is revoked, its browser sessions end and its open streams close; a browser that rotated gets a new session |
 | `GET /whoami` | the caller's org, scope and seat |
-| `GET /info` | no authentication: `version`, `public`, `registration`, `retention_days` |
+| `GET /info` | no authentication: `version`, `public`, `registration`, `retention_days`, `base_path` (the path prefix as this request reached the server: `/` or e.g. `/amail`) |
 | `POST /register` | no authentication, public mode: `{invite, org, user_name?}` → `{org, user_seat, token}` (201); 403 `invalid_invite`, 409 `org_exists` (at most 3 times per invite; then the invite is spent and gets 403), 422 `invalid_name`/`reserved_name`, 429 when the client address is over its limit |
 
 ### Web interface and nodes

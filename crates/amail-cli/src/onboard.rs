@@ -87,13 +87,18 @@ pub async fn login(url: &str, name: Option<String>, out: &Out) -> Result<()> {
 }
 
 /// Said when the API answers 404 at the URL given.
-const PREFIX_HINT: &str = "the server answered 404 for the API: if it runs under a path \
+const PREFIX_HINT: &str = "no amail API at this URL: if the server runs under a path \
      prefix (amail serve --base-path, or a reverse proxy location), include the prefix in \
      the URL, e.g. https://example.com/amail";
 
-/// A 404 from the server, or from a proxy in front of it (not JSON).
+/// An answer that suggests the URL lacks the server's path prefix: a 404
+/// from the server or from a proxy in front of it, or a successful answer
+/// that is not the API's (some proxies answer paths they do not route with
+/// an empty page).
 fn not_found(e: &anyhow::Error) -> bool {
-    crate::client::is_not_found(e) || e.chain().any(|c| c.to_string().starts_with("HTTP 404"))
+    crate::client::is_not_found(e)
+        || e.chain()
+            .any(|c| c.is::<serde_json::Error>() || c.to_string().starts_with("HTTP 404"))
 }
 
 /// The path of a server URL (`/` for none), e.g. `/amail` for

@@ -112,8 +112,19 @@ The first public version.
   loopback addresses (checked when connecting).
 - Fixed bounds on page sizes, thread answers (the newest 500 messages),
   replay buffers and conversation mirrors; see the security model.
-- Forwarded headers (`X-Forwarded-For`, `-Host`, `-Proto`) are believed
-  only from configured trusted proxies.
+- Forwarded headers (`X-Forwarded-For`, `-Host`, `-Proto`, `-Prefix`) are
+  believed only from configured trusted proxies.
+- Running under a URL path prefix such as `https://example.com/amail/`:
+  `amail serve --base-path /amail` (`AMAIL_BASE_PATH`), or a reverse proxy
+  that removes the prefix and sends `X-Forwarded-Prefix`. The web interface
+  works under any prefix without a rebuild (the server writes the prefix
+  into its page); the session cookie's `Path`, redirects and `/v1/info`
+  (`base_path`) follow it; `/healthz` also answers at the root. The CLI and
+  nodes take the URL with the prefix; `amail login` and `amail doctor` say
+  when a URL seems to lack it. Tested configurations for nginx and Caddy
+  are in the operations guide.
+- A browser link to a web interface route given as a path (`/org/root`)
+  is redirected to the route (`/#/org/root`).
 - An operator role: statistics without mail content, suspending, resuming
   and deleting orgs, invite codes and resetting an org's lost user token
   (`amail admin`, and `/admin` in the web interface).

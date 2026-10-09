@@ -47,6 +47,7 @@ services:
       RUST_LOG: ${RUST_LOG:-info}
       # Passed only when set (in the env file or the shell); see .env.example.
       AMAIL_TRUSTED_PROXIES:
+      AMAIL_BASE_PATH:
       AMAIL_RETENTION_DAYS:
       AMAIL_WEBHOOK_PRIVATE_TARGETS:
       AMAIL_MAX_SEATS_PER_ORG:

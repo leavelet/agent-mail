@@ -44,6 +44,8 @@ npm run check && npm run lint && npm test
 npm run build && (cd .. && cargo build -p amail-cli)
 PLAYWRIGHT_BROWSERS_PATH=.e2e/browsers npx playwright install chromium
 PLAYWRIGHT_BROWSERS_PATH=.e2e/browsers npm run e2e
+# the same tests with the servers under a path prefix (amail serve --base-path)
+AMAIL_E2E_BASE_PATH=/amail PLAYWRIGHT_BROWSERS_PATH=.e2e/browsers npm run e2e
 ```
 
 Continuous integration (`.github/workflows/ci.yml`) runs all of the above,
