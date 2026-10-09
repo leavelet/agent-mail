@@ -1,6 +1,6 @@
 <script lang="ts">
   import { ApiError, post } from '../lib/api';
-  import { pageUrl } from '../lib/base';
+  import { pageUrl, serverUrl } from '../lib/base';
   import { store } from '../lib/store.svelte';
   import { isKey } from '../lib/i18n';
   import { t, ui } from '../lib/ui.svelte';
@@ -16,7 +16,7 @@
   let done = $state.raw<RegisterResponse | null>(null);
   let copied = $state(false);
 
-  const origin = globalThis.location?.origin ?? '';
+  const origin = serverUrl();
   const closed = $derived(store.info !== null && !store.info.registration);
 
   async function submit(e: SubmitEvent) {

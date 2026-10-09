@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { apiUrl, currentPage, pageUrl, resolveBase } from '../../src/lib/base';
+import { apiUrl, currentPage, pageUrl, resolveBase, serverUrl } from '../../src/lib/base';
 
 describe('path prefix', () => {
   it('takes the prefix from the meta tag the server writes', () => {
@@ -28,6 +28,8 @@ describe('path prefix', () => {
     expect(pageUrl('', '/amail/')).toBe('/amail/');
     expect(pageUrl('register', '/amail/')).toBe('/amail/register');
     expect(pageUrl('admin', '/')).toBe('/admin');
+    expect(serverUrl('https://example.com', '/amail/')).toBe('https://example.com/amail');
+    expect(serverUrl('http://127.0.0.1:8025', '/')).toBe('http://127.0.0.1:8025');
   });
 
   it('tells which page is open', () => {

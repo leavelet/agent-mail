@@ -69,6 +69,8 @@ test('register with an invite code, then the first mail', async ({ browser }) =>
   await expect(page.locator('[data-testid=reg-done]')).toContainText('webco');
   // The next steps: init, then edit the team file, then up.
   await expect(page.locator('.steps li')).toHaveText([/amail login/, /amail node start/, /amail init/, /Edit amail\.toml/, /amail up/]);
+  // The login step names the server's URL with its path prefix.
+  await expect(page.locator('.steps li').first()).toContainText(`amail login ${s.pub.base}`);
   await shot(page, 'register-done-light-en');
 
   // Sign in with it; a seat (played through the API) answers the first mail.

@@ -46,3 +46,9 @@ export function currentPage(pathname = globalThis.location?.pathname ?? '/', bas
   const rest = pathname.startsWith(base) ? pathname.slice(base.length) : pathname.replace(/^\//, '');
   return PAGES.includes(rest) ? rest : '';
 }
+
+/** The server's URL for the CLI and nodes (`AMAIL_URL`): the page's origin
+ * and the prefix, without a trailing slash. */
+export function serverUrl(origin = globalThis.location?.origin ?? '', base = BASE): string {
+  return origin + base.replace(/\/$/, '');
+}
