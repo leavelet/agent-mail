@@ -58,7 +58,7 @@ pub fn entry_line(e: &InboxEntry) -> String {
         tags.join(" "),
         l(&m.from),
         source(m.source),
-        l(&m.subject),
+        text::subject(&m.subject),
         m.lines,
         if m.lines == 1 { "" } else { "s" },
         m.thread_id,
@@ -102,7 +102,7 @@ pub fn message(m: &Message) -> String {
     if let Some(cc) = addresses(&h.cc) {
         out.push_str(&format!("Cc: {cc}\n"));
     }
-    out.push_str(&format!("Subject: {}\n", l(&h.subject)));
+    out.push_str(&format!("Subject: {}\n", subject_header(h)));
     if let Some(p) = h.in_reply_to {
         out.push_str(&format!("In-Reply-To: #{p}\n"));
     }
@@ -121,6 +121,21 @@ pub fn message(m: &Message) -> String {
         out.push('\n');
     }
     out
+}
+
+/// The `Subject:` value: a subject longer than
+/// [`p::limits::SUBJECT_SHOWN_CHARS`] is cut, with its length and where to
+/// find all of it.
+fn subject_header(h: &MessageHeader) -> String {
+    let shown = text::subject(&h.subject);
+    let n = h.subject.chars().count();
+    if n <= p::limits::SUBJECT_SHOWN_CHARS {
+        return shown.into_owned();
+    }
+    format!(
+        "{shown} (cut: {n} characters; amail read {} --json shows all of it)",
+        h.id
+    )
 }
 
 /// What the delivery states mean, printed under `amail status`.
@@ -608,6 +623,39 @@ mod tests {
             u.starts_with("#7 thread 1 from mallory@evil (USER) "),
             "{u}"
         );
+    }
+
+    /// Subjects longer than 200 characters are cut on one-line output; the
+    /// message view says so and where the whole subject is.
+    #[test]
+    fn long_subjects_are_cut() {
+        let long = "界".repeat(p::limits::MAX_SUBJECT_CHARS);
+        let shown = format!("{}…", "界".repeat(p::limits::SUBJECT_SHOWN_CHARS));
+        let m = msg(Source::Agent, &long, "b");
+        let t = message(&m);
+        assert_eq!(
+            t.lines().nth(2).unwrap(),
+            format!("Subject: {shown} (cut: 4096 characters; amail read 7 --json shows all of it)")
+        );
+        let e = InboxEntry {
+            delivery: serde_json::from_value(serde_json::json!({
+                "seat": "w1", "class": "to", "mode": "immediate"
+            }))
+            .unwrap(),
+            message: m.header.clone(),
+            body: None,
+            preview: None,
+        };
+        assert_eq!(
+            entry_line(&e),
+            format!(
+                "#7 [to unread] mallory@evil (agent): {shown} | 3 lines, thread 1, 2026-10-04 10:00Z"
+            )
+        );
+        // At the limit, nothing is cut.
+        let exact = "é".repeat(p::limits::SUBJECT_SHOWN_CHARS);
+        let t = message(&msg(Source::Agent, &exact, "b"));
+        assert_eq!(t.lines().nth(2).unwrap(), format!("Subject: {exact}"));
     }
 
     #[test]

@@ -6,6 +6,7 @@
   import { store } from '../lib/store.svelte';
   import { threadFolder } from '../lib/nav';
   import { visible } from '../lib/visible';
+  import { shortSubject } from '../lib/subject';
   import { go, href } from '../lib/router.svelte';
   import type { DeleteMailResponse, ThreadResponse } from '../lib/types';
   import MessageCard from '../components/MessageCard.svelte';
@@ -84,7 +85,7 @@
     <p class="faint">{t('app.loading')}</p>
   {:else}
     <div class="page-head">
-      <h1>{#if data.messages[0]?.subject}<Vis text={data.messages[0].subject} />{:else}{t('mail.noSubject')}{/if}</h1>
+      <h1>{#if data.messages[0]?.subject}<Vis text={shortSubject(data.messages[0].subject)} />{:else}{t('mail.noSubject')}{/if}</h1>
       <span class="faint">{t('thread.title', { id: data.thread_id })} · {t('thread.messages', { n: data.messages.length })}</span>
       <span class="spacer"></span>
       <span class="parts">{#each participants as p}<a class="mono chip neutral" title={cardOf(p)} href={p.includes('@') ? undefined : href(['org', p])}>{p}</a>{/each}</span>

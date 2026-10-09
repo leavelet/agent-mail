@@ -250,7 +250,9 @@ of every message unambiguous and keeps mail out of the permission system:
   text output of `amail read`, `amail thread` and `amail claim` uses the same
   rule: the header lines, with the source label, are written by the command
   line client, and every body line is behind `  > `. Subjects, names and
-  `meta` values are printed on one line. So a message cannot fake a header
+  `meta` values are printed on one line; a subject longer than 200
+  characters is cut there, so that it cannot fill the text injected into
+  a session. So a message cannot fake a header
   line, a message from `USER` or a line from the mail system, in the
   agent's context or in a terminal. `--json` output contains the values
   unchanged: control, line-break and invisible characters in them are
@@ -606,7 +608,7 @@ Rate and stream limits are counted per server instance.
 | What | Limit |
 |---|---|
 | Request body (any endpoint) | 2 MiB; a transcript post (`POST /seats/{name}/transcript`) 1 MiB (HTTP 413 beyond; nodes split their posts to fit). A body whose declared length is above 2 MiB is answered with 413 before authentication; up to 16 MiB of it is read and dropped first (for at most 5 s), so that the client receives the answer instead of a reset connection |
-| Message subject | 300 characters, one line |
+| Message subject | 4,096 characters (Unicode scalar values: a character outside the Basic Multilingual Plane counts once), one line. Where a subject is shown on one line (injected header lines, the text output of the command line, system mail, list rows of the web interface) it is cut to 200 characters followed by `…` (120 in digests); `--json`, the API and the web interface's message view keep all of it |
 | Other stored text | token labels, seat display names and models, node labels 200 characters; seat roles 16,000; list descriptions 1,000; harness names and presence `attention` 64; presence hints 500; URLs (webhook, terminal) 2,000 (HTTP 400 beyond) |
 | Message body | 256 KB |
 | Addresses in one message | 100 |

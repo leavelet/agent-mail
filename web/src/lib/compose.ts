@@ -1,6 +1,7 @@
 // Parsing and validation for the compose form.
 
 import type { Meta, SendRequest } from './types';
+import { MAX_SUBJECT_CHARS, subjectLength } from './subject';
 
 const NAME = '[a-z0-9][a-z0-9._-]{0,62}';
 const ADDRESS = new RegExp(`^${NAME}(@${NAME})?$`);
@@ -31,7 +32,8 @@ export type ComposeError =
   | { kind: 'metaKey'; k: string }
   | { kind: 'metaValue'; k: string }
   | { kind: 'metaDup'; k: string }
-  | { kind: 'subject' };
+  | { kind: 'subject' }
+  | { kind: 'subjectLength' };
 
 export function parseMeta(rows: MetaRow[]): { meta: Meta; error?: ComposeError } {
   const meta: Meta = {};
@@ -66,6 +68,7 @@ export function buildSend(input: ComposeInput): { req?: SendRequest; error?: Com
   if (to.length === 0 && cc.length === 0) return { error: { kind: 'noTo' } };
   for (const a of [...to, ...cc]) if (!isAddress(a)) return { error: { kind: 'addr', a } };
   if (/[\r\n]/.test(input.subject)) return { error: { kind: 'subject' } };
+  if (subjectLength(input.subject.trim()) > MAX_SUBJECT_CHARS) return { error: { kind: 'subjectLength' } };
   const { meta, error } = parseMeta(input.meta);
   if (error) return { error };
   const req: SendRequest = { to, cc, subject: input.subject.trim(), body: input.body };
@@ -76,9 +79,10 @@ export function buildSend(input: ComposeInput): { req?: SendRequest; error?: Com
   return { req };
 }
 
-/** "Re: " once. */
+/** "Re: " once, within the subject limit. */
 export function replySubject(s: string): string {
-  return /^re:\s/i.test(s) ? s : `Re: ${s}`;
+  const r = /^re:\s/i.test(s) ? s : `Re: ${s}`;
+  return subjectLength(r) <= MAX_SUBJECT_CHARS ? r : Array.from(r).slice(0, MAX_SUBJECT_CHARS).join('');
 }
 
 /** The address being typed at the end of a field, for autocompletion. */

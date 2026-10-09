@@ -219,8 +219,14 @@ pub type Meta = std::collections::BTreeMap<String, String>;
 pub mod limits {
     // --- one message (HTTP 422 when exceeded) ---
 
-    /// Maximum subject length in characters.
-    pub const MAX_SUBJECT_CHARS: usize = 300;
+    /// Maximum subject length in characters (Unicode scalar values, so a
+    /// character outside the Basic Multilingual Plane counts once).
+    pub const MAX_SUBJECT_CHARS: usize = 4096;
+    /// A subject shown on one line (injected header lines, the command
+    /// line's text output, system mail, list rows of the web interface) is
+    /// cut to this many characters, followed by `…`. The message itself,
+    /// `--json` and the API keep the whole subject.
+    pub const SUBJECT_SHOWN_CHARS: usize = 200;
     /// Maximum body size in bytes.
     pub const MAX_BODY_BYTES: usize = 256 * 1024;
     /// Maximum number of addresses (`to` plus `cc`, as written) per message.

@@ -40,7 +40,9 @@
 ## Messages, threads and deliveries
 
 A **message** has a sender, `To` and `Cc` addresses, a single-line subject
-(at most 300 characters), a body (at most 256 KB), an optional priority
+(at most 4,096 characters; lines that list messages, injected mail and
+the command line's text output show its first 200 and `…`, `--json` and
+the web interface's message view all of it), a body (at most 256 KB), an optional priority
 (`urgent`), an optional acknowledgement request, and optional `meta`: up to
 16 single-line string fields (4 KB in total, keys `[a-z0-9_.-]{1,32}`) that
 the server stores and shows but does not interpret, for example

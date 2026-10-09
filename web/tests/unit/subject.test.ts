@@ -1,0 +1,31 @@
+import { describe, expect, it } from 'vitest';
+import { MAX_SUBJECT_CHARS, SUBJECT_SHOWN_CHARS, shortSubject, subjectLength } from '../../src/lib/subject';
+import { buildSend, replySubject } from '../../src/lib/compose';
+import { describe as describeItem } from '../../src/lib/notify';
+
+describe('subjects', () => {
+  it('counts code points, not UTF-16 units', () => {
+    expect(subjectLength('🚀🚀')).toBe(2);
+    expect(subjectLength('é界')).toBe(2);
+  });
+  it('cuts one-line subjects to 200 characters and an ellipsis', () => {
+    expect(shortSubject('Plan')).toBe('Plan');
+    const exact = '界'.repeat(SUBJECT_SHOWN_CHARS);
+    expect(shortSubject(exact)).toBe(exact);
+    expect(shortSubject('界'.repeat(MAX_SUBJECT_CHARS))).toBe(`${'界'.repeat(200)}…`);
+    // A character outside the BMP is never split into a lone surrogate.
+    expect(shortSubject('🚀'.repeat(201))).toBe(`${'🚀'.repeat(200)}…`);
+  });
+  it('accepts subjects up to the server limit and keeps replies within it', () => {
+    const base = { to: 'a', cc: '', body: '', urgent: false, ack: false, meta: [] };
+    expect(buildSend({ ...base, subject: '🚀'.repeat(MAX_SUBJECT_CHARS) }).req?.subject).toBe('🚀'.repeat(MAX_SUBJECT_CHARS));
+    expect(buildSend({ ...base, subject: '🚀'.repeat(MAX_SUBJECT_CHARS + 1) }).error).toEqual({ kind: 'subjectLength' });
+    const r = replySubject('界'.repeat(MAX_SUBJECT_CHARS));
+    expect(subjectLength(r)).toBe(MAX_SUBJECT_CHARS);
+    expect(r.startsWith('Re: 界')).toBe(true);
+  });
+  it('notifications show the short subject', () => {
+    const item = { kind: 'reply', message: { from: 'a', subject: '界'.repeat(300) } } as unknown as Parameters<typeof describeItem>[0];
+    expect(describeItem(item, (k) => k).body).toBe(`${'界'.repeat(200)}…`);
+  });
+});

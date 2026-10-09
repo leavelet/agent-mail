@@ -54,18 +54,21 @@ fn class(e: &InboxEntry) -> String {
 
 /// Make a value safe for a header line ([`text::line`]: line breaks become
 /// spaces, control and invisible characters visible escapes), cut to `max`
-/// characters after escaping. Mail content can then never start a line of
-/// its own, so it cannot pass itself off as a header or as a line from the
-/// mail system, and it cannot carry text the user does not see.
+/// characters after escaping ([`text::short_line`]). Mail content can then
+/// never start a line of its own, so it cannot pass itself off as a header
+/// or as a line from the mail system, and it cannot carry text the user
+/// does not see.
 fn clean(s: &str, max: usize) -> String {
-    let safe = text::line(s);
-    let mut chars = safe.chars();
-    let mut out: String = chars.by_ref().take(max).collect();
-    if chars.next().is_some() {
-        out.push('…');
-    }
-    out
+    text::short_line(s, max).into_owned()
 }
+
+/// Subjects on header lines: at most
+/// [`amail_proto::limits::SUBJECT_SHOWN_CHARS`] characters, so that a long
+/// subject (up to 4,096 characters) cannot fill the injection budget.
+const SUBJECT_SHOWN_MAX: usize = amail_proto::limits::SUBJECT_SHOWN_CHARS;
+
+/// Subjects in digest lines, which also carry a preview of the body.
+const DIGEST_SUBJECT_MAX: usize = 120;
 
 /// Escapes shown per body; further unsafe characters are shown as U+FFFD.
 /// This bounds how much longer than the body its rendering can be.
@@ -113,7 +116,7 @@ fn entry(e: &InboxEntry, with_body: bool) -> String {
     if m.ack_required {
         parts.push("ack requested".into());
     }
-    parts.push(format!("{:?}", clean(&m.subject, 300)));
+    parts.push(format!("{:?}", clean(&m.subject, SUBJECT_SHOWN_MAX)));
     parts.push(format!("thread {}", m.thread_id));
     let body = e.body.as_deref().filter(|_| with_body);
     let lines = format!("{} line{}", m.lines, if m.lines == 1 { "" } else { "s" });
@@ -253,7 +256,7 @@ pub fn digest(seat: &str, entries: &[InboxEntry], budget: usize) -> String {
         }
         let mut line = format!(
             "thread {thread} · {:?} · from {} · {} message{} · latest #{}",
-            clean(&latest.message.subject, 120),
+            clean(&latest.message.subject, DIGEST_SUBJECT_MAX),
             from.join(", "),
             v.len(),
             if v.len() == 1 { "" } else { "s" },
@@ -471,11 +474,12 @@ mod tests {
         assert!(t.len() <= 9000 && n >= 1, "{}", t.len());
 
         let tags: String = std::iter::repeat_n('\u{e0041}', 800).collect();
+        let subject: String = std::iter::repeat_n('\u{e0041}', limits::MAX_SUBJECT_CHARS).collect();
         let mut worst = e(
             1,
             Source::External,
             DeliveryClass::To,
-            &tags[..1200],
+            &subject,
             Some(&tags),
         );
         worst.message.from = "x".repeat(130);
@@ -641,6 +645,41 @@ mod tests {
             "{}",
             t.len()
         );
+    }
+
+    /// A subject of the maximum length (4,096 characters) is shown with
+    /// its first 200 characters (120 in a digest) and `…`, so that it takes
+    /// a bounded part of the injection budget.
+    #[test]
+    fn long_subjects() {
+        let long = "界".repeat(limits::MAX_SUBJECT_CHARS);
+        let shown = format!("\"{}…\"", "界".repeat(limits::SUBJECT_SHOWN_CHARS));
+        let a = e(1, Source::Agent, DeliveryClass::To, &long, Some("ok"));
+        let (t, n) = new_mail("w3", std::slice::from_ref(&a), false, 6000);
+        assert_eq!(n, 1);
+        let header = t.lines().nth(1).unwrap();
+        assert_eq!(
+            header,
+            format!("#1 from lead (agent) · to you · {shown} · thread 91")
+        );
+        let summary = unread_summary("w3", std::slice::from_ref(&a), 6000);
+        assert!(summary.contains(&shown), "{summary}");
+        let d = digest("w3", &[a], 6000);
+        assert!(
+            d.contains(&format!("\"{}…\"", "界".repeat(120))) && !d.contains(&shown),
+            "{d}"
+        );
+        // Many such messages: each header line stays short, and several fit
+        // in the smallest budget (Codex, 6,000 bytes).
+        let many: Vec<_> = (0..20)
+            .map(|i| e(i, Source::Agent, DeliveryClass::To, &long, None))
+            .collect();
+        let (t, n) = new_mail("w3", &many, false, 6000);
+        assert!(t.len() <= 6000, "{}", t.len());
+        assert!(n >= 8, "{n}");
+        for l in t.lines().filter(|l| l.starts_with('#')) {
+            assert!(l.chars().count() < limits::SUBJECT_SHOWN_CHARS + 100, "{l}");
+        }
     }
 
     #[test]

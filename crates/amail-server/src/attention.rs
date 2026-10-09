@@ -172,10 +172,11 @@ async fn escalate(st: &AppState, due: &AckDue, now: i64) -> amail_store::Result<
     {
         return Ok(());
     }
-    let subject: String = format!("Not acknowledged: {}", msg.subject)
-        .chars()
-        .take(amail_proto::limits::MAX_SUBJECT_CHARS)
-        .collect();
+    // The original subject, cut as on any one-line display.
+    let subject = format!(
+        "Not acknowledged: {}",
+        amail_proto::text::cut(&msg.subject, amail_proto::limits::SUBJECT_SHOWN_CHARS)
+    );
     let system = store.system_seat(due.org_id).await?;
     let mut deliveries = vec![NewDelivery {
         seat_id: due.sender_seat_id,

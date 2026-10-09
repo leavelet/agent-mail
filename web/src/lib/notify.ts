@@ -4,6 +4,7 @@
 
 import { load, save } from './storage';
 import type { AttentionItem } from './types';
+import { shortSubject } from './subject';
 
 const KEY = 'amail.notify';
 
@@ -55,7 +56,7 @@ export function describe(
   if (i.kind === 'seat') return { title: t('notify.seat', { seat: i.seat ?? '' }), body: i.hint ?? i.attention ?? '' };
   const m = i.message;
   const title = t(i.kind === 'ack' ? 'notify.ack' : i.kind === 'notice' ? 'notify.notice' : 'notify.reply', { from: m?.from ?? '' });
-  return { title, body: m?.subject ?? '' };
+  return { title, body: shortSubject(m?.subject ?? '') };
 }
 
 /** Show notifications for new items when enabled, permitted and the page is in the background. */

@@ -1379,11 +1379,7 @@ async fn run(cli: Cli) -> Result<()> {
                 // Replying to one's own message: go to its original recipients.
                 to = h.to.iter().filter(|a| *a != &me).cloned().collect();
             }
-            let subject = if h.subject.to_ascii_lowercase().starts_with("re:") {
-                h.subject.clone()
-            } else {
-                format!("Re: {}", h.subject)
-            };
+            let subject = reply_subject(&h.subject);
             let body = json!({
                 "to": to, "cc": cc, "subject": subject, "meta": parse_meta(&opts.meta)?,
                 "in_reply_to": id, "ack_timeout_s": opts.ack_timeout_s()?,
@@ -2188,6 +2184,21 @@ struct NodeFile {
 }
 
 /// A database URL without its password, for messages and logs.
+/// The subject of a reply: `Re: ` before the parent's subject unless it
+/// has one, kept within the subject limit (a parent at the limit would
+/// otherwise make the reply too long to send).
+fn reply_subject(parent: &str) -> String {
+    let subject = if parent
+        .get(..3)
+        .is_some_and(|p| p.eq_ignore_ascii_case("re:"))
+    {
+        parent.to_string()
+    } else {
+        format!("Re: {parent}")
+    };
+    subject.chars().take(p::limits::MAX_SUBJECT_CHARS).collect()
+}
+
 fn redact_db_url(db: &str) -> String {
     let Some((scheme, rest)) = db.split_once("://") else {
         return db.to_string();
@@ -2663,6 +2674,17 @@ mod tests {
         assert_eq!(a.dsh_bin, cwd.join("./bin/dsh").to_string_lossy());
         assert_eq!(a.codex_bin, "codex");
         assert_eq!(a.state_dir, Some(cwd.join("st")));
+    }
+
+    #[test]
+    fn reply_subjects() {
+        assert_eq!(reply_subject("Status"), "Re: Status");
+        assert_eq!(reply_subject("RE: Status"), "RE: Status");
+        assert_eq!(reply_subject("界"), "Re: 界");
+        let max = "界".repeat(p::limits::MAX_SUBJECT_CHARS);
+        let r = reply_subject(&max);
+        assert_eq!(r.chars().count(), p::limits::MAX_SUBJECT_CHARS);
+        assert!(r.starts_with("Re: 界"));
     }
 
     #[test]

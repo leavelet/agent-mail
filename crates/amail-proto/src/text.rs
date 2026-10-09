@@ -103,6 +103,45 @@ pub fn line(s: &str) -> Cow<'_, str> {
     map(s, |_| false, |c| is_line_break(c) || c == '\t')
 }
 
+/// [`line`], cut to at most `max` characters of the result, followed by `…`
+/// when something was left out. An escape is never cut in two.
+pub fn short_line(s: &str, max: usize) -> Cow<'_, str> {
+    let safe = line(s);
+    if safe.chars().count() <= max {
+        return safe;
+    }
+    let mut out = String::with_capacity(max + 3);
+    let mut n = 0;
+    for c in s.chars() {
+        let mut buf = [0u8; 4];
+        let piece = line(c.encode_utf8(&mut buf));
+        let k = piece.chars().count();
+        if n + k > max {
+            break;
+        }
+        out.push_str(&piece);
+        n += k;
+    }
+    out.push('…');
+    Cow::Owned(out)
+}
+
+/// A subject for one line of output: [`short_line`] with
+/// [`crate::limits::SUBJECT_SHOWN_CHARS`].
+pub fn subject(s: &str) -> Cow<'_, str> {
+    short_line(s, crate::limits::SUBJECT_SHOWN_CHARS)
+}
+
+/// `s` cut to `max` characters, followed by `…` when something was left
+/// out. Nothing is escaped: for text that is stored (a subject quoted in
+/// system mail) and made safe when it is shown.
+pub fn cut(s: &str, max: usize) -> Cow<'_, str> {
+    match s.char_indices().nth(max) {
+        None => Cow::Borrowed(s),
+        Some((i, _)) => Cow::Owned(format!("{}…", &s[..i])),
+    }
+}
+
 /// One line of a body (already split at `\n`): tabs are kept, other line
 /// breaks become spaces, other unsafe characters become visible escapes.
 pub fn body_line(s: &str) -> Cow<'_, str> {
@@ -235,6 +274,36 @@ mod tests {
         for c in ['\u{17b3}', '\u{17b6}', '\u{2801}', '\u{fe10}', '\u{e1000}'] {
             assert!(!is_invisible(c), "{:x}", c as u32);
         }
+    }
+
+    #[test]
+    fn short_subjects() {
+        use crate::limits::{MAX_SUBJECT_CHARS, SUBJECT_SHOWN_CHARS};
+        assert_eq!(subject("short"), "short");
+        assert!(matches!(subject("short"), Cow::Borrowed(_)));
+        let exact = "é".repeat(SUBJECT_SHOWN_CHARS);
+        assert_eq!(subject(&exact), exact);
+        // Characters, not bytes: a long subject keeps 200 and gets `…`.
+        let long = "界".repeat(MAX_SUBJECT_CHARS);
+        assert_eq!(
+            subject(&long),
+            format!("{}…", "界".repeat(SUBJECT_SHOWN_CHARS))
+        );
+        let rockets = "🚀".repeat(SUBJECT_SHOWN_CHARS + 1);
+        assert_eq!(subject(&rockets).chars().count(), SUBJECT_SHOWN_CHARS + 1);
+        // An escape counts with its rendered length and is never cut in two.
+        let tags: String = std::iter::repeat_n('\u{e0041}', MAX_SUBJECT_CHARS).collect();
+        let shown = subject(&tags);
+        assert_eq!(
+            shown,
+            format!("{}…", "\\u{e0041}".repeat(SUBJECT_SHOWN_CHARS / 9))
+        );
+        assert!(!shown.chars().any(is_unsafe));
+        // Line breaks still become spaces.
+        assert_eq!(short_line("a\nb\nc", 3), "a b…");
+        assert_eq!(cut("abcdef", 3), "abc…");
+        assert_eq!(cut("abc", 3), "abc");
+        assert_eq!(cut("界界界界", 2), "界界…");
     }
 
     #[test]

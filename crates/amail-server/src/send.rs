@@ -992,7 +992,7 @@ impl<'a> Resolver<'a> {
                     &format!("Seat {name} takes part in a thread with {peers}"),
                     &format!(
                         "Seat {name} of your org is now on thread {thread} (\"{}\") together with {peers}. It is not a contact of your org for {peers}: they see its card (name, kind, description) in this thread and may address it in replies there, but not in new threads, and it does not appear among the seats your org opens to them.\n",
-                        amail_proto::text::line(subject)
+                        amail_proto::text::subject(subject)
                     ),
                 )
                 .await;

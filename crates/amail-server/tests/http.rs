@@ -69,6 +69,7 @@ http_tests!(
     external_list_members_are_counted,
     third_org_list_members_are_counted,
     terminal_url_schemes,
+    long_subject_in_system_mail,
 );
 
 struct Server {
@@ -1811,12 +1812,26 @@ async fn size_limits(srv: Server) {
         async move {
             let (s, v) = a.post("/messages", body).await;
             assert_eq!(s, StatusCode::OK, "{v}");
+            v
         }
     };
-    ok(json!({ "to": ["owner"], "subject": "é".repeat(300), "body": "x".repeat(256 * 1024) }))
+    // The subject limit counts characters (Unicode scalar values): a
+    // character outside the Basic Multilingual Plane (4 bytes in UTF-8, 2
+    // units in UTF-16) counts once. The whole subject is stored.
+    let max_subject = "🚀".repeat(4096);
+    let sent =
+        ok(json!({ "to": ["owner"], "subject": max_subject, "body": "x".repeat(256 * 1024) }))
+            .await;
+    let stored = user
+        .ok(
+            Method::GET,
+            &format!("/messages/{}?peek=1", sent["id"]),
+            None,
+        )
         .await;
+    assert_eq!(stored["message"]["subject"], max_subject);
     check(
-        json!({ "to": ["owner"], "subject": "é".repeat(301), "body": "" }),
+        json!({ "to": ["owner"], "subject": "🚀".repeat(4097), "body": "" }),
         "subject_too_long",
     )
     .await;
@@ -2157,6 +2172,31 @@ async fn ack_escalation(srv: Server) {
         )
         .await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
+/// System mail quotes a long subject with its first 200 characters and
+/// `…`; the message it is about keeps all of it.
+async fn long_subject_in_system_mail(srv: Server) {
+    let user = srv.org("acme").await;
+    let s = user.seat("s").await;
+    user.seat("w1").await;
+    let long = "界".repeat(4096);
+    let v = s
+        .send(json!({ "to": ["w1"], "subject": long, "body": "x",
+                      "ack_required": true, "ack_timeout_s": 1 }))
+        .await;
+    wait_for("notice", || async { !s.inbox("unread=1").await.is_empty() }).await;
+    let inbox = s.inbox("unread=1").await;
+    let h = &inbox[0]["message"];
+    assert_eq!(h["source"], "system");
+    assert_eq!(
+        h["subject"],
+        format!("Not acknowledged: {}…", "界".repeat(200))
+    );
+    let m = s
+        .ok(Method::GET, &format!("/messages/{}?peek=1", v["id"]), None)
+        .await;
+    assert_eq!(m["message"]["subject"], long);
 }
 
 async fn system_mail_cannot_be_forged(srv: Server) {

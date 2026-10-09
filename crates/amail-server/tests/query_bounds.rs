@@ -459,8 +459,12 @@ async fn pages_are_bounded_by_bytes(b: Backend, t: &str) {
     let meta: serde_json::Map<String, Value> = (0..16)
         .map(|i| (format!("k{i}"), Value::String("\"".repeat(250))))
         .collect();
-    let subject = "\"".repeat(300);
-    let n = 300;
+    let subject = "\"".repeat(amail_proto::limits::MAX_SUBJECT_CHARS);
+    // In JSON every `"` is written as `\"`: a header is about 8,200 bytes of
+    // subject, 8,100 of `meta` and 300 of other fields, about 16.6 KB, so
+    // 200 of them (about 3.3 MB) need two pages of at most 2 MiB each: the
+    // first is cut, the second is not.
+    let n = 200;
     let mut sent = Vec::new();
     for _ in 0..n {
         sent.push(
@@ -476,6 +480,7 @@ async fn pages_are_bounded_by_bytes(b: Backend, t: &str) {
     assert_eq!(v["truncated"], true);
     let got = v["entries"].as_array().unwrap();
     assert!(!got.is_empty() && got.len() < n);
+    assert_eq!(got[0]["message"]["subject"], subject);
     let last = got.last().unwrap()["delivery"]["seq"].as_i64().unwrap();
     let (_, rest, _) = acme
         .call(

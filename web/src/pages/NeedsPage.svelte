@@ -1,5 +1,6 @@
 <script lang="ts">
   import Vis from '../components/Vis.svelte';
+  import { shortSubject } from '../lib/subject';
   import { store } from '../lib/store.svelte';
   import { t, ui } from '../lib/ui.svelte';
   import { href, go } from '../lib/router.svelte';
@@ -109,7 +110,7 @@
                 {:else if it.message}
                   {#if it.message.priority === 'urgent'}<span class="chip urgent">{t('mail.urgent')}</span>{/if}
                   {#if it.message.source === 'external' || it.message.source === 'system'}<span class="chip neutral" title={t(`mail.source.${it.message.source}.long`)}>{t(`mail.source.${it.message.source}`)}</span>{/if}
-                  <span class="subj">{#if it.message.subject}<Vis text={it.message.subject} />{:else}{t('mail.noSubject')}{/if}</span>
+                  <span class="subj">{#if it.message.subject}<Vis text={shortSubject(it.message.subject)} />{:else}{t('mail.noSubject')}{/if}</span>
                 {/if}
               </div>
               {#if it.kind === 'seat' && it.hint}<div class="l2 muted"><Vis text={it.hint} /></div>{/if}

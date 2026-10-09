@@ -5,6 +5,7 @@
   import { go } from '../lib/router.svelte';
   import { buildSend, isAddress, parseAddresses, replySubject, type ComposeError, type MetaRow } from '../lib/compose';
   import { ack, markRead } from '../lib/mailops';
+  import { MAX_SUBJECT_CHARS } from '../lib/subject';
   import { activeOrgs, addedContacts, otherOrgs, peerCandidates, sendErrorKey } from '../lib/openings';
   import type { Card, MessageResponse, SendPreview, SendResponse, Message, Delivery, ThreadResponse } from '../lib/types';
   import AddressInput from '../components/AddressInput.svelte';
@@ -135,6 +136,8 @@
         return t('compose.err.metaDup', { k: e.k });
       case 'subject':
         return t('compose.err.subject');
+      case 'subjectLength':
+        return t('compose.err.subjectLength', { n: String(MAX_SUBJECT_CHARS) });
     }
   }
 
@@ -201,7 +204,7 @@
         {#if previewError}<p class="error">{previewError}</p>{/if}
       </div>
     {/if}
-    <div class="field"><label for="c-subj">{t('compose.subject')}</label><input id="c-subj" type="text" maxlength="300" bind:value={subject} /></div>
+    <div class="field"><label for="c-subj">{t('compose.subject')}</label><input id="c-subj" type="text" bind:value={subject} /></div>
     <textarea
       id="c-body"
       aria-label={t('compose.body')}

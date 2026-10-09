@@ -79,6 +79,13 @@ The first public version.
   the database offers it. `sslrootcert` names a private certificate
   authority; see [operations](docs/operations.md#tls-to-the-database).
 
+- The subject limit is 4,096 characters (was 300), counted as Unicode
+  scalar values. Injected header lines, the command line's text output
+  (`amail inbox`, `read`, `thread`, `claim`), system mail and list rows of
+  the web interface show the first 200 characters and `…` (digests 120);
+  `--json`, the API and the web message view keep the whole subject.
+  `amail reply` and the web reply keep `Re: ` subjects within the limit.
+
 #### Running agents
 
 - `amail node`: a per-host daemon that injects mail into running Claude
