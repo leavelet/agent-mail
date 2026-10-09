@@ -86,6 +86,9 @@ The first public version.
   `--json`, the API and the web message view keep the whole subject.
   `amail reply` and the web reply keep `Re: ` subjects within the limit.
 
+- `amail send --ack --ack-timeout 0` (or `off`; `ack_timeout_s: 0` in the
+  API) asks for an acknowledgement without any reminder by system mail.
+
 #### Running agents
 
 - `amail node`: a per-host daemon that injects mail into running Claude

@@ -670,7 +670,8 @@ struct SendOpts {
     #[arg(long)]
     ack: bool,
     /// With --ack: tell me who has not acknowledged after this long (e.g.
-    /// 10m; default: the org's ack_timeout_min).
+    /// 10m; default: the org's ack_timeout_min). 0 (or off): ask for the
+    /// acknowledgement without any reminder.
     #[arg(long, value_name = "DURATION", requires = "ack")]
     ack_timeout: Option<String>,
     /// Send nothing: show who would get the message, which contact of your
@@ -683,12 +684,11 @@ impl SendOpts {
     fn ack_timeout_s(&self) -> Result<Option<u64>> {
         match &self.ack_timeout {
             None => Ok(None),
+            // 0 or `off`: no reminder (the server schedules none).
             Some(d) => Ok(Some(
                 amail_node::team::parse_duration(d)
                     .map_err(anyhow::Error::msg)?
-                    .context("--ack-timeout must be longer than 0")?
-                    .as_secs()
-                    .max(1),
+                    .map_or(0, |d| d.as_secs()),
             )),
         }
     }
@@ -2674,6 +2674,24 @@ mod tests {
         assert_eq!(a.dsh_bin, cwd.join("./bin/dsh").to_string_lossy());
         assert_eq!(a.codex_bin, "codex");
         assert_eq!(a.state_dir, Some(cwd.join("st")));
+    }
+
+    #[test]
+    fn ack_timeouts() {
+        let opts = |t: Option<&str>| SendOpts {
+            body: None,
+            meta: Vec::new(),
+            urgent: false,
+            ack: true,
+            ack_timeout: t.map(str::to_string),
+            dry_run: false,
+        };
+        assert_eq!(opts(None).ack_timeout_s().unwrap(), None);
+        assert_eq!(opts(Some("10m")).ack_timeout_s().unwrap(), Some(600));
+        // 0 (or off): the acknowledgement is asked for without a reminder.
+        assert_eq!(opts(Some("0")).ack_timeout_s().unwrap(), Some(0));
+        assert_eq!(opts(Some("off")).ack_timeout_s().unwrap(), Some(0));
+        assert!(opts(Some("ten")).ack_timeout_s().is_err());
     }
 
     #[test]

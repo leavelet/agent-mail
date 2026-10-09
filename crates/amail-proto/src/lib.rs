@@ -201,7 +201,9 @@ pub struct SendRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ack_required: Option<bool>,
     /// With `ack_required`: seconds until the sender is told who has not
-    /// acknowledged (default: the org's `ack_timeout_min`).
+    /// acknowledged (default: the org's `ack_timeout_min`). Zero asks for
+    /// the acknowledgement without scheduling any reminder (no system mail
+    /// to the sender or the leads).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ack_timeout_s: Option<u64>,
     /// Free-form string key/value pairs stored with the message and shown to

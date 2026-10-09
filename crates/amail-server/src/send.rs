@@ -49,10 +49,10 @@ pub async fn send(st: &AppState, auth: &Auth, req: SendRequest) -> ApiResult<Sen
     }
     check_sizes(&req)?;
     if let Some(t) = req.ack_timeout_s
-        && !(1..=30 * 86_400).contains(&t)
+        && t > 30 * 86_400
     {
         return Err(ApiError::bad_request(
-            "ack_timeout_s must be between 1 and 2592000 (30 days)",
+            "ack_timeout_s must be between 0 (no reminder) and 2592000 (30 days)",
         ));
     }
     // Protective limits (public mode): all orgs, then this org.
@@ -307,7 +307,9 @@ async fn send_inner(
     }
     let ack_required = req.ack_required.unwrap_or(false);
     let priority = req.priority.unwrap_or(Priority::Normal);
-    let ack_due = ack_required.then(|| {
+    // `ack_timeout_s: 0`: the acknowledgement is asked for, but no reminder
+    // is scheduled.
+    let ack_due = (ack_required && req.ack_timeout_s != Some(0)).then(|| {
         let ms = match req.ack_timeout_s {
             Some(s) => s as i64 * 1000,
             None => org.ack_timeout_min.max(1) * 60_000,

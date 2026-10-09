@@ -70,6 +70,7 @@ http_tests!(
     third_org_list_members_are_counted,
     terminal_url_schemes,
     long_subject_in_system_mail,
+    ack_without_reminder,
 );
 
 struct Server {
@@ -2168,7 +2169,7 @@ async fn ack_escalation(srv: Server) {
     let (st, _) = s
         .post(
             "/messages",
-            json!({ "to": ["w1"], "subject": "bad", "body": "", "ack_required": true, "ack_timeout_s": 0 }),
+            json!({ "to": ["w1"], "subject": "bad", "body": "", "ack_required": true, "ack_timeout_s": 2_592_001 }),
         )
         .await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
@@ -2197,6 +2198,49 @@ async fn long_subject_in_system_mail(srv: Server) {
         .ok(Method::GET, &format!("/messages/{}?peek=1", v["id"]), None)
         .await;
     assert_eq!(m["message"]["subject"], long);
+}
+
+/// `ack_timeout_s: 0` asks for an acknowledgement and schedules no
+/// reminder; the same message with a timeout of 1 s gets one.
+async fn ack_without_reminder(srv: Server) {
+    let user = srv.org("acme").await;
+    let a = user.seat("a").await;
+    let b = user.seat("b").await;
+    let quiet = a
+        .send(json!({ "to": ["b"], "subject": "no reminder", "body": "x",
+                      "ack_required": true, "ack_timeout_s": 0 }))
+        .await;
+    let id = quiet["id"].as_i64().unwrap();
+    let got = b
+        .ok(Method::GET, &format!("/messages/{id}?peek=1"), None)
+        .await;
+    assert_eq!(got["message"]["ack_required"], true);
+    a.send(json!({ "to": ["b"], "subject": "reminder", "body": "x",
+                   "ack_required": true, "ack_timeout_s": 1 }))
+        .await;
+    wait_for("reminder", || async {
+        !a.inbox("unread=1").await.is_empty()
+    })
+    .await;
+    // Both deadlines have passed; let the escalation loop run once more.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let inbox = a.inbox("").await;
+    let subjects: Vec<&str> = inbox
+        .iter()
+        .map(|e| e["message"]["subject"].as_str().unwrap())
+        .collect();
+    assert_eq!(subjects, ["Not acknowledged: reminder"], "{inbox:?}");
+    // It can still be acknowledged, and the sender's status shows it.
+    let ack = b
+        .ok(
+            Method::POST,
+            &format!("/messages/{id}/ack"),
+            Some(json!({})),
+        )
+        .await;
+    assert!(ack["delivery"]["acked_at"].is_string());
+    let st = a.get(&format!("/messages/{id}/status")).await;
+    assert_eq!(st.1["recipients"][0]["state"], "acked", "{:?}", st.1);
 }
 
 async fn system_mail_cannot_be_forged(srv: Server) {

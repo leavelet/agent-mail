@@ -325,7 +325,11 @@ within `--ack-timeout` (default: the org's `ack_timeout_min`, 15 minutes).
 When the time is up, the sender gets a `system` message naming who has not
 acknowledged; if they still have not after the same time again, a second
 one goes to the sender with those seats' leads (their parents) in `Cc`,
-once. System mail asks for no acknowledgement and costs no budget.
+once. With `--ack-timeout 0` (or `off`; `ack_timeout_s: 0` in the API) the
+acknowledgement is asked for without any reminder: the recipients see the
+request and the sender sees their acknowledgements in `amail status`, but
+no system mail is sent. System mail asks for no acknowledgement and costs
+no budget.
 
 **Send receipts** name recipients of your org that will not see the mail at
 once: asleep (and whether this mail starts them), offline, focused (until

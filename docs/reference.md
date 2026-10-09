@@ -37,7 +37,7 @@ exit code.
 
 | command | |
 |---|---|
-| `amail send --to a,b [--cc c] -s <subject> [-m <body>] [--urgent] [--ack [--ack-timeout 30m]] [--meta k=v]... [--dry-run]` | send; the body comes from stdin when `-m` is omitted. Mail to another org shows the contact of your org the server added in Cc, if any. `--dry-run` sends nothing and shows who would get it, the contact that would be added and what would be rejected |
+| `amail send --to a,b [--cc c] -s <subject> [-m <body>] [--urgent] [--ack [--ack-timeout 30m]] [--meta k=v]... [--dry-run]` | send; the body comes from stdin when `-m` is omitted. `--ack-timeout 0` (or `off`) asks for the acknowledgement without any reminder. Mail to another org shows the contact of your org the server added in Cc, if any. `--dry-run` sends nothing and shows who would get it, the contact that would be added and what would be rejected |
 | `amail inbox [--all] [--seat s]` | unread messages (all with `--all`) |
 | `amail read <id> [--peek]` | show a message; marks it read unless `--peek` |
 | `amail reply <id> [--all] [-m <body>] [--dry-run]` | reply; subject and thread are inherited |
@@ -130,7 +130,7 @@ from it with a credential the server has not seen valid lately get 429
 
 | | |
 |---|---|
-| `POST /messages` | send `{to, cc, subject, body, in_reply_to?, priority?, ack_required?, ack_timeout_s?, meta?}`; the answer lists each address with its seat count (and for a list in `To`, `wakes`: its members notified at once) and `notes` on recipients that will not see it at once. 507 `storage_quota` when the message, with one fixed amount per delivery, does not fit in the org's storage quota (always when the org is at its quota). Mail to another org: rejected addresses there get `unreachable`, `thread_closed` or `not_linked`; the contact of your org the server adds in Cc is listed with `added: true`; 422 `no_contact` (your org has no contact for that org), `list_on_cross_org` (a list on such mail); 429 `thread_rate_limited` (new threads to other orgs per seat) |
+| `POST /messages` | send `{to, cc, subject, body, in_reply_to?, priority?, ack_required?, ack_timeout_s?, meta?}`; `ack_timeout_s` (with `ack_required`) is 0 to 2,592,000 seconds: 0 asks for the acknowledgement without any reminder, omitted uses the org's `ack_timeout_min`; the answer lists each address with its seat count (and for a list in `To`, `wakes`: its members notified at once) and `notes` on recipients that will not see it at once. 507 `storage_quota` when the message, with one fixed amount per delivery, does not fit in the org's storage quota (always when the org is at its quota). Mail to another org: rejected addresses there get `unreachable`, `thread_closed` or `not_linked`; the contact of your org the server adds in Cc is listed with `added: true`; 422 `no_contact` (your org has no contact for that org), `list_on_cross_org` (a list on such mail); 429 `thread_rate_limited` (new threads to other orgs per seat) |
 | `POST /messages/preview` | the same body: `{recipients, rejected, deliveries}` as a send would give, nothing sent |
 | `GET /inbox` | `seat`, `unread`, `after_seq`, `before_seq`, `limit` (≤ 1000); headers only. A page is at most 2 MiB: when it was cut, `"truncated": true`, and the next page starts after the last entry (with `before_seq`: before the first). A page of more than 100 takes one of the org's query slots (see [below](#limits-on-expensive-requests)) |
 | `GET /messages/{id}` | full message; marks the caller's delivery read unless `peek=1` |
