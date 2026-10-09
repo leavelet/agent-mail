@@ -41,11 +41,82 @@ fn content_type(path: &str) -> &'static str {
     }
 }
 
-/// `GET /` and the app's static files. Hashed files under `assets/` are
-/// cached for a year; everything else is revalidated.
-pub async fn static_file(method: Method, uri: axum::http::Uri) -> Response {
+/// Header with which a trusted reverse proxy that removes a path prefix
+/// says what it removed (`X-Forwarded-Prefix: /amail`).
+pub const FORWARDED_PREFIX: &str = "x-forwarded-prefix";
+
+/// The path prefix under which the client reached the server: the prefix a
+/// trusted proxy says it removed (`X-Forwarded-Prefix`, when valid for
+/// [`crate::config::parse_base_path`]), followed by the server's own
+/// `--base-path`. Empty for the root, otherwise e.g. `/amail` (no trailing
+/// slash). The header is ignored from peers that are not trusted proxies.
+pub fn external_base(st: &AppState, peer: Peer, headers: &HeaderMap) -> String {
+    let forwarded = if peer.proxied {
+        headers
+            .get(FORWARDED_PREFIX)
+            .and_then(|v| v.to_str().ok())
+            // A chain of proxies may list several; the first is the
+            // client's side.
+            .and_then(|v| v.split(',').next())
+            // `/amail/` is taken as `/amail`.
+            .map(|v| v.trim().strip_suffix('/').unwrap_or(v.trim()))
+            .and_then(|v| match crate::config::parse_base_path(v) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    tracing::debug!("ignoring X-Forwarded-Prefix: {e}");
+                    None
+                }
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    format!("{forwarded}{}", st.config.base_path)
+}
+
+/// The app's page with the path prefix written into it, as
+/// `<meta name="amail-base" content="/amail/">` (always ending in `/`); the
+/// app resolves its API calls and links against it.
+fn index_with_base(bytes: &[u8], base: &str) -> Vec<u8> {
+    let html = String::from_utf8_lossy(bytes);
+    // `base` passed parse_base_path: no characters that need escaping.
+    let meta = format!("<head>\n    <meta name=\"amail-base\" content=\"{base}/\" />");
+    html.replacen("<head>", &meta, 1).into_bytes()
+}
+
+fn redirect(to: &str) -> Response {
+    let mut resp = StatusCode::FOUND.into_response();
+    if let Ok(v) = HeaderValue::from_str(to) {
+        resp.headers_mut().insert(header::LOCATION, v);
+    }
+    resp
+}
+
+/// `GET /` and the app's static files (below the path prefix, if any).
+/// Hashed files under `assets/` are cached for a year; everything else is
+/// revalidated.
+///
+/// The app routes with the URL fragment (`/#/org/root`). A browser asking
+/// for an HTML page at another path without a file extension
+/// (`/org/root`) is redirected to the same route as a fragment
+/// (`/#/org/root`), so that such links work too. With `--base-path /amail`,
+/// `/amail` is redirected to `/amail/`, where the app's relative asset
+/// references resolve.
+pub async fn static_file(
+    State(st): State<AppState>,
+    peer: Peer,
+    method: Method,
+    headers: HeaderMap,
+    axum::extract::OriginalUri(original): axum::extract::OriginalUri,
+    uri: axum::http::Uri,
+) -> Response {
     if method != Method::GET && method != Method::HEAD {
         return ApiError::not_found("no such endpoint").into_response();
+    }
+    let base = external_base(&st, peer, &headers);
+    let query = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+    if !st.config.base_path.is_empty() && original.path() == st.config.base_path {
+        return redirect(&format!("{base}/{query}"));
     }
     let path = uri.path().trim_start_matches('/');
     // The app's own pages: sign-in, registration, the operator's view.
@@ -54,6 +125,18 @@ pub async fn static_file(method: Method, uri: axum::http::Uri) -> Response {
         p => p,
     };
     let Some((name, bytes)) = assets::ASSETS.iter().find(|(p, _)| *p == path) else {
+        let html = headers
+            .get(header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("text/html"));
+        let last = path.rsplit('/').next().unwrap_or("");
+        let app_route = !path.starts_with("v1/")
+            && !path.starts_with("assets/")
+            && !last.contains('.')
+            && !path.contains("//");
+        if html && app_route {
+            return redirect(&format!("{base}/#/{path}{query}"));
+        }
         return ApiError::not_found("no such endpoint").into_response();
     };
     let cache = if name.starts_with("assets/") {
@@ -61,13 +144,21 @@ pub async fn static_file(method: Method, uri: axum::http::Uri) -> Response {
     } else {
         "no-cache"
     };
-    let mut resp = Response::new(Body::from(*bytes));
+    let body = if *name == "index.html" {
+        Body::from(index_with_base(bytes, &base))
+    } else {
+        Body::from(*bytes)
+    };
+    let mut resp = Response::new(body);
     let h = resp.headers_mut();
     h.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static(content_type(name)),
     );
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static(cache));
+    if *name == "index.html" {
+        h.insert(header::VARY, HeaderValue::from_static("X-Forwarded-Prefix"));
+    }
     resp
 }
 
@@ -114,9 +205,13 @@ pub(crate) fn https(st: &AppState, peer: Peer, headers: &HeaderMap) -> bool {
     fwd || origin
 }
 
-pub(crate) fn session_cookie(value: &str, max_age: i64, secure: bool) -> HeaderValue {
-    let mut c =
-        format!("{SESSION_COOKIE}={value}; Path=/; HttpOnly; SameSite=Strict; Max-Age={max_age}");
+/// The session cookie, valid for the paths under `base` (the external
+/// path prefix, empty for the root; see [`external_base`]).
+pub(crate) fn session_cookie(value: &str, max_age: i64, secure: bool, base: &str) -> HeaderValue {
+    let path = if base.is_empty() { "/" } else { base };
+    let mut c = format!(
+        "{SESSION_COOKIE}={value}; Path={path}; HttpOnly; SameSite=Strict; Max-Age={max_age}"
+    );
     if secure {
         c.push_str("; Secure");
     }
@@ -185,7 +280,12 @@ pub async fn login(
     let mut resp = Json(body).into_response();
     resp.headers_mut().insert(
         header::SET_COOKIE,
-        session_cookie(&secret, max_age, https(&st, peer, &headers)),
+        session_cookie(
+            &secret,
+            max_age,
+            https(&st, peer, &headers),
+            &external_base(&st, peer, &headers),
+        ),
     );
     Ok(resp)
 }
@@ -215,7 +315,12 @@ async fn operator_login(
     .into_response();
     resp.headers_mut().insert(
         header::SET_COOKIE,
-        session_cookie(&secret, OPERATOR_SESSION_S, https(st, peer, headers)),
+        session_cookie(
+            &secret,
+            OPERATOR_SESSION_S,
+            https(st, peer, headers),
+            &external_base(st, peer, headers),
+        ),
     );
     Ok(resp)
 }
@@ -239,7 +344,12 @@ pub async fn logout(
     let mut resp = StatusCode::NO_CONTENT.into_response();
     resp.headers_mut().insert(
         header::SET_COOKIE,
-        session_cookie("", 0, https(&st, peer, &headers)),
+        session_cookie(
+            "",
+            0,
+            https(&st, peer, &headers),
+            &external_base(&st, peer, &headers),
+        ),
     );
     Ok(resp)
 }

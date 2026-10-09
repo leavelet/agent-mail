@@ -57,10 +57,14 @@ pub async fn login(url: &str, name: Option<String>, out: &Out) -> Result<()> {
         bail!("no token given");
     }
     let c = Client::new(&url, &token);
-    let me: p::WhoAmI = c
-        .get("/whoami")
-        .await
-        .with_context(|| format!("checking the token with {url}"))?;
+    let me: p::WhoAmI = c.get("/whoami").await.map_err(|e| {
+        let e = e.context(format!("checking the token with {url}"));
+        if not_found(&e) {
+            e.context(PREFIX_HINT)
+        } else {
+            e
+        }
+    })?;
     let name = name.unwrap_or_else(|| profiles::default_name(&url, &me.org));
     let path = save_profile(
         &name,
@@ -80,6 +84,33 @@ pub async fn login(url: &str, name: Option<String>, out: &Out) -> Result<()> {
             path.display()
         ))
     })
+}
+
+/// Said when the API answers 404 at the URL given.
+const PREFIX_HINT: &str = "the server answered 404 for the API: if it runs under a path \
+     prefix (amail serve --base-path, or a reverse proxy location), include the prefix in \
+     the URL, e.g. https://example.com/amail";
+
+/// A 404 from the server, or from a proxy in front of it (not JSON).
+fn not_found(e: &anyhow::Error) -> bool {
+    crate::client::is_not_found(e) || e.chain().any(|c| c.to_string().starts_with("HTTP 404"))
+}
+
+/// The path of a server URL (`/` for none), e.g. `/amail` for
+/// `https://example.com/amail/`.
+fn url_path(url: &str) -> String {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let path = rest.find('/').map(|i| &rest[i..]).unwrap_or("");
+    let path = path
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('/');
+    if path.is_empty() {
+        "/".into()
+    } else {
+        path.to_string()
+    }
 }
 
 fn save_profile(name: &str, profile: Profile) -> Result<PathBuf> {
@@ -465,7 +496,38 @@ pub async fn doctor(profile: Option<&Path>, team_file: &Path, out: &Out) -> Resu
                 .await;
             match health {
                 Ok(resp) if resp.status().is_success() => {
-                    r.add(Level::Ok, "server", format!("{} answers", c.base()), None)
+                    // `/healthz` also answers at the root of a server under
+                    // a path prefix: the API tells whether the URL has it.
+                    match c.get::<p::ServerInfo>("/info").await {
+                        Ok(info) => {
+                            r.add(Level::Ok, "server", format!("{} answers", c.base()), None);
+                            let seen = info.base_path.unwrap_or_else(|| "/".into());
+                            let want = url_path(c.base());
+                            if seen != want {
+                                r.add(
+                                    Level::Warn,
+                                    "path prefix",
+                                    format!(
+                                        "the URL's path is {want} but the server sees the \
+                                         prefix {seen}"
+                                    ),
+                                    Some(
+                                        "behind a proxy that removes the prefix, have it send \
+                                         X-Forwarded-Prefix and list it in --trusted-proxy \
+                                         (see Running under a path prefix in \
+                                         docs/operations.md)"
+                                            .into(),
+                                    ),
+                                );
+                            }
+                        }
+                        Err(e) => r.add(
+                            Level::Fail,
+                            "server",
+                            format!("{} answers /healthz but not the API: {e:#}", c.base()),
+                            not_found(&e).then(|| PREFIX_HINT.into()),
+                        ),
+                    }
                 }
                 Ok(resp) => r.add(
                     Level::Fail,
@@ -841,4 +903,16 @@ pub async fn doctor(profile: Option<&Path>, team_file: &Path, out: &Out) -> Resu
             .join("\n"))
     })?;
     Ok(worst < Level::Fail)
+}
+
+#[cfg(test)]
+mod prefix_tests {
+    #[test]
+    fn url_paths() {
+        assert_eq!(super::url_path("http://127.0.0.1:8025"), "/");
+        assert_eq!(super::url_path("http://127.0.0.1:8025/"), "/");
+        assert_eq!(super::url_path("https://example.com/amail"), "/amail");
+        assert_eq!(super::url_path("https://example.com/amail/"), "/amail");
+        assert_eq!(super::url_path("https://example.com/a/b?x=1"), "/a/b");
+    }
 }

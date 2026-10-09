@@ -2,6 +2,7 @@
 // request carries the CSRF header the server requires for cookie auth.
 
 import type { ApiErrorBody } from './types';
+import { apiUrl } from './base';
 
 export const CSRF_HEADER = 'X-Amail-Csrf';
 
@@ -24,6 +25,7 @@ export function setUnauthorizedHandler(f: (() => void) | null): void {
   onUnauthorized = f;
 }
 
+/** `path` is an API path (`/v1/...`); it is sent below the app's path prefix. */
 export async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
   const headers: Record<string, string> = { [CSRF_HEADER]: '1', Accept: 'application/json' };
   const init: RequestInit = { method, headers, credentials: 'same-origin' };
@@ -33,7 +35,7 @@ export async function request<T>(method: string, path: string, body?: unknown): 
   }
   let resp: Response;
   try {
-    resp = await fetch(path, init);
+    resp = await fetch(apiUrl(path), init);
   } catch (e) {
     throw new ApiError(0, 'network', e instanceof Error ? e.message : String(e));
   }

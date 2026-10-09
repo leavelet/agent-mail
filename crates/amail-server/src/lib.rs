@@ -290,7 +290,8 @@ pub fn router(state: AppState) -> Router {
                 "method not allowed",
             )
         });
-    Router::new()
+    let base = state.config.base_path.clone();
+    let app = Router::new()
         .nest("/v1", v1)
         .route("/healthz", get(|| async { "ok" }))
         .fallback(web::static_file)
@@ -301,7 +302,18 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             peer::layer,
         ))
-        .with_state(state)
+        .with_state(state);
+    if base.is_empty() {
+        return app;
+    }
+    // Under a path prefix (`--base-path /amail`): everything below it, and
+    // `/healthz` at the root too, for health checks that do not know the
+    // prefix (the container image's). Other paths are not found.
+    Router::new()
+        .nest_service(&base, app)
+        .route("/healthz", get(|| async { "ok" }))
+        .fallback(|| async { error::ApiError::not_found("no such endpoint") })
+        .layer(axum::middleware::from_fn(web::headers))
 }
 
 /// Serve the API on `listener` until `shutdown` resolves.

@@ -1,7 +1,8 @@
 <script lang="ts">
   import { ApiError } from '../lib/api';
+  import { currentPage, pageUrl } from '../lib/base';
   import { store } from '../lib/store.svelte';
-  const operator = globalThis.location?.pathname === '/admin';
+  const operator = currentPage() === 'admin';
   import { t, ui } from '../lib/ui.svelte';
   import LangTheme from './LangTheme.svelte';
 
@@ -54,7 +55,7 @@
       </button>
     </div>
     {#if store.info?.registration && !operator}
-      <a class="reg" href="/register">{t('login.register')}</a>
+      <a class="reg" href={pageUrl('register')}>{t('login.register')}</a>
     {/if}
   </form>
   <div class="prefs"><LangTheme /></div>

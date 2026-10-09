@@ -52,6 +52,7 @@ node_tests!(
     open_policy_serves_sessions_and_reports_them,
     setting_changes_are_reported_once,
     lost_mailbox_event_is_recovered_at_turn_end,
+    node_under_path_prefix,
 );
 
 use amail_store::testutil::Backend;
@@ -2366,4 +2367,93 @@ async fn lost_mailbox_event_is_recovered_at_turn_end(b: Backend) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(h.seat_status("lost").await["pending"]["to"], 1);
+}
+
+/// A server under a path prefix (`--base-path /amail`), with the node's
+/// URL carrying it: the node's event stream, a session started with
+/// `amail run` (launch plan and hooks), the URL the session gets, and its
+/// commands.
+async fn node_under_path_prefix(b: Backend) {
+    let opts = Opts {
+        supervise: true,
+        base_path: "/amail",
+        ..Opts::default()
+    };
+    let Some(h) = setup(b, "node_under_path_prefix", opts).await else {
+        return;
+    };
+    assert!(h.api.base.ends_with("/amail"), "{}", h.api.base);
+    assert_eq!(h.status().await["server"], h.api.base);
+    h.seat("w1", "claude").await;
+    h.seat("w2", "claude").await;
+    let work = h.dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+
+    // A session started the way a person starts one: the node asks the
+    // server for the launch plan, the session's hooks reach the server.
+    let mut session = std::process::Command::new(BIN);
+    session
+        .args(["run", "w1", "--socket"])
+        .arg(&h.sock)
+        .current_dir(&work)
+        .env("FAKE_AMAIL", BIN)
+        .env("AMAIL_HOOK_TIMEOUT_MS", "5000")
+        .env("CLAUDE_CONFIG_DIR", h.dir.path().join("cc2"))
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    for k in ["AMAIL_SEAT", "AMAIL_TOKEN", "AMAIL_PROFILE", "AMAIL_URL"] {
+        session.env_remove(k);
+    }
+    let mut session = session.spawn().unwrap();
+    h.wait("w1 started", || async { h.state("w1").await == "idle" })
+        .await;
+
+    // Mail arrives over the node's event stream.
+    h.api.send(&["w1"], &[], "under a prefix", false).await;
+    h.wait_pending("w1", 1, 0, 0).await;
+
+    // The URL a session is given carries the prefix, and works.
+    let mut stand_in = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let plan = h
+        .node
+        .as_ref()
+        .unwrap()
+        .node
+        .handle(amail_node::wire::Request::Launch {
+            seat: "w2".into(),
+            cwd: work.to_string_lossy().into(),
+            pid: stand_in.id(),
+            harness: None,
+            extra: vec![],
+            pane: None,
+            mux_session: None,
+            permission_mode: None,
+            git_access: None,
+            dsh_jail: None,
+        })
+        .await;
+    assert_eq!(plan["env"]["AMAIL_URL"], h.api.base, "{plan}");
+    let token = plan["env"]["AMAIL_TOKEN"].as_str().unwrap();
+    let out = std::process::Command::new(BIN)
+        .args(["--json", "inbox"])
+        .env("AMAIL_URL", &h.api.base)
+        .env("AMAIL_TOKEN", token)
+        .env_remove("AMAIL_PROFILE")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _: Value = serde_json::from_slice(&out.stdout).unwrap();
+
+    let _ = stand_in.kill();
+    let _ = stand_in.wait();
+    let _ = session.kill();
+    let _ = session.wait();
 }

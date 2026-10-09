@@ -1,5 +1,6 @@
 <script lang="ts">
   import { del, enc, get, post, request } from '../lib/api';
+  import { pageUrl } from '../lib/base';
   import { t, ui } from '../lib/ui.svelte';
   import { fullTime, shortTime } from '../lib/time';
   import type { OperatorStats, OrgStat } from '../lib/types';
@@ -56,7 +57,7 @@
     } catch {
       // Signed out either way.
     }
-    location.href = '/';
+    location.href = pageUrl('');
   }
 </script>
 

@@ -6,6 +6,7 @@
   import { t, ui } from '../lib/ui.svelte';
   import { shortTime } from '../lib/time';
   import { enc } from '../lib/api';
+  import { apiUrl } from '../lib/base';
 
   /**
    * The read-only conversation mirror of a seat. With `seat`, it subscribes
@@ -34,7 +35,7 @@
 
   $effect(() => {
     if (!seat || typeof EventSource === 'undefined') return;
-    const src = new EventSource(`/v1/seats/${enc(seat)}/transcript`);
+    const src = new EventSource(apiUrl(`/v1/seats/${enc(seat)}/transcript`));
     es = src;
     // Every (re)connection replays the server's buffer: start from empty.
     src.onopen = () => {

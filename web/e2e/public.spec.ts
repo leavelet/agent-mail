@@ -44,7 +44,7 @@ test('register with an invite code, then the first mail', async ({ browser }) =>
       localStorage.setItem('amail.theme', t);
     }, [lang, theme]);
     await page.goto(`${s.pub.base}/`);
-    await expect(page.locator('a[href="/register"]')).toBeVisible();
+    await expect(page.locator(`a[href="${s.basePath}/register"]`)).toBeVisible();
     await page.goto(`${s.pub.base}/register`);
     await page.locator('#r-invite').fill(s.pub.invites[0]);
     await page.locator('#r-org').fill('webco');

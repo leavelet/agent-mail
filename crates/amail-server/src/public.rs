@@ -22,12 +22,18 @@ pub fn new_invite() -> String {
 }
 
 /// `GET /v1/info` (no authentication).
-pub async fn info(State(st): State<AppState>) -> Json<p::ServerInfo> {
+pub async fn info(
+    State(st): State<AppState>,
+    peer: crate::peer::Peer,
+    headers: axum::http::HeaderMap,
+) -> Json<p::ServerInfo> {
+    let base = crate::web::external_base(&st, peer, &headers);
     Json(p::ServerInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
         public: st.config.public,
         registration: st.config.registration,
         retention_days: st.config.retention_days,
+        base_path: Some(if base.is_empty() { "/".into() } else { base }),
     })
 }
 
@@ -221,7 +227,12 @@ pub async fn rotate_token(
             .await?;
         resp.headers_mut().insert(
             header::SET_COOKIE,
-            crate::web::session_cookie(&secret, max_age, crate::web::https(&st, peer, &headers)),
+            crate::web::session_cookie(
+                &secret,
+                max_age,
+                crate::web::https(&st, peer, &headers),
+                &crate::web::external_base(&st, peer, &headers),
+            ),
         );
     }
     Ok(resp)

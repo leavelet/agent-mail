@@ -163,7 +163,8 @@ pub struct Config {
     /// Invite-code registration (on in public mode).
     pub registration: bool,
     pub limits: Limits,
-    /// Peers whose `X-Forwarded-For`, `-Host` and `-Proto` are believed.
+    /// Peers whose `X-Forwarded-For`, `-Host`, `-Proto` and `-Prefix` are
+    /// believed.
     pub trusted_proxies: Vec<Cidr>,
     /// Webhooks may target loopback, private, link-local and reserved
     /// addresses (self-hosted default); public mode refuses them unless
@@ -178,6 +179,10 @@ pub struct Config {
     /// deleted orgs are looked for.
     pub retention_every: Duration,
     pub sweep_every: Duration,
+    /// The URL path prefix the server answers under (`amail serve
+    /// --base-path`), e.g. `/amail`; empty for the root. See
+    /// [`parse_base_path`].
+    pub base_path: String,
 }
 
 impl Default for Config {
@@ -192,6 +197,7 @@ impl Default for Config {
             retention_days: None,
             retention_every: Duration::from_secs(600),
             sweep_every: Duration::from_secs(15),
+            base_path: String::new(),
         }
     }
 }
@@ -212,6 +218,46 @@ impl Config {
     pub fn trusts(&self, ip: IpAddr) -> bool {
         self.trusted_proxies.iter().any(|c| c.contains(ip))
     }
+}
+
+/// Check a URL path prefix (`--base-path`, or `X-Forwarded-Prefix` from a
+/// trusted proxy) and return it in the form the server keeps: empty for the
+/// root (`/` or an empty string), otherwise a leading slash and no trailing
+/// slash, e.g. `/amail` or `/tools/amail`. Each segment may hold only
+/// letters, digits and `-._~`, and may not be `.` or `..`; so a prefix has
+/// no query, fragment, percent-encoding or empty segment, and can be written
+/// into HTML and a `Set-Cookie` header as it is.
+pub fn parse_base_path(s: &str) -> Result<String, String> {
+    let s = s.trim();
+    if s.is_empty() || s == "/" {
+        return Ok(String::new());
+    }
+    if !s.starts_with('/') {
+        return Err(format!("{s:?} must start with /"));
+    }
+    if s.ends_with('/') {
+        return Err(format!("{s:?} must not end with /"));
+    }
+    if s.len() > 200 {
+        return Err("a path prefix is at most 200 characters".into());
+    }
+    for seg in s[1..].split('/') {
+        if seg.is_empty() {
+            return Err(format!("{s:?} has an empty segment (//)"));
+        }
+        if seg == "." || seg == ".." {
+            return Err(format!("{s:?} may not contain . or .. segments"));
+        }
+        if let Some(c) = seg
+            .chars()
+            .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~')))
+        {
+            return Err(format!(
+                "{s:?} contains {c:?}; a path prefix may hold only letters, digits, -._~ and /"
+            ));
+        }
+    }
+    Ok(s.to_string())
 }
 
 /// Largest values of the org settings. `public` bounds apply in public
@@ -328,5 +374,38 @@ mod tests {
         assert!(all.contains("8.8.8.8".parse().unwrap()));
         assert!("10.0.0.0/33".parse::<Cidr>().is_err());
         assert!("nope".parse::<Cidr>().is_err());
+    }
+
+    #[test]
+    fn base_paths() {
+        for (s, want) in [
+            ("", ""),
+            ("/", ""),
+            (" /amail ", "/amail"),
+            ("/amail", "/amail"),
+            ("/tools/amail-1.x_y~z", "/tools/amail-1.x_y~z"),
+        ] {
+            assert_eq!(parse_base_path(s).as_deref(), Ok(want), "{s:?}");
+        }
+        for s in [
+            "amail",
+            "/amail/",
+            "//amail",
+            "/a//b",
+            "/..",
+            "/a/../b",
+            "/a/.",
+            "/a?x=1",
+            "/a#x",
+            "/a%2fb",
+            "/a b",
+            "/a\"b",
+            "/a<b",
+            "/ämail",
+            "http://x/amail",
+        ] {
+            assert!(parse_base_path(s).is_err(), "{s:?}");
+        }
+        assert!(parse_base_path(&format!("/{}", "a".repeat(200))).is_err());
     }
 }

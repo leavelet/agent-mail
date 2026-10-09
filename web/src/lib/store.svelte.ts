@@ -4,6 +4,7 @@
 // per second.
 
 import { ApiError, get, post, del, qs, enc, request, setUnauthorizedHandler } from './api';
+import { apiUrl } from './base';
 import { Coalescer } from './coalesce';
 import { announce, itemKey, newItems } from './notify';
 import { go } from './router.svelte';
@@ -169,7 +170,7 @@ class Store {
   private connect() {
     if (typeof EventSource === 'undefined') return;
     this.es?.close();
-    const es = new EventSource('/v1/events');
+    const es = new EventSource(apiUrl('/v1/events'));
     this.es = es;
     es.onopen = () => {
       this.live = true;

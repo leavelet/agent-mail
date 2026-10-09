@@ -1339,10 +1339,10 @@ async fn embedded_app_and_headers(srv: Server) {
         // Hashed assets are cached for long.
         let asset = body
             .split('"')
-            .find(|s| s.starts_with("/assets/") && s.ends_with(".js"))
+            .find(|s| s.starts_with("./assets/") && s.ends_with(".js"))
             .expect("an asset in index.html");
         let r = http
-            .get(format!("{}{asset}", srv.base))
+            .get(format!("{}/{}", srv.base, asset.trim_start_matches("./")))
             .send()
             .await
             .unwrap();

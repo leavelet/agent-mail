@@ -1,5 +1,6 @@
 <script lang="ts">
   import { ApiError, post } from '../lib/api';
+  import { pageUrl } from '../lib/base';
   import { store } from '../lib/store.svelte';
   import { isKey } from '../lib/i18n';
   import { t, ui } from '../lib/ui.svelte';
@@ -44,7 +45,7 @@
   async function signIn() {
     if (!done) return;
     await store.login(done.token);
-    history.replaceState(null, '', '/#/org');
+    history.replaceState(null, '', `${pageUrl('')}#/org`);
   }
 </script>
 
@@ -87,7 +88,7 @@ amail node start</pre></li>
         <span class="faint hint">{t('reg.userNameHint')}</span>
         {#if error}<p class="error" role="alert">{error}</p>{/if}
         <div class="row">
-          <a href="/">{t('reg.back')}</a>
+          <a href={pageUrl('')}>{t('reg.back')}</a>
           <span class="spacer"></span>
           <button class="primary" type="submit" disabled={busy || !invite.trim() || !org.trim()}>
             {busy ? t('reg.busy') : t('reg.submit')}

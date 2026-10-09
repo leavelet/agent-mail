@@ -3,6 +3,8 @@
 // a real `amail node` that hosts seat `be-1`, whose transcript is a fixture
 // file. A second org with 1,000 seats is created for the scale screenshot.
 // Everything runs under web/.e2e/run and is stopped by the returned teardown.
+// AMAIL_E2E_BASE_PATH=/amail runs both servers under that path prefix
+// (`--base-path`): the specs, the node and the CLI then use URLs with it.
 
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
@@ -33,6 +35,9 @@ function env(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
 // AMAIL_E2E_PORT_BASE: take ports from there on instead of free ones the
 // system picks (to keep to a range).
 let nextPort = Number(process.env.AMAIL_E2E_PORT_BASE ?? 0);
+
+const BASE_PATH = (process.env.AMAIL_E2E_BASE_PATH ?? '').replace(/\/$/, '');
+const prefixArgs = BASE_PATH ? ['--base-path', BASE_PATH] : [];
 
 async function freePort(): Promise<number> {
   if (nextPort) return nextPort++;
@@ -136,9 +141,9 @@ async function setup(procs: ChildProcess[]): Promise<void> {
   const inviterToken = (JSON.parse(run(['--json', 'admin', 'create-org', inviter, '--db', db])) as { token: string }).token;
 
   const port = await freePort();
-  const base = `http://127.0.0.1:${port}`;
+  const base = `http://127.0.0.1:${port}${BASE_PATH}`;
   const serveLog = fs.openSync(path.join(dir, 'serve.log'), 'a');
-  const serve = spawn(BIN, ['serve', '--db', db, '--listen', `127.0.0.1:${port}`], {
+  const serve = spawn(BIN, ['serve', '--db', db, '--listen', `127.0.0.1:${port}`, ...prefixArgs], {
     env: env({ RUST_LOG: process.env.RUST_LOG ?? 'info' }),
     stdio: ['ignore', serveLog, serveLog],
   });
@@ -302,9 +307,9 @@ async function setup(procs: ChildProcess[]): Promise<void> {
   const invites = (JSON.parse(run(['--json', 'admin', 'invite', 'create', '--count', '4', '--note', 'e2e', '--db', pubDb])) as { invites: { code: string }[] }).invites.map((i) => i.code);
   const opToken = (JSON.parse(run(['--json', 'admin', 'operator-token', 'create', '--label', 'e2e', '--db', pubDb])) as { token: string }).token;
   const pubPort = await freePort();
-  const pubBase = `http://localhost:${pubPort}`;
+  const pubBase = `http://localhost:${pubPort}${BASE_PATH}`;
   const pubLog = fs.openSync(path.join(dir, 'serve-public.log'), 'a');
-  const pub = spawn(BIN, ['serve', '--public', '--db', pubDb, '--listen', `127.0.0.1:${pubPort}`, '--retention-days', '90'], {
+  const pub = spawn(BIN, ['serve', '--public', '--db', pubDb, '--listen', `127.0.0.1:${pubPort}`, '--retention-days', '90', ...prefixArgs], {
     env: env({ RUST_LOG: process.env.RUST_LOG ?? 'info' }),
     stdio: ['ignore', pubLog, pubLog],
   });
@@ -320,6 +325,7 @@ async function setup(procs: ChildProcess[]): Promise<void> {
     seatTokens,
     transcript,
     node: nodeOk,
+    basePath: BASE_PATH,
     big: { org: 'scale', userToken: bigToken, nodeToken: bigNode },
     peer: { org: peerOrg, userToken: peerToken, seatTokens: peerSeatTokens, inviter },
     pub: { base: pubBase, invites, opToken, db: pubDb },
