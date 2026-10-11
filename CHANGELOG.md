@@ -104,6 +104,13 @@ The first public version.
   longer has it as unread or pending mail and is not woken or reminded;
   it can still read it by id and in its threads. Status shows
   `withdrawn` (migration 0021).
+- Reading or acknowledging a message counts as having been notified of
+  it. Before, a message the agent read on its own (`amail read` after
+  `amail inbox`, before a hook or wake had shown its header) kept
+  `notified_at` empty, so it stayed in the seat's pending mail, was
+  claimed and injected again at the next hook, and the web interface
+  showed its delivery as queued. `notified_via` is `read` or `ack` for
+  such deliveries; migration 0022 repairs existing rows.
 
 #### Running agents
 

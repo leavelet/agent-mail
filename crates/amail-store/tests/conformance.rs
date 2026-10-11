@@ -651,11 +651,23 @@ async fn send_inbox_read_ack(s: S) {
     let full = s.message(sent.message_id).await.unwrap().unwrap();
     assert_eq!(full.body, "body of hello\nsecond line");
 
+    // Nothing has shown the message to `a` yet: it is pending.
+    let p = s.pending(o.id, Some(a.id)).await.unwrap();
+    assert_eq!((p.len(), p[0].to), (1, 1));
+
     let (d, bump) = s.mark_read(sent.message_id, a.id).await.unwrap().unwrap();
     assert!(d.read_at.is_some());
     assert_eq!(bump.unwrap().seq, 2);
     assert_eq!(d.mod_seq, 2);
     assert_eq!(d.seq, 1);
+    // Reading on its own counts as notified: the delivery leaves the
+    // pending counts and a later claim does not take it.
+    assert_eq!(d.notified_at, d.read_at);
+    assert_eq!(d.notified_via.as_deref(), Some("read"));
+    let p = s.pending(o.id, Some(a.id)).await.unwrap();
+    assert_eq!((p[0].to, p[0].urgent), (0, 0));
+    let (claimed, bump) = s.claim(a.id, &filter(&[C::To])).await.unwrap();
+    assert!(claimed.is_empty() && bump.is_none());
     // Reading again changes nothing.
     let (_, bump) = s.mark_read(sent.message_id, a.id).await.unwrap().unwrap();
     assert!(bump.is_none());
@@ -690,6 +702,9 @@ async fn send_inbox_read_ack(s: S) {
     let (d, bump) = s.ack(sent.message_id, b.id).await.unwrap().unwrap();
     assert!(d.acked_at.is_some() && d.read_at.is_some());
     assert!(bump.is_some());
+    assert_eq!(d.notified_at, d.acked_at);
+    assert_eq!(d.notified_via.as_deref(), Some("ack"));
+    assert_eq!(s.pending(o.id, Some(b.id)).await.unwrap()[0].cc, 0);
     let (_, bump) = s.ack(sent.message_id, b.id).await.unwrap().unwrap();
     assert!(bump.is_none());
     assert!(s.mark_read(sent.message_id, u.id).await.unwrap().is_none());
@@ -832,22 +847,23 @@ async fn changes_feed(s: S) {
     assert_eq!(ch.len(), 1);
     assert_eq!(ch[0].delivery.message_id, m1.message_id);
     assert_eq!((ch[0].delivery.seq, ch[0].delivery.mod_seq), (1, 3));
+    // The read message counts as notified, so the claim takes only m2.
     let (claimed, bump) = s
         .claim(a.id, &filter(&[C::To, C::Cc, C::List]))
         .await
         .unwrap();
-    assert_eq!(claimed.len(), 2);
-    assert_eq!(bump.unwrap().seq, 5);
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(bump.unwrap().seq, 4);
     let ch = s.changes(a.id, 3, 100).await.unwrap();
     assert_eq!(
         ch.iter().map(|e| e.delivery.mod_seq).collect::<Vec<_>>(),
-        vec![4, 5]
+        vec![4]
     );
-    assert_eq!(ch[1].delivery.message_id, m2.message_id);
-    assert!(s.changes(a.id, 5, 100).await.unwrap().is_empty());
+    assert_eq!(ch[0].delivery.message_id, m2.message_id);
+    assert!(s.changes(a.id, 4, 100).await.unwrap().is_empty());
     assert_eq!(s.changes(a.id, 0, 1).await.unwrap().len(), 1);
     let seqs = s.seat_seqs(o.id).await.unwrap();
-    assert!(seqs.contains(&(a.id, "a".to_string(), 5)));
+    assert!(seqs.contains(&(a.id, "a".to_string(), 4)));
 }
 
 async fn archive(s: S) {

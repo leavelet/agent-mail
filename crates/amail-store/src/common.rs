@@ -2464,11 +2464,17 @@ macro_rules! impl_store_common {
                 Ok((released, Some(SeqBump { org_id, seat_id, seq: last })))
             }
 
+            /// Reading the body counts as having been notified: a delivery
+            /// the recipient read on its own (before a hook or wake showed
+            /// it) leaves the pending counts and is not claimed or injected
+            /// afterwards. `notified_via` is then `read`.
             pub async fn mark_read(c: &mut Conn, message_id: i64, seat_id: i64) -> Result<Option<(DeliveryRec, Option<SeqBump>)>> {
                 touch(
                     c,
-                    "UPDATE deliveries SET read_at = $1 WHERE message_id = $2 AND seat_id = $3 \
-                     AND read_at IS NULL RETURNING id",
+                    "UPDATE deliveries SET read_at = $1, \
+                     notified_via = CASE WHEN notified_at IS NULL THEN 'read' ELSE notified_via END, \
+                     notified_at = COALESCE(notified_at, $1) \
+                     WHERE message_id = $2 AND seat_id = $3 AND read_at IS NULL RETURNING id",
                     message_id,
                     seat_id,
                 )
@@ -2490,7 +2496,9 @@ macro_rules! impl_store_common {
             pub async fn ack(c: &mut Conn, message_id: i64, seat_id: i64) -> Result<Option<(DeliveryRec, Option<SeqBump>)>> {
                 touch(
                     c,
-                    "UPDATE deliveries SET acked_at = $1, read_at = COALESCE(read_at, $1) \
+                    "UPDATE deliveries SET acked_at = $1, read_at = COALESCE(read_at, $1), \
+                     notified_via = CASE WHEN notified_at IS NULL THEN 'ack' ELSE notified_via END, \
+                     notified_at = COALESCE(notified_at, $1) \
                      WHERE message_id = $2 AND seat_id = $3 AND acked_at IS NULL RETURNING id",
                     message_id,
                     seat_id,

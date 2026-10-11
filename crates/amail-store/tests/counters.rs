@@ -273,7 +273,9 @@ async fn counters_follow_deliveries(db: TestDb) {
             x.id
         ))
         .await;
-    assert_eq!(left[0], vec![12, 7]);
+    // `x` acknowledged 5 of its 12 list deliveries: acknowledged (and read)
+    // deliveries count as notified and leave the pending counts.
+    assert_eq!(left[0], vec![7, 7]);
 }
 
 async fn thread_visibility_lookups(db: TestDb) {

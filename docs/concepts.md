@@ -70,6 +70,12 @@ A **delivery** is one row per (message, recipient seat). It moves through
 `read` says what was put into the agent's context, not that the agent
 handled it.
 
+The states are ordered: a later state implies the earlier ones. A message
+the agent reads or acknowledges on its own, before a hook or wake showed
+its header, becomes `read` (or `acked`) and counts as notified at the same
+time, with `notified_via` set to `read` or `ack`. It leaves the seat's
+pending mail and is not injected afterwards.
+
 **Withdrawing.** While a delivery is `queued`, the sender (or the org's
 user, for any message of the org) can withdraw it: `amail withdraw <id>
 --from <seat>`, **Withdraw** in the web interface's delivery table, or
