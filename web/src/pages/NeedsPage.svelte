@@ -11,6 +11,7 @@
   import type { AttentionItem } from '../lib/types';
   import MessagePane from '../components/MessagePane.svelte';
   import StateBadge from '../components/StateBadge.svelte';
+  import NeedsTasks from '../components/NeedsTasks.svelte';
 
   let selectedKey = $state<string | null>(null);
   let pane: MessagePane | undefined = $state();
@@ -79,6 +80,7 @@
       <h1>{t('needs.title')} <span class="count {items.length ? 'alert' : ''}">{items.length}</span></h1>
       <p class="muted intro">{t('needs.intro')}</p>
     </div>
+    <NeedsTasks />
     {#if items.length === 0}
       <div class="empty done">✓ {t('needs.empty')}</div>
     {:else}

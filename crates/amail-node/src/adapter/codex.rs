@@ -1398,6 +1398,13 @@ impl Adapter for Codex {
         args.extend(ctx.extra.iter().cloned());
         if let Some(id) = ctx.resume {
             args.push(id.to_string());
+            // A resumed thread keeps the instructions of its first prompt,
+            // so an adopted one is told here that it is now a seat
+            // (`codex resume [SESSION_ID] [PROMPT]`). Its hooks are tied to
+            // the seat by the registration the node made when adopting.
+            if ctx.adopted {
+                args.push(adopted_prompt(info));
+            }
         } else {
             let start = if ctx.context_lost {
                 CONTEXT_LOST

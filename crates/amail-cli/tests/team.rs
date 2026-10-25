@@ -56,6 +56,7 @@ team_tests!(
     removed_seats_leave_the_node,
     several_team_files_and_nested_teams,
     up_reconciles_its_openings,
+    adopt_existing_sessions,
 );
 
 async fn setup(
@@ -2184,4 +2185,247 @@ async fn set_notice(h: &Harness, text: &str) {
         let mut c = sqlx::PgConnection::connect(&h.db.url).await.unwrap();
         sqlx::query(&q).execute(&mut c).await.unwrap();
     }
+}
+
+/// A Claude Code transcript of session `id`, started in `cwd`, in the
+/// node's Claude config dir.
+fn claude_session(h: &Harness, id: &str, cwd: &Path) {
+    let dir = h
+        .dir
+        .path()
+        .join("claude")
+        .join("projects")
+        .join("-adopted");
+    std::fs::create_dir_all(&dir).unwrap();
+    let rec = json!({"type": "user", "cwd": cwd, "sessionId": id,
+        "message": {"role": "user", "content": "earlier work"}});
+    std::fs::write(dir.join(format!("{id}.jsonl")), format!("{rec}\n")).unwrap();
+}
+
+/// A Codex rollout file of thread `id` in the node's Codex home.
+fn codex_session(h: &Harness, id: &str, cwd: &Path) {
+    let dir = h
+        .dir
+        .path()
+        .join("state")
+        .join("codex-home")
+        .join("sessions")
+        .join("2026")
+        .join("10")
+        .join("26");
+    std::fs::create_dir_all(&dir).unwrap();
+    let rec = json!({"type": "session_meta", "payload": {"id": id, "cwd": cwd}});
+    std::fs::write(
+        dir.join(format!("rollout-2026-10-26T10-00-00-{id}.jsonl")),
+        format!("{rec}\n"),
+    )
+    .unwrap();
+}
+
+/// Seats adopt existing sessions: from the team file (checked before
+/// anything changes, one seat per session), resumed with the seat intro,
+/// and with `amail seat adopt` (at the next start, or `--restart`).
+async fn adopt_existing_sessions(b: Backend) {
+    let Some(h) = setup(b, "adopt_existing_sessions", None).await else {
+        return;
+    };
+    let _i = inbox(&h, "c");
+    let work = h.dir.path().join("work");
+    let (cid, xid) = (
+        "3f1c2b4a-0d5e-4f6a-9b7c-8d9e0f1a2b3c",
+        "019a0b1c-2d3e-7f40-8a5b-6c7d8e9f0a1b",
+    );
+    claude_session(&h, cid, &work.join("c"));
+    codex_session(&h, xid, &work.join("x"));
+    let file = |c: &str, x: &str| {
+        format!(
+            r#"
+[team]
+workroot = "@DIR@/work"
+[defaults]
+model = "m"
+[[seat]]
+name = "c"
+harness = "claude"
+role = "Keeps the docs."
+{c}
+[[seat]]
+name = "x"
+harness = "codex"
+{x}
+[[seat]]
+name = "y"
+harness = "codex"
+"#
+        )
+    };
+    let f = h
+        .dir
+        .path()
+        .join("amail.toml")
+        .to_string_lossy()
+        .into_owned();
+
+    // A session that does not exist: refused, nothing changed.
+    write_team(&h, &file("session = \"no-such-session\"", ""));
+    let (ok, out) = cli(&h, &["up", "-f", &f]).await;
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("no Claude Code session no-such-session on this host"),
+        "{out}"
+    );
+    assert!(out.contains("nothing was changed"), "{out}");
+    assert!(
+        h.api
+            .get("/seats")
+            .await
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["name"] != "c")
+    );
+    assert!(ps(&h).await.is_empty());
+    // The same session on two seats: refused.
+    write_team(
+        &h,
+        &file(
+            &format!("session = \"{cid}\""),
+            &format!("session = \"{cid}\""),
+        ),
+    );
+    let (ok, out) = cli(&h, &["up", "-f", &f]).await;
+    assert!(!ok && out.contains("both have session"), "{out}");
+    assert!(ps(&h).await.is_empty());
+
+    // Both seats resume their sessions; the system prompt (Claude) or the
+    // first prompt (Codex) introduces the seat.
+    write_team(
+        &h,
+        &file(
+            &format!("session = \"{cid}\""),
+            &format!("session = \"{xid}\""),
+        ),
+    );
+    let out = up(&h, &[]).await;
+    assert!(
+        out.contains(&format!("seat c adopts session {cid}")),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("seat x adopts session {xid}")),
+        "{out}"
+    );
+    assert!(!out.contains("warning"), "{out}");
+    wait_state(&h, "c", "idle").await;
+    wait_state(&h, "x", "idle").await;
+    wait_state(&h, "y", "idle").await;
+    let l = launches(&h, "c");
+    assert_eq!(l.len(), 1, "{l:?}");
+    assert!(l[0].contains(&format!("--resume {cid}")), "{l:?}");
+    assert!(!l[0].contains("--session-id"), "{l:?}");
+    assert!(l[0].contains("--append-system-prompt"), "{l:?}");
+    assert!(l[0].contains("You are seat `c` in org"), "{l:?}");
+    assert!(l[0].contains("Keeps the docs."), "{l:?}");
+    let l = launches(&h, "x");
+    assert_eq!(l.len(), 1, "{l:?}");
+    assert!(l[0].contains(" resume "), "{l:?}");
+    assert!(
+        l[0].contains(&format!(
+            " {xid} [amail] This conversation now runs as a seat"
+        )),
+        "{l:?}"
+    );
+    assert!(l[0].contains("You are seat `x` in org"), "{l:?}");
+    assert!(l[0].contains("Team mail (amail)"), "{l:?}");
+    // The adopted thread's hooks are the seat's (it has no marker).
+    let r = row(&h, "x").await;
+    assert_eq!(r.attention, None, "{r:?}");
+    // Again: nothing to adopt, nothing restarted.
+    let out = up(&h, &[]).await;
+    assert!(!out.contains("adopts session"), "{out}");
+    // The intro is given once: the next start of x just resumes.
+    let (ok, out) = cli(&h, &["sleep", "x"]).await;
+    assert!(ok, "{out}");
+    let (ok, out) = cli(&h, &["wake", "x"]).await;
+    assert!(ok, "{out}");
+    wait_for("x started again", || launches(&h, "x").len() == 2).await;
+    let l = launches(&h, "x");
+    assert!(
+        l[1].contains(" resume ") && l[1].trim_end().ends_with(xid),
+        "{l:?}"
+    );
+
+    // One seat per session.
+    let (ok, out) = cli(&h, &["seat", "adopt", "y", xid]).await;
+    assert!(!ok && out.contains("already belongs to seat x"), "{out}");
+    let (ok, out) = cli(&h, &["seat", "adopt", "y", "missing-thread"]).await;
+    assert!(
+        !ok && out.contains("no Codex session missing-thread"),
+        "{out}"
+    );
+
+    // `seat adopt` on a running seat takes effect at its next start; hooks
+    // of the session still running do not undo it. A session started in
+    // another directory is accepted with a warning.
+    let other = h.dir.path().join("elsewhere");
+    let cid2 = "7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d";
+    claude_session(&h, cid2, &other);
+    let (ok, out) = cli(&h, &["seat", "adopt", "c", cid2]).await;
+    assert!(ok, "{out}");
+    assert!(
+        out.contains(&format!("seat c adopts session {cid2}")),
+        "{out}"
+    );
+    assert!(
+        out.contains("resumes the session at its next start"),
+        "{out}"
+    );
+    assert!(
+        out.contains("warning:") && out.contains("was started in"),
+        "{out}"
+    );
+    assert_eq!(launches(&h, "c").len(), 1);
+    std::fs::write(h.fake.join("c.prompt"), "").unwrap();
+    wait_for("a turn of the old session", || {
+        !h.fake.join("c.prompt").exists()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let (ok, out) = cli(&h, &["sleep", "c"]).await;
+    assert!(ok, "{out}");
+    let (ok, out) = cli(&h, &["wake", "c"]).await;
+    assert!(ok, "{out}");
+    wait_for("c started again", || launches(&h, "c").len() == 2).await;
+    let l = launches(&h, "c");
+    assert!(l[1].contains(&format!("--resume {cid2}")), "{l:?}");
+    wait_state(&h, "c", "idle").await;
+
+    // `--restart` resumes it now.
+    let (ok, out) = cli(&h, &["seat", "adopt", "c", cid, "--restart"]).await;
+    assert!(ok && out.contains("restarting the seat"), "{out}");
+    wait_for("c restarted", || launches(&h, "c").len() == 3).await;
+    assert!(launches(&h, "c")[2].contains(&format!("--resume {cid}")));
+    wait_state(&h, "c", "idle").await;
+
+    // An adopted session that cannot be resumed: a new session, and
+    // `amail ps` says so.
+    let cid3 = "0c1d2e3f-4a5b-4c6d-8e7f-9a0b1c2d3e4f";
+    claude_session(&h, cid3, &work.join("c"));
+    set_mode(&h, "c", "badresume");
+    let (ok, out) = cli(&h, &["seat", "adopt", "c", cid3, "--restart"]).await;
+    assert!(ok, "{out}");
+    wait_for("a fresh launch", || {
+        launches(&h, "c")
+            .last()
+            .is_some_and(|l| l.contains("--session-id"))
+    })
+    .await;
+    set_mode(&h, "c", "");
+    wait_state(&h, "c", "idle").await;
+    let r = row(&h, "c").await;
+    assert_eq!(r.attention.as_deref(), Some("adopt-failed"), "{r:?}");
+    assert!(r.hint.unwrap().contains(cid3));
+    let (_, text) = cli(&h, &["ps"]).await;
+    assert!(text.contains(cid3), "{text}");
+    cli(&h, &["down"]).await;
 }

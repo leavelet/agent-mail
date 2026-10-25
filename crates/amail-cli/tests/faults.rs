@@ -161,6 +161,7 @@ impl Env {
                     permission_mode: None,
                     git_access: None,
                     dsh_jail: None,
+                    session: None,
                 }
             })
             .collect();

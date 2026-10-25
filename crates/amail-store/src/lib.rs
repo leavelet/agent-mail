@@ -559,6 +559,25 @@ pub trait Store: Send + Sync + 'static {
     /// are cleared when the task leaves it. Closing a task writes an
     /// `unblocked` event on each task whose last open blocker it was.
     async fn change_task(&self, w: &TaskWrite, change: &TaskChange) -> Result<TaskChanged>;
+    /// The actor asks to take over a task assigned to another seat and not
+    /// started (stored `open`): one pending request per task. Refused with
+    /// `not_assigned` (unassigned: `take` it), `own_task`, `started`
+    /// (another state) and `steal_pending` (another seat asked first);
+    /// asking again changes nothing.
+    async fn steal_task(&self, w: &TaskWrite) -> Result<TaskChanged>;
+    /// Answer the pending steal request: `give` assigns the task to the
+    /// requester (`assigned` event noted `yielded to <seat> on request`),
+    /// otherwise the request is cleared (`steal_declined`). Only the
+    /// assignee answers, or the org's user (`as_user`): `not_assignee`.
+    async fn answer_task_steal(
+        &self,
+        w: &TaskWrite,
+        give: bool,
+        as_user: bool,
+    ) -> Result<TaskChanged>;
+    /// End the steal requests made at `cutoff` or before (`steal_expired`),
+    /// at most `limit`; each once.
+    async fn expire_task_steals(&self, cutoff: i64, limit: i64) -> Result<Vec<StealExpiredRec>>;
     /// Assign an unassigned task to the actor, atomically (`taken` when
     /// someone has it; nothing changes when the actor has it).
     async fn take_task(&self, w: &TaskWrite) -> Result<TaskChanged>;

@@ -126,6 +126,12 @@ The first public version.
   answers list the linked tasks; `task` events on `/v1/events` follow
   changes. Tasks are bounded per org and per task and count against the
   storage quota. Migration `0023_tasks.sql`.
+- Work stealing: a seat asks to take over a task assigned to another seat
+  that is not started (`/v1/tasks/{num}/steal`); the assignee is told by
+  system mail and answers with `yield` (the requester gets the task) or
+  `keep`. One pending request per task; it ends with the answer, with a
+  change of the task's assignee or state, or after 24 hours, and the
+  requester is told. Migration `0024_task_steal.sql`.
 
 #### Running agents
 
@@ -135,13 +141,23 @@ The first public version.
   `task_show`, `task_list`, `task_mine`, `task_next`, `task_waiting`,
   `task_owed`, `task_board`, `task_set`, `task_take`, `task_dep`,
   `task_undep`, `task_link`, `task_unlink`, `task_comment`,
-  `task_history`) as typed tools. Each answers the server's JSON with the
+  `task_history`, `task_steal`, `task_yield`, `task_keep`) as typed tools. Each answers the server's JSON with the
   command's text rendering; API errors are tool errors with the server's
   code and message. The node registers it for the sessions it launches
   (Claude Code: `--mcp-config` and an allow rule for its tools; Codex:
   `[mcp_servers.amail]` in the node's Codex home, the seat found from the
   thread id of each call). The command line stays the documented
   interface.
+- Seats can continue existing conversations: `session = "<id>"` on a seat
+  in the team file, `amail run <seat> --session <id>` and `amail seat adopt
+  <seat> <id> [--restart]` make the seat resume that Claude Code, Codex or
+  dsh session. The node checks that the session exists on this host (the
+  Claude Code transcript, the Codex rollout file in the node's Codex home,
+  the dsh session directory) and that no other seat has it; `amail up`
+  checks before it changes anything. The adopted session gets the seat
+  intro on its first start (Claude Code: in the system prompt; Codex and
+  dsh: in a first prompt). A failed resume falls back to a new session and
+  shows `adopt-failed` in `amail ps`.
 - The unread summary a hook adds at the start of a turn leaves out mail
   the session was shown before. Before, every `UserPromptSubmit` listed up
   to 20 unread headers, so a message that stayed unread (a body over 800
@@ -218,6 +234,19 @@ The first public version.
   settings. English and Chinese, light and dark.
 - Browser notifications for new items in the "needs you" queue (opt-in in
   the settings).
+- Tasks: a board per org with one column per shown state (`ready` among
+  them) and a table with the list filters and paging. Each card has a
+  priority control, and cards are dragged within their column (or moved
+  with Alt+Up/Down) to set their rank; a card cannot be dropped in another
+  column. A task page shows the record, dependencies, child tasks, linked
+  threads with their latest message, the discussion thread and the
+  history, and lets the user change the state (with the seat and reason
+  for `blocked`), assignee, priority, due time and labels, add and remove
+  dependencies, link and unlink threads, comment, and answer a request to
+  take the task over. A seat's page lists its tasks and what others wait
+  for from it; a thread lists its tasks under the subject; "needs you"
+  lists tasks waiting for the user and the user's overdue tasks. All of it
+  follows `task` events live.
 
 #### Public servers and getting started
 

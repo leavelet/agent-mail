@@ -41,7 +41,7 @@
 use crate::wire::GitAccess;
 use amail_proto::{PermissionMode, valid_name};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -115,6 +115,27 @@ struct SeatRaw {
     /// `[[seat]]` only: join this group (as a worker of its lead, unless
     /// `parent` says otherwise).
     group: Option<String>,
+    /// An existing harness session the seat adopts (resumes).
+    session: Option<String>,
+}
+
+/// A session id is used in file names: letters, digits and `-_.:` only,
+/// not starting with a dot, at most 128 characters.
+pub fn check_session_id(id: &str) -> Result<(), String> {
+    let ok = !id.is_empty()
+        && id.len() <= 128
+        && !id.starts_with('.')
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.:".contains(&b));
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "session {id:?} is not a session id (letters, digits and -_.: only, at most 128 \
+             characters)"
+        ))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -236,6 +257,9 @@ pub struct SeatPlan {
     pub display_name: Option<String>,
     /// When native wake-ups fail, type the nudge into the terminal (guarded).
     pub paste_fallback: bool,
+    /// An existing session of the seat's harness that the seat adopts: the
+    /// node resumes it (see `docs/teams.md`).
+    pub session: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -555,6 +579,9 @@ pub fn parse(text: &str, base: &Path) -> Result<Team, TeamError> {
         let role = role.map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
         let desc = description(&what, s.description.as_ref())?;
         let open = open_list(&what, s.open.as_ref())?;
+        if let Some(id) = &s.session {
+            check_session_id(id).map_err(|e| TeamError(format!("{what}: {e}")))?;
+        }
         seats.push(SeatPlan {
             name: s.name.clone(),
             parent,
@@ -578,6 +605,7 @@ pub fn parse(text: &str, base: &Path) -> Result<Team, TeamError> {
                 .or(inherit.paste_fallback)
                 .or(defaults.paste_fallback)
                 .unwrap_or(false),
+            session: s.session.clone(),
         });
         Ok(())
     };
@@ -739,6 +767,18 @@ pub fn parse(text: &str, base: &Path) -> Result<Team, TeamError> {
     }
     if seats.is_empty() {
         return err("the team file defines no seats ([[seat]] or [[group]])");
+    }
+    let mut sessions: BTreeMap<&str, &str> = BTreeMap::new();
+    for s in &seats {
+        if let Some(id) = s.session.as_deref()
+            && let Some(first) = sessions.insert(id, &s.name)
+        {
+            return err(format!(
+                "seats {first:?} and {:?} both have session {id:?}; a session can be the \
+                 session of one seat only",
+                s.name
+            ));
+        }
     }
 
     // Parents exist; no cycles; order parents first.
@@ -1737,6 +1777,44 @@ workers = [{ name = "store-1" }, { name = "store-2", description = "On call.", o
         let t =
             team("[defaults]\nharness = \"dsh\"\n[[seat]]\nname = \"a\"\ncwd = \"/x\"\n").unwrap();
         assert_eq!(t.seat("a").unwrap().dsh_jail, None);
+    }
+
+    #[test]
+    fn adopted_sessions() {
+        let t = team(
+            "[team]\nworkroot = \"/w\"\n[defaults]\nharness = \"claude\"\n[[seat]]\nname = \"a\"\ncwd = \"/x\"\nsession = \"0b6a1c9e-2f3d\"\n\
+             [[group]]\nname = \"g\"\nparent = \"a\"\nlead = { name = \"l\", session = \"t-1\" }\n\
+             workers = [{ name = \"w\", session = \"t-2\" }]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            t.seat("a").unwrap().session.as_deref(),
+            Some("0b6a1c9e-2f3d")
+        );
+        assert_eq!(t.seat("l").unwrap().session.as_deref(), Some("t-1"));
+        assert_eq!(t.seat("w").unwrap().session.as_deref(), Some("t-2"));
+        let e = team(
+            "[defaults]\nharness = \"claude\"\n[[seat]]\nname = \"a\"\ncwd = \"/x\"\nsession = \"s\"\n\
+             [[seat]]\nname = \"b\"\ncwd = \"/y\"\nsession = \"s\"\n",
+        )
+        .unwrap_err();
+        assert!(e.0.contains("both have session"), "{e}");
+        let e = team("[defaults]\nharness = \"claude\"\n[[seat]]\nname = \"a\"\ncwd = \"/x\"\nsession = \"../x\"\n").unwrap_err();
+        assert!(e.0.contains("is not a session id"), "{e}");
+    }
+
+    #[test]
+    fn session_ids() {
+        for ok in [
+            "0b6a1c9e-2f3d-4e5f-8a9b-0c1d2e3f4a5b",
+            "session-1",
+            "a:b.c_d",
+        ] {
+            assert!(check_session_id(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", ".", "..", "a/b", "a b", "../x", &"x".repeat(129)] {
+            assert!(check_session_id(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

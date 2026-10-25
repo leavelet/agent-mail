@@ -423,3 +423,29 @@ kbd {
   border-radius: 4px;
   background: var(--surface-2);
 }
+
+/* Task states (see stateTone in lib/tasks.ts). */
+.chip.tone-ok {
+  color: var(--ok);
+  background: var(--ok-weak);
+}
+.chip.tone-accent {
+  color: var(--accent);
+  background: var(--accent-weak);
+}
+.chip.tone-warn {
+  color: var(--warn);
+  background: var(--warn-weak);
+}
+.chip.tone-danger {
+  color: var(--danger);
+  background: var(--danger-weak);
+}
+.chip.tone-notice {
+  color: var(--notice);
+  background: var(--notice-weak);
+}
+.chip.tone-neutral {
+  color: var(--muted);
+  background: var(--surface-2);
+}

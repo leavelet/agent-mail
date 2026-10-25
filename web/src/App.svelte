@@ -25,6 +25,10 @@
   import PeerOrgPage from './pages/PeerOrgPage.svelte';
   import RegisterPage from './pages/RegisterPage.svelte';
   import OperatorPage from './pages/OperatorPage.svelte';
+  import TasksPage from './pages/TasksPage.svelte';
+  import TaskPage from './pages/TaskPage.svelte';
+  import TaskNewPage from './pages/TaskNewPage.svelte';
+  import { parseTaskNum } from './lib/tasks';
 
   const registering = currentPage() === 'register';
 
@@ -50,7 +54,7 @@
     if (ui.helpOpen) return;
     if (gPending) {
       gPending = false;
-      const target = { n: 'needs', o: 'org', i: 'inbox', a: 'archive' }[e.key];
+      const target = { n: 'needs', o: 'org', t: 'tasks', i: 'inbox', a: 'archive' }[e.key];
       if (target) {
         go([target]);
         e.preventDefault();
@@ -112,6 +116,12 @@
         {#key parts[1]}<PeerOrgPage name={parts[1]} />{/key}
       {:else if section === 'orgs'}
         <OthersPage />
+      {:else if section === 'tasks' && parts[1] === 'new'}
+        <TaskNewPage />
+      {:else if section === 'tasks' && parts[1] && parseTaskNum(parts[1])}
+        <TaskPage num={parseTaskNum(parts[1]) ?? 0} />
+      {:else if section === 'tasks'}
+        <TasksPage />
       {:else if section === 'needs'}
         <NeedsPage />
       {:else if section === 'inbox'}

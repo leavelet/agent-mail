@@ -6,7 +6,7 @@ use crate::Out;
 use crate::client::{Client, enc};
 use amail_node::mux::AttachPlan;
 use amail_node::team::{self, Team};
-use amail_node::wire::{GitAccess, PsRow, Request, SeatPlacement};
+use amail_node::wire::{GitAccess, PsRow, Request, SeatPlacement, SessionClaim};
 use amail_proto::{self as p, PostPolicy, SeatKind, TokenScope};
 use anyhow::{Context, Result, bail};
 use reqwest::Method;
@@ -386,6 +386,24 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
                 me.org
             );
         }
+    }
+    // Existing sessions the file gives seats: they must exist on this host
+    // and belong to no other seat (the node checks).
+    let claims: Vec<SessionClaim> = t
+        .seats
+        .iter()
+        .filter_map(|s| {
+            Some(SessionClaim {
+                seat: s.name.clone(),
+                harness: s.harness.clone(),
+                session: s.session.clone()?,
+                cwd: t.workdir(&s.name).to_string_lossy().into_owned(),
+            })
+        })
+        .collect();
+    if !claims.is_empty() {
+        node(&Request::CheckSessions { claims }, Duration::from_secs(30))
+            .context("a session in the team file cannot be adopted; nothing was changed")?;
     }
     let main = match (&t.repo, t.uses_worktrees()) {
         (Some(repo), true) => {
@@ -839,6 +857,7 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
                 permission_mode: plan.permission_mode,
                 git_access: Some(t.git_access(&s)),
                 dsh_jail: plan.dsh_jail,
+                session: plan.session.clone(),
             }
         })
         .collect();
@@ -894,6 +913,9 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
     }
     for (action, seats) in &by_action {
         report.push(format!("{action}: {}", seats.join(", ")));
+    }
+    for a in v["adopted"].as_array().into_iter().flatten() {
+        report.push(adopted_line(a));
     }
     if !restart_needed.is_empty() {
         report.push(format!(
@@ -1097,6 +1119,46 @@ pub fn attach(target: &str) -> Result<()> {
     let last = &plan.attach;
     let err = std::process::Command::new(&last[0]).args(&last[1..]).exec();
     Err(anyhow::anyhow!("running {}: {err}", last[0]))
+}
+
+/// A line about a seat that adopted an existing session (`up`, `seat adopt`).
+fn adopted_line(a: &Value) -> String {
+    let seat = a["seat"].as_str().unwrap_or("?");
+    let mut line = format!(
+        "seat {seat} adopts session {}",
+        a["session"].as_str().unwrap_or("?")
+    );
+    if let Some(cwd) = a["cwd"].as_str() {
+        line.push_str(&format!(" (started in {cwd})"));
+    }
+    if a["restarting"].as_bool() == Some(true) {
+        line.push_str("; restarting the seat to resume it now");
+    } else if a["running"].as_bool() == Some(true) {
+        line.push_str(&format!(
+            "; the seat is running, so it resumes the session at its next start (amail seat \
+             adopt {seat} <id> --restart, or amail sleep {seat} then amail wake {seat}, \
+             restarts it now)"
+        ));
+    } else {
+        line.push_str("; its next start resumes it");
+    }
+    if let Some(w) = a["warning"].as_str() {
+        line.push_str(&format!("\nwarning: {w}"));
+    }
+    line
+}
+
+/// `amail seat adopt`: the supervised seat resumes an existing session.
+pub fn adopt(seat: &str, session: &str, restart: bool, out: &Out) -> Result<()> {
+    let v = node(
+        &Request::Adopt {
+            seat: seat.to_string(),
+            session: session.to_string(),
+            restart,
+        },
+        Duration::from_secs(60),
+    )?;
+    out.show(&v, || Ok(adopted_line(&v)))
 }
 
 pub fn sleep(seat: &str, out: &Out) -> Result<()> {
