@@ -153,7 +153,7 @@ JSON-RPC error.
 | `thread` | `id` (a thread or any message in it) | `amail thread` |
 | `search` | `text`, `before_id?`, `limit?` (at most 200) | `GET /archive/search`; for a seat token, which that call refuses, the subjects and senders of the newest 1,000 messages of the seat's mailbox (`mode: "inbox_subjects"`) |
 | `who` | `org?`, `text?` | `amail who [--search] [--org]` |
-| `status` | `id?` | without `id`: `GET /whoami`, the seat's record (state as the node reports it, focus) and the unread count; with `id`: `amail status <id>` |
+| `status` | `id?` | without `id`: `GET /whoami`, the seat's record (state as the node reports it, focus) and the unread count (counted up to 100); with `id`: `amail status <id>` |
 | `focus` | `state` (`on`, `off`), `minutes?` | `amail focus on [--for]` / `off` |
 | `task_new` | `title`, `body?`, `priority?`, `assignee?`, `team?`, `parent?`, `labels[]?`, `due?`, `from_message?` | `POST /tasks` |
 | `task_show` | `num` | `GET /tasks/{num}` |
@@ -164,6 +164,7 @@ JSON-RPC error.
 | `task_board` | `team?` | `GET /tasks/board` |
 | `task_set` | `num`, `title?`, `body?`, `state?`, `priority?`, `rank?`, `assignee?`, `team?`, `parent?`, `labels[]?`, `due?`, `waiting_on?`, `blocked_reason?` (`null` clears) | `PATCH /tasks/{num}` |
 | `task_take` | `num` | `POST /tasks/{num}/take` |
+| `task_steal`, `task_yield`, `task_keep` | `num` | `POST /tasks/{num}/steal`, `/yield`, `/keep` (ask to take over a task assigned to another seat and not started; answer a pending request on your own task) |
 | `task_dep`, `task_undep` | `num`, `blocked_by` | `POST /tasks/{num}/deps`, `DELETE …/deps/{other}` |
 | `task_link` | `num`, `thread_id` or `message_id` | `POST /tasks/{num}/links` |
 | `task_unlink` | `num`, `thread_id` | `DELETE /tasks/{num}/links/{thread}` |

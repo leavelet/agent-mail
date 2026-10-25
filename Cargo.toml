@@ -30,6 +30,8 @@ hex = "0.4"
 jiff = "0.2"
 libc = "0.2"
 rand = "0.9"
+# The MCP server of `amail mcp`: only the server and the stdio transport.
+rmcp = { version = "3.7", default-features = false, features = ["server", "transport-io"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

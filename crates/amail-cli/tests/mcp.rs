@@ -39,6 +39,9 @@ const TOOLS: &[&str] = &[
     "task_board",
     "task_set",
     "task_take",
+    "task_steal",
+    "task_yield",
+    "task_keep",
     "task_dep",
     "task_undep",
     "task_link",
@@ -188,6 +191,38 @@ fn drive(url: &str, t1: &str, t2: &str) {
     assert_eq!(detail["task"]["num"], json!(num), "{show}");
     assert_eq!(detail["task"]["assignee"], "w2", "{show}");
     assert_eq!(detail["events"][0]["kind"], "created", "{show}");
+
+    // Work stealing: w1 asks for a task of w2's that is not started; w2
+    // keeps it, then yields after a second request.
+    let other = m1.call("task_new", json!({"title": "port tests", "assignee": "w2"}));
+    let num2 = ok(&other)["task"]["num"].as_i64().unwrap();
+    let steal = m1.call("task_steal", json!({"num": num2}));
+    assert_eq!(ok(&steal)["task"]["steal_requested_by"], "w1", "{steal}");
+    assert!(
+        steal["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("takeover requested by w1"),
+        "{steal}"
+    );
+    // Only the assignee answers.
+    let wrong = m1.call("task_keep", json!({"num": num2}));
+    assert_eq!(
+        wrong["structuredContent"]["error"]["status"], 403,
+        "{wrong}"
+    );
+    let keep = m2.call("task_keep", json!({"num": num2}));
+    assert!(
+        ok(&keep)["task"].get("steal_requested_by").is_none(),
+        "{keep}"
+    );
+    assert_eq!(ok(&keep)["task"]["assignee"], "w2", "{keep}");
+    ok(&m1.call("task_steal", json!({"num": format!("t{num2}")})));
+    let yielded = m2.call("task_yield", json!({"num": num2}));
+    assert_eq!(ok(&yielded)["task"]["assignee"], "w1", "{yielded}");
+    // A started task cannot be asked for.
+    let started = m1.call("task_steal", json!({"num": num}));
+    assert_eq!(err_code(&started), "started", "{started}");
 
     // Errors: an unknown task is the server's error as a tool error; bad
     // arguments too.

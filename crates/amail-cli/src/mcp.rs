@@ -607,6 +607,31 @@ const TOOLS: &[ToolDef] = &[
         schema: task_num_only,
     },
     ToolDef {
+        name: "task_steal",
+        description: "Ask to take over a task that is assigned to another seat and not \
+            started yet (stored state open). The assignee is told by mail and answers with \
+            yield (you get the task) or keep; you are told either way, and the request \
+            expires after 24 hours. For an unassigned task use `task_take` instead; a task \
+            in doing, review or blocked cannot be asked for.",
+        read_only: false,
+        schema: task_num_only,
+    },
+    ToolDef {
+        name: "task_yield",
+        description: "Answer a pending takeover request on a task assigned to you: hand the \
+            task to the seat that asked (its `steal_requested_by`). Use it when you have not \
+            started the task and the other seat can do it.",
+        read_only: false,
+        schema: task_num_only,
+    },
+    ToolDef {
+        name: "task_keep",
+        description: "Answer a pending takeover request on a task assigned to you: keep the \
+            task. The request is cleared and the seat that asked is told.",
+        read_only: false,
+        schema: task_num_only,
+    },
+    ToolDef {
         name: "task_dep",
         description: "Make task `num` depend on task `blocked_by`: it is ready only when that \
             task is done or cancelled. Refused when it would make a cycle.",
@@ -1214,11 +1239,12 @@ async fn status(c: &Client, a: &Args<'_>) -> Result<(Value, String)> {
             }
             out["seat"] = v;
         }
-        if let Ok(v) = c.raw(Method::GET, "/inbox?unread=1&limit=1000", None).await
+        // At most 100: a larger page takes one of the org's query slots.
+        if let Ok(v) = c.raw(Method::GET, "/inbox?unread=1&limit=100", None).await
             && let Ok(r) = parse::<p::InboxResponse>(&v)
         {
             let n = r.entries.len();
-            let more = if r.truncated || n >= 1000 { "+" } else { "" };
+            let more = if r.truncated || n >= 100 { "+" } else { "" };
             lines.push(format!("unread: {n}{more}"));
             out["unread"] = json!(n);
         }
@@ -1426,6 +1452,19 @@ async fn task(c: &Client, name: &str, a: &Args<'_>) -> Result<(Value, String)> {
                 .await?;
             detail(v, "took ")
         }
+        "task_steal" | "task_yield" | "task_keep" => {
+            let n = a.req_task("num")?;
+            let op = &name["task_".len()..];
+            let v = c
+                .raw(Method::POST, &format!("/tasks/{n}/{op}"), None)
+                .await?;
+            let verb = match op {
+                "steal" => "asked to take over ",
+                "yield" => "yielded ",
+                _ => "kept ",
+            };
+            detail(v, verb)
+        }
         "task_dep" => {
             let n = a.req_task("num")?;
             let other = a.req_task("blocked_by")?;
@@ -1543,6 +1582,16 @@ fn detail(v: Value, verb: &str) -> Result<(Value, String)> {
     if let Some(r) = &t.blocked_reason {
         lines.push(format!("blocked: {}", output::l(r)));
     }
+    if let Some(by) = &t.steal_requested_by {
+        lines.push(format!(
+            "takeover requested by {}{}: the assignee answers with task_yield or task_keep",
+            output::l(by),
+            t.steal_requested_at
+                .as_deref()
+                .map(|at| format!(" at {}", output::short_time(at)))
+                .unwrap_or_default()
+        ));
+    }
     for (label, refs) in [
         ("depends on", &d.blockers),
         ("blocks", &d.blocked),
@@ -1610,6 +1659,9 @@ fn task_line(t: &p::Task) -> String {
     }
     if let Some(d) = &t.due {
         s.push_str(&format!(" due {}", output::short_time(d)));
+    }
+    if let Some(by) = &t.steal_requested_by {
+        s.push_str(&format!(" takeover requested by {}", output::l(by)));
     }
     s
 }
