@@ -51,6 +51,8 @@ pub(super) fn request_op(req: &Request) -> Option<(NoticeOp, Vec<String>)> {
         Request::Forget { seats } => (NoticeOp::Forget, seats.clone()),
         Request::Wake { seat } => (NoticeOp::Wake, vec![seat.clone()]),
         Request::Sleep { seat } => (NoticeOp::Sleep, vec![seat.clone()]),
+        // Choosing the session a seat resumes is part of placing it.
+        Request::Adopt { seat, .. } => (NoticeOp::Up, vec![seat.clone()]),
         _ => return None,
     })
 }

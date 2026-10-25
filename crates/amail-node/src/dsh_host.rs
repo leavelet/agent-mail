@@ -30,7 +30,8 @@ pub struct HostArgs {
     pub endpoint: PathBuf,
     /// Load this session instead of creating one.
     pub resume: Option<String>,
-    /// The first prompt of a new session.
+    /// The first prompt of a new session (or of a resumed one, when the
+    /// node gives one: an adopted session's first start).
     pub prompt: Option<String>,
     /// The seat's model, `provider/model` (a bare name is a DeepSeek model):
     /// selected for a resumed session (a new one takes it from the
@@ -459,9 +460,9 @@ async fn attach(a: &HostArgs, cwd: &str, origin: &str, token: &str) -> Result<St
             );
         }
     }
-    if a.resume.is_none()
-        && let Some(p) = a.prompt.as_deref().filter(|p| !p.is_empty())
-    {
+    // A resumed session gets a prompt only when the node gives one (an
+    // adopted session's first start).
+    if let Some(p) = a.prompt.as_deref().filter(|p| !p.is_empty()) {
         api.prompt(&session, p).await?;
     }
     Ok(session)

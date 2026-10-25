@@ -530,6 +530,7 @@ async fn codex_metadata_recovery(b: Backend, restart: bool) {
             permission_mode: Some(amail_proto::PermissionMode::Unattended),
             git_access: None,
             dsh_jail: None,
+            session: None,
         })
         .await;
     assert!(plan.get("error").is_none(), "{plan}");
@@ -718,6 +719,7 @@ async fn codex_failed_turns_from_the_app_server(b: Backend) {
             permission_mode: Some(amail_proto::PermissionMode::Unattended),
             git_access: None,
             dsh_jail: None,
+            session: None,
         })
         .await;
     assert!(plan.get("error").is_none(), "{plan}");

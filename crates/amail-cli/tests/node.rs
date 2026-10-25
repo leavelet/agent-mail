@@ -56,6 +56,7 @@ node_tests!(
     lost_mailbox_event_is_recovered_at_turn_end,
     withdrawn_mail_neither_wakes_nor_is_injected,
     node_under_path_prefix,
+    run_adopts_a_session,
 );
 
 use amail_store::testutil::Backend;
@@ -481,6 +482,7 @@ async fn codex_registration_and_rows(b: Backend) {
             permission_mode: Some(amail_proto::PermissionMode::Unattended),
             git_access: None,
             dsh_jail: None,
+            session: None,
         })
         .await;
     assert!(plan.get("error").is_none(), "{plan}");
@@ -530,6 +532,7 @@ async fn codex_registration_and_rows(b: Backend) {
             permission_mode: None,
             git_access: None,
             dsh_jail: None,
+            session: None,
         })
         .await;
     assert!(
@@ -554,6 +557,7 @@ async fn codex_registration_and_rows(b: Backend) {
             permission_mode: None,
             git_access: None,
             dsh_jail: None,
+            session: None,
         })
         .await;
     assert!(prompting.get("error").is_none(), "{prompting}");
@@ -1869,6 +1873,7 @@ async fn socket_checks_callers(b: Backend) {
             permission_mode: None,
             git_access: None,
             dsh_jail: None,
+            session: None,
         })
         .await;
     let pass = plan["env"]["AMAIL_CODEX_PASS"]
@@ -2003,6 +2008,7 @@ env -u AMAIL_TOKEN CODEX_THREAD_ID={tid} AMAIL_CODEX_PASS={pass} timeout 10 "$B"
             permission_mode: None,
             git_access: None,
             dsh_jail: None,
+            session: None,
         },
     )
     .await;
@@ -2090,6 +2096,7 @@ async fn transcript_paths_are_checked(b: Backend) {
             permission_mode: None,
             git_access: None,
             dsh_jail: None,
+            session: None,
         })
         .await;
     let prompt = plan["args"].as_array().unwrap().last().unwrap().clone();
@@ -2667,6 +2674,7 @@ async fn node_under_path_prefix(b: Backend) {
             permission_mode: None,
             git_access: None,
             dsh_jail: None,
+            session: None,
         })
         .await;
     assert_eq!(plan["env"]["AMAIL_URL"], h.api.base, "{plan}");
@@ -2689,4 +2697,125 @@ async fn node_under_path_prefix(b: Backend) {
     let _ = stand_in.wait();
     let _ = session.kill();
     let _ = session.wait();
+}
+
+/// `amail run --session`: a seat started by hand adopts an existing
+/// session. It must exist on this host and belong to no other seat; a
+/// Codex thread is tied to the seat without a registration marker.
+async fn run_adopts_a_session(b: Backend) {
+    let Some(h) = setup(b, "run_adopts_a_session", Opts::default()).await else {
+        return;
+    };
+    h.seat("cx", "codex").await;
+    h.seat("cy", "codex").await;
+    h.seat("cl", "claude").await;
+    let cwd = h.dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let launch = |seat: &str, session: &str| amail_node::wire::Request::Launch {
+        seat: seat.into(),
+        cwd: cwd.to_string_lossy().into(),
+        pid: std::process::id(),
+        harness: None,
+        extra: vec![],
+        pane: None,
+        mux_session: None,
+        permission_mode: None,
+        git_access: None,
+        dsh_jail: None,
+        session: Some(session.into()),
+    };
+    let node = &h.node.as_ref().unwrap().node;
+    let sid = "019a0b1c-2d3e-7f40-8a5b-6c7d8e9f0a1b";
+    let r = node.handle(launch("cx", sid)).await;
+    assert!(
+        r["error"].as_str().unwrap().contains("no Codex session"),
+        "{r}"
+    );
+    let r = node.handle(launch("cx", "../x")).await;
+    assert!(
+        r["error"].as_str().unwrap().contains("not a session id"),
+        "{r}"
+    );
+    let day = h.dir.path().join("state/codex-home/sessions/2026/10/26");
+    std::fs::create_dir_all(&day).unwrap();
+    std::fs::write(
+        day.join(format!("rollout-2026-10-26T10-00-00-{sid}.jsonl")),
+        json!({"type": "session_meta", "payload": {"id": sid, "cwd": cwd}}).to_string() + "\n",
+    )
+    .unwrap();
+    let plan = node.handle(launch("cx", sid)).await;
+    assert!(plan.get("error").is_none(), "{plan}");
+    let args: Vec<String> = serde_json::from_value(plan["args"].clone()).unwrap();
+    assert_eq!(args[0], "resume");
+    let at = args.iter().position(|a| a == sid).expect("the thread id");
+    assert!(
+        args[at + 1].starts_with("[amail] This conversation now runs as a seat"),
+        "{args:?}"
+    );
+    assert!(args[at + 1].contains("You are seat `cx`"), "{args:?}");
+    // Its hooks are the seat's: mail is shown.
+    let m = h
+        .api
+        .send(&["cx"], &[], "for the adopted thread", false)
+        .await;
+    h.wait_pending("cx", 1, 0, 0).await;
+    let env = vec![
+        (
+            "CODEX_HOME".to_string(),
+            h.dir
+                .path()
+                .join("state/codex-home")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        (
+            "AMAIL_CODEX_PASS".to_string(),
+            plan["env"]["AMAIL_CODEX_PASS"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        ),
+    ];
+    let prompt = with(
+        codex("UserPromptSubmit"),
+        &[("session_id", json!(sid)), ("prompt", json!(args[at + 1]))],
+    );
+    let out = h.hook("codex", env, prompt).await;
+    assert!(out.to_string().contains(&format!("#{m}")), "{out}");
+    // One seat per session.
+    let r = node.handle(launch("cy", sid)).await;
+    assert!(
+        r["error"]
+            .as_str()
+            .unwrap()
+            .contains("already belongs to seat cx"),
+        "{r}"
+    );
+
+    // Claude Code: resumed (no new id); the seat intro is in the system
+    // prompt.
+    let cid = "3f1c2b4a-0d5e-4f6a-9b7c-8d9e0f1a2b3c";
+    let dir = h.dir.path().join("claude/projects/-work");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join(format!("{cid}.jsonl")),
+        json!({"type": "user", "cwd": cwd, "sessionId": cid}).to_string() + "\n",
+    )
+    .unwrap();
+    let plan = node.handle(launch("cl", cid)).await;
+    assert!(plan.get("error").is_none(), "{plan}");
+    // Started in the seat's directory: no warning.
+    assert!(
+        !plan["notice"].to_string().contains("was started in"),
+        "{plan}"
+    );
+    let args: Vec<String> = serde_json::from_value(plan["args"].clone()).unwrap();
+    let at = args.iter().position(|a| a == "--resume").unwrap();
+    assert_eq!(args[at + 1], cid);
+    assert!(!args.iter().any(|a| a == "--session-id"), "{args:?}");
+    let sp = args
+        .iter()
+        .position(|a| a == "--append-system-prompt")
+        .unwrap();
+    assert!(args[sp + 1].contains("You are seat `cl`"), "{args:?}");
 }
