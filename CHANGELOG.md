@@ -129,6 +129,16 @@ The first public version.
 
 #### Running agents
 
+- Seats can continue existing conversations: `session = "<id>"` on a seat
+  in the team file, `amail run <seat> --session <id>` and `amail seat adopt
+  <seat> <id> [--restart]` make the seat resume that Claude Code, Codex or
+  dsh session. The node checks that the session exists on this host (the
+  Claude Code transcript, the Codex rollout file in the node's Codex home,
+  the dsh session directory) and that no other seat has it; `amail up`
+  checks before it changes anything. The adopted session gets the seat
+  intro on its first start (Claude Code: in the system prompt; Codex and
+  dsh: in a first prompt). A failed resume falls back to a new session and
+  shows `adopt-failed` in `amail ps`.
 - The unread summary a hook adds at the start of a turn leaves out mail
   the session was shown before. Before, every `UserPromptSubmit` listed up
   to 20 unread headers, so a message that stayed unread (a body over 800
