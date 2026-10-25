@@ -480,4 +480,50 @@ async fn run(backend: Backend) {
     assert!(err.contains("is not a task number"), "{err}");
     let err = w1.fail(&["task", "new"]);
     assert!(err.contains("give a title"), "{err}");
+
+    // Work stealing: w2 asks for w1's t3 (ready, not started); w1 yields.
+    let line = w2.run(&["task", "steal", "t3"]);
+    assert_eq!(
+        line.trim(),
+        "t3   ready   normal w1       Emit code  · w2 asks to take over"
+    );
+    let mine = w1.run(&["task", "mine"]);
+    assert!(
+        mine.contains("t3   ready   normal w1       Emit code  · w2 asks to take over"),
+        "{mine}"
+    );
+    let list = owner.run(&["task", "list", "--assignee", "w1"]);
+    assert!(list.contains("Emit code  · w2 asks to take over"), "{list}");
+    let board = owner.run(&["task", "board"]);
+    assert!(
+        board.contains("Emit code  · w2 asks to take over"),
+        "{board}"
+    );
+    let show = w1.run(&["task", "show", "t3"]);
+    assert!(show.contains("Takeover: asked for by w2 at "), "{show}");
+    assert!(
+        show.contains("  w2  w2 asked to take over from w1"),
+        "{show}"
+    );
+    let line = w1.run(&["task", "yield", "t3"]);
+    assert_eq!(line.trim(), "t3   ready   normal w2       Emit code");
+    assert_eq!(w2.nums(&["task", "next"]), vec![3, 6]);
+    // w2 asks for t5; w1 keeps it.
+    w2.run(&["task", "steal", "5"]);
+    let line = w1.run(&["task", "keep", "t5"]);
+    assert_eq!(line.trim(), "t5   ready   normal w1       Migrate the data");
+    let d = w1.json(&["task", "show", "t5"]);
+    assert!(d["task"].get("steal_requested_by").is_none(), "{d}");
+    let history = w1.run(&["task", "history", "t5"]);
+    assert!(
+        history.contains("  w1  request of w2 to take over declined"),
+        "{history}"
+    );
+    // A started task cannot be asked for; nor can it be answered without
+    // a request.
+    w2.run(&["task", "start", "t6"]);
+    let err = w1.fail(&["task", "steal", "t6"]);
+    assert!(err.starts_with("error: started: "), "{err}");
+    let err = w1.fail(&["task", "yield", "t5"]);
+    assert!(err.starts_with("error: not_found: "), "{err}");
 }

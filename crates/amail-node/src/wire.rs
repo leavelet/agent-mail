@@ -113,6 +113,10 @@ pub enum Request {
         /// uses its team file's `dsh_jail`; the default is on.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         dsh_jail: Option<bool>,
+        /// An existing harness session for the seat to adopt (`amail run
+        /// --session`): checked like [`Request::Adopt`], then resumed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
     },
     /// Mail credentials for the seat that owns a harness thread (for agents
     /// whose tool commands do not inherit the launch environment). `pass`
@@ -152,6 +156,30 @@ pub enum Request {
     Ps,
     /// Where a seat's pane (or a group's session) is, and how to attach.
     Locate { target: String },
+    /// Check that these existing harness sessions can be adopted (they
+    /// exist on this host and no other seat has them); changes nothing.
+    /// `amail up` asks this before it changes anything.
+    CheckSessions { claims: Vec<SessionClaim> },
+    /// `amail seat adopt`: the supervised `seat` resumes the existing
+    /// harness session `session` at its next start; with `restart`, a
+    /// running seat is restarted now.
+    Adopt {
+        seat: String,
+        session: String,
+        #[serde(default)]
+        restart: bool,
+    },
+}
+
+/// A seat that is to adopt an existing harness session (see
+/// [`Request::CheckSessions`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionClaim {
+    pub seat: String,
+    pub harness: String,
+    pub session: String,
+    /// The seat's working directory.
+    pub cwd: String,
 }
 
 /// Where and how a supervised seat runs on this host.
@@ -181,6 +209,10 @@ pub struct SeatPlacement {
     /// The seat's `dsh_jail` from the team file; `None` means on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dsh_jail: Option<bool>,
+    /// The seat's `session` from the team file: an existing harness session
+    /// to adopt. Adopted when it differs from the one the file gave before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
 }
 
 /// A row of `amail ps`.

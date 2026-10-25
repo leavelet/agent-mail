@@ -26,7 +26,7 @@ use super::*;
 use crate::mux::PaneSpec;
 use crate::persist::Managed;
 use crate::team::Restart;
-use crate::wire::{PsRow, SeatPlacement};
+use crate::wire::{PsRow, SeatPlacement, SessionClaim};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Intent {
@@ -225,6 +225,18 @@ pub(super) fn attention_of(st: &State, name: &str) -> Option<(String, String)> {
             format!("wake-ups are not answered; look at the pane (amail attach {name})"),
         ));
     }
+    if attention.is_none()
+        && let Some(id) = m.and_then(|m| m.adopt_failed.as_deref())
+    {
+        attention = Some((
+            "adopt-failed".into(),
+            format!(
+                "the adopted session {id} could not be resumed, so the seat runs a new \
+                 session; check the id (amail seat adopt {name} <id>), or amail wake {name} \
+                 to clear this"
+            ),
+        ));
+    }
     if attention.is_none() && s.is_some_and(|s| s.restore_pending) {
         attention = Some((
             "recovery-unverified".into(),
@@ -268,12 +280,21 @@ pub(super) fn restore(st: &mut State, harness: impl Fn(&str) -> Option<Harness>)
 }
 
 /// A hook from a supervised seat. Returns true if a start slot was freed.
+/// The hook's session becomes the one the seat resumes, except while the
+/// seat waits to start a session it adopted: hooks from another session
+/// then come from the one that ran before the adoption. The adopted
+/// session's own first hook ends that wait.
 pub(super) fn on_hook(st: &mut State, seat: &str, session_id: Option<&str>) -> bool {
-    if let (Some(m), Some(sid)) = (st.saved.managed.get_mut(seat), session_id)
-        && m.resume.as_deref() != Some(sid)
-    {
-        m.resume = Some(sid.to_string());
-        st.save_dirty = true;
+    if let (Some(m), Some(sid)) = (st.saved.managed.get_mut(seat), session_id) {
+        if m.adopt_intro {
+            if m.resume.as_deref() == Some(sid) {
+                m.adopt_intro = false;
+                st.save_dirty = true;
+            }
+        } else if m.resume.as_deref() != Some(sid) {
+            m.resume = Some(sid.to_string());
+            st.save_dirty = true;
+        }
     }
     let rt = st.sup.entry(seat.to_string()).or_default();
     rt.hooked = true;
@@ -304,6 +325,7 @@ pub(super) fn launched(
         }
         if resume.is_none() {
             m.context_lost = false;
+            m.adopt_intro = false;
         }
         m.dormant = false;
         st.save_dirty = true;
@@ -624,7 +646,7 @@ impl Node {
     }
 
     /// Ask the process of `seat` to end; the exit is handled when it is gone.
-    fn begin_stop(&self, st: &mut State, seat: &str, intent: Intent) {
+    pub(super) fn begin_stop(&self, st: &mut State, seat: &str, intent: Intent) {
         let Some(m) = st.saved.managed.get(seat).cloned() else {
             return;
         };
@@ -937,6 +959,14 @@ impl Node {
                         "seat {seat}: resuming its session failed; the next start is a new session"
                     );
                     let mm = st.saved.managed.get_mut(seat).expect("present");
+                    if std::mem::take(&mut mm.adopt_intro) {
+                        // The session the seat adopted: `amail ps` says so.
+                        tracing::warn!(
+                            "seat {seat}: the adopted session {} could not be resumed",
+                            mm.resume.as_deref().unwrap_or("?")
+                        );
+                        mm.adopt_failed = mm.resume.clone();
+                    }
                     mm.resume = None;
                     mm.context_lost = true;
                 }
@@ -949,7 +979,17 @@ impl Node {
                     mm.failures = 0;
                     mm.last_exit = Some("exited normally (status 0)".into());
                 } else {
+                    let adopted = st
+                        .saved
+                        .managed
+                        .get(seat)
+                        .and_then(|m| m.adopt_failed.clone())
+                        .filter(|_| resume_failed);
                     let what = match (resume_failed, code) {
+                        (true, _) if adopted.is_some() => format!(
+                            "could not resume its adopted session {}",
+                            adopted.unwrap_or_default()
+                        ),
                         (true, _) => "could not resume its session".to_string(),
                         (false, Some(c)) => format!("exited with status {c}"),
                         (false, None) => "was killed or vanished".to_string(),
@@ -1011,13 +1051,40 @@ impl Node {
 
     // --- requests ---------------------------------------------------------
 
-    pub(super) fn sup_up(
+    pub(super) async fn sup_up(
         &self,
         seats: Vec<SeatPlacement>,
         settings: crate::team::Settings,
         start_all: bool,
         only: Option<Vec<String>>,
     ) -> Value {
+        // Sessions the file gives seats for the first time (or changed):
+        // all are checked before anything changes.
+        let claims: Vec<SessionClaim> = {
+            let st = self.lock();
+            seats
+                .iter()
+                .filter_map(|p| {
+                    let id = p.session.as_ref()?;
+                    let known = st
+                        .saved
+                        .managed
+                        .get(&p.seat)
+                        .is_some_and(|m| m.adopted.as_ref() == Some(id));
+                    (!known).then(|| SessionClaim {
+                        seat: p.seat.clone(),
+                        harness: p.harness.clone(),
+                        session: id.clone(),
+                        cwd: p.cwd.clone(),
+                    })
+                })
+                .collect()
+        };
+        let found = match self.check_claims(&claims).await {
+            Ok(f) => f,
+            Err(errors) => return json!({"error": errors.join("\n")}),
+        };
+        let mut adopted = Vec::new();
         let mut out = Vec::new();
         let mut st = self.lock();
         let old = std::mem::replace(&mut st.saved.settings, settings.clone());
@@ -1070,6 +1137,9 @@ impl Node {
                 resume: None,
                 codex_effort: None,
                 context_lost: false,
+                adopted: None,
+                adopt_intro: false,
+                adopt_failed: None,
                 failures: 0,
                 failed: false,
                 pid: None,
@@ -1088,6 +1158,7 @@ impl Node {
                 if m.resume.take().is_some() {
                     m.context_lost = true;
                 }
+                m.adopt_intro = false;
             }
             if m.mux_session != p.mux_session || m.tab != p.tab {
                 m.pane = None;
@@ -1102,6 +1173,13 @@ impl Node {
             m.mux_session = p.mux_session.clone();
             m.tab = p.tab.clone();
             let running = m.pid.is_some_and(|pid| alive(pid, m.pid_start));
+            // A removed `session` changes nothing but lets the same id be
+            // adopted again later.
+            let adopt = p
+                .session
+                .clone()
+                .filter(|id| m.adopted.as_ref() != Some(id));
+            m.adopted = p.session.clone();
             let stuck = running && start && self.is_stuck(&st, &p.seat);
             let action = if stuck {
                 restart.push(p.seat.clone());
@@ -1130,6 +1208,23 @@ impl Node {
             let name = p.seat.clone();
             st.saved.managed.insert(name.clone(), m);
             st.seat(&name).harness = h;
+            if let Some(id) = adopt {
+                let registers = h.is_some_and(|h| self.adapter(h).registers_sessions());
+                super::adopt::adopt_into(&mut st, &name, &id, registers);
+                let f = found
+                    .iter()
+                    .find(|(c, _)| c.seat == name)
+                    .map(|(_, f)| f.clone())
+                    .unwrap_or_default();
+                tracing::info!("seat {name}: adopts session {id}");
+                adopted.push(json!({
+                    "seat": name,
+                    "session": id,
+                    "cwd": f.cwd,
+                    "warning": f.warning,
+                    "running": running,
+                }));
+            }
             if action == "starting" {
                 st.sup.entry(name).or_default().retry_at = None;
             }
@@ -1145,6 +1240,7 @@ impl Node {
         let (policy, source) = (self.local_policy(), self.policy_source());
         json!({
             "seats": out,
+            "adopted": adopted,
             "settings_changed": changed,
             "local_policy": policy,
             "local_policy_source": source,
@@ -1322,6 +1418,7 @@ impl Node {
                 m.held = None;
                 m.failed = false;
                 m.failures = 0;
+                m.adopt_failed = None;
             }
             if let Some(rt) = st.sup.get_mut(seat) {
                 rt.retry_at = None;

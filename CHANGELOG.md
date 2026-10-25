@@ -128,7 +128,8 @@ The first public version.
   storage quota. Migration `0023_tasks.sql`.
 - `amail task`: `new` (also `--from <message>`), `show`, `history`,
   `list` with the API's filters, `mine`, `next [--pool]`, `waiting`,
-  `owed`, `board`, `set`, `assign`, `take`, `block [--on seat]`,
+  `owed`, `board`, `set`, `assign`, `take`, `steal`/`yield`/`keep`,
+  `block [--on seat]`,
   `unblock`, `start`, `review`, `done`, `cancel`, `reopen`, `dep`/`undep`,
   `link`/`unlink` and `comment`; one line per task in text output and the
   server's JSON with `--json`. `amail thread` lists the tasks linked to
@@ -137,9 +138,25 @@ The first public version.
   `[amail] you have N open task(s), M ready: amail task mine` when the
   seat has unfinished tasks (`GET /tasks/mine?seat=` with the node
   token; the only task call node tokens may make).
+- Work stealing: a seat asks to take over a task assigned to another seat
+  that is not started (`/v1/tasks/{num}/steal`); the assignee is told by
+  system mail and answers with `yield` (the requester gets the task) or
+  `keep`. One pending request per task; it ends with the answer, with a
+  change of the task's assignee or state, or after 24 hours, and the
+  requester is told. Migration `0024_task_steal.sql`.
 
 #### Running agents
 
+- Seats can continue existing conversations: `session = "<id>"` on a seat
+  in the team file, `amail run <seat> --session <id>` and `amail seat adopt
+  <seat> <id> [--restart]` make the seat resume that Claude Code, Codex or
+  dsh session. The node checks that the session exists on this host (the
+  Claude Code transcript, the Codex rollout file in the node's Codex home,
+  the dsh session directory) and that no other seat has it; `amail up`
+  checks before it changes anything. The adopted session gets the seat
+  intro on its first start (Claude Code: in the system prompt; Codex and
+  dsh: in a first prompt). A failed resume falls back to a new session and
+  shows `adopt-failed` in `amail ps`.
 - The unread summary a hook adds at the start of a turn leaves out mail
   the session was shown before. Before, every `UserPromptSubmit` listed up
   to 20 unread headers, so a message that stayed unread (a body over 800

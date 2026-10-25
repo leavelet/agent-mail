@@ -129,6 +129,7 @@ name = "docs"
 parent = "root"
 cwd = "docs"                     # relative to the team file
 role_file = "roles/docs.md"
+# session = "<harness session id>"  # resume an existing conversation (see below)
 ```
 
 `permission_mode = "unattended"` runs agents without permission prompts
@@ -207,6 +208,80 @@ every session's system prompt, so they are short.
   `template.toml` (`workdir = "worktree"` or `"none"`). Placeholders:
   `{seat}`, `{parent}`, `{subordinates}`, `{group}`, `{workdir}`,
   `{branch}`. Templates are text only.
+
+## Starting from existing conversations
+
+A seat can continue a Claude Code, Codex or dsh conversation that already
+exists on this host instead of starting a new one. Give the seat the
+conversation's session id:
+
+- in the team file: `session = "<id>"` on a `[[seat]]`, a group's `lead`
+  or a table in a group's `workers` array (not on `workers = { count =
+  ... }`). `amail up` records it as the session the seat resumes when the
+  seat is created and whenever the value changes; the next start of the
+  seat resumes it. Removing the field changes nothing: the seat keeps the
+  session it has. Writing the same id again later adopts it again.
+- for a seat you start by hand: `amail run <seat> --session <id>`.
+- for a seat the node already supervises: `amail seat adopt <seat> <id>`.
+  A running seat keeps its current session and resumes the adopted one at
+  its next start; `--restart` restarts it now (`amail sleep <seat>` then
+  `amail wake <seat>` does the same).
+
+Where to find the id: Claude Code names the session's transcript file
+after it (`projects/<project directory>/<id>.jsonl` in its config
+directory); Codex names the rollout file after it
+(`sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl` in its home).
+
+Before it accepts an id, the node checks:
+
+- The session belongs to the seat's harness and exists on this host:
+  - Claude Code: a transcript `<id>.jsonl` under `projects/` of the
+    node's Claude config directory (`$CLAUDE_CONFIG_DIR` of the node, else
+    `~/.claude`), in any project directory. The node reports the directory
+    the session was started in and warns when it is not the seat's working
+    directory: Claude Code keeps sessions per project directory and
+    resumes a session from the directory it was started in, so `claude
+    --resume` from another directory can fail (not tried with a real
+    Claude Code; if it fails, the seat falls back as described below). Set
+    the seat's `cwd` to that directory to avoid this.
+  - Codex: a rollout file under `sessions/` of the node's Codex home
+    (`<node state dir>/codex-home`) whose first line is the `session_meta`
+    of that id, or, when the node's Codex app-server runs, an answer to
+    `thread/read` for it. Codex seats do not use `~/.codex`: a conversation
+    from your own Codex home is not found until its rollout file is copied
+    to the same place under the node's Codex home. Whether Codex then
+    resumes a copied rollout file was not tried with a real Codex.
+  - dsh: the session's directory under `sessions/` of the seat's dsh home
+    (`<node state dir>/dsh-home/<seat>`).
+- A session is the session of one seat only: an id that another seat of
+  this node resumes or has registered is refused with that seat's name, and
+  so are two seats of one team file with the same id.
+
+`amail up` checks every new `session` before it changes anything; an error
+names the seat and the reason, and nothing is changed.
+
+On its first start as a seat, the adopted session learns that it is a
+seat:
+
+- Claude Code: every start, a resumed one included, gets the mail
+  instructions and the seat intro (who the seat is, its lead, its role) in
+  `--append-system-prompt`.
+- Codex: a resumed thread keeps the instructions of its first prompt, so
+  the node starts it with `codex resume <id> <prompt>`, where the prompt
+  says that the conversation now runs as the seat, with the seat intro and
+  the mail rules. A resumed thread has no registration marker; the node ties
+  the thread to the seat when it adopts it.
+- dsh: the overlay (system prompt) is written at every start, and the host
+  also sends the same prompt as for Codex to the loaded session.
+
+The prompt is given once: the session's first hook ends it, and later
+starts resume without it. From then on the seat's session is whatever its
+hooks report, as for any seat.
+
+If Claude Code cannot resume the adopted session (`No conversation found
+with session ID`), the seat starts a new session that is told its earlier
+context is gone; `amail ps` flags the seat `adopt-failed` with the id until
+the next adoption or `amail wake <seat>`.
 
 ## Sessions and their lifecycle
 

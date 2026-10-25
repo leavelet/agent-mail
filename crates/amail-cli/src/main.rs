@@ -328,6 +328,10 @@ enum Cmd {
         /// file's `dsh_jail`.
         #[arg(long, value_parser = parse_on_off)]
         dsh_jail: Option<bool>,
+        /// Adopt this existing session of the seat's harness and resume it
+        /// (it must exist on this host and belong to no other seat).
+        #[arg(long)]
+        session: Option<String>,
         /// The node socket (default: AMAIL_NODE_SOCK, then the standard path).
         #[arg(long)]
         socket: Option<PathBuf>,
@@ -797,6 +801,16 @@ enum SeatCmd {
     Rm {
         name: String,
     },
+    /// Make a seat the node supervises resume an existing session of its
+    /// harness from its next start (node command; see docs/teams.md).
+    Adopt {
+        seat: String,
+        /// The harness session id.
+        session: String,
+        /// Restart the seat now if it is running.
+        #[arg(long)]
+        restart: bool,
+    },
     /// Create a token for a seat and print it.
     Token {
         name: String,
@@ -1077,6 +1091,7 @@ fn main() -> ExitCode {
         permission_mode,
         git_access,
         dsh_jail,
+        session,
         socket,
         extra,
     } = &cli.cmd
@@ -1088,6 +1103,7 @@ fn main() -> ExitCode {
                 *permission_mode,
                 *git_access,
                 *dsh_jail,
+                session.clone(),
                 socket.clone(),
                 extra.clone(),
             )
@@ -1244,6 +1260,14 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Attach { target } => return team_cmd::attach(&target),
         Cmd::Sleep { seat } => return team_cmd::sleep(&seat, &out),
         Cmd::Wake { seat } => return team_cmd::wake(&seat, &out),
+        Cmd::Seat(SeatCmd::Adopt {
+            seat,
+            session,
+            restart,
+        }) => {
+            linux_only("amail seat adopt")?;
+            return team_cmd::adopt(&seat, &session, restart, &out);
+        }
         Cmd::Node(NodeCli {
             cmd: Some(NodeCmd::Status),
             ..
@@ -1300,6 +1324,7 @@ async fn run(cli: Cli) -> Result<()> {
         | Cmd::Attach { .. }
         | Cmd::Sleep { .. }
         | Cmd::Wake { .. }
+        | Cmd::Seat(SeatCmd::Adopt { .. })
         | Cmd::Node(NodeCli { cmd: None, .. })
         | Cmd::Node(NodeCli {
             cmd:
@@ -1984,6 +2009,7 @@ async fn seat_cmd(c: &Client, out: &Out, cmd: SeatCmd) -> Result<()> {
                 })
             })
         }
+        SeatCmd::Adopt { .. } => unreachable!(),
         SeatCmd::Token { name, label } => {
             let v = c
                 .raw(
@@ -2606,12 +2632,14 @@ fn wait_for_terminal_size(seat: &str) {
 }
 
 /// `amail run`: ask the node how to start the seat's harness, then exec it.
+#[allow(clippy::too_many_arguments)]
 fn run_seat(
     seat: &str,
     harness: Option<String>,
     permission_mode: Option<p::PermissionMode>,
     git_access: Option<amail_node::wire::GitAccess>,
     dsh_jail: Option<bool>,
+    session: Option<String>,
     socket: Option<PathBuf>,
     extra: Vec<String>,
 ) -> Result<()> {
@@ -2638,6 +2666,7 @@ fn run_seat(
             permission_mode,
             git_access,
             dsh_jail,
+            session,
         },
         std::time::Duration::from_secs(180),
     )?;

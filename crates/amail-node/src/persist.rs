@@ -186,6 +186,22 @@ pub struct Managed {
     /// The seat had a session that is gone: the next fresh start says so.
     #[serde(default)]
     pub context_lost: bool,
+    /// The `session` the team file last gave the seat (an existing harness
+    /// session it adopted). `amail up` adopts the file's session again only
+    /// when this differs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopted: Option<String>,
+    /// `resume` is an adopted session that has not run as this seat yet:
+    /// its next start tells it that it is now a seat (see
+    /// [`crate::adapter::adopted_prompt`]). Cleared by the session's first
+    /// hook.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub adopt_intro: bool,
+    /// An adopted session that could not be resumed (the seat runs a new
+    /// session instead), for `amail ps`. Cleared by the next adoption or
+    /// `amail wake`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adopt_failed: Option<String>,
     /// Consecutive failed runs.
     #[serde(default)]
     pub failures: u32,

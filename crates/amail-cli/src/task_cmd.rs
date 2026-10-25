@@ -144,6 +144,13 @@ pub enum TaskCmd {
     Assign { task: String, seat: String },
     /// Assign an unassigned task to yourself (refused if someone has it).
     Take { task: String },
+    /// Ask the assignee of a task that is not started to hand it over to
+    /// you (they answer with `yield` or `keep`).
+    Steal { task: String },
+    /// Answer a request to take over your task: hand it over.
+    Yield { task: String },
+    /// Answer a request to take over your task: keep it.
+    Keep { task: String },
     /// Set a task `blocked`: waiting for a seat's action or an event that is
     /// not another task (use `dep` for that).
     Block {
@@ -277,6 +284,9 @@ pub fn task_line(t: &p::Task) -> String {
             (None, None) => {}
         }
     }
+    if let Some(w) = &t.steal_requested_by {
+        s.push_str(&format!("  · {} asks to take over", l(w)));
+    }
     s
 }
 
@@ -330,6 +340,9 @@ pub fn event_line(e: &p::TaskEvent) -> String {
         K::Commented => "commented".into(),
         K::ReminderSent => format!("reminder {field} sent to {}", v(&e.to)),
         K::Unblocked => format!("unblocked: {} closed", v(&e.to)),
+        K::StealRequested => format!("{} asked to take over from {}", v(&e.to), v(&e.from)),
+        K::StealDeclined => format!("request of {} to take over declined", v(&e.to)),
+        K::StealExpired => format!("request of {} to take over expired", v(&e.to)),
     };
     if let Some(m) = e.message_id {
         what.push_str(&format!(" (#{m})"));
@@ -356,6 +369,18 @@ pub fn detail_text(d: &p::TaskDetail) -> String {
     out.push(format!("Priority: {} (rank {})", t.priority, t.rank));
     out.push(format!("Reporter: {}", l(&t.reporter)));
     out.push(format!("Assignee: {}", seat_or_dash(&t.assignee)));
+    if let Some(w) = &t.steal_requested_by {
+        let at = t
+            .steal_requested_at
+            .as_deref()
+            .map(|a| format!(" at {}", short_time(a)))
+            .unwrap_or_default();
+        out.push(format!(
+            "Takeover: asked for by {}{at} (the assignee answers: amail task yield t{n} / keep t{n})",
+            l(w),
+            n = t.num
+        ));
+    }
     if let Some(x) = &t.team {
         out.push(format!("Team: {}", l(x)));
     }
@@ -577,6 +602,15 @@ async fn patch(c: &Client, out: &Out, task: &str, body: Value) -> Result<()> {
     let n = num(task)?;
     let v = c
         .raw(Method::PATCH, &format!("/tasks/{n}"), Some(&body))
+        .await?;
+    changed(out, &v)
+}
+
+/// `POST /tasks/{num}/<action>` without a body.
+async fn post(c: &Client, out: &Out, task: &str, action: &str) -> Result<()> {
+    let n = num(task)?;
+    let v = c
+        .raw(Method::POST, &format!("/tasks/{n}/{action}"), None)
         .await?;
     changed(out, &v)
 }
@@ -842,13 +876,10 @@ pub async fn run(c: &Client, out: &Out, cmd: TaskCmd) -> Result<()> {
         TaskCmd::Assign { task, seat } => {
             patch(c, out, &task, json!({ "assignee": or_null(&seat) })).await
         }
-        TaskCmd::Take { task } => {
-            let n = num(&task)?;
-            let v = c
-                .raw(Method::POST, &format!("/tasks/{n}/take"), None)
-                .await?;
-            changed(out, &v)
-        }
+        TaskCmd::Take { task } => post(c, out, &task, "take").await,
+        TaskCmd::Steal { task } => post(c, out, &task, "steal").await,
+        TaskCmd::Yield { task } => post(c, out, &task, "yield").await,
+        TaskCmd::Keep { task } => post(c, out, &task, "keep").await,
         TaskCmd::Block { task, on, reason } => {
             let mut b = json!({ "state": "blocked" });
             if let Some(s) = on {
@@ -963,6 +994,8 @@ mod tests {
             created_at: "2026-10-26T10:00:00Z".into(),
             updated_at: "2026-10-26T10:00:00Z".into(),
             closed_at: None,
+            steal_requested_by: None,
+            steal_requested_at: None,
         }
     }
 

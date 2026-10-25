@@ -43,6 +43,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Notify, OnceCell};
 
+mod adopt;
 mod caller;
 mod mirror;
 mod notices;
@@ -1230,6 +1231,7 @@ impl Node {
                 permission_mode,
                 git_access,
                 dsh_jail,
+                session,
             } => match self
                 .launch(
                     &seat,
@@ -1242,6 +1244,7 @@ impl Node {
                     permission_mode,
                     git_access,
                     dsh_jail,
+                    session.as_deref(),
                 )
                 .await
             {
@@ -1258,13 +1261,19 @@ impl Node {
                 settings,
                 start,
                 only,
-            } => self.sup_up(seats, settings, start, only),
+            } => self.sup_up(seats, settings, start, only).await,
             Request::Down { seats } => self.sup_down(seats).await,
             Request::Forget { seats } => self.sup_forget(seats).await,
             Request::Sleep { seat } => self.sup_sleep(&seat).await,
             Request::Wake { seat } => self.sup_wake(&seat).await,
             Request::Ps => self.sup_ps(),
             Request::Locate { target } => self.sup_locate(&target),
+            Request::CheckSessions { claims } => self.sup_check_sessions(claims).await,
+            Request::Adopt {
+                seat,
+                session,
+                restart,
+            } => self.sup_adopt(&seat, &session, restart).await,
         }
     }
 
@@ -1294,6 +1303,7 @@ impl Node {
                 permission_mode,
                 git_access,
                 dsh_jail,
+                session,
                 ..
             } => Ok(Request::Launch {
                 seat,
@@ -1307,6 +1317,7 @@ impl Node {
                 permission_mode,
                 git_access,
                 dsh_jail,
+                session,
             }),
             req => Ok(req),
         }
@@ -1367,6 +1378,7 @@ impl Node {
                 permission_mode,
                 git_access,
                 dsh_jail,
+                session,
                 ..
             } => Request::Launch {
                 seat,
@@ -1380,6 +1392,7 @@ impl Node {
                 permission_mode,
                 git_access,
                 dsh_jail,
+                session,
             },
             req => req,
         }
@@ -2070,9 +2083,27 @@ impl Node {
         permission_mode: Option<PermissionMode>,
         git_access: Option<GitAccess>,
         dsh_jail: Option<bool>,
+        session: Option<&str>,
     ) -> Result<LaunchPlan> {
         let managed = self.lock().saved.managed.get(seat).cloned();
         let harness = harness.or(managed.as_ref().map(|m| m.harness.as_str()));
+        // `amail run --session`: the seat adopts an existing session. It is
+        // checked before the server issues a new token for the seat when
+        // the harness is known here.
+        let claim = |h: Harness, id: &str| crate::wire::SessionClaim {
+            seat: seat.to_string(),
+            harness: h.as_str().to_string(),
+            session: id.to_string(),
+            cwd: cwd.to_string(),
+        };
+        let mut checked = None;
+        if let (Some(id), Some(h)) = (session, harness.and_then(Harness::parse)) {
+            let found = self
+                .check_claim(&claim(h, id))
+                .await
+                .map_err(anyhow::Error::msg)?;
+            checked = Some((h, found));
+        }
         let mut info = self.server.launch(seat).await?;
         if info.seat != seat {
             bail!("the server answered for seat {:?}, not {seat:?}", info.seat);
@@ -2114,6 +2145,17 @@ impl Node {
             .or_else(|| info.harness.clone())
             .with_context(|| format!("seat {seat} has no harness; set one or pass --harness"))?;
         let h = Harness::parse(&name).with_context(|| format!("unknown harness {name:?}"))?;
+        let mut adopt_notice = None;
+        if let Some(id) = session {
+            let found = match checked {
+                Some((ch, found)) if ch == h => found,
+                _ => self
+                    .check_claim(&claim(h, id))
+                    .await
+                    .map_err(anyhow::Error::msg)?,
+            };
+            adopt_notice = found.warning;
+        }
         self.ensure_prepared(h).await?;
         let nonce = hex::encode(rand::random::<[u8; 8]>());
         {
@@ -2138,13 +2180,37 @@ impl Node {
         }
         self.refresh_kick.notify_one();
         // A supervised seat resumes its last session when it has one;
-        // Claude Code sessions get their id up front.
-        let resume = managed
+        // Claude Code sessions get their id up front. A session given with
+        // `amail run --session` is adopted instead.
+        let registers = self.adapter(h).registers_sessions();
+        let mut managed = managed;
+        if let Some(id) = session {
+            let mut st = self.lock();
+            if managed.is_some() {
+                adopt::adopt_into(&mut st, seat, id, registers);
+                managed = st.saved.managed.get(seat).cloned();
+            } else if registers {
+                adopt::register(&mut st, seat, id);
+            }
+        }
+        let same_harness = managed
             .as_ref()
-            .filter(|m| Harness::parse(&m.harness) == Some(h))
-            .and_then(|m| m.resume.clone());
+            .filter(|m| Harness::parse(&m.harness) == Some(h));
+        let resume = session
+            .map(str::to_string)
+            .or_else(|| same_harness.and_then(|m| m.resume.clone()));
+        // A session that existed before it became this seat, on its first
+        // start as the seat.
+        let adopted = session.is_some() || same_harness.is_some_and(|m| m.adopt_intro);
         let context_lost = managed.as_ref().is_some_and(|m| m.context_lost);
         let new_id = (resume.is_none() && h == Harness::Claude).then(supervise::uuid_v4);
+        if registers && let Some(id) = &resume {
+            // A resumed session sends no registration marker.
+            let mut st = self.lock();
+            if !st.saved.sessions.contains_key(id) {
+                adopt::register(&mut st, seat, id);
+            }
+        }
         self.save_now();
         let plan = self
             .adapter(h)
@@ -2160,6 +2226,7 @@ impl Node {
                 codex_effort: managed.as_ref().and_then(|m| m.codex_effort.as_deref()),
                 new_session_id: new_id.as_deref(),
                 context_lost,
+                adopted: adopted && resume.is_some(),
             })
             .await?;
         {
@@ -2177,10 +2244,10 @@ impl Node {
             st.save_dirty = true;
         }
         // The adapter's notice (if any) follows the node's.
-        let notice = match (notice, plan.notice.clone()) {
-            (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
-            (a, b) => a.or(b),
-        };
+        let notice = [notice, adopt_notice, plan.notice.clone()]
+            .into_iter()
+            .flatten()
+            .reduce(|a, b| format!("{a}\n{b}"));
         let plan = LaunchPlan { notice, ..plan };
         if managed.is_some() {
             let lazy = self.adapter(h).resume_is_lazy();

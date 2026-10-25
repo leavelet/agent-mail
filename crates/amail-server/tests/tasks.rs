@@ -52,6 +52,7 @@ task_tests!(
     size_bounds,
     storage_quota_and_request_limit,
     reminder_cap,
+    work_stealing,
 );
 
 struct Server {
@@ -1016,4 +1017,110 @@ async fn reminder_cap(srv: Server) {
     assert_eq!(n, 1, "one notice");
     let w1_count = w1.reminders().await.len();
     assert!(w1_count <= 103, "{w1_count}");
+}
+
+async fn work_stealing(srv: Server) {
+    let org = srv.org("alpha").await;
+    let w1 = org.seat("w1").await;
+    let w2 = org.seat("w2").await;
+    let w3 = org.seat("w3").await;
+    org.task(json!({ "title": "parser", "assignee": "w1" }))
+        .await;
+    eventually("assignment", || async { w1.reminders().await.len() == 1 }).await;
+    // Unassigned and started tasks are refused.
+    org.task(json!({ "title": "free" })).await;
+    let (s, c) = w2.refused(Method::POST, "/tasks/2/steal", json!({})).await;
+    assert_eq!(
+        (s, c.as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, "not_assigned")
+    );
+    // The request reaches the assignee, in To, with the two commands.
+    let d = w2.post("/tasks/1/steal", json!({})).await;
+    assert_eq!(d["task"]["steal_requested_by"], "w2");
+    assert!(d["task"]["steal_requested_at"].is_string());
+    eventually("the request", || async { w1.reminders().await.len() == 2 }).await;
+    let inbox = w1.inbox().await;
+    let last = inbox.last().unwrap();
+    assert_eq!(
+        last["message"]["subject"],
+        "w2 asks to take over t1: parser"
+    );
+    assert_eq!(last["delivery"]["class"], "to");
+    let id = last["message"]["id"].as_i64().unwrap();
+    let body = w1.get(&format!("/messages/{id}?peek=1")).await["message"]["body"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        body.contains("amail task yield t1") && body.contains("amail task keep t1"),
+        "{body}"
+    );
+    // `mine` shows the request.
+    let mine = w1.get("/tasks/mine").await;
+    assert_eq!(mine["tasks"][0]["steal_requested_by"], "w2");
+    // A second requester waits; others cannot answer.
+    let (s, c) = w3.refused(Method::POST, "/tasks/1/steal", json!({})).await;
+    assert_eq!((s, c.as_str()), (StatusCode::CONFLICT, "steal_pending"));
+    let (s, c) = w3.refused(Method::POST, "/tasks/1/yield", json!({})).await;
+    assert_eq!((s, c.as_str()), (StatusCode::FORBIDDEN, "not_assignee"));
+    let (s, _) = w2.refused(Method::POST, "/tasks/1/keep", json!({})).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    // Keep: the requester is told, once.
+    w1.post("/tasks/1/keep", json!({})).await;
+    eventually("the decline", || async {
+        w2.reminders().await == ["t1 stays with w1: your request to take it over was declined"]
+    })
+    .await;
+    // Yield: the requester gets the task and the assigned reminder.
+    w3.post("/tasks/1/steal", json!({})).await;
+    let d = w1.post("/tasks/1/yield", json!({})).await;
+    assert_eq!(d["task"]["assignee"], "w3");
+    let given = d["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rfind(|e| e["kind"] == "assigned")
+        .unwrap()
+        .clone();
+    assert_eq!(given["note"], "yielded to w3 on request");
+    assert_eq!(given["actor"], "w1");
+    eventually("the hand-over", || async {
+        w3.reminders().await == ["t1 assigned to you: parser"]
+    })
+    .await;
+    // The user may answer too, or just assign (which ends the request).
+    w2.post("/tasks/1/steal", json!({})).await;
+    org.patch(1, json!({ "assignee": "w1" })).await;
+    eventually("the cleared request", || async {
+        w2.reminders().await.len() == 2
+    })
+    .await;
+    assert_eq!(
+        w2.reminders().await[1],
+        "t1: your request to take it over ended: the task was reassigned"
+    );
+    // Started: refused.
+    w1.patch(1, json!({ "state": "doing" })).await;
+    let (s, c) = w2.refused(Method::POST, "/tasks/1/steal", json!({})).await;
+    assert_eq!(
+        (s, c.as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, "started")
+    );
+    // Expiry after 24 hours (aged here): the requester is told once.
+    w1.patch(1, json!({ "state": "open" })).await;
+    w2.post("/tasks/1/steal", json!({})).await;
+    srv.sql("UPDATE tasks SET steal_requested_at = 0 WHERE steal_requested_at IS NOT NULL")
+        .await;
+    eventually("the expiry", || async { w2.reminders().await.len() == 3 }).await;
+    assert!(w2.reminders().await[2].contains("expired"));
+    assert!(
+        org.get("/tasks/1").await["task"]
+            .get("steal_requested_by")
+            .is_none()
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(w2.reminders().await.len(), 3);
+    // Every mail went to the right seat once.
+    // (assigned, w2's request, w3's request, assigned again, w2's request)
+    assert_eq!(w1.reminders().await.len(), 5, "{:?}", w1.reminders().await);
 }

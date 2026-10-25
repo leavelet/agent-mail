@@ -157,11 +157,28 @@ pub struct LaunchCtx<'a> {
     pub new_session_id: Option<&'a str>,
     /// The seat had a session whose context is gone; tell the new one.
     pub context_lost: bool,
+    /// `resume` is an existing session the seat adopted and that has not
+    /// run as the seat yet: tell it that it is now a seat
+    /// ([`adopted_prompt`]) where the harness cannot give a resumed
+    /// session a new system prompt.
+    pub adopted: bool,
 }
 
 /// The first prompt of a new session that replaces a lost one.
 pub const CONTEXT_LOST: &str = "[amail] This is a new session: the context of your previous \
 session is gone. Read your unread mail first (amail inbox), then carry on with your role.";
+
+/// The first prompt of an adopted session (one that existed before it
+/// became a seat) on harnesses that cannot change a resumed session's
+/// system prompt: who it is now, and the mail rules.
+pub fn adopted_prompt(info: &LaunchInfo) -> String {
+    format!(
+        "[amail] This conversation now runs as a seat of an amail team: from now on you \
+         work as this seat and receive mail through the `amail` command.\n\n{}\n\n{}\nRead your unread mail first (amail inbox), then carry on with your role.",
+        crate::inject::seat_intro(info),
+        crate::inject::MAIL_INSTRUCTIONS,
+    )
+}
 
 #[async_trait::async_trait]
 pub trait Adapter: Send + Sync + 'static {
