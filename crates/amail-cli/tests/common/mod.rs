@@ -698,3 +698,121 @@ impl Drop for ZellijSession {
         }
     }
 }
+
+/// `amail mcp` as a child process, driven over stdio with
+/// newline-delimited JSON-RPC.
+pub struct McpProc {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    lines: std::sync::mpsc::Receiver<String>,
+    next_id: i64,
+    _home: tempfile::TempDir,
+}
+
+impl McpProc {
+    /// Start `amail mcp <args>` with only `env`, `PATH` and an empty
+    /// `HOME` (so no saved login of the person running the tests is used).
+    pub fn start(args: &[&str], env: &[(&str, &str)]) -> McpProc {
+        let home = tempfile::tempdir().unwrap();
+        let mut cmd = Command::new(BIN);
+        cmd.arg("mcp")
+            .args(args)
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", home.path())
+            .env("AMAIL_CONFIG_DIR", home.path().join("cfg"))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        McpProc {
+            child,
+            stdin,
+            lines: rx,
+            next_id: 1,
+            _home: home,
+        }
+    }
+
+    /// Write one raw line.
+    pub fn write_line(&mut self, line: &str) {
+        self.stdin.write_all(line.as_bytes()).unwrap();
+        self.stdin.write_all(b"\n").unwrap();
+        self.stdin.flush().unwrap();
+    }
+
+    /// Wait for the answer with this id (other lines are skipped).
+    pub fn answer(&mut self, id: i64) -> Value {
+        let end = Instant::now() + Duration::from_secs(30);
+        loop {
+            let left = end.saturating_duration_since(Instant::now());
+            let line = self
+                .lines
+                .recv_timeout(left)
+                .unwrap_or_else(|_| panic!("no answer to request {id}"));
+            let v: Value = serde_json::from_str(&line)
+                .unwrap_or_else(|e| panic!("not JSON from amail mcp: {e}: {line}"));
+            if v["id"] == json!(id) {
+                return v;
+            }
+        }
+    }
+
+    /// Send a request and wait for its answer.
+    pub fn request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+        let line = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        self.write_line(&line.to_string());
+        self.answer(id)
+    }
+
+    /// `initialize` and the `initialized` notification.
+    pub fn initialize(&mut self) -> Value {
+        let v = self.request(
+            "initialize",
+            json!({"protocolVersion": "2025-06-18", "capabilities": {},
+                   "clientInfo": {"name": "amail-test", "version": "1"}}),
+        );
+        self.write_line(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+        v
+    }
+
+    /// `tools/call`: the result (panics on a JSON-RPC error).
+    pub fn call(&mut self, tool: &str, args: Value) -> Value {
+        self.call_meta(tool, args, None)
+    }
+
+    /// `tools/call` with `_meta`.
+    pub fn call_meta(&mut self, tool: &str, args: Value, meta: Option<Value>) -> Value {
+        let mut params = json!({"name": tool, "arguments": args});
+        if let Some(m) = meta {
+            params["_meta"] = m;
+        }
+        let v = self.request("tools/call", params);
+        assert!(v.get("error").is_none(), "{tool}: {v}");
+        v["result"].clone()
+    }
+}
+
+impl Drop for McpProc {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}

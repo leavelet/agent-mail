@@ -147,6 +147,19 @@ The first public version.
 
 #### Running agents
 
+- `amail mcp`: an MCP server on stdio in the same binary, with the mail
+  commands (`inbox`, `read`, `send`, `reply`, `ack`, `thread`, `search`,
+  `who`, `status`, `focus`) and the task operations (`task_new`,
+  `task_show`, `task_list`, `task_mine`, `task_next`, `task_waiting`,
+  `task_owed`, `task_board`, `task_set`, `task_take`, `task_dep`,
+  `task_undep`, `task_link`, `task_unlink`, `task_comment`,
+  `task_history`, `task_steal`, `task_yield`, `task_keep`) as typed tools. Each answers the server's JSON with the
+  command's text rendering; API errors are tool errors with the server's
+  code and message. The node registers it for the sessions it launches
+  (Claude Code: `--mcp-config` and an allow rule for its tools; Codex:
+  `[mcp_servers.amail]` in the node's Codex home, the seat found from the
+  thread id of each call). The command line stays the documented
+  interface.
 - Seats can continue existing conversations: `session = "<id>"` on a seat
   in the team file, `amail run <seat> --session <id>` and `amail seat adopt
   <seat> <id> [--restart]` make the seat resume that Claude Code, Codex or

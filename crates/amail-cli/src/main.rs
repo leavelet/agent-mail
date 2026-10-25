@@ -2,6 +2,7 @@
 
 mod admin;
 mod client;
+mod mcp;
 mod onboard;
 mod openings_cmd;
 mod output;
@@ -266,6 +267,15 @@ enum Cmd {
         node_state_dir: Option<PathBuf>,
         #[arg(long, requires = "node_state_dir")]
         node_socket: Option<PathBuf>,
+    },
+    /// Run an MCP server on stdin and stdout with mail and task tools
+    /// (see docs/reference.md#mcp-server).
+    Mcp {
+        /// The registration the node writes for the sessions it launches:
+        /// use only a seat's identity (the Codex thread's seat through the
+        /// node, or AMAIL_TOKEN), never a saved login.
+        #[arg(long)]
+        node: bool,
     },
     /// Run a seat's DeepSeek Harness web host (started by `amail run`).
     #[command(hide = true)]
@@ -1218,6 +1228,7 @@ async fn run(cli: Cli) -> Result<()> {
             }
             return Ok(());
         }
+        Cmd::Mcp { node } => return mcp::run(cli.profile.as_deref(), node).await,
         Cmd::Node(NodeCli { cmd: None, run }) => {
             linux_only("amail node")?;
             return node_daemon(run.absolutized()).await;
@@ -1317,6 +1328,7 @@ async fn run(cli: Cli) -> Result<()> {
         | Cmd::Doctor { .. }
         | Cmd::Healthcheck { .. }
         | Cmd::Hook { .. }
+        | Cmd::Mcp { .. }
         | Cmd::DshHost { .. }
         | Cmd::Run { .. }
         | Cmd::Down { .. }

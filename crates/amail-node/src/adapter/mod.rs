@@ -164,6 +164,9 @@ pub struct LaunchCtx<'a> {
     pub adopted: bool,
 }
 
+/// The name under which harness configurations register `amail mcp`.
+pub const MCP_SERVER: &str = "amail";
+
 /// The first prompt of a new session that replaces a lost one.
 pub const CONTEXT_LOST: &str = "[amail] This is a new session: the context of your previous \
 session is gone. Read your unread mail first (amail inbox), then carry on with your role.";
