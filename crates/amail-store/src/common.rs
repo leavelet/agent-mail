@@ -160,7 +160,8 @@ macro_rules! auth_select {
         "SELECT t.id AS token_id, t.scope, t.seat_id, o.id, o.name, o.send_rate_per_min, o.send_burst, \
          o.max_recipients, o.max_thread_depth, o.webhook_url, o.ack_timeout_min, o.focus_max_min, \
          o.digest_interval_min, o.created_at, o.suspended_at, o.stored_bytes, o.kept_bytes, \
-         o.display_name, o.description, o.visibility, o.outbound, o.new_threads_per_hour, o.notice, s.id AS s_id, \
+         o.display_name, o.description, o.visibility, o.outbound, o.new_threads_per_hour, o.notice, \
+         o.task_stale_hours, o.task_bytes, s.id AS s_id, \
          s.org_id AS s_org_id, s.name AS s_name, \
          s.kind AS s_kind, s.parent_id AS s_parent_id, p.name AS s_parent_name, \
          s.display_name AS s_display_name, s.role AS s_role, s.harness AS s_harness, \
@@ -224,7 +225,7 @@ pub(crate) enum Dialect {
 
 impl Dialect {
     /// Case-insensitive `LIKE` (SQLite's `LIKE` folds ASCII letters).
-    fn ilike(self) -> &'static str {
+    pub(crate) fn ilike(self) -> &'static str {
         match self {
             Dialect::Sqlite => "LIKE",
             Dialect::Postgres => "ILIKE",
@@ -424,6 +425,8 @@ pub(crate) struct OrgRow {
     outbound: String,
     new_threads_per_hour: i64,
     notice: Option<String>,
+    task_stale_hours: i64,
+    task_bytes: i64,
 }
 
 impl From<OrgRow> for Org {
@@ -453,6 +456,8 @@ impl From<OrgRow> for Org {
             outbound: r.outbound.parse().unwrap_or(amail_proto::Outbound::AnySeat),
             new_threads_per_hour: r.new_threads_per_hour,
             notice: r.notice,
+            task_stale_hours: r.task_stale_hours,
+            task_bytes: r.task_bytes,
         }
     }
 }
@@ -1270,6 +1275,10 @@ macro_rules! impl_store_common {
                     .bind(team.id)
                     .execute(&mut *c)
                     .await?;
+                sqlx::query("UPDATE tasks SET team_id = NULL WHERE team_id = $1")
+                    .bind(team.id)
+                    .execute(&mut *c)
+                    .await?;
                 sqlx::query("UPDATE teams SET parent_id = $1 WHERE parent_id = $2")
                     .bind(team.parent_id)
                     .bind(team.id)
@@ -1549,7 +1558,8 @@ macro_rules! impl_store_common {
                      display_name = CASE WHEN $11 THEN $12 ELSE display_name END, \
                      description = CASE WHEN $13 THEN $14 ELSE description END, \
                      visibility = COALESCE($15, visibility), outbound = COALESCE($16, outbound), \
-                     new_threads_per_hour = COALESCE($17, new_threads_per_hour) WHERE id = $5",
+                     new_threads_per_hour = COALESCE($17, new_threads_per_hour), \
+                     task_stale_hours = COALESCE($18, task_stale_hours) WHERE id = $5",
                 )
                 .bind(p.send_rate_per_min)
                 .bind(p.send_burst)
@@ -1568,6 +1578,7 @@ macro_rules! impl_store_common {
                 .bind(p.visibility.map(|v| v.as_str()))
                 .bind(p.outbound.map(|v| v.as_str()))
                 .bind(p.new_threads_per_hour)
+                .bind(p.task_stale_hours)
                 .execute(&mut *c)
                 .await?;
                 org_by_id(c, org_id).await?.ok_or_else(|| StoreError::NotFound("org".into()))
@@ -3598,7 +3609,12 @@ macro_rules! impl_store_common {
                 }
                 // After its deliveries are gone, the mail it sent that no
                 // other org received has no deliveries left.
-                let steps: [&str; 25] = [
+                let steps: [&str; 30] = [
+                    "DELETE FROM task_events WHERE org_id = $1",
+                    "DELETE FROM task_links WHERE org_id = $1",
+                    "DELETE FROM task_deps WHERE org_id = $1",
+                    "UPDATE tasks SET parent_id = NULL WHERE org_id = $1",
+                    "DELETE FROM tasks WHERE org_id = $1",
                     "DELETE FROM web_sessions WHERE token_id IN (SELECT id FROM tokens WHERE org_id = $1)",
                     "DELETE FROM tokens WHERE org_id = $1",
                     "DELETE FROM claim_keys WHERE seat_id IN (SELECT id FROM seats WHERE org_id = $1)",
@@ -3706,7 +3722,7 @@ macro_rules! impl_store_common {
                 if kept {
                     sqlx::query(
                         "UPDATE orgs SET deleted_at = $1, deleted_name = name, name = $2, \
-                         webhook_url = NULL, stored_bytes = 0, kept_bytes = 0 WHERE id = $3",
+                         webhook_url = NULL, stored_bytes = 0, kept_bytes = 0, task_bytes = 0 WHERE id = $3",
                     )
                     .bind(now)
                     .bind(format!("deleted:{org_id}"))
@@ -4836,6 +4852,96 @@ macro_rules! impl_store_common {
                 let hash = hash.to_string();
                 run!(self.write, |c| q::reset_user_tokens(c, org_id, &hash).await)
             }
+
+            // --- tasks (see `tasks.rs`) ---
+
+            async fn create_task(&self, task: &$crate::NewTaskRec) -> $crate::Result<$crate::TaskRec> {
+                let task = task.clone();
+                run!(self.write, |c| tq::create(c, &task).await)
+            }
+
+            async fn task(&self, org_id: i64, num: i64) -> $crate::Result<Option<$crate::TaskRec>> {
+                run!(self.read, |c| tq::by_num(c, org_id, num).await)
+            }
+
+            async fn task_detail(&self, org_id: i64, num: i64, events: i64) -> $crate::Result<Option<$crate::TaskDetailRec>> {
+                run!(self.read, |c| tq::detail(c, org_id, num, events).await)
+            }
+
+            async fn change_task(&self, w: &$crate::TaskWrite, change: &$crate::TaskChange) -> $crate::Result<$crate::TaskChanged> {
+                let (w, change) = (w.clone(), change.clone());
+                run!(self.write, |c| tq::change(c, &w, &change).await)
+            }
+
+            async fn take_task(&self, w: &$crate::TaskWrite) -> $crate::Result<$crate::TaskChanged> {
+                let w = w.clone();
+                run!(self.write, |c| tq::take(c, &w).await)
+            }
+
+            async fn add_task_dep(&self, w: &$crate::TaskWrite, blocker: i64) -> $crate::Result<$crate::TaskChanged> {
+                let w = w.clone();
+                run!(self.write, |c| tq::add_dep(c, &w, blocker).await)
+            }
+
+            async fn remove_task_dep(&self, w: &$crate::TaskWrite, blocker: i64) -> $crate::Result<$crate::TaskChanged> {
+                let w = w.clone();
+                run!(self.write, |c| tq::remove_dep(c, &w, blocker).await)
+            }
+
+            async fn add_task_link(&self, w: &$crate::TaskWrite, thread_id: i64, auto: bool, note: Option<&str>) -> $crate::Result<bool> {
+                let (w, note) = (w.clone(), note.map(str::to_string));
+                run!(self.write, |c| tq::add_link(c, &w, thread_id, auto, note.as_deref()).await)
+            }
+
+            async fn remove_task_link(&self, w: &$crate::TaskWrite, thread_id: i64) -> $crate::Result<bool> {
+                let w = w.clone();
+                run!(self.write, |c| tq::remove_link(c, &w, thread_id).await)
+            }
+
+            async fn record_task_comment(&self, w: &$crate::TaskWrite, message_id: i64, thread_id: i64) -> $crate::Result<$crate::TaskRec> {
+                let w = w.clone();
+                run!(self.write, |c| tq::comment(c, &w, message_id, thread_id).await)
+            }
+
+            async fn record_task_reminder(&self, org_id: i64, task_id: i64, kind: &str, to: &str, message_id: i64) -> $crate::Result<()> {
+                let (kind, to) = (kind.to_string(), to.to_string());
+                run!(self.write, |c| tq::reminder(c, org_id, task_id, &kind, &to, message_id).await)
+            }
+
+            async fn task_events(&self, org_id: i64, num: i64, after_seq: i64, limit: i64) -> $crate::Result<Option<(Vec<$crate::TaskEventRec>, i64)>> {
+                run!(self.read, |c| tq::events(c, org_id, num, after_seq, limit).await)
+            }
+
+            async fn tasks(&self, query: &$crate::TaskQuery) -> $crate::Result<$crate::TaskPage> {
+                let query = query.clone();
+                run!(self.read_query, |c| tq::list(c, &query).await)
+            }
+
+            async fn tasks_waiting(&self, org_id: i64, seat_id: i64, limit: i64) -> $crate::Result<(Vec<$crate::TaskWaitRec>, bool)> {
+                run!(self.read_query, |c| tq::waiting(c, org_id, seat_id, limit).await)
+            }
+
+            async fn tasks_owed(&self, org_id: i64, seat_id: i64, limit: i64) -> $crate::Result<(Vec<$crate::TaskWaitRec>, bool)> {
+                run!(self.read_query, |c| tq::owed(c, org_id, seat_id, limit).await)
+            }
+
+            async fn task_board(&self, org_id: i64, team_id: Option<i64>, stale_hours: i64, now: i64) -> $crate::Result<$crate::TaskBoardRec> {
+                run!(self.read_query, |c| tq::board(c, org_id, team_id, stale_hours, now).await)
+            }
+
+            async fn thread_tasks(&self, org_id: i64, thread_id: i64) -> $crate::Result<Vec<$crate::TaskRec>> {
+                run!(self.read, |c| tq::thread_tasks(c, org_id, thread_id).await)
+            }
+
+            async fn claim_due_tasks(&self, now: i64, limit: i64) -> $crate::Result<Vec<$crate::TaskRec>> {
+                run!(self.write, |c| tq::claim_due(c, now, limit).await)
+            }
+
+            async fn claim_stale_tasks(&self, now: i64, limit: i64) -> $crate::Result<Vec<$crate::TaskRec>> {
+                run!(self.write, |c| tq::claim_stale(c, now, limit).await)
+            }
         }
+
+        impl_task_queries!($db, $dialect);
     };
 }

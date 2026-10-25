@@ -300,12 +300,12 @@ impl SqliteStore {
 /// $20 whether it is notice mail, $21 the user seat that wrote it in the
 /// sender's name (NULL: the sender did).
 /// The org's `stored_bytes` grows by $17 plus $19 per delivery created; the
-/// message is refused when that would exceed $18, and also when the org was
-/// deleted meanwhile.
+/// message is refused when that, with the org's `task_bytes`, would exceed
+/// $18, and also when the org was deleted meanwhile.
 /// Returns `(message_id, thread_id, seat_id, org_id, seq)` per delivery.
 const SEND_SQL: &str = "
 UPDATE temp.send_quota SET fits = COALESCE((SELECT deleted_at IS NULL
-       AND ($18 IS NULL OR stored_bytes + $17 + $19 * json_array_length($14) <= $18) FROM orgs WHERE id = $1), FALSE);
+       AND ($18 IS NULL OR stored_bytes + task_bytes + $17 + $19 * json_array_length($14) <= $18) FROM orgs WHERE id = $1), FALSE);
 INSERT INTO messages (org_id, sender_seat_id, thread_id, parent_id, depth, subject, body, lines,
                       to_addrs, cc_addrs, priority, ack_required, created_at, meta, ack_due, notice, written_by)
 VALUES ($1, $2, COALESCE($3, 0), $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $15, $16, $20, $21);

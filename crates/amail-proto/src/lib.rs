@@ -46,6 +46,9 @@ macro_rules! string_enum {
     };
 }
 
+mod tasks;
+pub use tasks::*;
+
 string_enum!(
     /// Kind of seat. Every org has exactly one `user` seat, and one hidden
     /// `system` seat that sends system mail (it is never in the directory,
@@ -435,6 +438,59 @@ pub mod limits {
     /// are disconnected.
     pub const MIRROR_SEAT_BYTES: usize = 16 * 1024 * 1024;
 
+    // --- tasks (see `docs/concepts.md`, Tasks) ---
+
+    /// Characters of a task's title (one line).
+    pub const MAX_TASK_TITLE_CHARS: usize = 512;
+    /// Bytes of a task's body.
+    pub const MAX_TASK_BODY_BYTES: usize = 64 * 1024;
+    /// Labels of one task.
+    pub const MAX_TASK_LABELS: usize = 10;
+    /// Characters of one label.
+    pub const MAX_TASK_LABEL_CHARS: usize = 32;
+    /// Characters of a blocked task's reason (one line).
+    pub const MAX_TASK_REASON_CHARS: usize = 512;
+    /// Ancestors a task may have (`parent`, its parent, ...).
+    pub const MAX_TASK_PARENT_DEPTH: usize = 4;
+    /// Tasks of one org that are not `done` or `cancelled`.
+    pub const MAX_OPEN_TASKS: i64 = 20_000;
+    /// Tasks of one org in all (numbers are never reused).
+    pub const MAX_TASKS: i64 = 200_000;
+    /// Events kept in full per task; older ones are deleted and counted
+    /// (`events_compacted`).
+    pub const MAX_TASK_EVENTS: i64 = 1_000;
+    /// Threads linked to one task.
+    pub const MAX_TASK_LINKS: i64 = 50;
+    /// Blockers of one task (`blocked_by` edges).
+    pub const MAX_TASK_BLOCKERS: i64 = 50;
+    /// Tasks one task blocks.
+    pub const MAX_TASK_BLOCKED: i64 = 200;
+    /// Longest chain of dependencies the cycle check follows; an edge that
+    /// would make a longer one is refused.
+    pub const MAX_TASK_DEP_DEPTH: usize = 32;
+    /// Reminder mails (system mail about tasks) one org receives per hour;
+    /// further ones are dropped and the user is told once.
+    pub const TASK_REMINDERS_PER_HOUR: f64 = 200.0;
+    /// Tasks one `GET /tasks?text=` request looks at (newest first) before
+    /// it answers with what it found and a cursor (`next_before`).
+    pub const TASK_TEXT_SCAN: i64 = 5_000;
+    /// Largest page of `GET /tasks` and of the personal queries.
+    pub const MAX_TASK_PAGE: i64 = 500;
+    /// Tasks per column of `GET /tasks/board` (the column's `count` is
+    /// complete).
+    pub const BOARD_COLUMN_TASKS: i64 = 100;
+    /// Events in `GET /tasks/{num}`.
+    pub const TASK_SHOWN_EVENTS: i64 = 20;
+    /// Highest `task_stale_hours` an org may set (0 turns stale reminders
+    /// off).
+    pub const MAX_TASK_STALE_HOURS: i64 = 24 * 365;
+    /// Bytes counted against the storage quota for each task, on top of
+    /// its texts (title, body, labels, reason).
+    pub const STORED_BYTES_PER_TASK: i64 = 512;
+    /// Bytes counted against the storage quota for each task event, on top
+    /// of its texts, and for each dependency and link.
+    pub const STORED_BYTES_PER_TASK_EVENT: i64 = 128;
+
     /// Characters of `s`, or an error naming `field` and the limit.
     pub fn check_chars(field: &str, s: &str, max: usize) -> Result<(), String> {
         if s.chars().count() > max {
@@ -707,6 +763,10 @@ pub struct ThreadResponse {
     /// replies in this thread, whether or not their org opened them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub participants: Vec<Card>,
+    /// Tasks of the caller's org linked to this thread, or whose discussion
+    /// thread it is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tasks: Vec<TaskRef>,
     /// Older messages were left out (a thread answers at most its newest
     /// 500 messages, and headers of at most [`limits::MAX_PAGE_BYTES`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1142,6 +1202,14 @@ pub struct OrgInfo {
     /// is exempt).
     #[serde(default = "default_new_threads")]
     pub new_threads_per_hour: i64,
+    /// Hours after which a task in `doing` or `review` that nobody changed
+    /// is reminded to its assignee (once per period); 0: never.
+    #[serde(default = "default_stale_hours")]
+    pub task_stale_hours: i64,
+    /// Bytes of the org's tasks (their texts, events, dependencies and
+    /// links), counted against the storage quota with `stored_bytes`.
+    #[serde(default)]
+    pub task_bytes: i64,
     /// A one-time notice for the user (user tokens), for example that an
     /// upgrade closed what links used to open; cleared with
     /// `DELETE /v1/org/notice`.
@@ -1159,6 +1227,10 @@ fn default_outbound() -> Outbound {
 
 fn default_new_threads() -> i64 {
     10
+}
+
+fn default_stale_hours() -> i64 {
+    24
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1204,6 +1276,9 @@ pub struct OrgPatch {
     pub outbound: Option<Outbound>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_threads_per_hour: Option<i64>,
+    /// See [`OrgInfo::task_stale_hours`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_stale_hours: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------
