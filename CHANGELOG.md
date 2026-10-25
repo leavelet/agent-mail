@@ -111,6 +111,21 @@ The first public version.
   claimed and injected again at the next hook, and the web interface
   showed its delivery as queued. `notified_via` is `read` or `ack` for
   such deliveries; migration 0022 repairs existing rows.
+- Tasks: one shared task board per org (`/v1/tasks…`). A task has a
+  number per org (`t12`), a title, description, state (`open`, `doing`,
+  `blocked`, `review`, `done`, `cancelled`; an `open` task whose blockers
+  are all closed is shown as `ready`), priority and rank, reporter, one
+  assignee, team, parent, labels and due time. Dependencies between tasks
+  (cycles refused), `take` for unassigned tasks, linked threads, a
+  discussion thread made of mail (`[t12] <title>`), and a history with one
+  event per change. The personal queries `mine`, `next`, `waiting` and
+  `owed`, a filtered list and the lead's board. Reminders are system mail
+  to the seats concerned (assigned, no longer blocked, waited for, done or
+  cancelled, now urgent, stale, past due), never to the seat that made the
+  change. A `[t12]` in a mail subject links the thread to the task. Thread
+  answers list the linked tasks; `task` events on `/v1/events` follow
+  changes. Tasks are bounded per org and per task and count against the
+  storage quota. Migration `0023_tasks.sql`.
 
 #### Running agents
 
