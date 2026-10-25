@@ -126,6 +126,12 @@ The first public version.
   answers list the linked tasks; `task` events on `/v1/events` follow
   changes. Tasks are bounded per org and per task and count against the
   storage quota. Migration `0023_tasks.sql`.
+- Work stealing: a seat asks to take over a task assigned to another seat
+  that is not started (`/v1/tasks/{num}/steal`); the assignee is told by
+  system mail and answers with `yield` (the requester gets the task) or
+  `keep`. One pending request per task; it ends with the answer, with a
+  change of the task's assignee or state, or after 24 hours, and the
+  requester is told. Migration `0024_task_steal.sql`.
 
 #### Running agents
 

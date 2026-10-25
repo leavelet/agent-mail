@@ -106,6 +106,8 @@ pub fn task_out(t: &TaskRec) -> p::Task {
         blocked_reason: t.blocked_reason.clone(),
         thread: t.thread_id,
         waits_on: t.waits_on.clone(),
+        steal_requested_by: t.steal_requested_by.clone(),
+        steal_requested_at: t.steal_requested_at.map(render::ts),
         created_at: render::ts(t.created_at),
         updated_at: render::ts(t.updated_at),
         closed_at: t.closed_at.map(render::ts),
@@ -298,6 +300,12 @@ async fn team_id(st: &AppState, org: &Org, name: &str) -> ApiResult<i64> {
 fn store_err(st: &AppState, e: StoreError) -> ApiError {
     match e {
         StoreError::Refused("taken", m) => ApiError::new(StatusCode::CONFLICT, "taken", m),
+        StoreError::Refused("steal_pending", m) => {
+            ApiError::new(StatusCode::CONFLICT, "steal_pending", m)
+        }
+        StoreError::Refused("not_assignee", m) => {
+            ApiError::new(StatusCode::FORBIDDEN, "not_assignee", m)
+        }
         StoreError::Refused(code, m) => ApiError::unprocessable(code, m),
         StoreError::StorageQuota(stored) => {
             let mut e = ApiError::storage_quota(stored, st.config.limits.org_storage_bytes);
@@ -494,6 +502,119 @@ pub async fn patch(
 }
 
 /// `POST /v1/tasks/{num}/take`.
+/// `POST /v1/tasks/{num}/steal`: ask the assignee to hand over a task
+/// that is not started; the assignee is told by system mail what to run.
+pub async fn steal(
+    State(st): State<AppState>,
+    auth: Auth,
+    Path(num): Path<String>,
+) -> ApiResult<Json<p::TaskDetail>> {
+    let num = parse_num(&num)?;
+    let w = write_ctx(&st, &auth, num)?;
+    let ch = st
+        .store
+        .steal_task(&w)
+        .await
+        .map_err(|e| store_err(&st, e))?;
+    if !ch.fields.is_empty() {
+        publish(&st, auth.org.id, num, "steal", &ch.fields);
+        let t = &ch.task;
+        if let (Some(a), Some(an), Some(by)) = (t.assignee_id, &t.assignee, &t.steal_requested_by) {
+            let mut r = Reminder::new(
+                a,
+                an.clone(),
+                "steal",
+                t,
+                format!("{by} asks to take over t{}: {}", t.num, t.title),
+            );
+            r.extra = Some(format!(
+                "\nTo hand the task to {by}, run:\n    amail task yield t{n}\nTo keep it, run:\n    amail task keep t{n}\n\
+                 Only the command answers: a reply to this mail does not. Without an answer the \
+                 request expires after 24 hours and the task stays with you.\n",
+                n = t.num
+            ));
+            remind(&st, &auth.org, w.actor_id, vec![r]).await;
+        }
+    }
+    Ok(Json(detail(&st, auth.org.id, num).await?))
+}
+
+/// `POST /v1/tasks/{num}/yield` and `/keep`: the assignee (or the org's
+/// user) answers a pending steal request.
+async fn answer(
+    st: AppState,
+    auth: Auth,
+    num: String,
+    give: bool,
+) -> ApiResult<Json<p::TaskDetail>> {
+    let num = parse_num(&num)?;
+    let w = write_ctx(&st, &auth, num)?;
+    let ch = st
+        .store
+        .answer_task_steal(&w, give, auth.is_user())
+        .await
+        .map_err(|e| store_err(&st, e))?;
+    if give {
+        after_change(&st, &auth.org, w.actor_id, &ch, "assigned").await;
+    } else {
+        publish(&st, auth.org.id, num, "steal", &ch.fields);
+        remind(&st, &auth.org, w.actor_id, steal_ended(&ch)).await;
+    }
+    Ok(Json(detail(&st, auth.org.id, num).await?))
+}
+
+pub async fn yield_task(
+    State(st): State<AppState>,
+    auth: Auth,
+    Path(num): Path<String>,
+) -> ApiResult<Json<p::TaskDetail>> {
+    answer(st, auth, num, true).await
+}
+
+pub async fn keep(
+    State(st): State<AppState>,
+    auth: Auth,
+    Path(num): Path<String>,
+) -> ApiResult<Json<p::TaskDetail>> {
+    answer(st, auth, num, false).await
+}
+
+/// The requester of a steal request that this change ended without giving
+/// it the task: told why.
+fn steal_ended(ch: &TaskChanged) -> Vec<Reminder> {
+    let (b, t) = (&ch.before, &ch.task);
+    let (Some(by), Some(by_name)) = (b.steal_requested_by_id, &b.steal_requested_by) else {
+        return Vec::new();
+    };
+    if t.steal_requested_by_id.is_some() || t.assignee_id == Some(by) {
+        return Vec::new();
+    }
+    let owner = b.assignee.clone().unwrap_or_default();
+    let line = if t.assignee_id == b.assignee_id && t.state == b.state {
+        format!(
+            "t{} stays with {owner}: your request to take it over was declined",
+            t.num
+        )
+    } else if t.assignee_id != b.assignee_id {
+        format!(
+            "t{}: your request to take it over ended: the task was reassigned",
+            t.num
+        )
+    } else {
+        format!(
+            "t{}: your request to take it over ended: the task is now {}",
+            t.num, t.state
+        )
+    };
+    vec![Reminder::new(
+        by,
+        by_name.clone(),
+        "steal_declined",
+        t,
+        line,
+    )]
+}
+
 pub async fn take(
     State(st): State<AppState>,
     auth: Auth,
@@ -1111,6 +1232,8 @@ pub struct Reminder {
     line: String,
     /// A copy (the team's lead, for stale tasks).
     cc: Option<(i64, String)>,
+    /// More text for the body, after the lines.
+    extra: Option<String>,
 }
 
 impl Reminder {
@@ -1122,6 +1245,7 @@ impl Reminder {
             task: task.clone(),
             line,
             cc: None,
+            extra: None,
         }
     }
 }
@@ -1167,6 +1291,7 @@ fn change_reminders(ch: &TaskChanged) -> Vec<Reminder> {
             format!("t{} waits for you: {why}", t.num),
         ));
     }
+    out.extend(steal_ended(ch));
     if t.state.is_closed() && !b.state.is_closed() {
         for d in &ch.unblocked {
             let (id, name) = d.responsible();
@@ -1216,6 +1341,11 @@ fn reminder_body(org: &Org, rs: &[&Reminder]) -> String {
     for r in rs {
         body.push_str(&r.line);
         body.push('\n');
+    }
+    for r in rs {
+        if let Some(x) = &r.extra {
+            body.push_str(x);
+        }
     }
     let mut seen = Vec::new();
     for r in rs {
@@ -1422,7 +1552,26 @@ pub async fn scan(st: &AppState) -> amail_store::Result<()> {
     let now = amail_store::now_ms();
     let due = st.store.claim_due_tasks(now, 500).await?;
     let stale = st.store.claim_stale_tasks(now, 500).await?;
+    let expired = st
+        .store
+        .expire_task_steals(now - STEAL_REQUEST_HOURS * 3_600_000, 500)
+        .await?;
     let mut by_org: HashMap<i64, Vec<Reminder>> = HashMap::new();
+    for x in &expired {
+        let t = &x.task;
+        publish(st, t.org_id, t.num, "steal", &["steal".to_string()]);
+        by_org.entry(t.org_id).or_default().push(Reminder::new(
+            x.requester_id,
+            x.requester.clone(),
+            "steal_expired",
+            t,
+            format!(
+                "t{}: your request to take it over expired ({} did not answer in {STEAL_REQUEST_HOURS} hours)",
+                t.num,
+                t.assignee.as_deref().unwrap_or("the assignee")
+            ),
+        ));
+    }
     for t in &due {
         let (id, name) = t.responsible();
         by_org.entry(t.org_id).or_default().push(Reminder::new(

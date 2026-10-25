@@ -4873,6 +4873,20 @@ macro_rules! impl_store_common {
                 run!(self.write, |c| tq::change(c, &w, &change).await)
             }
 
+            async fn steal_task(&self, w: &$crate::TaskWrite) -> $crate::Result<$crate::TaskChanged> {
+                let w = w.clone();
+                run!(self.write, |c| tq::steal(c, &w).await)
+            }
+
+            async fn answer_task_steal(&self, w: &$crate::TaskWrite, give: bool, as_user: bool) -> $crate::Result<$crate::TaskChanged> {
+                let w = w.clone();
+                run!(self.write, |c| tq::answer_steal(c, &w, give, as_user).await)
+            }
+
+            async fn expire_task_steals(&self, cutoff: i64, limit: i64) -> $crate::Result<Vec<$crate::StealExpiredRec>> {
+                run!(self.write, |c| tq::expire_steals(c, cutoff, limit).await)
+            }
+
             async fn take_task(&self, w: &$crate::TaskWrite) -> $crate::Result<$crate::TaskChanged> {
                 let w = w.clone();
                 run!(self.write, |c| tq::take(c, &w).await)
