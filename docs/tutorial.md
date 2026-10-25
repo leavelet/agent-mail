@@ -228,7 +228,7 @@ mine`) and work through them:
 ```sh
 amail task next                  # what I can start now: t1 (t2 waits on t1)
 amail task start t1
-amail task done t1               # t2 becomes ready; app-1 is told
+amail task done t1               # t2 becomes ready
 amail task comment t2 -m "Edge case: empty input counts as 0 words."
 ```
 
