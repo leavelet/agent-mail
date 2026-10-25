@@ -26,6 +26,7 @@ pub mod public;
 mod render;
 mod revoke;
 mod send;
+pub mod tasks;
 pub mod transcript;
 mod ui;
 pub mod web;
@@ -65,6 +66,8 @@ pub struct AppState {
     pub activity: Arc<activity::Activity>,
     /// Seat and list changes, for `directory` events.
     pub directory: Arc<dirwatch::DirectoryHub>,
+    /// Task changes, for `task` events.
+    pub tasks: Arc<tasks::TaskHub>,
 }
 
 impl AppState {
@@ -86,6 +89,7 @@ impl AppState {
             revocations: Arc::new(revoke::Revocations::default()),
             activity: Arc::new(activity::Activity::default()),
             directory: Arc::new(dirwatch::DirectoryHub::default()),
+            tasks: Arc::new(tasks::TaskHub::default()),
         }
     }
 
@@ -166,6 +170,7 @@ pub fn start_background(state: &AppState) -> Vec<tokio::task::JoinHandle<()>> {
         tasks.extend(c.start(state));
     }
     tasks.push(tokio::spawn(attention::run(state.clone())));
+    tasks.push(tokio::spawn(crate::tasks::run(state.clone())));
     tasks.push(tokio::spawn(activity::run(
         state.activity.clone(),
         state.store.clone(),
@@ -232,6 +237,26 @@ pub fn router(state: AppState) -> Router {
             "/threads/{id}",
             get(mail::thread).delete(deletion::delete_thread),
         )
+        .route("/tasks", get(tasks::list).post(tasks::create))
+        .route("/tasks/mine", get(tasks::mine))
+        .route("/tasks/next", get(tasks::next))
+        .route("/tasks/waiting", get(tasks::waiting))
+        .route("/tasks/owed", get(tasks::owed))
+        .route("/tasks/board", get(tasks::board))
+        .route("/tasks/{num}", get(tasks::get).patch(tasks::patch))
+        .route("/tasks/{num}/take", post(tasks::take))
+        .route("/tasks/{num}/deps", post(tasks::add_dep))
+        .route(
+            "/tasks/{num}/deps/{other}",
+            axum::routing::delete(tasks::remove_dep),
+        )
+        .route("/tasks/{num}/links", post(tasks::add_link))
+        .route(
+            "/tasks/{num}/links/{thread}",
+            axum::routing::delete(tasks::remove_link),
+        )
+        .route("/tasks/{num}/comments", post(tasks::comment))
+        .route("/tasks/{num}/events", get(tasks::events))
         .route("/inbox", get(mail::inbox))
         .route("/claim", post(mail::claim))
         .route("/claim/release", post(mail::release))

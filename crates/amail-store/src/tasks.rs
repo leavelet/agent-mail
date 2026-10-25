@@ -485,9 +485,7 @@ macro_rules! impl_task_queries {
             }
 
             async fn open_count(c: &mut Conn, org_id: i64) -> Result<i64> {
-                Ok(sqlx::query_scalar(concat!(
-                    "SELECT COUNT(*) FROM tasks WHERE org_id = $1 AND state NOT IN ('done', 'cancelled')"
-                ))
+                Ok(sqlx::query_scalar("SELECT COUNT(*) FROM tasks WHERE org_id = $1 AND state NOT IN ('done', 'cancelled')")
                 .bind(org_id)
                 .fetch_one(&mut *c)
                 .await?)
@@ -654,10 +652,8 @@ macro_rules! impl_task_queries {
             /// and those whose last open blocker it was (with an
             /// `unblocked` event each).
             async fn after_close(c: &mut Conn, w: &TaskWrite, closed: &TaskRec, now: i64, bytes: &mut i64) -> Result<(Vec<TaskRec>, Vec<TaskRec>)> {
-                let ids: Vec<i64> = sqlx::query_scalar(concat!(
-                    "SELECT d.task_id FROM task_deps d JOIN tasks x ON x.id = d.task_id \
-                     WHERE d.blocker_id = $1 AND x.state NOT IN ('done', 'cancelled')"
-                ))
+                let ids: Vec<i64> = sqlx::query_scalar("SELECT d.task_id FROM task_deps d JOIN tasks x ON x.id = d.task_id \
+                     WHERE d.blocker_id = $1 AND x.state NOT IN ('done', 'cancelled')")
                 .bind(closed.id)
                 .fetch_all(&mut *c)
                 .await?;
@@ -1262,12 +1258,10 @@ macro_rules! impl_task_queries {
                 .bind(limit + 1)
                 .fetch_all(&mut *c)
                 .await?;
-                let pairs: Vec<(i64, i64)> = sqlx::query_as(concat!(
-                    "SELECT d.task_id, d.blocker_id FROM task_deps d JOIN tasks t ON t.id = d.task_id \
+                let pairs: Vec<(i64, i64)> = sqlx::query_as("SELECT d.task_id, d.blocker_id FROM task_deps d JOIN tasks t ON t.id = d.task_id \
                      JOIN tasks b ON b.id = d.blocker_id WHERE t.org_id = $1 AND t.assignee_id = $2 \
                      AND t.state NOT IN ('done', 'cancelled') AND b.state NOT IN ('done', 'cancelled') \
-                     ORDER BY t.num, b.num LIMIT $3"
-                ))
+                     ORDER BY t.num, b.num LIMIT $3")
                 .bind(org_id)
                 .bind(seat_id)
                 .bind(limit + 1)
@@ -1304,16 +1298,14 @@ macro_rules! impl_task_queries {
                 .bind(limit + 1)
                 .fetch_all(&mut *c)
                 .await?;
-                let pairs: Vec<(i64, i64)> = sqlx::query_as(concat!(
-                    "SELECT d.blocker_id, d.task_id FROM task_deps d JOIN tasks b ON b.id = d.blocker_id \
+                let pairs: Vec<(i64, i64)> = sqlx::query_as("SELECT d.blocker_id, d.task_id FROM task_deps d JOIN tasks b ON b.id = d.blocker_id \
                      JOIN tasks x ON x.id = d.task_id WHERE b.org_id = $1 \
                      AND COALESCE(b.assignee_id, b.reporter_id) = $2 \
                      AND b.state NOT IN ('done', 'cancelled') AND x.state NOT IN ('done', 'cancelled') \
                      AND COALESCE(x.assignee_id, x.reporter_id) <> $2 \
                      AND NOT EXISTS (SELECT 1 FROM task_deps d2 JOIN tasks b2 ON b2.id = d2.blocker_id \
                        WHERE d2.task_id = x.id AND d2.blocker_id <> b.id AND b2.state NOT IN ('done', 'cancelled')) \
-                     ORDER BY b.num, x.num LIMIT $3"
-                ))
+                     ORDER BY b.num, x.num LIMIT $3")
                 .bind(org_id)
                 .bind(seat_id)
                 .bind(limit + 1)
@@ -1411,12 +1403,10 @@ macro_rules! impl_task_queries {
             /// reminded, and return them (each once, also with several
             /// instances).
             pub async fn claim_due(c: &mut Conn, now: i64, limit: i64) -> Result<Vec<TaskRec>> {
-                let ids: Vec<i64> = sqlx::query_scalar(concat!(
-                    "UPDATE tasks SET due_reminded_at = $1 WHERE id IN (SELECT id FROM tasks \
+                let ids: Vec<i64> = sqlx::query_scalar("UPDATE tasks SET due_reminded_at = $1 WHERE id IN (SELECT id FROM tasks \
                      WHERE due IS NOT NULL AND due_reminded_at IS NULL AND due <= $1 \
                      AND state NOT IN ('done', 'cancelled') ORDER BY due LIMIT $2) \
-                     AND due_reminded_at IS NULL RETURNING id"
-                ))
+                     AND due_reminded_at IS NULL RETURNING id")
                 .bind(now)
                 .bind(limit)
                 .fetch_all(&mut *c)

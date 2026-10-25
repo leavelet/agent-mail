@@ -43,7 +43,20 @@ use std::collections::HashMap;
 
 pub async fn send(st: &AppState, auth: &Auth, req: SendRequest) -> ApiResult<SendResponse> {
     let sender = auth.mail_seat()?.clone();
-    send_from(st, auth, &sender, None, req).await
+    send_from(st, auth, &sender, None, req, false).await
+}
+
+/// A comment of a task (`POST /v1/tasks/{num}/comments`), sent as the
+/// caller's seat. `in_reply_to` is the task's discussion thread, which
+/// every seat of the org may comment in: the reader's access to it is not
+/// asked. The caller records the comment on the task.
+pub async fn send_comment(
+    st: &AppState,
+    auth: &Auth,
+    sender: &Seat,
+    req: SendRequest,
+) -> ApiResult<SendResponse> {
+    send_from(st, auth, sender, None, req, true).await
 }
 
 /// `POST /v1/seats/{name}/messages`: the org's user writes a message in the
@@ -72,7 +85,7 @@ pub async fn send_as(
             "only agent seats can be written for; the user sends as itself",
         ));
     }
-    let result = send_from(st, auth, &sender, Some(user), req).await?;
+    let result = send_from(st, auth, &sender, Some(user), req, false).await?;
     tracing::info!(
         org_id = auth.org.id,
         token_id = auth.token_id,
@@ -84,13 +97,14 @@ pub async fn send_as(
 }
 
 /// Send `req` as `sender`; `written_by`: the user seat that wrote it in the
-/// sender's name.
+/// sender's name; `comment`: a task comment (see [`send_comment`]).
 async fn send_from(
     st: &AppState,
     auth: &Auth,
     sender: &Seat,
     written_by: Option<String>,
     req: SendRequest,
+    comment: bool,
 ) -> ApiResult<SendResponse> {
     let org = &auth.org;
     if req.to.is_empty() && req.cc.is_empty() {
@@ -135,9 +149,9 @@ async fn send_from(
     }
     // A link ended or an opening was removed between the check and the
     // send's transaction: decide again (the recipient is then refused).
-    let mut result = send_inner(st, auth, sender, written_by.clone(), req.clone()).await;
+    let mut result = send_inner(st, auth, sender, written_by.clone(), req.clone(), comment).await;
     if matches!(&result, Err(e) if e.code == "boundary_changed") {
-        result = send_inner(st, auth, sender, written_by, req).await;
+        result = send_inner(st, auth, sender, written_by, req, comment).await;
     }
     if result.is_err()
         && limited
@@ -226,7 +240,7 @@ pub async fn preview(st: &AppState, auth: &Auth, req: SendRequest) -> ApiResult<
         return Err(ApiError::bad_request("at least one recipient is required"));
     }
     check_sizes(&req)?;
-    let (r, _) = resolve_all(st, auth, &sender, &req).await?;
+    let (r, _) = resolve_all(st, auth, &sender, &req, false).await?;
     Ok(p::SendPreview {
         deliveries: r.seats.len() as u32,
         recipients: r.results,
@@ -244,6 +258,7 @@ async fn resolve_all<'a>(
     auth: &'a Auth,
     sender: &'a Seat,
     req: &SendRequest,
+    comment: bool,
 ) -> ApiResult<(Resolver<'a>, Placement)> {
     let org = &auth.org;
     // Thread inheritance and the hop limit.
@@ -252,6 +267,7 @@ async fn resolve_all<'a>(
         Some(pid) => {
             let parent = st.store.message(pid).await?;
             let parent = match parent {
+                Some(p) if comment && p.org_id == org.id => p,
                 Some(p) if crate::mail::can_read(st, auth, &p).await? => p,
                 _ => return Err(ApiError::not_found(format!("no message {pid}"))),
             };
@@ -289,9 +305,11 @@ async fn send_inner(
     sender: &Seat,
     written_by: Option<String>,
     req: SendRequest,
+    comment: bool,
 ) -> ApiResult<SendResponse> {
     let org = &auth.org;
-    let (mut r, (thread_id, parent_id, depth)) = resolve_all(st, auth, sender, &req).await?;
+    let (mut r, (thread_id, parent_id, depth)) =
+        resolve_all(st, auth, sender, &req, comment).await?;
     if r.seats.is_empty() {
         let mut e = ApiError::unprocessable("no_recipients", "no recipient could be resolved");
         e.rejected = r.rejected;
@@ -420,6 +438,11 @@ async fn send_inner(
         st.bus.publish(*org_id, events);
     }
     notify_users(st, org, &r.orgs, &sent).await;
+    // Replies in a task's discussion thread and `[t12]` subjects (a task
+    // comment is recorded by its caller).
+    if !comment {
+        crate::tasks::after_send(st, org, sender, msg.written_by.as_deref(), &msg, &sent).await;
+    }
     r.tell_new_participants(&msg.deliveries, sent.thread_id, &msg.subject)
         .await;
     let notes = notes(st, org, sender, &msg.deliveries, priority).await;

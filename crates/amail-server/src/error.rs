@@ -84,6 +84,7 @@ impl From<StoreError> for ApiError {
             StoreError::Conflict(m) => Self::new(StatusCode::CONFLICT, "conflict", m),
             StoreError::Invalid(m) => Self::bad_request(m),
             StoreError::StorageQuota(stored) => Self::storage_quota(stored, None),
+            StoreError::Refused(code, m) => Self::unprocessable(code, m),
             StoreError::Timeout => Self::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "query_timeout",

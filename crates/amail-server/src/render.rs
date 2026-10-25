@@ -236,6 +236,8 @@ pub fn org(o: &Org, storage_quota: Option<i64>) -> p::OrgInfo {
         visibility: o.visibility,
         outbound: o.outbound,
         new_threads_per_hour: o.new_threads_per_hour,
+        task_stale_hours: o.task_stale_hours,
+        task_bytes: o.task_bytes,
         notice: o.notice.clone(),
     }
 }

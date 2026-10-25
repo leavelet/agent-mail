@@ -67,6 +67,12 @@ pub enum Wire {
         o: i64,
         d: amail_proto::DirectoryEvent,
     },
+    /// A task of the org changed.
+    #[serde(rename = "k")]
+    Task {
+        o: i64,
+        v: amail_proto::TaskBusEvent,
+    },
     /// The sender's own liveness ping (others ignore it).
     #[serde(rename = "h")]
     Ping,
@@ -290,6 +296,7 @@ impl Cluster {
                     .chain(s.into_iter().map(crate::revoke::Cred::Session)),
             ),
             Wire::Directory { o, d } => st.directory.deliver(o, d),
+            Wire::Task { o, v } => st.tasks.deliver(o, v),
             Wire::Ping => {}
         }
     }

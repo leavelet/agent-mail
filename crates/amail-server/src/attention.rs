@@ -30,6 +30,9 @@ pub struct Config {
     pub scan_every: Duration,
     /// How often expired claim keys, watches and instances are dropped.
     pub cleanup_every: Duration,
+    /// How often task due times and stale tasks are looked for (the stale
+    /// pass itself runs at most once an hour per org).
+    pub task_scan_every: Duration,
 }
 
 impl Default for Config {
@@ -37,6 +40,7 @@ impl Default for Config {
         Config {
             scan_every: Duration::from_secs(5),
             cleanup_every: Duration::from_secs(60),
+            task_scan_every: Duration::from_secs(60),
         }
     }
 }
