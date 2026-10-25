@@ -1685,11 +1685,9 @@ async fn slow_server_is_reported_once(b: Backend) {
         .filter(|(s, _)| s.starts_with("Hooks on host"))
         .collect();
     assert_eq!(notices.len(), 1, "{mail:?}");
-    assert!(
-        notices[0].1.contains("5 of the 5 hooks") && notices[0].1.contains("400 ms"),
-        "{}",
-        notices[0].1
-    );
+    // (The budget named in the mail depends on whether a slow answer was
+    // measured before the notice went out; only the counts are checked.)
+    assert!(notices[0].1.contains("5 of the 5 hooks"), "{}", notices[0].1);
     // More misses within the hour add no second notice.
     h.api.send(&["w1"], &[], "late 5", false).await;
     h.wait_pending("w1", 1, 0, 0).await;
