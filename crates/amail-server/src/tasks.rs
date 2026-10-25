@@ -1,8 +1,10 @@
 //! Tasks (`/v1/tasks…`): one shared record per task of an org, with
 //! dependencies, linked threads, a discussion thread and a history.
 //!
-//! - Every call needs a user or seat token and stays inside the caller's
-//!   org: task numbers name tasks of that org only, and nothing of a task
+//! - Every call needs a user or seat token, except `GET /tasks/mine`,
+//!   which a node token may call for an agent seat (`seat=`) to show the
+//!   seat its task count when a session starts. Every call stays inside
+//!   the caller's org: task numbers name tasks of that org only, and nothing of a task
 //!   reaches another org (a comment mail that reaches another org's seat is
 //!   ordinary mail to it).
 //! - The actor of every change is the token's seat (a user token: the
@@ -751,6 +753,8 @@ pub struct ListParams {
     before: Option<i64>,
     limit: Option<i64>,
     pool: Option<String>,
+    /// `mine` with a node token: the agent seat.
+    seat: Option<String>,
 }
 
 fn flag(v: &Option<String>) -> bool {
@@ -856,13 +860,20 @@ pub async fn list(
 
 /// `GET /v1/tasks/mine`: the caller's unfinished tasks, `ready` first, then
 /// `doing`, `review`, `blocked`, `open`; within each by priority, rank
-/// and number.
+/// and number. A node token names an agent seat with `seat=` (as for the
+/// seat's inbox): the node shows the seat its count at session start.
 pub async fn mine(
     State(st): State<AppState>,
     auth: Auth,
     Query(q): Query<ListParams>,
 ) -> ApiResult<Json<p::TaskList>> {
-    let me = actor(&auth)?;
+    let node_seat;
+    let me = if auth.scope == TokenScope::Node {
+        node_seat = auth.mailbox(&st, q.seat.as_deref()).await?;
+        &node_seat
+    } else {
+        actor(&auth)?
+    };
     let page = st
         .store
         .tasks(&TaskQuery {

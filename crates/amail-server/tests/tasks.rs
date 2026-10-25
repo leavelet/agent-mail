@@ -862,7 +862,9 @@ async fn other_orgs_see_no_tasks(srv: Server) {
     // Alpha reading that thread sees none of bravo's tasks.
     let t = a.get(&format!("/threads/{x_thread}")).await;
     assert!(t.get("tasks").is_none(), "{t}");
-    // Node tokens have no tasks.
+    // Node tokens have no tasks, except the count of an agent seat's own
+    // (`mine?seat=`) that the node shows at session start.
+    a.task(json!({ "title": "for wa", "assignee": "wa" })).await;
     let node = a
         .ok(Method::POST, "/tokens", Some(json!({ "scope": "node" })))
         .await;
@@ -872,6 +874,19 @@ async fn other_orgs_see_no_tasks(srv: Server) {
     };
     let (s, _) = n.call(Method::GET, "/tasks", None).await;
     assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _) = n.call(Method::GET, "/tasks/next?seat=wa", None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, v) = n.call(Method::GET, "/tasks/mine?seat=wa", None).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["tasks"][0]["title"], "for wa", "{v}");
+    assert_eq!(v["tasks"].as_array().unwrap().len(), 1, "{v}");
+    let (s, _) = n.call(Method::GET, "/tasks/mine", None).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, _) = n.call(Method::GET, "/tasks/mine?seat=owner", None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    // A seat token's `seat=` changes nothing: it is always its own seat.
+    let (_, v) = wa.call(Method::GET, "/tasks/mine?seat=owner", None).await;
+    assert_eq!(v["tasks"][0]["title"], "for wa", "{v}");
 }
 
 async fn size_bounds(srv: Server) {
