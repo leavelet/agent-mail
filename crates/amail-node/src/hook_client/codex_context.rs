@@ -701,7 +701,21 @@ mod tests {
             let retained = dir.path().join("retained-image");
             std::fs::copy("/bin/sleep", &path).unwrap();
             std::fs::hard_link(&path, &retained).unwrap();
-            let child = std::process::Command::new(&path).arg("60").spawn().unwrap();
+            // Under a parallel test run another thread's fork can hold the
+            // just-written file open for a moment, and exec then fails with
+            // ETXTBSY; try again briefly.
+            let child = (0..50)
+                .find_map(
+                    |_| match std::process::Command::new(&path).arg("60").spawn() {
+                        Ok(c) => Some(c),
+                        Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) => {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                            None
+                        }
+                        Err(e) => panic!("spawning the test image: {e}"),
+                    },
+                )
+                .expect("the test image stayed busy");
             Self {
                 child,
                 _dir: dir,
