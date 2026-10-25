@@ -256,6 +256,11 @@ struct SeatRt {
     /// Claimed mail whose injection never reached the agent; shown by the
     /// next injecting hook.
     stash: Vec<InboxEntry>,
+    /// Messages the current session was shown, as new mail or in an unread
+    /// summary. The summary a turn starts with leaves them out: mail that
+    /// stays unread (a long body the agent did not `amail read`) would
+    /// otherwise be listed again at every turn. Cleared at session start.
+    listed: HashSet<i64>,
     /// Last hook or launch (Unix ms).
     last_activity: i64,
     /// What the server was last told about the seat needing a person.
@@ -296,6 +301,7 @@ impl SeatRt {
             wakes: 0,
             reported: false,
             stash: Vec::new(),
+            listed: HashSet::new(),
             last_activity: 0,
             reported_attention: None,
             digest_since: None,
@@ -585,6 +591,8 @@ struct Plan {
     digest: bool,
     /// Show unread headers (nothing claimed).
     summary: bool,
+    /// Messages the session was shown already; left out of the summary.
+    listed: HashSet<i64>,
     /// Mail claimed earlier whose injection was lost.
     stash: Vec<InboxEntry>,
 }
@@ -946,6 +954,9 @@ impl Node {
         let mut st = self.lock();
         st.unshow(seat, &entries);
         let s = st.seat(seat);
+        for e in &entries {
+            s.listed.remove(&e.message.id);
+        }
         let mut all = entries;
         all.append(&mut s.stash);
         all.sort_by_key(|e| e.delivery.seq);
@@ -1563,6 +1574,8 @@ impl Node {
                     if let Some(s) = adapter.session_start_state(source) {
                         st.set_state(seat, s);
                     }
+                    // A new (or resumed) session has seen nothing yet.
+                    st.seat(seat).listed.clear();
                     plan.summary = connected;
                     // Ask the server again (see `recheck_pending`).
                     recheck = true;
@@ -1636,6 +1649,9 @@ impl Node {
             }
             if !plan.stash.is_empty() {
                 st.record_stash(seat);
+            }
+            if plan.summary {
+                plan.listed = st.seat(seat).listed.clone();
             }
             st.record_live(seat);
             if recheck && connected {
@@ -1719,9 +1735,11 @@ impl Node {
                     let seen: HashSet<i64> = claimed.iter().map(|e| e.message.id).collect();
                     // Mail still waiting to be notified is injected in full by
                     // the next claim; listing it here too would show it twice.
+                    // Mail this session was shown before is not listed again.
                     r.entries
                         .into_iter()
                         .filter(|e| !seen.contains(&e.message.id))
+                        .filter(|e| !plan.listed.contains(&e.message.id))
                         .filter(|e| {
                             e.delivery.notified_at.is_some()
                                 || e.delivery.mode != amail_proto::DeliveryMode::Immediate
@@ -1813,7 +1831,11 @@ impl Node {
         }
         claimed.extend(digest);
         if out != Output::None {
-            self.lock().note_shown(seat, &claimed);
+            let mut st = self.lock();
+            st.note_shown(seat, &claimed);
+            let s = st.seat(seat);
+            s.listed
+                .extend(claimed.iter().chain(&summary).map(|e| e.message.id));
         }
         (out, claimed)
     }

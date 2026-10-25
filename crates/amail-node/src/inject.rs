@@ -201,7 +201,8 @@ pub fn new_mail(seat: &str, entries: &[InboxEntry], more: bool, budget: usize) -
     (out, shown)
 }
 
-/// Unread mail at session start (headers only; nothing is claimed).
+/// Unread mail at session start, and at the start of a turn for mail the
+/// session was not shown before (headers only; nothing is claimed).
 pub fn unread_summary(seat: &str, entries: &[InboxEntry], budget: usize) -> String {
     render(
         format!("[amail] {seat} has {} unread message(s):", entries.len()),

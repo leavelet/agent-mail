@@ -114,6 +114,14 @@ The first public version.
 
 #### Running agents
 
+- The unread summary a hook adds at the start of a turn leaves out mail
+  the session was shown before. Before, every `UserPromptSubmit` listed up
+  to 20 unread headers, so a message that stayed unread (a body over 800
+  characters the agent never ran `amail read` on) was listed again at every
+  turn and taken for new mail. A new or resumed session still gets the
+  whole list once at `SessionStart`.
+
+
 - `amail node`: a per-host daemon that injects mail into running Claude
   Code and Codex sessions through their hooks (between tool calls, or at
   the end of a turn) and wakes idle sessions; every delivery is shown

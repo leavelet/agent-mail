@@ -145,6 +145,42 @@ async fn claude_state_machine(b: Backend) {
         "{text}"
     );
     assert_eq!(injected_ids(&text), vec![long]);
+    // A turn's summary leaves out what the session was shown before, so
+    // the unread `long` is not listed again; with nothing pending, nothing
+    // is injected.
+    let v = h
+        .hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    assert_eq!(v, Value::Null);
+    // The same for mail shown in full by a claim and left unread.
+    let long2 = h
+        .api
+        .post(
+            "/messages",
+            json!({"to": ["w1"], "subject": "long two", "body": "y".repeat(1000)}),
+        )
+        .await["id"]
+        .as_i64()
+        .unwrap();
+    h.wait_pending("w1", 1, 0, 0).await;
+    let v = h
+        .hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    assert_eq!(injected_ids(&hook_text(&v).unwrap()), vec![long2]);
+    h.wait_pending("w1", 0, 0, 0).await;
+    let v = h
+        .hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    assert_eq!(v, Value::Null);
+    // A new session is shown the unread mail once more.
+    let v = h
+        .hook(
+            "claude",
+            env.clone(),
+            with(claude("SessionStart"), &[("source", json!("resume"))]),
+        )
+        .await;
+    assert_eq!(injected_ids(&hook_text(&v).unwrap()), vec![long, long2]);
     h.hook("claude", env.clone(), claude("UserPromptSubmit"))
         .await;
     let m_to = h.api.send(&["w1"], &[], "to mail 2", false).await;

@@ -119,6 +119,12 @@ resumes them when mail arrives. See [team files](teams.md).
    limit for hook context (counted as rendered, prefixes and escapes
    included); the node keeps the others and shows them with the next hook. Subjects and `meta` are single-line, so mail content cannot pass
    itself off as a header or as a line from the mail system.
+   Besides new mail, a `SessionStart` hook lists the seat's unread mail
+   (headers only, at most 20, nothing claimed): what an earlier session
+   was shown and did not read. A `UserPromptSubmit` hook lists only
+   unread mail this session was not shown before, so a message that
+   stays unread (a long body the agent never ran `amail read` on) is
+   listed once per session, not at every turn.
 8. **Reading and answering.** The agent runs `amail read`, `amail reply`
    or `amail ack` like any shell command; those calls mark the delivery
    `read` or `acked`, which the sender can see.
