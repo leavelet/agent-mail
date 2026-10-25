@@ -299,9 +299,9 @@ impl SqliteStore {
 /// $18 the org's storage quota (NULL: none), $19 the bytes per delivery,
 /// $20 whether it is notice mail, $21 the user seat that wrote it in the
 /// sender's name (NULL: the sender did).
-/// The org's `stored_bytes` grows by $17 plus $19 per delivery created; the
-/// message is refused when that, with the org's `task_bytes`, would exceed
-/// $18, and also when the org was deleted meanwhile.
+/// The org's `stored_bytes` grows by $17 plus $19 per delivery created. The
+/// message is refused when `stored_bytes + task_bytes` plus that growth
+/// would exceed the quota $18, and when the org was deleted meanwhile.
 /// Returns `(message_id, thread_id, seat_id, org_id, seq)` per delivery.
 const SEND_SQL: &str = "
 UPDATE temp.send_quota SET fits = COALESCE((SELECT deleted_at IS NULL

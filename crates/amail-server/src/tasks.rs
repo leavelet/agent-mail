@@ -1178,23 +1178,16 @@ fn change_reminders(ch: &TaskChanged) -> Vec<Reminder> {
                 format!("t{} is no longer blocked: t{} {}", d.num, t.num, t.state),
             ));
         }
-        let closed = format!("t{} {}: {}", t.num, t.state, t.title);
+        // The reporter is told; assignees of tasks that still wait on other
+        // blockers are not (they could not start anyway, and a reminder in
+        // `To` wakes them).
         out.push(Reminder::new(
             t.reporter_id,
             t.reporter.clone(),
             "closed",
             t,
-            closed.clone(),
+            format!("t{} {}: {}", t.num, t.state, t.title),
         ));
-        for d in ch
-            .dependents
-            .iter()
-            .filter(|d| !ch.unblocked.iter().any(|u| u.id == d.id))
-        {
-            if let (Some(id), Some(name)) = (d.assignee_id, &d.assignee) {
-                out.push(Reminder::new(id, name.clone(), "closed", t, closed.clone()));
-            }
-        }
     }
     out
 }

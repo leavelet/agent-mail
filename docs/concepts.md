@@ -426,8 +426,8 @@ addressed in `To`, so an idle agent is woken:
 - the last blocker of a task closes, or its last dependency is removed:
   the task's assignee (its reporter when it has none);
 - a task is set `blocked` waiting on a seat: that seat;
-- a task is `done` or `cancelled`: its reporter, and the assignees of the
-  unfinished tasks it blocks;
+- a task is `done` or `cancelled`: its reporter (a task it was the last
+  blocker of gets the reminder above);
 - a task becomes `urgent`: its assignee;
 - a task in `doing` or `review` has not changed for the org's stale period
   (`task_stale_hours`, 24 by default, 0 turns this off): its assignee, once
