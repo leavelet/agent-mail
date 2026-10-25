@@ -24,9 +24,11 @@ macro_rules! task_select {
              t.assignee_id, asg.name AS assignee, t.team_id, tm.name AS team, t.parent_id, \
              pt.num AS parent_num, t.labels, t.due, t.waiting_on_id, ws.name AS waiting_on, \
              t.blocked_reason, t.thread_id, t.created_at, t.updated_at, t.closed_at, t.event_seq, \
-             t.events_compacted FROM tasks t JOIN seats rs ON rs.id = t.reporter_id \
+             t.events_compacted, t.steal_requested_by AS steal_by_id, sb.name AS steal_by, \
+             t.steal_requested_at AS steal_at FROM tasks t JOIN seats rs ON rs.id = t.reporter_id \
              LEFT JOIN seats asg ON asg.id = t.assignee_id LEFT JOIN teams tm ON tm.id = t.team_id \
-             LEFT JOIN tasks pt ON pt.id = t.parent_id LEFT JOIN seats ws ON ws.id = t.waiting_on_id"
+             LEFT JOIN tasks pt ON pt.id = t.parent_id LEFT JOIN seats ws ON ws.id = t.waiting_on_id \
+             LEFT JOIN seats sb ON sb.id = t.steal_requested_by"
         )
     };
 }
@@ -82,6 +84,9 @@ pub(crate) struct TaskRow {
     closed_at: Option<i64>,
     event_seq: i64,
     events_compacted: i64,
+    steal_by_id: Option<i64>,
+    steal_by: Option<String>,
+    steal_at: Option<i64>,
 }
 
 impl TaskRow {
@@ -115,6 +120,9 @@ impl TaskRow {
             event_seq: self.event_seq,
             events_compacted: self.events_compacted,
             waits_on: Vec::new(),
+            steal_requested_by_id: self.steal_by_id,
+            steal_requested_by: self.steal_by,
+            steal_requested_at: self.steal_at,
         })
     }
 }
@@ -748,10 +756,15 @@ macro_rules! impl_task_queries {
                 if t.state != before.state {
                     t.closed_at = if t.state.is_closed() { Some(now) } else { None };
                 }
+                // A pending steal request ends when the assignee or the state changes.
+                let clear_steal = before.steal_requested_by_id.is_some()
+                    && (t.assignee_id != before.assignee_id || t.state != before.state);
                 sqlx::query(
                     "UPDATE tasks SET title = $2, body = $3, state = $4, priority = $5, rank = $6, assignee_id = $7, \
                      team_id = $8, parent_id = $9, labels = $10, due = $11, waiting_on_id = $12, blocked_reason = $13, \
-                     closed_at = $14, due_reminded_at = CASE WHEN $15 THEN NULL ELSE due_reminded_at END WHERE id = $1",
+                     closed_at = $14, due_reminded_at = CASE WHEN $15 THEN NULL ELSE due_reminded_at END, \
+                     steal_requested_by = CASE WHEN $16 THEN NULL ELSE steal_requested_by END, \
+                     steal_requested_at = CASE WHEN $16 THEN NULL ELSE steal_requested_at END WHERE id = $1",
                 )
                 .bind(before.id)
                 .bind(&t.title)
@@ -768,14 +781,28 @@ macro_rules! impl_task_queries {
                 .bind(&t.blocked_reason)
                 .bind(t.closed_at)
                 .bind(t.due != before.due)
+                .bind(clear_steal)
                 .execute(&mut *c)
                 .await?;
                 let after = must(c, w.org_id, w.num).await?;
-                let (fields, evs) = field_events(&before, &after);
+                let (mut fields, evs) = field_events(&before, &after);
                 let mut bytes = task_bytes(&after) - task_bytes(&before);
                 let wb = w.written_by.as_deref();
                 for e in evs {
                     bytes += event(c, before.id, w.org_id, w.actor_id, wb, now, e).await?;
+                }
+                if clear_steal {
+                    let why = if after.assignee_id != before.assignee_id {
+                        "cleared: the task was reassigned"
+                    } else {
+                        "cleared: the task's state changed"
+                    };
+                    let e = Ev::new(TaskEventKind::StealDeclined)
+                        .from(before.assignee.clone())
+                        .to(before.steal_requested_by.clone())
+                        .note(why);
+                    bytes += event(c, before.id, w.org_id, w.actor_id, wb, now, e).await?;
+                    fields.push("steal");
                 }
                 let (mut dependents, mut unblocked) = (Vec::new(), Vec::new());
                 if after.state.is_closed() && !before.state.is_closed() {
@@ -807,6 +834,163 @@ macro_rules! impl_task_queries {
                     unblocked: Vec::new(),
                     dependents: Vec::new(),
                 }
+            }
+
+            /// A request of the actor to take over the task (see
+            /// [`crate::Store::steal_task`]).
+            pub async fn steal(c: &mut Conn, w: &TaskWrite) -> Result<TaskChanged> {
+                lock(c, w.org_id).await?;
+                let now = now_ms();
+                let before = must(c, w.org_id, w.num).await?;
+                let Some(actor) = w.actor_id else {
+                    return Err(StoreError::Invalid("steal needs a seat".into()));
+                };
+                let Some(owner) = before.assignee_id else {
+                    return Err(refused(
+                        "not_assigned",
+                        format!("t{} has no assignee: take it instead (amail task take t{})", before.num, before.num),
+                    ));
+                };
+                if owner == actor {
+                    return Err(refused("own_task", format!("t{} is assigned to you", before.num)));
+                }
+                if before.state != TaskState::Open {
+                    return Err(refused(
+                        "started",
+                        format!("t{} is {}: only a task that is not started can be taken over", before.num, before.state),
+                    ));
+                }
+                match before.steal_requested_by_id {
+                    Some(s) if s == actor => return Ok(unchanged(before)),
+                    Some(_) => {
+                        return Err(refused(
+                            "steal_pending",
+                            format!(
+                                "{} already asked to take over t{}; wait until {} answers or the request expires",
+                                before.steal_requested_by.clone().unwrap_or_default(),
+                                before.num,
+                                before.assignee.clone().unwrap_or_default()
+                            ),
+                        ));
+                    }
+                    None => {}
+                }
+                sqlx::query("UPDATE tasks SET steal_requested_by = $2, steal_requested_at = $3 WHERE id = $1")
+                    .bind(before.id)
+                    .bind(actor)
+                    .bind(now)
+                    .execute(&mut *c)
+                    .await?;
+                let task = must(c, w.org_id, w.num).await?;
+                let e = Ev::new(TaskEventKind::StealRequested)
+                    .from(before.assignee.clone())
+                    .to(task.steal_requested_by.clone());
+                let bytes = event(c, before.id, w.org_id, w.actor_id, w.written_by.as_deref(), now, e).await?;
+                charge(c, w.org_id, bytes, w.quota).await?;
+                let task = must(c, w.org_id, w.num).await?;
+                Ok(TaskChanged {
+                    before,
+                    task,
+                    fields: vec!["steal".into()],
+                    unblocked: Vec::new(),
+                    dependents: Vec::new(),
+                })
+            }
+
+            /// Answer a pending steal request: `give` hands the task to the
+            /// requester, otherwise the assignee keeps it. Only the assignee
+            /// answers, or the org's user (`as_user`).
+            pub async fn answer_steal(c: &mut Conn, w: &TaskWrite, give: bool, as_user: bool) -> Result<TaskChanged> {
+                lock(c, w.org_id).await?;
+                let now = now_ms();
+                let before = must(c, w.org_id, w.num).await?;
+                let (Some(by), Some(by_name)) = (before.steal_requested_by_id, before.steal_requested_by.clone()) else {
+                    return Err(StoreError::NotFound(format!("t{} has no pending request to take it over", before.num)));
+                };
+                if !as_user && (w.actor_id.is_none() || before.assignee_id != w.actor_id) {
+                    return Err(refused(
+                        "not_assignee",
+                        format!("only the assignee of t{} or the org's user answers the request", before.num),
+                    ));
+                }
+                let wb = w.written_by.as_deref();
+                let mut bytes = 0;
+                if give {
+                    sqlx::query(
+                        "UPDATE tasks SET assignee_id = $2, steal_requested_by = NULL, steal_requested_at = NULL, \
+                         updated_at = $3 WHERE id = $1",
+                    )
+                    .bind(before.id)
+                    .bind(by)
+                    .bind(now)
+                    .execute(&mut *c)
+                    .await?;
+                    let e = Ev::new(TaskEventKind::Assigned)
+                        .field("assignee")
+                        .from(before.assignee.clone())
+                        .to(Some(by_name.clone()))
+                        .note(format!("yielded to {by_name} on request"));
+                    bytes += event(c, before.id, w.org_id, w.actor_id, wb, now, e).await?;
+                } else {
+                    sqlx::query("UPDATE tasks SET steal_requested_by = NULL, steal_requested_at = NULL WHERE id = $1")
+                        .bind(before.id)
+                        .execute(&mut *c)
+                        .await?;
+                    let e = Ev::new(TaskEventKind::StealDeclined)
+                        .from(before.assignee.clone())
+                        .to(Some(by_name.clone()));
+                    bytes += event(c, before.id, w.org_id, w.actor_id, wb, now, e).await?;
+                }
+                charge(c, w.org_id, bytes, None).await?;
+                let task = must(c, w.org_id, w.num).await?;
+                Ok(TaskChanged {
+                    before,
+                    task,
+                    fields: vec![if give { "assignee" } else { "steal" }.into()],
+                    unblocked: Vec::new(),
+                    dependents: Vec::new(),
+                })
+            }
+
+            /// End the steal requests made before `cutoff` (each once,
+            /// also with several instances), with a `steal_expired` event.
+            pub async fn expire_steals(c: &mut Conn, cutoff: i64, limit: i64) -> Result<Vec<StealExpiredRec>> {
+                let rows: Vec<(i64, i64, i64, i64)> = sqlx::query_as(
+                    "SELECT t.id, t.org_id, t.num, t.steal_requested_by FROM tasks t \
+                     WHERE t.steal_requested_at IS NOT NULL AND t.steal_requested_by IS NOT NULL \
+                     AND t.steal_requested_at <= $1 \
+                     ORDER BY t.steal_requested_at LIMIT $2",
+                )
+                .bind(cutoff)
+                .bind(limit)
+                .fetch_all(&mut *c)
+                .await?;
+                let now = now_ms();
+                let mut out = Vec::new();
+                for (id, org_id, num, by) in rows {
+                    let before = must(c, org_id, num).await?;
+                    let n = sqlx::query(
+                        "UPDATE tasks SET steal_requested_by = NULL, steal_requested_at = NULL \
+                         WHERE id = $1 AND steal_requested_by = $2 AND steal_requested_at <= $3",
+                    )
+                    .bind(id)
+                    .bind(by)
+                    .bind(cutoff)
+                    .execute(&mut *c)
+                    .await?
+                    .rows_affected();
+                    if n == 0 {
+                        continue;
+                    }
+                    let requester = before.steal_requested_by.clone().unwrap_or_default();
+                    let e = Ev::new(TaskEventKind::StealExpired)
+                        .from(before.assignee.clone())
+                        .to(Some(requester.clone()));
+                    let bytes = event(c, id, org_id, None, None, now, e).await?;
+                    charge(c, org_id, bytes, None).await?;
+                    out.push(StealExpiredRec { task: must(c, org_id, num).await?, requester_id: by, requester });
+                }
+                Ok(out)
             }
 
             pub async fn take(c: &mut Conn, w: &TaskWrite) -> Result<TaskChanged> {
@@ -1084,6 +1268,9 @@ macro_rules! impl_task_queries {
                     "urgent" => "urgent",
                     "stale" => "stale",
                     "due" => "due",
+                    "steal" => "steal",
+                    "steal_declined" => "steal_declined",
+                    "steal_expired" => "steal_expired",
                     _ => "other",
                 });
                 let bytes = event(c, task_id, org_id, None, None, now_ms(), e).await?;

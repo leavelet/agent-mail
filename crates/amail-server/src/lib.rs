@@ -245,6 +245,9 @@ pub fn router(state: AppState) -> Router {
         .route("/tasks/board", get(tasks::board))
         .route("/tasks/{num}", get(tasks::get).patch(tasks::patch))
         .route("/tasks/{num}/take", post(tasks::take))
+        .route("/tasks/{num}/steal", post(tasks::steal))
+        .route("/tasks/{num}/yield", post(tasks::yield_task))
+        .route("/tasks/{num}/keep", post(tasks::keep))
         .route("/tasks/{num}/deps", post(tasks::add_dep))
         .route(
             "/tasks/{num}/deps/{other}",

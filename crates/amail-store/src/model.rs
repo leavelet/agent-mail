@@ -715,6 +715,10 @@ pub struct TaskRec {
     pub events_compacted: i64,
     /// Numbers of the blockers that are not closed, lowest first.
     pub waits_on: Vec<i64>,
+    /// A pending request to take the task over: the seat and when.
+    pub steal_requested_by_id: Option<i64>,
+    pub steal_requested_by: Option<String>,
+    pub steal_requested_at: Option<i64>,
 }
 
 impl TaskRec {
@@ -915,6 +919,15 @@ pub struct TaskWaitRec {
     pub task: TaskRec,
     pub seat: Option<String>,
     pub other: Option<TaskRec>,
+}
+
+/// A steal request that expired ([`crate::Store::expire_task_steals`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StealExpiredRec {
+    /// The task afterwards (no request).
+    pub task: TaskRec,
+    pub requester_id: i64,
+    pub requester: String,
 }
 
 /// One seat's load ([`crate::Store::task_board`]).

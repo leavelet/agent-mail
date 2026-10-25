@@ -417,6 +417,22 @@ A task has one assignee or none; shared work is split into child tasks.
 refused when another seat took it first, so a pool of workers can share
 unassigned tasks.
 
+### Taking over a task
+
+A seat may ask to take over a task that is assigned to another seat and
+not started (stored state `open`): `POST /tasks/{num}/steal`. The task
+then shows the request (`steal_requested_by`, `steal_requested_at`), and
+the assignee gets system mail in `To` that names the two commands that
+answer it: `amail task yield t12` hands the task to the requester, who is
+told it is assigned to them; `amail task keep t12` keeps it, and the
+requester is told. Only the assignee or the org's user answers. A reply to
+the mail is not an answer: mail content is never interpreted. A task has
+at most one pending request; a request ends when it is answered, when the
+task's assignee or state changes (the requester is told), or after 24
+hours without an answer (the requester is told). An unassigned task is
+taken with `take` instead, and a task in `doing`, `review` or `blocked`
+cannot be asked for.
+
 ### Reminders
 
 The server tells the seats concerned by system mail (source `system`),
