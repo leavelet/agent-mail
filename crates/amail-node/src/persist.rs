@@ -180,6 +180,9 @@ pub struct Managed {
     /// Harness session to resume at the next start.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<String>,
+    /// Explicit Codex effort retained with an imported/resumed seat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_effort: Option<String>,
     /// The seat had a session that is gone: the next fresh start says so.
     #[serde(default)]
     pub context_lost: bool,

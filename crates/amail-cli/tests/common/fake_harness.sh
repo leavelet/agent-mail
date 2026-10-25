@@ -5,7 +5,7 @@
 #
 # Files in $D (the directory of this script):
 #   <seat>.launches  one line per start: "<unix ms> <pid> <args...>"
-#   <seat>.mode      optional behaviour: trust | exit3 | badresume | slow | noturn |
+#   <seat>.mode      optional behaviour: trust | exit3 | launchererror | badresume | slow | noturn |
 #                    deaf (ignores native wake-ups; its screen shows an empty
 #                    input box) | deafdialog (the same, with a dialog open)
 #   <seat>.busy      while it exists, a turn keeps making tool calls
@@ -79,6 +79,10 @@ trust)
 exit3)
     echo "crashing on purpose"
     exit 3
+    ;;
+launchererror)
+    echo "configured model is not valid for this seat"
+    exit 1
     ;;
 badresume)
     if [ -n "$resumed" ]; then

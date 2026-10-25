@@ -100,6 +100,15 @@ node uses `AMAIL_URL`, then `node.toml`, then the current saved login's URL.
 `node.toml` may also set `label` and `local_policy`; `amail node token
 --save` keeps them.
 
+`--codex-sandbox` (`AMAIL_CODEX_SANDBOX`) selects a native Codex policy:
+`read-only`, `workspace-write`, or `danger-full-access`. It applies to fresh
+and resumed sessions and replaces the node's `git_access` permission profiles;
+the node does not change repository permission files or git layout in this
+mode. Without the option, the normal workspace and git-access profiles apply.
+`danger-full-access` runs commands without the Codex sandbox; use it only when
+that access is intended, such as an externally isolated host that cannot run
+the workspace sandbox.
+
 ### Server and operator
 
 | command | |

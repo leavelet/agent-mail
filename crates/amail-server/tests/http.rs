@@ -73,6 +73,7 @@ http_tests!(
     ack_without_reminder,
     written_for_an_agent,
     withdraw_unseen_delivery,
+    legacy_cancel_alias,
     withdraw_seen_delivery_conflicts,
     withdraw_competes_with_claim,
     withdrawn_mail_leaves_the_users_queue,
@@ -2396,6 +2397,32 @@ async fn counts_of(user: &Client, seat: &str) -> Value {
 /// it leaves the recipient's unread mail and every count that pushes or
 /// wakes, and the sender's status says `withdrawn`; the recipient can still
 /// read the message by id and in its thread.
+async fn legacy_cancel_alias(srv: Server) {
+    let user = srv.org("acme").await;
+    let a = user.seat("a").await;
+    let b = user.seat("b").await;
+    let sent = a
+        .send(json!({"to": ["b"], "subject": "legacy cancellation", "body": "keep history"}))
+        .await;
+    let id = sent["id"].as_i64().unwrap();
+    let path = format!("/messages/{id}/deliveries/b/cancel");
+    assert_eq!(b.post(&path, json!({})).await.0, StatusCode::FORBIDDEN);
+    let result = a.ok(Method::POST, &path, Some(json!({}))).await;
+    assert_eq!(result["changed"], true);
+    assert_eq!(result["delivery"]["mode"], "archive");
+    assert!(result["delivery"]["withdrawn_at"].is_string());
+    assert!(result["delivery"]["read_at"].is_null());
+    let repeat = a
+        .ok(
+            Method::POST,
+            &format!("/messages/{id}/deliveries/b/withdraw"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(repeat["changed"], false);
+    assert_eq!(repeat["delivery"], result["delivery"]);
+}
+
 async fn withdraw_unseen_delivery(srv: Server) {
     let user = srv.org("acme").await;
     let a = user.seat("a").await;

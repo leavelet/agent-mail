@@ -70,6 +70,48 @@ fn codex(name: &str) -> Value {
     fixture("codex", name)
 }
 
+/// The real CLI must not ignore the locator or fall back to inherited
+/// credentials when its caller is not the original Codex backend.
+#[test]
+fn hook_context_rejects_nonbackend_before_contacting_node() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let home = state.join("codex-home");
+    let run = dir.path().join("run");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir(&run).unwrap();
+    std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let saved = state.join("node-state.json");
+    std::fs::write(&saved, r#"{"codex_pass":"private-fixture-pass"}"#).unwrap();
+    std::fs::set_permissions(&saved, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let socket = run.join("node.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+
+    let out = Command::new(BIN)
+        .args(["hook", "codex", "--node-state-dir"])
+        .arg(&state)
+        .arg("--node-socket")
+        .arg(&socket)
+        .env("CODEX_HOME", &home)
+        .env("AMAIL_NODE_SOCK", &socket)
+        .env("AMAIL_CODEX_PASS", "inherited-fixture-pass")
+        .env("AMAIL_HOOK_DEBUG", "1")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("fixture-pass"));
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
 /// Every row of the Claude Code state table, plus presence reporting.
 async fn claude_state_machine(b: Backend) {
     let Some(h) = setup(b, "claude_state_machine", Opts::default()).await else {

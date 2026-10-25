@@ -61,6 +61,8 @@ pub struct Config {
     pub amail_exe: PathBuf,
     pub claude_bin: String,
     pub codex_bin: String,
+    /// Explicit native Codex policy; otherwise use amail's workspace/git profiles.
+    pub codex_sandbox: Option<crate::adapter::codex::SandboxMode>,
     /// The `dsh` launcher (DeepSeek Harness).
     pub dsh_bin: String,
     /// Environment given only to dsh hosts (e.g. the model provider's key).
@@ -120,8 +122,8 @@ pub struct Config {
     pub max_restarts: u32,
     /// A run that lasted this long resets the crash count.
     pub stable_after: Duration,
-    /// A resumed session that dies this soon without a hook means the
-    /// resume failed: the next start is a new session.
+    /// A resumed session that dies this soon without a hook can fall back
+    /// to a new session only with an explicit missing-session diagnostic.
     pub resume_grace: Duration,
     pub supervise_interval: Duration,
     /// How often a mirrored transcript file is checked for new lines.
@@ -175,6 +177,7 @@ impl Config {
             amail_exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("amail")),
             claude_bin: "claude".into(),
             codex_bin: "codex".into(),
+            codex_sandbox: None,
             dsh_bin: "dsh".into(),
             dsh_env: BTreeMap::new(),
             codex_auth: crate::paths::home().join(".codex").join("auth.json"),
@@ -274,6 +277,9 @@ struct SeatRt {
     turn_quiet_checked: Option<Instant>,
     /// What the last checks of a quiet busy seat found (see [`turns`]).
     quiet: turns::QuietRt,
+    /// A surviving Codex session restored without a current turn result.
+    /// It cannot receive automatic mail wakes until positively reconciled.
+    restore_pending: bool,
 }
 
 impl SeatRt {
@@ -305,6 +311,7 @@ impl SeatRt {
             turn_check: None,
             turn_quiet_checked: None,
             quiet: Default::default(),
+            restore_pending: false,
         }
     }
 
@@ -325,6 +332,9 @@ impl SeatRt {
     /// mail kept from a lost answer, or a due digest. In focus, only urgent
     /// mail (and kept mail) counts.
     fn wants_wake(&self, now: i64, digest_every: i64) -> bool {
+        if self.restore_pending {
+            return false;
+        }
         if !self.stash.is_empty() || self.pending.urgent > 0 {
             return true;
         }
@@ -755,6 +765,7 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
         server_url: cfg.url.clone(),
         claude_bin: cfg.claude_bin.clone(),
         codex_bin: cfg.codex_bin.clone(),
+        codex_sandbox: cfg.codex_sandbox,
         dsh_bin: cfg.dsh_bin.clone(),
         dsh_env: cfg.dsh_env.clone(),
         codex_auth: cfg.codex_auth.clone(),
@@ -763,9 +774,9 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
     let claude: Arc<dyn Adapter> = Arc::new(crate::adapter::claude::Claude::new(env.clone()));
     let codex: Arc<dyn Adapter> = Arc::new(crate::adapter::codex::Codex::new(env.clone()));
     let dsh: Arc<dyn Adapter> = Arc::new(crate::adapter::dsh::Dsh::new(env));
-    // Live sessions survive restarts. One whose process (and wake target) is
-    // still there is assumed idle: a wake-up that reaches a busy session is
-    // harmless (it is handled after the current turn).
+    // A surviving process is not evidence of a normal last turn. Codex can
+    // retain a live CLI after a failed request; hold automatic wakes until
+    // positive reconciliation or a real new in-progress hook.
     for (seat, l) in st.saved.live.clone() {
         let adapter = match Harness::parse(&l.harness) {
             Some(Harness::Claude) => &claude,
@@ -784,7 +795,12 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
         }
         let s = st.seat(&seat);
         s.harness = Some(adapter.harness());
-        s.state = SeatState::Idle;
+        s.restore_pending = adapter.harness() == Harness::Codex;
+        s.state = if s.restore_pending {
+            SeatState::Busy
+        } else {
+            SeatState::Idle
+        };
         s.session = Some(SessionRt {
             id: l.session_id.clone(),
             pid: Some((l.pid, l.pid_start)),
@@ -1568,6 +1584,7 @@ impl Node {
                     recheck = true;
                 }
                 Event::UserPromptSubmit { .. } => {
+                    st.seat(seat).restore_pending = false;
                     st.set_state(seat, SeatState::Busy);
                     self.turn_started(&mut st, seat);
                     let s = st.seat(seat);
@@ -1584,6 +1601,7 @@ impl Node {
                     plan.summary = connected && registered;
                 }
                 Event::PostToolUse => {
+                    st.seat(seat).restore_pending = false;
                     st.set_state(seat, SeatState::Busy);
                     let s = st.seat(seat);
                     plan.stash = std::mem::take(&mut s.stash);
@@ -1593,6 +1611,12 @@ impl Node {
                         plan.claim_to = connected && s.pending.to > 0;
                         plan.claim_urgent = connected && s.pending.urgent > 0;
                     }
+                }
+                Event::Stop | Event::Interrupt if st.seat(seat).restore_pending => {
+                    // A late terminal hook alone cannot prove that the
+                    // restored turn succeeded. Do not inject pending mail.
+                    st.set_state(seat, SeatState::Busy);
+                    self.check_kick.notify_one();
                 }
                 Event::Stop => {
                     let s = st.seat(seat);
@@ -1999,6 +2023,7 @@ impl Node {
                 extra,
                 nonce: &nonce,
                 resume: resume.as_deref(),
+                codex_effort: managed.as_ref().and_then(|m| m.codex_effort.as_deref()),
                 new_session_id: new_id.as_deref(),
                 context_lost,
             })
@@ -2102,6 +2127,8 @@ impl Node {
                     "wake_retry_ms": s.wake_retry_at.map(|d| d.saturating_duration_since(now).as_millis() as u64),
                     "wakes": s.wakes,
                     "turn_failed": st.turn_failure(name, self.cfg.turn_fail_limit),
+                    "recovery_unverified": s.restore_pending,
+                    "quiet_recovery": turns::quiet_recovery_diagnostics(&st, name),
                 })
             })
             .collect();
@@ -2626,7 +2653,7 @@ impl Node {
                     s.reported = s.state != SeatState::Offline;
                     let a = attention.remove(name).flatten();
                     s.reported_attention = a.clone();
-                    let (tag, hint) = a.unzip();
+                    let (tag, hint) = presence_attention(a);
                     names.push(name.clone());
                     out.push(PresenceUpdate {
                         seat: name.clone(),
@@ -2788,8 +2815,100 @@ pub fn request(socket: &std::path::Path, req: &Request, timeout: Duration) -> Re
     Ok(v)
 }
 
+/// Bound the complete wire hint, including text added around a saved failure.
+/// Keep the saved reason and the local diagnostic view unchanged.
+fn presence_attention(attention: Option<(String, String)>) -> (Option<String>, Option<String>) {
+    let (tag, hint) = attention.unzip();
+    (
+        tag,
+        hint.map(|value| {
+            value
+                .chars()
+                .take(amail_proto::limits::MAX_HINT_CHARS)
+                .collect()
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn restored_session_holds_all_automatic_wake_classes() {
+        let mut s = super::SeatRt::new("cx");
+        s.restore_pending = true;
+        s.pending.to = 1;
+        s.pending.urgent = 1;
+        s.pending.digest = 1;
+        s.digest_since = Some(0);
+        assert!(!s.wants_wake(1000, 10));
+        s.restore_pending = false;
+        assert!(s.wants_wake(1000, 10));
+    }
+
+    #[test]
+    fn presence_attention_bounds_formatted_failures_in_a_mixed_batch() {
+        use amail_proto::limits::{MAX_HINT_CHARS, check_chars};
+
+        let mut st = super::State::default();
+        st.turn_fail_limit = 3;
+        st.seat("reference").state = amail_proto::SeatState::Offline;
+        st.seat("healthy").state = amail_proto::SeatState::Busy;
+        let reason = super::turns::clean_reason(&"error ".repeat(150));
+        let failure = st.saved.turns.entry("reference".into()).or_default();
+        failure.failures = 3;
+        failure.reason = Some(reason.clone());
+
+        let raw = super::supervise::attention_of(&st, "reference").unwrap();
+        assert!(check_chars("attention_hint", &raw.1, MAX_HINT_CHARS).is_err());
+        let batch: Vec<_> = ["reference", "healthy"]
+            .into_iter()
+            .map(|name| {
+                (
+                    name,
+                    super::presence_attention(super::supervise::attention_of(&st, name)),
+                )
+            })
+            .collect();
+        for (_, (_, hint)) in &batch {
+            if let Some(hint) = hint {
+                check_chars("attention_hint", hint, MAX_HINT_CHARS).unwrap();
+            }
+        }
+        assert_eq!(batch[0].1.0.as_deref(), Some("turn-failed"));
+        assert_eq!(batch[1].1, (None, None));
+        assert_eq!(st.seats["healthy"].state, amail_proto::SeatState::Busy);
+        assert_eq!(
+            st.saved.turns["reference"].reason.as_deref(),
+            Some(reason.as_str())
+        );
+        assert_eq!(st.saved.turns["reference"].failures, 3);
+        assert_eq!(super::supervise::attention_of(&st, "reference"), Some(raw));
+    }
+
+    #[test]
+    fn presence_attention_limits_characters_without_damaging_utf8() {
+        use amail_proto::limits::{MAX_HINT_CHARS, check_chars};
+
+        assert_eq!(super::presence_attention(None), (None, None));
+        for text in ["", "a", "界", "🧪"] {
+            for count in [MAX_HINT_CHARS - 1, MAX_HINT_CHARS, MAX_HINT_CHARS + 1] {
+                let input = text.repeat(count);
+                let (tag, hint) = super::presence_attention(Some(("login".into(), input.clone())));
+                assert_eq!(tag.as_deref(), Some("login"));
+                let hint = hint.unwrap();
+                check_chars("attention_hint", &hint, MAX_HINT_CHARS).unwrap();
+                assert_eq!(
+                    hint.chars().count(),
+                    input.chars().count().min(MAX_HINT_CHARS)
+                );
+                assert!(input.starts_with(&hint));
+                if input.chars().count() <= MAX_HINT_CHARS {
+                    assert_eq!(hint, input);
+                }
+            }
+        }
+    }
+
     #[test]
     fn activity_is_restored_from_the_conversation_log() {
         let dir = tempfile::tempdir().unwrap();

@@ -8,8 +8,7 @@
 //!   reserved by `amail run`; after that the hook's `session_id` identifies
 //!   the seat.
 //! - Hooks are defined in the home's `config.toml` and pre-trusted there
-//!   (trust hashes cover the command string, which is fixed as
-//!   `<amail> hook codex`).
+//!   (trust hashes cover the binary and the explicit node-context paths).
 //! - Wake-up: `codex queue --thread <session id> --message ...`, which starts
 //!   a turn on an idle thread and fires `UserPromptSubmit`.
 //! - Launch flags are limited to ones that keep the session attached to the
@@ -24,6 +23,8 @@ use std::path::Path;
 use std::time::Duration;
 use tokio::sync::Mutex;
 
+mod quiet;
+
 /// Hook events: (config name, snake_case name used in trust keys).
 const EVENTS: &[(&str, &str)] = &[
     ("SessionStart", "session_start"),
@@ -36,6 +37,45 @@ const EVENTS: &[(&str, &str)] = &[
 ];
 
 const HOOK_TIMEOUT: i64 = 5;
+
+/// An explicit native Codex sandbox policy, instead of amail's git profiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxMode {
+    ReadOnly,
+    WorkspaceWrite,
+    DangerFullAccess,
+}
+
+impl SandboxMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::WorkspaceWrite => "workspace-write",
+            Self::DangerFullAccess => "danger-full-access",
+        }
+    }
+
+    fn permissions(self) -> &'static str {
+        match self {
+            Self::ReadOnly => ":read-only",
+            Self::WorkspaceWrite => ":workspace",
+            Self::DangerFullAccess => ":danger-full-access",
+        }
+    }
+}
+
+impl std::str::FromStr for SandboxMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "read-only" => Ok(Self::ReadOnly),
+            "workspace-write" => Ok(Self::WorkspaceWrite),
+            "danger-full-access" => Ok(Self::DangerFullAccess),
+            _ => Err("expected read-only, workspace-write or danger-full-access".into()),
+        }
+    }
+}
 
 /// The permissions profile Codex sessions run under by default (see
 /// `apply_managed`); it carries the grants of `git_access = "worktree"`.
@@ -582,6 +622,17 @@ impl Codex {
         self.home().join("config.toml")
     }
 
+    // Codex uses the canonical source path in hook keys, including when
+    // CODEX_HOME was supplied through a short symlink for Unix sockets.
+    fn hook_config_path(&self) -> PathBuf {
+        self.config_path().canonicalize().unwrap_or_else(|_| {
+            self.home()
+                .canonicalize()
+                .unwrap_or_else(|_| self.home())
+                .join("config.toml")
+        })
+    }
+
     pub fn control_socket(&self) -> PathBuf {
         self.home()
             .join("app-server-control")
@@ -589,9 +640,15 @@ impl Codex {
     }
 
     pub fn hook_command(&self) -> String {
+        let state =
+            std::path::absolute(&self.env.state_dir).unwrap_or_else(|_| self.env.state_dir.clone());
+        let socket = std::path::absolute(&self.env.node_socket)
+            .unwrap_or_else(|_| self.env.node_socket.clone());
         format!(
-            "{} hook codex",
-            shell_quote(&self.env.amail_exe.to_string_lossy())
+            "{} hook codex --node-state-dir {} --node-socket {}",
+            shell_quote(&self.env.amail_exe.to_string_lossy()),
+            shell_quote(&state.to_string_lossy()),
+            shell_quote(&socket.to_string_lossy())
         )
     }
 
@@ -622,7 +679,7 @@ impl Codex {
         // serde_json maps are sorted, and to_string is compact.
         let hash = hex::encode(Sha256::digest(canonical.to_string().as_bytes()));
         (
-            format!("{}:{snake}:0:0", self.config_path().display()),
+            format!("{}:{snake}:0:0", self.hook_config_path().display()),
             format!("sha256:{hash}"),
         )
     }
@@ -669,7 +726,13 @@ impl Codex {
         // `grant_git`).
         t.insert(
             "default_permissions".into(),
-            V::String(PERMISSIONS_PROFILE.into()),
+            V::String(
+                self.env
+                    .codex_sandbox
+                    .map(SandboxMode::permissions)
+                    .unwrap_or(PERMISSIONS_PROFILE)
+                    .into(),
+            ),
         );
         for name in [PERMISSIONS_PROFILE, FULL_PROFILE, OFF_PROFILE] {
             profile_fs(t, name);
@@ -692,6 +755,11 @@ impl Codex {
     /// holds the `worktree` grants of every seat; seats with `full` or
     /// `off` select their own profile through `select_profile`.
     fn grant_git(&self, cwd: &str, seat: &str, access: GitAccess) -> Result<Option<String>> {
+        // An explicit native policy controls access itself. Do not rewrite
+        // the repository or select a project profile that overrides it.
+        if self.env.codex_sandbox.is_some() {
+            return Ok(None);
+        }
         let cwd = Path::new(cwd);
         let dirs = git_dirs(cwd);
         let top = git_out(cwd, &["rev-parse", "--show-toplevel"]).map(|s| PathBuf::from(s.trim()));
@@ -765,9 +833,13 @@ impl Codex {
             )],
         )
         .await?;
+        self.parse_hook_status(&r[0])
+    }
+
+    fn parse_hook_status(&self, response: &Value) -> Result<Vec<(String, String, String)>> {
         let mut out = Vec::new();
-        let config = self.config_path();
-        for entry in r[0]["data"].as_array().into_iter().flatten() {
+        let config = self.hook_config_path();
+        for entry in response["data"].as_array().into_iter().flatten() {
             for h in entry["hooks"].as_array().into_iter().flatten() {
                 let src = h["sourcePath"].as_str().unwrap_or_default();
                 if Path::new(src) != config {
@@ -779,6 +851,14 @@ impl Codex {
                     h["trustStatus"].as_str().unwrap_or_default().to_string(),
                 ));
             }
+        }
+        if out.len() != EVENTS.len() {
+            bail!(
+                "codex reported {} managed hooks from {}, expected {}",
+                out.len(),
+                config.display(),
+                EVENTS.len()
+            );
         }
         Ok(out)
     }
@@ -911,6 +991,64 @@ impl Codex {
         vec![first, json!({"threadId": thread, "permissions": profile})]
     }
 
+    fn selected_resume_settings(
+        &self,
+        thread: &str,
+        model: Option<&str>,
+        mode: PermissionMode,
+        git_access: GitAccess,
+        effort: Option<&str>,
+    ) -> Vec<Value> {
+        let mut calls = Self::resume_settings(thread, model, mode, git_access);
+        if let Some(effort) = effort {
+            calls[0]["effort"] = json!(effort);
+        }
+        if let Some(sandbox) = self.env.codex_sandbox {
+            calls[1]["permissions"] = json!(sandbox.permissions());
+        }
+        calls
+    }
+
+    fn check_effort(effort: &str) -> Result<()> {
+        if !matches!(
+            effort,
+            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+        ) {
+            bail!("unsupported managed Codex effort {effort:?}");
+        }
+        Ok(())
+    }
+
+    /// The node persists the intended effort with a seat's resume ID.
+    /// Read it at wake time too: a controller restart does not relaunch
+    /// live seats, and must not discard this per-thread setting.
+    fn resume_effort(&self, thread: &str) -> Result<Option<String>> {
+        let path = self.env.state_dir.join("node-state.json");
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let state: Value = serde_json::from_str(&text)?;
+        let mut efforts = Vec::new();
+        for seat in state["managed"]
+            .as_object()
+            .into_iter()
+            .flat_map(|m| m.values())
+        {
+            if seat["resume"].as_str() == Some(thread)
+                && let Some(effort) = seat["codex_effort"].as_str()
+            {
+                Self::check_effort(effort)?;
+                efforts.push(effort.to_string());
+            }
+        }
+        if efforts.len() > 1 {
+            bail!("multiple managed seats specify the effort of Codex thread {thread}");
+        }
+        Ok(efforts.pop())
+    }
+
     /// A resumed session may attach to a thread the shared daemon still
     /// has loaded (its previous session ended a moment ago, e.g. when the
     /// node starts a seat again right after `amail sleep`). Codex then
@@ -919,11 +1057,12 @@ impl Codex {
     /// still loaded takes them; one that is not loaded is loaded with the
     /// launch flags instead) and again after the session has attached.
     fn apply_settings_on_resume(&self, thread: &str, ctx: &LaunchCtx<'_>) {
-        let calls = Self::resume_settings(
+        let calls = self.selected_resume_settings(
             thread,
             ctx.info.model.as_deref(),
             ctx.permission_mode,
             ctx.git_access,
+            ctx.codex_effort,
         );
         let socket = self.control_socket();
         let (thread, seat) = (thread.to_string(), ctx.info.seat.clone());
@@ -1096,7 +1235,29 @@ impl Adapter for Codex {
         Ok(parse_turns(r.first().unwrap_or(&Value::Null)))
     }
 
+    async fn completed_quiet_turn(
+        &self,
+        probe: &QuietTurnContext,
+        history_error: Option<&anyhow::Error>,
+    ) -> Result<Option<QuietTurnProof>> {
+        quiet::recover(self, probe, history_error).await
+    }
+
     async fn wake(&self, target: &str, text: &str) -> Result<()> {
+        // The TUI can apply the shared home's default effort on attach.
+        // Restore this seat's intended value before submitting any nudge,
+        // so its next model turn cannot race the delayed resume settings.
+        if let Some(effort) = self.resume_effort(target)? {
+            crate::codex_rpc::socket_calls(
+                &self.control_socket(),
+                &[(
+                    "thread/settings/update",
+                    json!({"threadId": target, "effort": effort}),
+                )],
+            )
+            .await
+            .context("restoring Codex effort before queueing wake-up")?;
+        }
         let out = tokio::process::Command::new(&self.env.codex_bin)
             .args(["queue", "--thread", target, "--message", text])
             .env("CODEX_HOME", self.home())
@@ -1150,13 +1311,16 @@ impl Adapter for Codex {
                     bail!("codex hook {k} is {s} after trusting it");
                 }
             }
-            Err(e) => tracing::warn!("could not verify codex hook trust: {e:#}"),
+            Err(e) => return Err(e.context("could not verify codex hook trust")),
         }
         Ok(())
     }
 
     async fn launch(&self, ctx: &LaunchCtx<'_>) -> Result<LaunchPlan> {
         Self::check_extra(ctx.extra)?;
+        if let Some(effort) = ctx.codex_effort {
+            Self::check_effort(effort)?;
+        }
         let notice;
         {
             let _g = self.lock.lock().await;
@@ -1181,6 +1345,9 @@ impl Adapter for Codex {
             // No `-s`: the sandbox comes from the `amail` permissions profile
             // (workspace + network + the seat's git directories).
             args.extend(["-a", "never"].map(String::from));
+        }
+        if let Some(sandbox) = self.env.codex_sandbox {
+            args.extend(["-s".to_string(), sandbox.as_str().to_string()]);
         }
         args.extend(ctx.extra.iter().cloned());
         if let Some(id) = ctx.resume {
@@ -1336,6 +1503,7 @@ mod tests {
             server_url: "http://127.0.0.1:1".into(),
             claude_bin: "claude".into(),
             codex_bin: "codex".into(),
+            codex_sandbox: None,
             dsh_bin: "dsh".into(),
             dsh_env: BTreeMap::new(),
             codex_auth: root.join("auth.json"),
@@ -1350,6 +1518,158 @@ mod tests {
         fs.insert(common.join("hooks").to_string_lossy().into(), "read".into());
         codex.write_config(&t).unwrap();
         (tmp, root, codex)
+    }
+
+    #[test]
+    fn managed_effort_survives_controller_recreation_and_stays_per_thread() {
+        let (_tmp, _root, codex) = setup();
+        assert_eq!(codex.resume_effort("system").unwrap(), None);
+        let path = codex.env.state_dir.join("node-state.json");
+        let mut state = json!({"managed": {
+            "system": {"resume": "system-id", "codex_effort": "xhigh"},
+            "worker": {"resume": "worker-id", "codex_effort": "max"}
+        }});
+        std::fs::write(&path, state.to_string()).unwrap();
+        assert_eq!(
+            codex.resume_effort("system-id").unwrap().as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(
+            codex.resume_effort("worker-id").unwrap().as_deref(),
+            Some("max")
+        );
+        assert_eq!(codex.resume_effort("unmanaged-id").unwrap(), None);
+        state["managed"]["system"]["codex_effort"] = json!("high");
+        std::fs::write(&path, state.to_string()).unwrap();
+        assert_eq!(
+            codex.resume_effort("system-id").unwrap().as_deref(),
+            Some("high")
+        );
+        state["managed"]["worker"]["resume"] = json!("system-id");
+        std::fs::write(&path, state.to_string()).unwrap();
+        assert!(codex.resume_effort("system-id").is_err());
+        assert!(Codex::check_effort("arbitrary-config=true").is_err());
+    }
+
+    #[test]
+    fn managed_hooks_keep_context_locator_on_regeneration_without_secrets() {
+        let (_tmp, root, mut codex) = setup();
+        codex.env.node_socket = root.join("socket with ' quote.sock");
+        codex.env.codex_pass = "must-never-be-in-config".into();
+        let expected = format!(
+            "{} hook codex --node-state-dir {} --node-socket {}",
+            shell_quote(&codex.env.amail_exe.to_string_lossy()),
+            shell_quote(&codex.env.state_dir.to_string_lossy()),
+            shell_quote(&codex.env.node_socket.to_string_lossy()),
+        );
+        let trust: BTreeMap<_, _> = EVENTS
+            .iter()
+            .map(|(_, snake)| codex.trust_entry(snake))
+            .collect();
+        let mut config = toml::Table::new();
+        codex.apply_managed(&mut config, &trust);
+        let once = config.clone();
+        codex.apply_managed(&mut config, &trust);
+        assert_eq!(config, once);
+        for (event, snake) in EVENTS {
+            assert_eq!(
+                config["hooks"][event][0]["hooks"][0]["command"].as_str(),
+                Some(expected.as_str())
+            );
+            let (key, hash) = codex.trust_entry(snake);
+            assert_eq!(
+                config["hooks"]["state"][&key]["trusted_hash"].as_str(),
+                Some(hash.as_str())
+            );
+        }
+        assert!(
+            !toml::to_string(&config)
+                .unwrap()
+                .contains(&codex.env.codex_pass)
+        );
+    }
+
+    #[test]
+    fn hook_trust_resolves_symlinked_home_and_rejects_missing_hooks() {
+        let (_tmp, root, mut codex) = setup();
+        let physical_config = codex.config_path();
+        let alias = root.join("short-state");
+        std::os::unix::fs::symlink(&codex.env.state_dir, &alias).unwrap();
+        codex.env.state_dir = alias;
+
+        let hooks: Vec<_> = EVENTS
+            .iter()
+            .map(|(_, snake)| {
+                let (key, hash) = codex.trust_entry(snake);
+                assert_eq!(key, format!("{}:{snake}:0:0", physical_config.display()));
+                json!({"sourcePath": physical_config, "key": key,
+                       "currentHash": hash, "trustStatus": "trusted"})
+            })
+            .collect();
+        let response = json!({"data": [{"hooks": hooks}]});
+        let status = codex.parse_hook_status(&response).unwrap();
+        assert_eq!(status.len(), EVENTS.len());
+        assert!(status.iter().all(|(_, _, s)| s == "trusted"));
+        assert!(codex.parse_hook_status(&json!({"data": []})).is_err());
+        let mut partial = response;
+        partial["data"][0]["hooks"].as_array_mut().unwrap().pop();
+        assert!(codex.parse_hook_status(&partial).is_err());
+    }
+
+    #[test]
+    fn explicit_sandbox_survives_prepare_and_resume_without_git_changes() {
+        let (_tmp, root, mut codex) = setup();
+        let repo = root.join("repo");
+        let packed = std::fs::read(repo.join(".git/packed-refs")).unwrap();
+        let mut config = codex.read_config().unwrap();
+        assert_eq!(
+            config["default_permissions"].as_str(),
+            Some(PERMISSIONS_PROFILE)
+        );
+
+        codex.env.codex_sandbox = Some(SandboxMode::DangerFullAccess);
+        for _ in 0..2 {
+            codex.apply_managed(&mut config, &BTreeMap::new());
+            codex.write_config(&config).unwrap();
+            assert_eq!(
+                config["default_permissions"].as_str(),
+                Some(":danger-full-access")
+            );
+            assert_eq!(
+                codex
+                    .grant_git(repo.to_str().unwrap(), "seat", GitAccess::Full)
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                codex
+                    .grant_git(
+                        root.join("wt").to_str().unwrap(),
+                        "seat",
+                        GitAccess::Worktree
+                    )
+                    .unwrap(),
+                None
+            );
+            let calls = codex.selected_resume_settings(
+                "existing-thread",
+                Some("kept-model"),
+                PermissionMode::Unattended,
+                GitAccess::Full,
+                Some("xhigh"),
+            );
+            assert_eq!(calls[0]["model"], "kept-model");
+            assert_eq!(calls[0]["approvalPolicy"], "never");
+            assert_eq!(calls[0]["effort"], "xhigh");
+            assert_eq!(calls[1]["permissions"], ":danger-full-access");
+        }
+        assert!(!repo.join(".codex/config.toml").exists());
+        assert!(!root.join("wt/.codex/config.toml").exists());
+        assert!(!repo.join(".git/packed-refs").is_symlink());
+        assert_eq!(
+            std::fs::read(repo.join(".git/packed-refs")).unwrap(),
+            packed
+        );
     }
 
     fn rules(codex: &Codex, profile: &str) -> BTreeMap<String, String> {

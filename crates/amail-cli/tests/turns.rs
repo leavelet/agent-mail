@@ -38,10 +38,37 @@ turn_tests!(
     claude_failures_are_bounded,
     session_ending_mid_turn_is_a_failure,
     codex_failed_turns_from_the_app_server,
+    codex_metadata_error_recovers_only_proven_completion,
+    codex_restart_holds_failed_surviving_session,
 );
 
 fn claude(name: &str) -> Value {
     fixture("claude", name)
+}
+
+/// Model the current hook-list provider during prepare. The production trust
+/// validation still runs; no real backend is started by this isolated suite.
+fn install_fake_codex_hook_rpc(cfg: &amail_node::Config) {
+    std::fs::write(&cfg.codex_bin, r#"#!/usr/bin/env python3
+import json,os,sys
+from pathlib import Path
+with Path(__file__).with_name("codex.log").open("a") as f:
+    f.write(" ".join(sys.argv[1:])+"\n")
+if sys.argv[1:] == ["app-server"]:
+    config = str((Path(os.environ["CODEX_HOME"])/"config.toml").resolve())
+    events = ["SessionStart","UserPromptSubmit","PostToolUse","PermissionRequest","Stop","Interrupt","SessionEnd"]
+    for line in sys.stdin:
+        request=json.loads(line)
+        if "id" not in request: continue
+        if request.get("method") == "hooks/list":
+            result={"data":[{"hooks":[{"sourcePath":config,"key":e,"currentHash":"fixture","trustStatus":"trusted"} for e in events]}]}
+        else:
+            result={}
+        print(json.dumps({"jsonrpc":"2.0","id":request["id"],"result":result}),flush=True)
+    sys.exit(0)
+if len(sys.argv)>1 and sys.argv[1] == "queue": sys.exit(0)
+sys.exit(1)
+"#).unwrap();
 }
 
 fn opts(backoff_ms: u64, notices: bool) -> Opts {
@@ -52,12 +79,16 @@ fn opts(backoff_ms: u64, notices: bool) -> Opts {
         ..Default::default()
     };
     o.tweak = Some(if backoff_ms == 300 {
-        |c: &mut amail_node::Config| c.turn_retry_backoff = Duration::from_millis(300)
+        |c: &mut amail_node::Config| {
+            c.turn_retry_backoff = Duration::from_millis(300);
+            install_fake_codex_hook_rpc(c);
+        }
     } else {
         |c: &mut amail_node::Config| {
             c.turn_retry_backoff = Duration::from_millis(150);
             c.turn_quiet = Duration::from_millis(600);
             c.turn_check_delay = Duration::from_millis(100);
+            install_fake_codex_hook_rpc(c);
         }
     });
     o
@@ -271,6 +302,9 @@ async fn claude_failures_are_bounded(b: Backend) {
     // A turn that ends normally clears it.
     h.wait("released", || async { released(&h, m1, "w1").await })
         .await;
+    // The server release and the node's pending-count refresh are separate
+    // asynchronous observations. Wait for both before supplying a new prompt.
+    h.wait_pending("w1", 1, 0, 0).await;
     let v = h
         .hook("claude", env.clone(), claude("UserPromptSubmit"))
         .await;
@@ -351,6 +385,9 @@ async fn session_ending_mid_turn_is_a_failure(b: Backend) {
 struct FakeAppServer {
     turns: Arc<Mutex<Value>>,
     calls: Arc<Mutex<usize>>,
+    history_error: Arc<Mutex<Option<Value>>>,
+    thread: Arc<Mutex<Value>>,
+    queue: Arc<Mutex<Value>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -364,16 +401,32 @@ impl FakeAppServer {
     fn start(path: &std::path::Path) -> FakeAppServer {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let listener = tokio::net::UnixListener::bind(path).unwrap();
+        // Keep the fixture inside the project even with a long TMPDIR.
+        use std::os::fd::AsRawFd;
+        let dir = std::fs::File::open(path.parent().unwrap()).unwrap();
+        let short = std::path::PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()))
+            .join(path.file_name().unwrap());
+        let listener = tokio::net::UnixListener::bind(short).unwrap();
+        drop(dir);
         let turns = Arc::new(Mutex::new(json!([])));
         let calls = Arc::new(Mutex::new(0));
-        let (t2, c2) = (turns.clone(), calls.clone());
+        let history_error = Arc::new(Mutex::new(None::<Value>));
+        let thread = Arc::new(Mutex::new(json!({})));
+        let queue = Arc::new(Mutex::new(json!({"data":[],"nextCursor":null})));
+        let (t2, c2, e2, th2, q2) = (
+            turns.clone(),
+            calls.clone(),
+            history_error.clone(),
+            thread.clone(),
+            queue.clone(),
+        );
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut s, _)) = listener.accept().await else {
                     return;
                 };
-                let (turns, calls) = (t2.clone(), c2.clone());
+                let (turns, calls, history_error, thread, queue) =
+                    (t2.clone(), c2.clone(), e2.clone(), th2.clone(), q2.clone());
                 tokio::spawn(async move {
                     // Handshake: read the request, answer 101.
                     let mut hdr = Vec::new();
@@ -418,13 +471,27 @@ impl FakeAppServer {
                         let Some(id) = req.get("id").cloned() else {
                             continue;
                         };
+                        let error = if req["method"] == "thread/turns/list" {
+                            history_error.lock().unwrap().clone()
+                        } else {
+                            None
+                        };
                         let result = if req["method"] == "thread/turns/list" {
                             *calls.lock().unwrap() += 1;
                             json!({"data": turns.lock().unwrap().clone()})
+                        } else if req["method"] == "thread/read" {
+                            assert_eq!(req["params"]["includeTurns"], false);
+                            thread.lock().unwrap().clone()
+                        } else if req["method"] == "thread/queue/list" {
+                            queue.lock().unwrap().clone()
                         } else {
                             json!({})
                         };
-                        let out = json!({"jsonrpc": "2.0", "id": id, "result": result}).to_string();
+                        let out = match error {
+                            Some(error) => json!({"jsonrpc":"2.0","id":id,"error":error}),
+                            None => json!({"jsonrpc":"2.0","id":id,"result":result}),
+                        }
+                        .to_string();
                         let mut f = vec![0x81u8];
                         if out.len() < 126 {
                             f.push(out.len() as u8);
@@ -440,12 +507,204 @@ impl FakeAppServer {
                 });
             }
         });
-        FakeAppServer { turns, calls, task }
+        FakeAppServer {
+            turns,
+            calls,
+            history_error,
+            thread,
+            queue,
+            task,
+        }
     }
 
     fn set(&self, turns: Value) {
         *self.turns.lock().unwrap() = turns;
     }
+}
+
+/// The same failure that held a finished session busy in production. Prove
+/// normal completion without releasing shown mail or waking an active/queued
+/// session. All calls exercise the actual node and Unix RPC transport.
+async fn codex_metadata_error_recovers_only_proven_completion(b: Backend) {
+    codex_metadata_recovery(b, false).await;
+}
+
+async fn codex_restart_holds_failed_surviving_session(b: Backend) {
+    codex_metadata_recovery(b, true).await;
+}
+
+async fn codex_metadata_recovery(b: Backend, restart: bool) {
+    let Some(mut h) = Harness::start(b, "codex_metadata_recovery", opts(150, false)).await else {
+        return;
+    };
+    h.seat("cx", "codex").await;
+    let home = h.dir.path().join("state/codex-home");
+    let app = FakeAppServer::start(&home.join("app-server-control/app-server-control.sock"));
+    let sid = "00000000-0000-7000-8000-00000000c0de";
+    let cwd = h.dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let plan = h
+        .node
+        .as_ref()
+        .unwrap()
+        .node
+        .handle(amail_node::wire::Request::Launch {
+            seat: "cx".into(),
+            cwd: cwd.to_string_lossy().into(),
+            pid: std::process::id(),
+            harness: None,
+            extra: vec![],
+            pane: None,
+            mux_session: None,
+            permission_mode: Some(amail_proto::PermissionMode::Unattended),
+            git_access: None,
+            dsh_jail: None,
+        })
+        .await;
+    assert!(plan.get("error").is_none(), "{plan}");
+    let args: Vec<String> = serde_json::from_value(plan["args"].clone()).unwrap();
+    let env = vec![
+        (
+            "CODEX_HOME".to_string(),
+            home.to_string_lossy().into_owned(),
+        ),
+        (
+            "AMAIL_CODEX_PASS".to_string(),
+            plan["env"]["AMAIL_CODEX_PASS"].as_str().unwrap().into(),
+        ),
+    ];
+    let file = home.join("sessions/rollout-recovery.jsonl");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    let head = json!({"type":"session_meta","payload":{"id":sid}}).to_string() + "\n";
+    let event = |kind: &str, id: &str| {
+        json!({"type":"event_msg","timestamp":jiff::Timestamp::now().to_string(),
+            "payload":{"type":kind,"turn_id":id}})
+        .to_string()
+            + "\n"
+    };
+    let started = head.clone()
+        + &event("task_started", "t1")
+        + &event("thread_settings_applied", "t1")
+        + &event("item_completed", "t1");
+    std::fs::write(&file, &started).unwrap();
+    let hook = |name: &str, extra: &[(&str, Value)]| {
+        let mut fields = vec![("session_id", json!(sid)), ("transcript_path", json!(file))];
+        fields.extend(extra.iter().cloned());
+        with(fixture("codex", name), &fields)
+    };
+    let shown = h.api.send(&["cx"], &[], "first work", false).await;
+    h.wait_pending("cx", 1, 0, 0).await;
+    h.hook(
+        "codex",
+        env.clone(),
+        hook(
+            "UserPromptSubmit",
+            &[("prompt", json!(args.last().unwrap()))],
+        ),
+    )
+    .await;
+    assert_eq!(h.state("cx").await, "busy");
+    let command_pair = json!({"type":"response_item", "payload":{"type":"function_call","call_id":"done"}}).to_string()+"\n"
+        +&json!({"type":"response_item", "payload":{"type":"function_call_output","call_id":"done"}}).to_string()+"\n";
+    let late_command = json!({"type":"event_msg", "timestamp":jiff::Timestamp::now().to_string(),
+        "payload":{"type":"item_completed", "thread_id":sid,"turn_id":"t1",
+        "item":{"type":"CommandExecution","id":"done","status":"completed"}}})
+    .to_string()
+        + "\n";
+    let complete = started.clone() + &command_pair + &event("task_complete", "t1") + &late_command;
+    std::fs::write(&file, &complete).unwrap();
+    *app.history_error.lock().unwrap() = Some(json!({
+        "code":-32603,
+        "message":"failed to list thread history: thread-store internal error: failed to read thread metadata: error returned from database: (code: 11) database disk image is malformed"
+    }));
+    *app.thread.lock().unwrap() = json!({
+        "thread":{"id":sid,"status":{"type":"active"},"path":file}
+    });
+    let next = h.api.send(&["cx"], &[], "next current work", false).await;
+    tokio::time::sleep(Duration::from_millis(1450)).await;
+    assert_eq!(
+        h.state("cx").await,
+        "busy",
+        "backend activity must prevent recovery"
+    );
+
+    app.thread.lock().unwrap()["thread"]["status"]["type"] = json!("idle");
+    *app.queue.lock().unwrap() = json!({"data":[{"id":"queued"}],"nextCursor":null});
+    tokio::time::sleep(Duration::from_millis(1450)).await;
+    assert_eq!(
+        h.state("cx").await,
+        "busy",
+        "queued input must prevent recovery"
+    );
+
+    *app.queue.lock().unwrap() = json!({"data":[],"nextCursor":null});
+    std::fs::write(&file, complete.clone() + &event("task_started", "next")).unwrap();
+    tokio::time::sleep(Duration::from_millis(1450)).await;
+    assert_eq!(
+        h.state("cx").await,
+        "busy",
+        "an unfinished successor must prevent recovery"
+    );
+
+    std::fs::write(
+        &file,
+        started.clone() + &event("error", "t1") + &event("task_complete", "t1"),
+    )
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(1450)).await;
+    assert_eq!(
+        h.state("cx").await,
+        "busy",
+        "failed lifecycle must not become success"
+    );
+
+    let terminal_error = json!({"type":"event_msg", "timestamp":jiff::Timestamp::now().to_string(),
+        "payload":{"type":"task_complete", "turn_id":"t1", "error":{
+            "message":"HTTP 400 Invalid model name passed in model=deepseek-flash", "codex_error_info":"other"
+        }}}).to_string()+"\n";
+    std::fs::write(&file, started.clone() + &terminal_error).unwrap();
+    if restart {
+        // A saved live PID and pending mail must not bypass the completion
+        // proof during startup, even when the backend says idle/queue0.
+        h.restart_node().await;
+    }
+    tokio::time::sleep(Duration::from_millis(1450)).await;
+    assert_eq!(h.state("cx").await, "busy");
+    assert!(
+        !h.codex_calls().iter().any(|c| c.starts_with("queue")),
+        "terminal error was retried as normal completion"
+    );
+    assert!(!released(&h, shown, "cx").await);
+    assert!(
+        h.seat_status("cx").await["turn_failed"].is_null(),
+        "must not fabricate failure counts"
+    );
+    if restart {
+        assert_eq!(h.seat_status("cx").await["recovery_unverified"], true);
+        // A late Stop cannot inject pending mail or unlock the wake gate.
+        let stopped = h.hook("codex", env.clone(), hook("Stop", &[])).await;
+        assert!(hook_text(&stopped).is_none());
+        tokio::time::sleep(Duration::from_millis(750)).await;
+        assert_eq!(h.state("cx").await, "busy");
+        assert!(!h.codex_calls().iter().any(|c| c.starts_with("queue")));
+    }
+
+    std::fs::write(&file, complete).unwrap();
+    h.wait("proven normal completion", || async {
+        h.state("cx").await == "idle"
+    })
+    .await;
+    assert!(
+        !released(&h, shown, "cx").await,
+        "shown mail must not be replayed"
+    );
+    assert!(h.seat_status("cx").await["turn_failed"].is_null());
+    h.wait("normal wake of pending work", || async {
+        h.codex_calls().iter().any(|c| c.starts_with("queue"))
+    })
+    .await;
+    let v = h.hook("codex", env, hook("UserPromptSubmit", &[])).await;
+    assert_eq!(injected_ids(&hook_text(&v).unwrap()), vec![next]);
 }
 
 /// Codex hooks report no failed turn: the node asks the app-server how the

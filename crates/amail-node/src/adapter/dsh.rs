@@ -855,6 +855,7 @@ mod tests {
             server_url: "http://127.0.0.1:1".into(),
             claude_bin: "claude".into(),
             codex_bin: "codex".into(),
+            codex_sandbox: None,
             dsh_bin: "dsh".into(),
             dsh_env: BTreeMap::from([("DEEPSEEK_API_KEY".to_string(), "k".to_string())]),
             codex_auth: dir.join("auth.json"),

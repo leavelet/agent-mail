@@ -254,7 +254,15 @@ enum Cmd {
     /// Hook entry point for a harness (`claude`, `codex` or `dsh`). Reads the hook
     /// input on stdin; never fails and never blocks for long.
     #[command(hide = true)]
-    Hook { harness: String },
+    Hook {
+        harness: String,
+        /// Restore the existing Codex node context after checking the real
+        /// backend, socket peers and private state. Never selects a seat.
+        #[arg(long, requires = "node_socket")]
+        node_state_dir: Option<PathBuf>,
+        #[arg(long, requires = "node_state_dir")]
+        node_socket: Option<PathBuf>,
+    },
     /// Run a seat's DeepSeek Harness web host (started by `amail run`).
     #[command(hide = true)]
     DshHost {
@@ -618,6 +626,10 @@ struct NodeArgs {
     claude_bin: String,
     #[arg(long, env = "AMAIL_CODEX_BIN", default_value = "codex")]
     codex_bin: String,
+    /// Native Codex policy instead of amail's workspace/git profiles:
+    /// read-only, workspace-write or danger-full-access.
+    #[arg(long, env = "AMAIL_CODEX_SANDBOX")]
+    codex_sandbox: Option<amail_node::adapter::codex::SandboxMode>,
     /// The DeepSeek Harness launcher.
     #[arg(long, env = "AMAIL_DSH_BIN", default_value = "dsh")]
     dsh_bin: String,
@@ -995,8 +1007,21 @@ fn main() -> ExitCode {
         Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())
     };
     // The hook client runs on every harness hook: no runtime, no failures.
-    if let Cmd::Hook { harness } = &cli.cmd {
-        let out = amail_node::hook_client::run(harness);
+    if let Cmd::Hook {
+        harness,
+        node_state_dir,
+        node_socket,
+    } = &cli.cmd
+    {
+        let context =
+            node_state_dir
+                .as_ref()
+                .zip(node_socket.as_ref())
+                .map(|(state_dir, socket)| amail_node::hook_client::NodeContext {
+                    state_dir: state_dir.clone(),
+                    socket: socket.clone(),
+                });
+        let out = amail_node::hook_client::run_with_context(harness, context.as_ref());
         if !out.is_empty() {
             use std::io::Write;
             let mut stdout = std::io::stdout().lock();
@@ -2345,6 +2370,7 @@ fn node_args(a: &NodeArgs) -> (Vec<String>, Option<String>) {
         label,
         claude_bin,
         codex_bin,
+        codex_sandbox,
         dsh_bin,
         dsh_env_file,
         zellij_bin,
@@ -2369,6 +2395,10 @@ fn node_args(a: &NodeArgs) -> (Vec<String>, Option<String>) {
     opt("--label", label.clone());
     opt("--claude-bin", Some(claude_bin.clone()));
     opt("--codex-bin", Some(codex_bin.clone()));
+    opt(
+        "--codex-sandbox",
+        codex_sandbox.map(|mode| mode.as_str().to_string()),
+    );
     opt("--dsh-bin", Some(dsh_bin.clone()));
     opt("--dsh-env-file", path(dsh_env_file));
     opt("--zellij-bin", Some(zellij_bin.clone()));
@@ -2439,6 +2469,7 @@ async fn node_daemon(a: NodeArgs) -> Result<()> {
     cfg.local_policy = a.local_policy.or(file.local_policy);
     cfg.claude_bin = a.claude_bin;
     cfg.codex_bin = a.codex_bin;
+    cfg.codex_sandbox = a.codex_sandbox;
     cfg.dsh_bin = a.dsh_bin;
     if let Some(f) = &a.dsh_env_file {
         cfg.dsh_env = amail_node::adapter::dsh::read_env_file(f)?;
@@ -2629,6 +2660,40 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
+    #[test]
+    fn hook_node_context_paths_are_explicit_and_paired() {
+        let cli = Cli::try_parse_from([
+            "amail",
+            "hook",
+            "codex",
+            "--node-state-dir",
+            "/node path",
+            "--node-socket",
+            "/socket path/node.sock",
+        ])
+        .unwrap();
+        let Cmd::Hook {
+            harness,
+            node_state_dir,
+            node_socket,
+        } = cli.cmd
+        else {
+            panic!("wrong command")
+        };
+        assert_eq!(harness, "codex");
+        assert_eq!(node_state_dir, Some(PathBuf::from("/node path")));
+        assert_eq!(node_socket, Some(PathBuf::from("/socket path/node.sock")));
+        assert!(
+            Cli::try_parse_from(["amail", "hook", "codex", "--node-state-dir", "/node"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["amail", "hook", "codex", "--node-socket", "/node.sock"]).is_err()
+        );
+        for harness in ["claude", "codex", "dsh"] {
+            assert!(Cli::try_parse_from(["amail", "hook", harness]).is_ok());
+        }
+    }
+
     /// A value for every option of `amail node`.
     const FULL: &[&str] = &[
         "--url=http://127.0.0.1:19511",
@@ -2638,6 +2703,7 @@ mod tests {
         "--label=host one",
         "--claude-bin=/opt/claude/bin/claude",
         "--codex-bin=/opt/codex/codex",
+        "--codex-sandbox=danger-full-access",
         "--dsh-bin=/opt/dsh/node_modules/.bin/dsh",
         "--dsh-env-file=/tmp/amail-test/dsh.env",
         "--zellij-bin=/opt/zellij",

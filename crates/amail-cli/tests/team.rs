@@ -43,6 +43,7 @@ team_tests!(
     max_live_sleeps_least_recently_active,
     start_limit_bounds_cold_starts,
     crash_restart_backoff_and_resume_fallback,
+    resumed_launcher_failure_keeps_history,
     seats_needing_a_person_show_in_ps,
     server_commands_sleep_and_wake,
     session_without_a_turn_starts_fresh,
@@ -722,6 +723,60 @@ fn crash_config(c: &mut amail_node::Config) {
     c.restart_backoff = Duration::from_millis(300);
 }
 
+/// An exit-1 launcher/configuration failure must not create a new identity,
+/// including after automatic retries and a later successful manual wake.
+async fn resumed_launcher_failure_keeps_history(b: Backend) {
+    let Some(h) = setup(
+        b,
+        "resumed_launcher_failure_keeps_history",
+        Some(crash_config),
+    )
+    .await
+    else {
+        return;
+    };
+    let _i = inbox(&h, "s");
+    write_team(
+        &h,
+        "[team]\nworkroot = \"@DIR@/work\"\n[defaults]\nharness = \"claude\"\n[[seat]]\nname = \"s\"\n",
+    );
+    up(&h, &[]).await;
+    wait_state(&h, "s", "idle").await;
+    let sid = launches(&h, "s")[0]
+        .split(' ')
+        .skip_while(|w| *w != "--session-id")
+        .nth(1)
+        .unwrap()
+        .to_string();
+    set_mode(&h, "s", "launchererror");
+    kill9(row(&h, "s").await.pid.unwrap());
+    wait_state(&h, "s", "failed").await;
+    let failed_launches = launches(&h, "s");
+    assert!(failed_launches.len() > 1);
+    for launch in &failed_launches[1..] {
+        assert!(
+            launch.contains(&format!("--resume {sid}")),
+            "{failed_launches:?}"
+        );
+        assert!(
+            !launch.contains("This is a new session"),
+            "{failed_launches:?}"
+        );
+    }
+
+    set_mode(&h, "s", "");
+    let (ok, out) = cli(&h, &["wake", "s"]).await;
+    assert!(ok, "{out}");
+    wait_state(&h, "s", "idle").await;
+    assert!(
+        launches(&h, "s")
+            .last()
+            .unwrap()
+            .contains(&format!("--resume {sid}"))
+    );
+    cli(&h, &["down"]).await;
+}
+
 /// A killed session is restarted and resumed; a failing resume falls back
 /// to a new session that is told its context is gone; repeated crashes
 /// back off and then give up, visibly in `ps`.
@@ -769,6 +824,12 @@ async fn crash_restart_backoff_and_resume_fallback(b: Backend) {
     assert!(l[3].contains("--session-id"), "{l:?}");
     assert!(l[3].contains("This is a new session"), "{l:?}");
     assert!(!l[3].contains("--resume"), "{l:?}");
+    let recovered_sid = l[3]
+        .split(' ')
+        .skip_while(|w| *w != "--session-id")
+        .nth(1)
+        .unwrap()
+        .to_string();
     tokio::time::sleep(Duration::from_millis(1600)).await;
 
     // Crashing every time: backoff, then give up.
@@ -777,6 +838,15 @@ async fn crash_restart_backoff_and_resume_fallback(b: Backend) {
     wait_state(&h, "s", "failed").await;
     let l = launches(&h, "s");
     assert_eq!(l.len(), 7, "{l:?}");
+    // A pre-hook launcher failure is not evidence that the history is
+    // missing. Every retry must still request the saved session.
+    for launch in &l[4..] {
+        assert!(
+            launch.contains(&format!("--resume {recovered_sid}")),
+            "{l:?}"
+        );
+        assert!(!launch.contains("This is a new session"), "{l:?}");
+    }
     let t: Vec<i64> = l[4..]
         .iter()
         .map(|x| x.split(' ').next().unwrap().parse().unwrap())
@@ -803,6 +873,7 @@ async fn crash_restart_backoff_and_resume_fallback(b: Backend) {
     wait_state(&h, "s", "idle").await;
     assert_eq!(row(&h, "s").await.attention, None);
     assert!(h.seat_status("s").await["turn_failed"].is_null());
+    assert!(launches(&h, "s")[7].contains(&format!("--resume {recovered_sid}")));
 
     // Killed during a turn that showed mail: a failed turn. The mail is
     // marked not read again and shown by a turn of the restarted session.
