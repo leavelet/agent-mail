@@ -2,7 +2,7 @@
 
 use amail_proto::{
     DeliveryClass, DeliveryMode, LinkState, Meta, OrgVisibility, Outbound, PermissionMode,
-    PostPolicy, Priority, SeatKind, TokenScope,
+    PostPolicy, Priority, SeatKind, TaskEventKind, TaskPriority, TaskState, TokenScope,
 };
 
 pub use amail_proto::{NewList, NewSeat};
@@ -40,6 +40,12 @@ pub struct Org {
     pub new_threads_per_hour: i64,
     /// A one-time notice for the user.
     pub notice: Option<String>,
+    /// Hours after which a `doing` or `review` task nobody changed is
+    /// reminded (0: never).
+    pub task_stale_hours: i64,
+    /// Bytes of the org's tasks, counted against the storage quota with
+    /// `stored_bytes`.
+    pub task_bytes: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -668,4 +674,268 @@ pub struct RowCounts {
     pub tokens: i64,
     pub revoked_tokens: i64,
     pub web_sessions: i64,
+}
+
+// --- tasks ---------------------------------------------------------------------
+
+/// A task as stored, with the names of its seats, team and parent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRec {
+    pub id: i64,
+    pub org_id: i64,
+    pub num: i64,
+    pub title: String,
+    /// Empty in listings (see [`crate::Store::tasks`]).
+    pub body: String,
+    /// The stored state (never `ready`).
+    pub state: TaskState,
+    pub priority: TaskPriority,
+    pub rank: i64,
+    pub reporter_id: i64,
+    pub reporter: String,
+    pub assignee_id: Option<i64>,
+    pub assignee: Option<String>,
+    pub team_id: Option<i64>,
+    pub team: Option<String>,
+    pub parent_id: Option<i64>,
+    /// The parent's number.
+    pub parent: Option<i64>,
+    pub labels: Vec<String>,
+    pub due: Option<i64>,
+    pub waiting_on_id: Option<i64>,
+    pub waiting_on: Option<String>,
+    pub blocked_reason: Option<String>,
+    /// The discussion thread.
+    pub thread_id: Option<i64>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub closed_at: Option<i64>,
+    /// Events written in all (the last event's seq).
+    pub event_seq: i64,
+    pub events_compacted: i64,
+    /// Numbers of the blockers that are not closed, lowest first.
+    pub waits_on: Vec<i64>,
+}
+
+impl TaskRec {
+    /// Stored `open` and every blocker closed.
+    pub fn ready(&self) -> bool {
+        self.state == TaskState::Open && self.waits_on.is_empty()
+    }
+    /// The state answers show: `ready` for a ready task.
+    pub fn shown_state(&self) -> TaskState {
+        if self.ready() {
+            TaskState::Ready
+        } else {
+            self.state
+        }
+    }
+    /// The seat reminders about the task go to: the assignee, else the
+    /// reporter.
+    pub fn responsible(&self) -> (i64, &str) {
+        match (self.assignee_id, &self.assignee) {
+            (Some(id), Some(n)) => (id, n),
+            _ => (self.reporter_id, &self.reporter),
+        }
+    }
+}
+
+/// A task event as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskEventRec {
+    pub task_id: i64,
+    pub seq: i64,
+    pub at: i64,
+    pub actor: Option<String>,
+    pub written_by: Option<String>,
+    pub kind: TaskEventKind,
+    pub field: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub note: Option<String>,
+    pub message_id: Option<i64>,
+}
+
+/// A link of a thread to a task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskLinkRec {
+    pub thread_id: i64,
+    pub seat: Option<String>,
+    pub created_at: i64,
+}
+
+/// [`crate::Store::task_detail`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskDetailRec {
+    pub task: TaskRec,
+    pub blockers: Vec<TaskRec>,
+    pub blocked: Vec<TaskRec>,
+    pub children: Vec<TaskRec>,
+    pub links: Vec<TaskLinkRec>,
+    /// The newest events, oldest first.
+    pub events: Vec<TaskEventRec>,
+}
+
+/// A new task ([`crate::Store::create_task`]). Seat, team and parent are
+/// checked to be of the org.
+#[derive(Debug, Clone, Default)]
+pub struct NewTaskRec {
+    pub org_id: i64,
+    pub reporter_id: i64,
+    /// The user seat when the user acts in the name of `reporter_id`.
+    pub written_by: Option<String>,
+    pub title: String,
+    pub body: String,
+    pub priority: Option<TaskPriority>,
+    pub assignee_id: Option<i64>,
+    /// `None`: the assignee's team, else the reporter's.
+    pub team_id: Option<i64>,
+    /// The parent's number.
+    pub parent: Option<i64>,
+    pub labels: Vec<String>,
+    pub due: Option<i64>,
+    /// A thread to link.
+    pub link_thread: Option<i64>,
+    /// Refuse ([`crate::StoreError::StorageQuota`]) when the org's stored
+    /// bytes and task bytes would exceed this.
+    pub quota: Option<i64>,
+}
+
+/// Who changes which task ([`crate::Store::change_task`] and the other
+/// task writes).
+#[derive(Debug, Clone, Default)]
+pub struct TaskWrite {
+    pub org_id: i64,
+    pub num: i64,
+    /// The seat recorded as the actor; `None` for the server itself.
+    pub actor_id: Option<i64>,
+    pub written_by: Option<String>,
+    /// See [`NewTaskRec::quota`].
+    pub quota: Option<i64>,
+}
+
+/// Changes of a task's fields: a missing field is unchanged, `Some(None)`
+/// clears it. Seats and teams are ids of the org's.
+#[derive(Debug, Clone, Default)]
+pub struct TaskChange {
+    pub title: Option<String>,
+    pub body: Option<String>,
+    /// A stored state (not `ready`).
+    pub state: Option<TaskState>,
+    pub priority: Option<TaskPriority>,
+    pub rank: Option<i64>,
+    pub assignee_id: Option<Option<i64>>,
+    pub team_id: Option<Option<i64>>,
+    /// The parent's number.
+    pub parent: Option<Option<i64>>,
+    pub labels: Option<Vec<String>>,
+    pub due: Option<Option<i64>>,
+    pub waiting_on_id: Option<Option<i64>>,
+    pub blocked_reason: Option<Option<String>>,
+}
+
+/// What a task write did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskChanged {
+    pub before: TaskRec,
+    /// The task afterwards.
+    pub task: TaskRec,
+    /// The fields whose value changed (`assignee` among them).
+    pub fields: Vec<String>,
+    /// Tasks that became startable by this write: their last open blocker
+    /// closed (or, removing a dependency, the task itself).
+    pub unblocked: Vec<TaskRec>,
+    /// When the task was closed by this write: the unfinished tasks it
+    /// blocks (those in `unblocked` included).
+    pub dependents: Vec<TaskRec>,
+}
+
+/// The listing of [`crate::Store::tasks`].
+#[derive(Debug, Clone, Default)]
+pub struct TaskQuery {
+    pub org_id: i64,
+    /// Shown states (`ready` among them); empty: every state.
+    pub states: Vec<TaskState>,
+    /// `Some(None)`: unassigned tasks.
+    pub assignee_id: Option<Option<i64>>,
+    /// With `assignee_id`: also unassigned tasks of this team.
+    pub pool_team_id: Option<i64>,
+    pub reporter_id: Option<i64>,
+    /// Tasks of the team: `team` set to it, or assignee or reporter one of
+    /// its seats.
+    pub team_id: Option<i64>,
+    pub priority: Option<TaskPriority>,
+    pub label: Option<String>,
+    /// The parent's number.
+    pub parent: Option<i64>,
+    pub due_before: Option<i64>,
+    /// `doing` or `review` and not changed since then.
+    pub stale_before: Option<i64>,
+    /// Only tasks with blockers that are not closed.
+    pub waiting_only: bool,
+    /// Substring of the title or body (case-insensitive for ASCII); looks
+    /// at the newest [`amail_proto::limits::TASK_TEXT_SCAN`] tasks below
+    /// `before`.
+    pub text: Option<String>,
+    /// Number cursor: tasks below it.
+    pub before: Option<i64>,
+    pub limit: i64,
+    pub order: TaskOrder,
+}
+
+/// The order of [`TaskQuery`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TaskOrder {
+    /// Newest (highest number) first; pages continue with `before`.
+    #[default]
+    Newest,
+    /// By shown state (`ready`, `doing`, `review`, `blocked`, `open`,
+    /// closed), then priority, rank and number.
+    Personal,
+    /// By priority, rank and number.
+    Priority,
+    /// Most recently closed first.
+    Closed,
+}
+
+/// A page of [`crate::Store::tasks`].
+#[derive(Debug, Clone, Default)]
+pub struct TaskPage {
+    pub tasks: Vec<TaskRec>,
+    /// Order `Newest`: more may match below this number.
+    pub next_before: Option<i64>,
+    /// The page is full: more tasks may match.
+    pub truncated: bool,
+}
+
+/// One entry of the waiting and owed queries: a task, the seat concerned
+/// and the other task (see [`crate::Store::tasks_waiting`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskWaitRec {
+    pub task: TaskRec,
+    pub seat: Option<String>,
+    pub other: Option<TaskRec>,
+}
+
+/// One seat's load ([`crate::Store::task_board`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SeatLoadRec {
+    pub seat: String,
+    pub doing: i64,
+    pub ready: i64,
+    pub blocked: i64,
+    pub waiting: i64,
+    pub review: i64,
+}
+
+/// [`crate::Store::task_board`].
+#[derive(Debug, Clone, Default)]
+pub struct TaskBoardRec {
+    /// Per shown state: its count and its first tasks.
+    pub columns: Vec<(TaskState, i64, Vec<TaskRec>)>,
+    pub load: Vec<SeatLoadRec>,
+    pub stale: Vec<TaskRec>,
+    pub overdue: Vec<TaskRec>,
+    /// Unfinished tasks with unfinished blockers.
+    pub chains: Vec<TaskRec>,
 }

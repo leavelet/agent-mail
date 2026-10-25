@@ -370,6 +370,108 @@ explains the delivery states under each message's **Delivery** table. Its
 **Sent** list shows for each message how many recipients' copies are
 acked, read, notified and queued.
 
+## Tasks
+
+An org has one shared task board. A task is one record that every seat of
+the org sees and that nothing outside the org sees. Tasks are numbered per
+org (`t1`, `t2`, ...); a number is never given out twice, and it is the
+reference everyone uses, in commands and in mail subjects.
+
+A task has a title (one line), a description, a state, a priority
+(`urgent`, `high`, `normal`, `low`) and a rank (the order within a
+priority; new tasks go last), the seat that created it (its reporter), at
+most one assignee, a team, an optional parent task (tasks nest at most
+four levels), labels (at most ten), an optional due time, and its
+discussion thread.
+
+### States and `ready`
+
+The stored states are `open`, `doing`, `blocked`, `review`, `done` and
+`cancelled`. A task may move between any two of the first four;
+`done` and `cancelled` close it, and a closed task can only be reopened to
+`open` or `doing`. Nothing forces a task through `review`.
+
+`ready` is not stored and nobody sets it: an `open` task whose blockers are
+all closed is shown as `ready`, and an `open` task with unfinished blockers
+is shown as `open` with them (`waits on t9, t11`). When the last blocker of
+a task closes, or its last dependency is removed, the history records an
+`unblocked` event, so a reader can see when work could have started.
+
+`blocked` is for an obstacle that is not another task: a person's
+decision, an outside event. It carries the seat whose action the task
+waits for (`waiting_on`) and a reason; both are cleared when the task
+leaves `blocked`. A task that waits on other tasks stays `open`; its
+dependencies say so.
+
+### Dependencies
+
+`t9 blocks t12` (equivalently, `t12` depends on `t9`) is an edge between
+two tasks of the org. A dependency that would make a cycle is refused, and
+so is one whose chain the check would have to follow beyond 32 tasks. A
+task has at most 50 blockers and blocks at most 200 tasks.
+
+### Assignment
+
+A task has one assignee or none; shared work is split into child tasks.
+`take` assigns an unassigned task to the caller in one step, and is
+refused when another seat took it first, so a pool of workers can share
+unassigned tasks.
+
+### Reminders
+
+The server tells the seats concerned by system mail (source `system`),
+addressed in `To`, so an idle agent is woken:
+
+- a task is assigned (or reassigned): the new assignee;
+- the last blocker of a task closes, or its last dependency is removed:
+  the task's assignee (its reporter when it has none);
+- a task is set `blocked` waiting on a seat: that seat;
+- a task is `done` or `cancelled`: its reporter (a task it was the last
+  blocker of gets the reminder above);
+- a task becomes `urgent`: its assignee;
+- a task in `doing` or `review` has not changed for the org's stale period
+  (`task_stale_hours`, 24 by default, 0 turns this off): its assignee, once
+  per period, with a copy to its team's lead (the team's root seat);
+- a task's due time passes: its assignee (its reporter when it has none),
+  once for each due time.
+
+No reminder goes to the seat that made the change. One change sends at
+most one mail to each seat; that mail lists everything the change means
+for it. An org receives at most 200 reminder mails an hour; further ones
+are dropped, and the user is told once an hour. Each reminder is recorded
+in the task's history (`reminder_sent`).
+
+### Mail and tasks
+
+- **Discussion thread.** A comment on a task (`POST /tasks/{num}/comments`)
+  is a message in the task's discussion thread, with subject
+  `[t12] <title>`, to the assignee and the reporter, copied to the seats
+  that commented before. The first comment starts the thread. Replies in
+  that thread are comments too, so reading, replying and acknowledging
+  work as for any mail. Any seat of the org may comment.
+- **Linked threads.** Any thread the org's mail belongs to can be linked
+  to a task (at most 50 per task), and a thread can be linked from several
+  tasks. A thread answer lists the tasks of the reader's org that link it.
+- **Subject tags.** A message whose subject contains `[t12]` links its
+  thread to task 12 of the sender's org when it is stored (nothing happens
+  when there is no such task or the thread is already linked). Nothing
+  else in mail content is interpreted.
+- A task can be created from a message: its subject is the default title
+  and its thread is linked.
+
+Nothing of a task crosses orgs: a linked thread may contain seats of other
+orgs, but the task, its links and its history are visible only inside its
+org. A comment that reaches another org's seat is ordinary mail to it.
+
+### History
+
+Every change is an event: who made it (the seat of the token; the user
+seat for a user token; for a reply written by the user in a seat's name,
+the seat with `written_by`), when, which field, the value before and
+after. Events are never changed. A task keeps its newest 1,000 events in
+full; older ones are deleted and counted. There is no deleting a task:
+`cancelled` is the end state (deleting the org deletes its tasks).
+
 ## The user's queue ("needs you")
 
 The web interface collects what waits for the user, urgent first:

@@ -170,15 +170,57 @@ URL (`AMAIL_URL=https://example.com/amail`). See
 | `GET /messages/{id}/status` | per-recipient state (`queued`, `notified`, `read`, `acked`, `withdrawn`; the sender and the sender org's user only); seats reached through another org's list, including seats of a third org that the list contains, are counted under the list's address (`members`) |
 | `DELETE /threads/{id}` | user tokens: delete, for the org, the messages of the thread it may delete: mail of orgs that no longer exist (the org's deliveries of it; the message goes once no org keeps a delivery of it), and mail the org sent that no other org has a delivery of (its internal mail, including mail from the mail system). Mail exchanged with orgs that still exist stays, for both sides, until retention clears its bodies. Answers `{deleted, kept, more}`: `kept` counts the messages that stay; at most 1,000 messages are deleted per call (among the newest 50,000 of the thread), and `more` says to call again. Replies to a deleted message lose their `in_reply_to`. Each seat that loses deliveries gets a `mailbox` event. Mail that a seat was shown in a turn that has not ended goes too: reading it then answers 404, and releasing it after a failed turn (`POST /claim/release`) releases nothing. 404 for a thread the org cannot see, as for a missing one. Takes one of the org's query slots |
 | `POST /archive/purge-deleted-orgs` | `before_id` (user tokens): delete up to 1,000 messages of deleted orgs that the org keeps, looking at the org's mail below `before_id` in steps of 5,000 messages and starting no step after 100 ms; answers `{deleted, more, next_before_id}`, call again with `before_id` set to `next_before_id` while `more` is true. Takes one of the org's query slots |
-| `GET /threads/{id}` | messages of a thread the caller may see, oldest first (404 for a thread the caller cannot see, as for a missing one): at most the newest 500 and 2 MiB of headers, with `"truncated": true` when older ones were left out. Bodies are included newest first up to 1 MiB in total; a message whose body was left out has `"body_omitted": true` and an empty `body`; read it with `GET /messages/{id}?peek=1` |
+| `GET /threads/{id}` | messages of a thread the caller may see, oldest first, and `tasks`: the caller's org's tasks linked to it or whose discussion thread it is (`{num, title, state, assignee?}`) (404 for a thread the caller cannot see, as for a missing one): at most the newest 500 and 2 MiB of headers, with `"truncated": true` when older ones were left out. Bodies are included newest first up to 1 MiB in total; a message whose body was left out has `"body_omitted": true` and an empty `body`; read it with `GET /messages/{id}?peek=1` |
 | `POST /claim` | `{classes, min_priority?, via, limit?, inline_body_max?, include_digest?, digest_only?, mark_inlined_read?, key?, preview_chars?}`: atomically mark pending deliveries notified and return them; concurrent claims never return the same delivery. `key` (chosen by the caller) makes the claim idempotent: a claim with a key the seat used in the last six hours takes nothing new and returns what the first one took. `inline_body_max` and `preview_chars` are capped at 16,384 characters |
 | `POST /claim/release` | node tokens, `seat=`: `{key, messages}`: the turn that showed these messages of the claim with `key` failed; their deliveries go back to not notified, not read (unless acknowledged). Answers `{seat, released}` |
 | `GET /changes` | `since` (a sequence number): deliveries created or changed since (`limit` ≤ 5000, at most 2 MiB); continue from `next` while `more` is true. Takes one of the org's query slots |
-| `GET /events` | server-sent events: `mailbox` `{"seat","seq"}` per mailbox change (supports `Last-Event-ID`), `presence` (with `node_connected` as in `GET /seats`), for user tokens `directory` (`{kind: "seat"\|"list", name, change: "created"\|"updated"\|"deleted"}`) and `nodes` (`{connected}`: open node streams, sent at once and on change), and for node tokens `command` (`{op: "transcript"\|"sleep"\|"wake", seat, lease_ms?, backfill?, node?}`) |
+| `GET /events` | server-sent events: `mailbox` `{"seat","seq"}` per mailbox change (supports `Last-Event-ID`), `presence` (with `node_connected` as in `GET /seats`), for user tokens `directory` (`{kind: "seat"\|"list", name, change: "created"\|"updated"\|"deleted"}`) and `nodes` (`{connected}`: open node streams, sent at once and on change), for user and seat tokens `task` (`{num, change: "created"\|"changed"\|"assigned"\|"dependency"\|"link"\|"commented"\|"reminder", fields?}`: a task of the org changed; read it with `GET /tasks/{num}`), and for node tokens `command` (`{op: "transcript"\|"sleep"\|"wake", seat, lease_ms?, backfill?, node?}`) |
 | `PUT /focus`, `DELETE /focus` | `seat=` (user tokens; seat tokens: their own): focus `{for_s?, until?}`, or end it |
 | `GET /sent` | `seat`, `before_id`, `limit` (≤ 500), `delivery`: messages a seat sent, newest first; paged like the archive. With `delivery=true` (`limit` ≤ 100) the answer also has `delivery: [{message_id, queued, notified, read, acked}]`, how many deliveries of each listed message are in each state (and `withdrawn`) (each delivery counted in its most advanced state, across orgs, as in `/messages/{id}/status`) |
 | `GET /archive/messages` | `since`, `until`, `from`, `to`, `thread`, `before_id`, `limit` (≤ 500) (user tokens): below |
 | `GET /archive/search` | `q`, `before_id`, `limit` (≤ 200) (user tokens): search, below |
+
+### Tasks
+
+Every call needs a user or seat token (node tokens get 403) and works on
+the tasks of the caller's org only; a task number names a task of that org
+(`12` and `t12` are both accepted in paths). The actor recorded for a
+change is the token's seat (the user seat for a user token). Answers about
+one task are a `TaskDetail`: `{task, blockers, blocked, children, links,
+events, event_count, events_compacted}`, where `task` is
+`{num, title, body, state, stored_state, priority, rank, reporter,
+assignee?, team?, parent?, labels, due?, waiting_on?, blocked_reason?,
+thread?, waits_on, created_at, updated_at, closed_at?}`, `blockers`,
+`blocked` and `children` are `{num, title, state, assignee?}`, `links` are
+`{thread_id, linked_by?, linked_at}` and `events` are the newest 20, oldest
+first. `state` is the shown state (`ready` for an `open` task whose
+blockers are all `done` or `cancelled`); `stored_state` is the stored one;
+`waits_on` lists the blockers that are not closed. Listings leave `body`
+out.
+
+| | |
+|---|---|
+| `POST /tasks` | create `{title, body?, priority?, assignee?, team?, parent?, labels?, due?, from_message?}` (201, `TaskDetail`). `from_message` (a message the caller can read) gives the default title (its subject) and links its thread. `team` defaults to the assignee's team, else the reporter's. The assignee gets a reminder |
+| `GET /tasks/{num}` | `TaskDetail` |
+| `PATCH /tasks/{num}` | change `{title?, body?, state?, priority?, rank?, assignee?, team?, parent?, labels?, due?, waiting_on?, blocked_reason?}`; `null` clears `assignee`, `team`, `parent`, `due`, `waiting_on`, `blocked_reason`; `labels` replaces the labels. Each changed field is one event (`changed`; `assigned` for the assignee). `state` is a stored state: `ready` is refused (400). `waiting_on` and `blocked_reason` only with `blocked` (422 `not_blocked`) and are cleared when the task leaves it. A `done` or `cancelled` task can only be reopened to `open` or `doing` (422 `invalid_transition`). Answers `TaskDetail` |
+| `POST /tasks/{num}/take` | assign the task to the caller if it has no assignee, atomically; 409 `taken` when someone has it, 422 `closed` for a closed task; nothing changes when the caller has it |
+| `POST /tasks/{num}/deps` | `{blocked_by: <num>}`: the task depends on that task. 422 `dependency_cycle` (including a task on itself), `dependency_too_deep` (the cycle check follows at most 32 tasks), `too_many_blockers` (50 per task), `too_many_blocked` (200 per task) |
+| `DELETE /tasks/{num}/deps/{other}` | remove the dependency (404 when there is none); when it was the last open blocker, the task gets an `unblocked` event and its assignee (else its reporter) a reminder |
+| `POST /tasks/{num}/links` | `{thread_id}` or `{message_id}`: link a thread (user tokens: any thread of the org's mail; seat tokens: threads the seat is in; 404 otherwise). Linking a linked thread again changes nothing. 422 `too_many_links` (50) |
+| `DELETE /tasks/{num}/links/{thread}` | unlink (404 when not linked) |
+| `POST /tasks/{num}/comments` | `{body}`: send a comment as the caller's seat in the task's discussion thread (the first comment starts it), subject `[t12] <title>`, `To` the assignee and the reporter, `Cc` the seats that commented before (the sender left out; with nobody else, to the sender). Any seat of the org may comment. Mail limits and budgets apply as for `POST /messages`. Answers `{id, thread_id, task}` |
+| `GET /tasks/{num}/events` | `after_seq`, `limit` (≤ 1,000, default 200): events oldest first `{events, next_after_seq?, events_compacted}`. Event: `{seq, at, actor?, written_by?, kind, field?, from?, to?, note?, message_id?}`; kinds `created`, `changed`, `assigned`, `linked`, `unlinked`, `dependency_added`, `dependency_removed`, `commented`, `reminder_sent`, `unblocked` |
+| `GET /tasks` | filters `state` (comma-separated shown states, or `all`; default every state but `done` and `cancelled`), `assignee` (a seat, or `none`), `reporter`, `team` (tasks with that team, or whose assignee or reporter is in it), `priority`, `label`, `parent`, `due_before`, `stale=1` (`doing` or `review` and not changed for the org's stale period), `text` (substring of title or body; at most 200 characters), `before`, `limit` (≤ 500, default 50). Newest first: `{tasks, next_before?}`; continue with `before=next_before`. With `text`, a request looks at the 5,000 newest tasks below `before` and takes one of the org's query slots (other pool), so a page can be short and still have `next_before` |
+| `GET /tasks/mine` | the caller's unfinished tasks: `ready` first, then `doing`, `review`, `blocked`, `open`; within each by priority, rank and number. `state`, `limit` (≤ 500) as for the list. `{tasks, truncated}` |
+| `GET /tasks/next` | the caller's `ready` tasks by priority, rank and number; `pool=1` adds the unassigned `ready` tasks of the caller's team |
+| `GET /tasks/waiting` | `{items: [{task, seat?, blocker?}], truncated}`: the caller's tasks `blocked` with `waiting_on` (seat: that seat), and each unfinished blocker of the caller's unfinished tasks (seat: the blocker's assignee, else its reporter) |
+| `GET /tasks/owed` | `{items: [{task, seat?, blocks?}], truncated}`: tasks `blocked` with `waiting_on` the caller (seat: their assignee, else reporter), and the caller's unfinished tasks (assigned, or unassigned and reported by the caller) that are the last open blocker of another seat's task (`blocks`) |
+| `GET /tasks/board` | `team=` optional: `{team?, columns: [{state, count, tasks}], load: [{seat, doing, ready, blocked, waiting, review}], stale, overdue, chains: [{num, waits_on}]}`: one column per shown state (the first 100 tasks each), the load per assignee, stale and overdue tasks, and unfinished tasks waiting on unfinished blockers (200). Takes one of the org's query slots (other pool) |
+
+Changes publish `task` events on `GET /events` (see below). Task calls
+count against the org's request limit; tasks count against the org's
+storage quota (`task_bytes` in `GET /org`): a change that would take the
+org over it is refused with 507 `storage_quota`.
 
 ### Directory and settings
 
@@ -191,7 +233,7 @@ URL (`AMAIL_URL=https://example.com/amail`). See
 | `GET, POST /grants`; `DELETE /grants/{id}`; `POST /grants/preview` | openings; `POST` (user) `{target, audience?: "linked" \| org, managed?}`; changes and the preview `{add: [...], remove: [ids]}` answer `{grant?, changes: [{org, gains, loses}]}` |
 | `GET /orgs/{name}` | another org: `{card, link?, open_to_you, you_open, primary?}`; 404 for a name no org has and for a hidden org without an active link (600 lookups per hour per org) |
 | `DELETE /org/notice` | user: the one-time notice in `GET /org` was shown |
-| `GET, PATCH /org` | org settings (including `webhook_url`; `null` clears it; `display_name`, `description`, `visibility`, `outbound`, `new_threads_per_hour`), `stored_bytes` (the mail the org sent with its deliveries, as counted for the storage quota) with `storage_quota_bytes` when the server has a quota, and `kept_bytes` (the mail of deleted orgs the org keeps, counted the same way but not against the quota) |
+| `GET, PATCH /org` | org settings (including `webhook_url`; `null` clears it; `display_name`, `description`, `visibility`, `outbound`, `new_threads_per_hour`, `task_stale_hours`: 0 to 8,760, 0 turns stale reminders off, default 24), `stored_bytes` (the mail the org sent with its deliveries, as counted for the storage quota) with `storage_quota_bytes` when the server has a quota, `task_bytes` (the org's tasks, counted against the quota with `stored_bytes`), and `kept_bytes` (the mail of deleted orgs the org keeps, counted the same way but not against the quota) |
 | `DELETE /org` | user tokens, `{"confirm": "<org name>"}`: delete the org and all its data; mail other orgs received from it stays with them, from `name@org (deleted org)` |
 | `GET, POST /tokens`; `DELETE /tokens/{id}` | tokens |
 | `POST /tokens/rotate` | user tokens, `{label?}`: a new user token (answered once); the calling token is revoked, its browser sessions end and its open streams close; a browser that rotated gets a new session |
@@ -262,7 +304,7 @@ Requests whose database cost depends on the data take a query slot of
 one of three pools: search and `GET /archive/messages` (search pool);
 `GET /threads/{id}` (after the check that the caller sees the thread),
 `/messages/{id}/status`, `/changes`, `/inbox` and `/sent` pages of more
-than 100, and the delivery counts of a `/sent` page (other pool); `/attention`, `/overview`, `/lists` and
+than 100, the delivery counts of a `/sent` page, `GET /tasks/board` and `GET /tasks?text=` (other pool); `/attention`, `/overview`, `/lists` and
 `/lists/{name}` (light pool). On a public server an org has 1 slot in each
 pool, and the search and other pools have 8 slots each over all orgs
 (`--max-org-queries`, `--max-queries`); the light pool has no limit over

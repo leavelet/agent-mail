@@ -344,11 +344,13 @@ pub async fn thread(
         messages.drain(..messages.len() - keep);
         truncated = true;
     }
+    let tasks = crate::tasks::thread_refs(&st, auth.org.id, id).await;
     Ok(Json(p::ThreadResponse {
         thread_id: id,
         truncated,
         messages,
         participants,
+        tasks,
     }))
 }
 
@@ -601,6 +603,21 @@ pub async fn events(
     } else {
         stream::empty().boxed()
     };
+    // User and seat tokens also get `task` events (a task of the org
+    // changed).
+    let task_events = if matches!(auth.scope, TokenScope::User | TokenScope::Seat) {
+        BroadcastStream::new(st.tasks.subscribe(auth.org.id))
+            .filter_map(|r| {
+                std::future::ready(r.ok().map(|t| {
+                    Event::default()
+                        .event("task")
+                        .data(serde_json::to_string(&t).unwrap_or_default())
+                }))
+            })
+            .boxed()
+    } else {
+        stream::empty().boxed()
+    };
     // Node tokens also get `command` events (sleep, wake, transcript leases);
     // while the stream is open the node counts as connected.
     let commands = if auth.scope == TokenScope::Node {
@@ -624,7 +641,11 @@ pub async fn events(
         .chain(live)
         .map(Some)
         .chain(stream::once(std::future::ready(None)));
-    let others = stream::select(stream::select(presence, commands), user_events).map(Some);
+    let others = stream::select(
+        stream::select(presence, commands),
+        stream::select(user_events, task_events),
+    )
+    .map(Some);
     let stream = stream::select(mailbox, others)
         .take_while(|e| std::future::ready(e.is_some()))
         .filter_map(std::future::ready)

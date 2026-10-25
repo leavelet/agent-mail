@@ -11,6 +11,8 @@
 mod budget;
 #[macro_use]
 mod common;
+#[macro_use]
+mod tasks;
 mod model;
 mod postgres;
 mod sqlite;
@@ -55,6 +57,10 @@ pub enum StoreError {
     /// [`amail_proto::limits::QUERY_TIMEOUT_MS`] and was cancelled.
     #[error("query cancelled: it took too long")]
     Timeout,
+    /// A task write that breaks a rule (a bound, a cycle, a transition):
+    /// a code for the API's error and a message.
+    #[error("{1}")]
+    Refused(&'static str, String),
 }
 
 impl From<sqlx::Error> for StoreError {
@@ -525,4 +531,123 @@ pub trait Store: Send + Sync + 'static {
     async fn rotate_token(&self, org_id: i64, old: i64, new: &NewToken) -> Result<i64>;
     /// Revoke all user tokens of the org and issue one with this hash.
     async fn reset_user_tokens(&self, org_id: i64, hash: &str) -> Result<()>;
+
+    // --- tasks -------------------------------------------------------------------
+    //
+    // Everything is scoped to one org. Writes record their events (one per
+    // changed field), charge the org's `task_bytes` and are refused with
+    // [`StoreError::StorageQuota`] over the quota they are given, and with
+    // [`StoreError::Refused`] when they break a rule (bounds, cycles,
+    // transitions).
+
+    /// Create a task with the next number of the org (and its `created`
+    /// event, `assigned` when it has an assignee, `linked` for
+    /// `link_thread`).
+    async fn create_task(&self, task: &NewTaskRec) -> Result<TaskRec>;
+    /// A task by number, with its body.
+    async fn task(&self, org_id: i64, num: i64) -> Result<Option<TaskRec>>;
+    /// A task with its blockers, the tasks it blocks, its children, its
+    /// links and its newest `events` events.
+    async fn task_detail(
+        &self,
+        org_id: i64,
+        num: i64,
+        events: i64,
+    ) -> Result<Option<TaskDetailRec>>;
+    /// Change fields. A closed task can only be reopened (`open` or
+    /// `doing`); `waiting_on` and `blocked_reason` go with `blocked` and
+    /// are cleared when the task leaves it. Closing a task writes an
+    /// `unblocked` event on each task whose last open blocker it was.
+    async fn change_task(&self, w: &TaskWrite, change: &TaskChange) -> Result<TaskChanged>;
+    /// Assign an unassigned task to the actor, atomically (`taken` when
+    /// someone has it; nothing changes when the actor has it).
+    async fn take_task(&self, w: &TaskWrite) -> Result<TaskChanged>;
+    /// The task depends on task `blocker` (by number). Refused when it
+    /// would make a cycle, when the chain of dependencies the check follows
+    /// is longer than [`amail_proto::limits::MAX_TASK_DEP_DEPTH`], or over
+    /// the fan-out bounds.
+    async fn add_task_dep(&self, w: &TaskWrite, blocker: i64) -> Result<TaskChanged>;
+    /// Remove a dependency; the task gets an `unblocked` event when it was
+    /// its last open blocker.
+    async fn remove_task_dep(&self, w: &TaskWrite, blocker: i64) -> Result<TaskChanged>;
+    /// Link a thread; false when it was linked. With `auto` (a `[tNN]`
+    /// subject) a missing task, the task's own discussion thread and a
+    /// task at its link bound are no error: nothing happens.
+    async fn add_task_link(
+        &self,
+        w: &TaskWrite,
+        thread_id: i64,
+        auto: bool,
+        note: Option<&str>,
+    ) -> Result<bool>;
+    /// Unlink a thread; false when it was not linked.
+    async fn remove_task_link(&self, w: &TaskWrite, thread_id: i64) -> Result<bool>;
+    /// Record a comment (a message in the discussion thread); the first
+    /// makes `thread_id` the task's discussion thread.
+    async fn record_task_comment(
+        &self,
+        w: &TaskWrite,
+        message_id: i64,
+        thread_id: i64,
+    ) -> Result<TaskRec>;
+    /// Record a reminder mail about a task (`reminder_sent`, no actor).
+    async fn record_task_reminder(
+        &self,
+        org_id: i64,
+        task_id: i64,
+        kind: &str,
+        to: &str,
+        message_id: i64,
+    ) -> Result<()>;
+    /// Events after `after_seq`, oldest first, and how many were
+    /// compacted; `None` when there is no such task.
+    async fn task_events(
+        &self,
+        org_id: i64,
+        num: i64,
+        after_seq: i64,
+        limit: i64,
+    ) -> Result<Option<(Vec<TaskEventRec>, i64)>>;
+    /// Tasks by [`TaskQuery`] (without bodies).
+    async fn tasks(&self, q: &TaskQuery) -> Result<TaskPage>;
+    /// The seat's waiting list: its tasks `blocked` with `waiting_on`
+    /// (seat: that seat), and the unfinished blockers of its unfinished
+    /// tasks (seat: the blocker's assignee, else reporter; other: the
+    /// blocker). True when cut at `limit`.
+    async fn tasks_waiting(
+        &self,
+        org_id: i64,
+        seat_id: i64,
+        limit: i64,
+    ) -> Result<(Vec<TaskWaitRec>, bool)>;
+    /// Who waits for the seat: tasks `blocked` with `waiting_on` it (seat:
+    /// their assignee, else reporter), and its unfinished tasks (assigned,
+    /// or unassigned and reported by it) that are the last open blocker of
+    /// another seat's task (other: that task).
+    async fn tasks_owed(
+        &self,
+        org_id: i64,
+        seat_id: i64,
+        limit: i64,
+    ) -> Result<(Vec<TaskWaitRec>, bool)>;
+    /// The board: counts and first tasks per shown state, load per
+    /// assignee, stale (period `stale_hours`; 0: none) and overdue tasks,
+    /// and tasks waiting on unfinished blockers.
+    async fn task_board(
+        &self,
+        org_id: i64,
+        team_id: Option<i64>,
+        stale_hours: i64,
+        now: i64,
+    ) -> Result<TaskBoardRec>;
+    /// Tasks of the org whose discussion thread this is or that link it.
+    async fn thread_tasks(&self, org_id: i64, thread_id: i64) -> Result<Vec<TaskRec>>;
+    /// Unfinished tasks whose due time passed and that were not reminded
+    /// of it, marked reminded (at most `limit`; each once across
+    /// instances).
+    async fn claim_due_tasks(&self, now: i64, limit: i64) -> Result<Vec<TaskRec>>;
+    /// The stale pass of every org that had none for an hour: `doing` and
+    /// `review` tasks not changed and not reminded for the org's stale
+    /// period, marked reminded (at most `limit` per org).
+    async fn claim_stale_tasks(&self, now: i64, limit: i64) -> Result<Vec<TaskRec>>;
 }

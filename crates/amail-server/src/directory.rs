@@ -99,6 +99,14 @@ pub async fn patch_org(
     check(patch.focus_max_min, 1, "focus_max_min")?;
     check(patch.digest_interval_min, 1, "digest_interval_min")?;
     check(patch.new_threads_per_hour, 0, "new_threads_per_hour")?;
+    if let Some(h) = patch.task_stale_hours
+        && !(0..=p::limits::MAX_TASK_STALE_HOURS).contains(&h)
+    {
+        return Err(ApiError::bad_request(format!(
+            "task_stale_hours must be between 0 (off) and {}",
+            p::limits::MAX_TASK_STALE_HOURS
+        )));
+    }
     check_description(inner(&patch.description))?;
     if let Some(Some(d)) = &patch.display_name {
         p::check_paragraph("display_name", d, p::limits::MAX_ORG_DISPLAY_NAME_CHARS)
