@@ -80,6 +80,7 @@ exit code.
 | `amail node status` | the node's view of its seats, its local policy and where that comes from, the program it starts for each harness (and whether it was found), and the names of the variables `--dsh-env-file` sets |
 | `amail node web-token` | a login token for the node's browser terminal |
 | `amail run <seat> [--harness claude\|codex\|dsh] [--permission-mode default\|unattended] [--git-access worktree\|full\|off] [--dsh-jail on\|off] [-- args]` | start the seat's harness session in this terminal. `--permission-mode unattended` runs it without permission prompts; without the flag a seat placed by `amail up` uses its team file's `permission_mode` and any other seat keeps the prompts. The server's seat setting is not used. `--git-access` (Codex seats) sets what the sandbox may write in the git repository (see [harness support](harnesses.md)); without it a seat placed by `amail up` uses its team file's `git_access`, any other seat `worktree` |
+| `amail mcp [--node]` | an MCP server on stdin and stdout with mail and task tools ([below](#mcp-server)) |
 | `amail up [-f amail.toml] [--only g,s] [--no-start] [--prune]` | bring a team up from a team file ([team files](teams.md)) |
 | `amail down [--only g,s]` / `amail ps` | stop the team's sessions / one line per seat: state, zellij pane, pending mail, last activity (ACTIVE: the seat's last hook or launch; after a node restart, the last write to its conversation log until its next hook), and whether a person is needed |
 | `amail attach <group or seat>` / `amail sleep <seat>` / `amail wake <seat>` | attach this terminal to a group's zellij session (for a seat: on the seat's tab) / put a seat to sleep (mail already waiting does not start it again; new mail, `wake` or `up` does) / start it now; on a seat the node believes busy, look again whether its turn ended and say what was found |
@@ -123,6 +124,96 @@ the workspace sandbox.
 
 All `amail admin` commands take `--db` (or `AMAIL_DB`) and work directly on
 the database.
+
+## MCP server
+
+`amail mcp` is an MCP server (stdio, newline-delimited JSON-RPC) in the
+same binary. It offers the mail and task commands as typed tools, so a
+harness can call them without a shell command. The command line stays the
+documented interface: the hooks and the mail instructions name `amail`
+commands, and the MCP server is an addition to them.
+
+Each tool makes the same API calls as the matching command and answers
+the server's JSON (the same JSON as the command with `--json`) as
+structured content, with the command's text rendering as text content. An
+API error is a tool result with `isError: true` whose structured content
+is the server's `{"error": {"code", "message", "status"}}`; a missing or
+malformed argument gives the code `invalid_arguments`. A line that is not
+JSON is skipped without an answer; a request for an unknown method gets a
+JSON-RPC error.
+
+| tool | arguments | command or call |
+|---|---|---|
+| `inbox` | `all?`, `limit?` (50, at most 1,000) | `amail inbox` |
+| `read` | `id`, `peek?` | `amail read` |
+| `send` | `to[]`, `cc[]?`, `subject`, `body`, `priority?` (`normal`, `urgent`), `ack_required?`, `meta?` (string values), `dry_run?` | `amail send` |
+| `reply` | `id`, `body`, `all?`, `priority?`, `ack_required?`, `dry_run?` | `amail reply` |
+| `ack` | `id` | `amail ack` |
+| `thread` | `id` (a thread or any message in it) | `amail thread` |
+| `search` | `text`, `before_id?`, `limit?` (at most 200) | `GET /archive/search`; for a seat token, which that call refuses, the subjects and senders of the newest 1,000 messages of the seat's mailbox (`mode: "inbox_subjects"`) |
+| `who` | `org?`, `text?` | `amail who [--search] [--org]` |
+| `status` | `id?` | without `id`: `GET /whoami`, the seat's record (state as the node reports it, focus) and the unread count; with `id`: `amail status <id>` |
+| `focus` | `state` (`on`, `off`), `minutes?` | `amail focus on [--for]` / `off` |
+| `task_new` | `title`, `body?`, `priority?`, `assignee?`, `team?`, `parent?`, `labels[]?`, `due?`, `from_message?` | `POST /tasks` |
+| `task_show` | `num` | `GET /tasks/{num}` |
+| `task_list` | `state?`, `assignee?`, `reporter?`, `team?`, `priority?`, `label?`, `parent?`, `due_before?`, `stale?`, `text?`, `before?`, `limit?` | `GET /tasks` |
+| `task_mine` | `state?`, `limit?` | `GET /tasks/mine` |
+| `task_next` | `pool?` | `GET /tasks/next` |
+| `task_waiting`, `task_owed` | | `GET /tasks/waiting`, `/owed` |
+| `task_board` | `team?` | `GET /tasks/board` |
+| `task_set` | `num`, `title?`, `body?`, `state?`, `priority?`, `rank?`, `assignee?`, `team?`, `parent?`, `labels[]?`, `due?`, `waiting_on?`, `blocked_reason?` (`null` clears) | `PATCH /tasks/{num}` |
+| `task_take` | `num` | `POST /tasks/{num}/take` |
+| `task_dep`, `task_undep` | `num`, `blocked_by` | `POST /tasks/{num}/deps`, `DELETE …/deps/{other}` |
+| `task_link` | `num`, `thread_id` or `message_id` | `POST /tasks/{num}/links` |
+| `task_unlink` | `num`, `thread_id` | `DELETE /tasks/{num}/links/{thread}` |
+| `task_comment` | `num`, `body` | `POST /tasks/{num}/comments` |
+| `task_history` | `num`, `after_seq?`, `limit?` | `GET /tasks/{num}/events` |
+
+A task number is an integer or a string such as `"t12"`. Tools that only
+read are marked with the `readOnlyHint` annotation.
+
+**Identity.** Without `--node`, the server finds its server URL and token
+as the command line does ([above](#configuration-of-the-command-line)),
+once, when it starts. With `--node`, which is what the node registers for
+the sessions it launches, it uses only a seat's identity, never a saved
+login: for a tool call whose `_meta` has `threadId` (Codex sends it with
+every tool call), the credentials the node holds for that Codex thread,
+asked for with the node's Codex pass (`AMAIL_CODEX_PASS`); otherwise
+`AMAIL_TOKEN` with `AMAIL_URL`. When the server finds no identity it still
+starts, and every tool call answers the code `no_identity`.
+
+**Registration by the node.** Sessions that `amail run` or `amail up`
+starts get the server without any setup (see [harness
+support](harnesses.md)): Claude Code through `--mcp-config <state
+dir>/claude/mcp.json`, Codex through `[mcp_servers.amail]` in the node's
+Codex home. The node rewrites both when it starts; your own harness
+configuration is not changed. dsh seats do not get it.
+
+**Registering it by hand**, for a session you start yourself with
+`AMAIL_TOKEN` and `AMAIL_URL` set, or with a saved login. Claude Code: a
+project `.mcp.json` (or a file given with `claude --mcp-config`):
+
+```json
+{
+  "mcpServers": {
+    "amail": { "type": "stdio", "command": "amail", "args": ["mcp"] }
+  }
+}
+```
+
+Codex, in `config.toml`; Codex passes only a fixed set of variables to MCP
+servers, so name the ones the server needs:
+
+```toml
+[mcp_servers.amail]
+command = "amail"
+args = ["mcp"]
+env_vars = ["AMAIL_URL", "AMAIL_TOKEN", "AMAIL_PROFILE"]
+```
+
+Without `AMAIL_TOKEN`, a server registered this way uses your current
+saved login, which is your user token: register it like this only for
+sessions that may act as you.
 
 ## HTTP API
 

@@ -49,6 +49,17 @@ asks the node for the seat's recipe and starts `claude` with:
 Your own Claude Code settings are not changed. The hooks see the session's
 `AMAIL_SEAT`.
 
+**MCP server.** The launch also passes `--mcp-config <state
+dir>/claude/mcp.json`, a file the node writes that registers `amail mcp
+--node` as the server `amail` ([reference](reference.md#mcp-server)), and
+the `--settings` file allows its tools (`permissions.allow:
+["mcp__amail"]`), so they run without a permission prompt in the `default`
+permission mode too. Claude Code starts the server as a child of the
+session, with the session's environment, so the server acts as the seat of
+the session's `AMAIL_TOKEN`. The file holds no credential and is the same
+for every seat. `amail` commands in the shell keep the session's permission
+mode.
+
 **Wake-up.** The node writes a one-line message to the session's inbox
 socket, which starts a turn; that turn's `UserPromptSubmit` hook injects the
 mail. Claude Code drops identical messages sent within a short time, so the
@@ -98,6 +109,21 @@ an upgrade that added the pass get no mail until the daemon restarts
 (`amail down`, then `amail up`). Only launch flags that
 keep the session on the shared daemon are allowed (`-m`, `-a`, `-s`, `-C`,
 ...; not `-c`, `-p`, `--remote`).
+
+**MCP server.** The home's `config.toml` also has `[mcp_servers.amail]`:
+`amail mcp --node` ([reference](reference.md#mcp-server)), with the node
+socket in `env` and `env_vars = ["AMAIL_CODEX_PASS"]`. The shared daemon
+starts the server for each thread and passes it only the variables Codex
+passes to every MCP server, the configured `env` and the `env_vars` it
+names from the daemon's environment; the pass is therefore not written in
+the file. No variable names the thread. Codex instead sends the thread id
+in the `_meta` of every tool call (`threadId`; in the Codex source, not yet
+observed with codex-cli 0.160), and the server asks the node for the
+credentials of that thread's seat, as `amail` commands do with
+`CODEX_THREAD_ID`. A call without a thread id the node knows answers
+`no_identity`; the server never falls back to a saved login. The entry does
+not change the hook commands, so the hooks' trust hashes stay the same;
+other `mcp_servers` entries in the file are kept.
 
 **Sandbox and permissions.** `unattended` Codex seats (chosen in the team
 file or with `amail run --permission-mode`, as for Claude Code) run with `-a never`
@@ -233,6 +259,10 @@ the GUI or fails, dsh runs no hook, so the wrapper follows the session log
 and reports a `turn/end` that did not complete as the end of the turn.
 Only the session amail created for the seat is connected to mail; other
 sessions a person opens in the same host's GUI are ignored.
+
+**MCP server.** dsh seats do not get the amail MCP server: amail does not
+know of an MCP configuration in dsh's patch overlays. Agents there use the
+`amail` command line.
 
 **Wake-up.** The node logs in to the host with its launch token and queues
 the nudge with `session/prompt` (mode `queue`). On an idle session this
