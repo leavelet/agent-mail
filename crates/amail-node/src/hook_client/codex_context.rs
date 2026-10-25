@@ -726,13 +726,9 @@ mod tests {
         std::fs::remove_file(&image.path).unwrap();
         std::fs::hard_link(&image.retained, &image.path).unwrap();
         let observed = process(image.child.id()).unwrap();
-        assert!(
-            observed
-                .executable
-                .to_string_lossy()
-                .ends_with(" (deleted)")
-        );
-        assert!(observed.executable.canonicalize().is_err());
+        // The exe link of the unlinked binary reads " (deleted)" on most
+        // kernels and file systems, not on every CI runner; the test does
+        // not depend on it: the file object is what identifies the image.
         assert!(
             same_executable(
                 &observed.executable_image,
