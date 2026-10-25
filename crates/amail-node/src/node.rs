@@ -36,7 +36,7 @@ use amail_proto::{
 };
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -97,10 +97,14 @@ pub struct Config {
     pub screen_check_after: Duration,
     pub heartbeat: Duration,
     pub liveness_interval: Duration,
-    /// Total time of the server calls one hook waits for (claims, inbox).
-    /// Must stay well below the hook client's wait (300 ms), which is well
-    /// below the harness's hook timeout (3-5 s); see [`crate::hook_client`].
+    /// The least total time of the server calls one hook waits for
+    /// (claims, inbox). The budget grows with the latency the node measures,
+    /// up to `hook_budget_max` (see `Node::hook_budget`); both stay well
+    /// below the hook client's wait (2 s), which is well below the
+    /// harness's hook timeout (3-5 s); see [`crate::hook_client`].
     pub hook_server_timeout: Duration,
+    /// The most a hook waits for the server, however slow it measures.
+    pub hook_budget_max: Duration,
     /// The zellij binary, and the size of the headless client that keeps
     /// panes wide while nobody is attached (see [`crate::mux`]).
     pub zellij_bin: String,
@@ -194,6 +198,7 @@ impl Config {
             heartbeat: Duration::from_secs(30),
             liveness_interval: Duration::from_secs(2),
             hook_server_timeout: crate::server::HOOK_SERVER_TIMEOUT,
+            hook_budget_max: Duration::from_millis(1500),
             zellij_bin: "zellij".into(),
             pane_cols: 200,
             pane_rows: 60,
@@ -229,6 +234,14 @@ const DIGEST_LIMIT: u32 = 100;
 /// An answer that would reach the hook client less than this before its
 /// deadline is kept for the next hook instead of being sent.
 const LATE_MARGIN: Duration = Duration::from_millis(30);
+
+/// Hooks that asked the server for mail are counted over this window, with
+/// whether they got their answer in time; see `Node::hook_budget`.
+const HOOK_WINDOW: Duration = Duration::from_secs(600);
+/// A slow-server notice needs this many misses in the window (and at least
+/// 30% of the hooks), and is repeated at most once per `SLOW_NOTICE_EVERY`.
+const SLOW_NOTICE_MISSES: usize = 5;
+const SLOW_NOTICE_EVERY: Duration = Duration::from_secs(3600);
 
 #[derive(Debug, Clone, Default)]
 struct SessionRt {
@@ -385,6 +398,11 @@ struct State {
     turn_notices: Vec<amail_proto::NodeNotice>,
     /// [`Config::turn_fail_limit`].
     turn_fail_limit: u32,
+    /// Hooks that asked the server for mail in the last [`HOOK_WINDOW`]:
+    /// when, and whether the answer came too late for the hook.
+    hooks: VecDeque<(Instant, bool)>,
+    /// When the user was last told that hooks miss the server.
+    slow_notice_at: Option<Instant>,
 }
 
 impl Default for State {
@@ -405,7 +423,35 @@ impl Default for State {
             prior_state: false,
             turn_notices: Vec::new(),
             turn_fail_limit: 3,
+            hooks: VecDeque::new(),
+            slow_notice_at: None,
         }
+    }
+}
+
+impl State {
+    /// A hook asked the server for mail; `missed`: its answer came too
+    /// late for the hook (the mail is kept for the next one).
+    fn note_hook(&mut self, now: Instant, missed: bool) {
+        self.hooks.push_back((now, missed));
+        while self
+            .hooks
+            .front()
+            .is_some_and(|(t, _)| now.duration_since(*t) > HOOK_WINDOW)
+        {
+            self.hooks.pop_front();
+        }
+    }
+
+    /// Hooks in the window that asked the server, and how many missed.
+    fn hook_stats(&self, now: Instant) -> (usize, usize) {
+        let recent = self
+            .hooks
+            .iter()
+            .filter(|(t, _)| now.duration_since(*t) <= HOOK_WINDOW);
+        let hooks = recent.clone().count();
+        let misses = recent.filter(|(_, m)| *m).count();
+        (hooks, misses)
     }
 }
 
@@ -1337,6 +1383,22 @@ impl Node {
     // --- hooks ----------------------------------------------------------------
 
     /// Handle one hook; returns its stdout.
+    /// How long one hook's server calls may take in total: twice the
+    /// slowest answer measured in the last [`crate::server::LATENCY_WINDOW`]
+    /// plus a little, at least `hook_server_timeout`, at most
+    /// `hook_budget_max`. A hook that waits longer than this would slow the
+    /// agent down; one that waits less than the server takes shows mail one
+    /// hook late (the claim is retried and kept). Only hooks with mail to
+    /// fetch pay this: without pending mail no server call is made.
+    fn hook_budget(&self) -> Duration {
+        let floor = self.cfg.hook_server_timeout;
+        let cap = self.cfg.hook_budget_max.max(floor);
+        match self.server.latency().max {
+            Some(slowest) => (slowest * 2 + Duration::from_millis(50)).clamp(floor, cap),
+            None => floor,
+        }
+    }
+
     pub async fn hook(&self, harness: &str, env: &BTreeMap<String, String>, input: &str) -> String {
         self.hook_outcome(harness, env, input, None).await.stdout
     }
@@ -1371,7 +1433,7 @@ impl Node {
             let (a, s) = (adapter.clone(), seat.clone());
             tokio::spawn(async move { a.registered(&sid, &s).await });
         }
-        let own = Instant::now() + self.cfg.hook_server_timeout;
+        let own = Instant::now() + self.hook_budget();
         let deadline = deadline.map_or(own, |d| d.min(own));
         let (out, shown) = self
             .run_hook(&*adapter, env, &hook, &seat, registered, deadline)
@@ -1726,10 +1788,15 @@ impl Node {
         if plan.digest {
             calls.push(spec(&[To, Cc, List], false, true));
         }
+        let made_calls = !calls.is_empty() || plan.summary;
+        // A server answer that came after the deadline: the mail is shown
+        // one hook late.
+        let mut timed_out = false;
         let mut keyed: Vec<(String, Vec<InboxEntry>)> = Vec::new();
         for spec in calls {
             let key = claim_key();
-            let call = self.server.claim(seat, &spec, &key, None);
+            let left = deadline.saturating_duration_since(Instant::now());
+            let call = self.server.claim(seat, &spec, &key, Some(left));
             let err = match tokio::time::timeout_at(deadline.into(), call).await {
                 Ok(Ok(r)) => {
                     keyed.push((key.clone(), r.entries.clone()));
@@ -1741,8 +1808,14 @@ impl Node {
                     }
                     continue;
                 }
-                Ok(Err(e)) => e,
-                Err(_) => anyhow::anyhow!("hook deadline passed"),
+                Ok(Err(e)) => {
+                    timed_out |= Instant::now() >= deadline;
+                    e
+                }
+                Err(_) => {
+                    timed_out = true;
+                    anyhow::anyhow!("hook deadline passed")
+                }
             };
             tracing::debug!("claim for {seat}: {err:#}");
             failed = true;
@@ -1753,7 +1826,8 @@ impl Node {
             }
         }
         let summary = if plan.summary && !failed {
-            let call = self.server.unread(seat, SUMMARY_LIMIT);
+            let left = deadline.saturating_duration_since(Instant::now());
+            let call = self.server.unread(seat, SUMMARY_LIMIT, left);
             match tokio::time::timeout_at(deadline.into(), call).await {
                 Ok(Ok(r)) => {
                     let seen: HashSet<i64> = claimed.iter().map(|e| e.message.id).collect();
@@ -1770,7 +1844,10 @@ impl Node {
                         })
                         .collect()
                 }
-                _ => Vec::new(),
+                _ => {
+                    timed_out |= Instant::now() >= deadline;
+                    Vec::new()
+                }
             }
         } else {
             Vec::new()
@@ -1781,6 +1858,9 @@ impl Node {
             let mut st = self.lock();
             for (key, entries) in &keyed {
                 st.note_claimed(seat, key, entries);
+            }
+            if made_calls {
+                st.note_hook(Instant::now(), timed_out);
             }
             if claimed.len() > stashed || !digest.is_empty() {
                 let s = st.seat(seat);
@@ -2123,8 +2203,12 @@ impl Node {
             })
         })
         .collect();
+        let latency = self.server.latency();
+        let budget = self.hook_budget();
         let st = self.lock();
         let now = Instant::now();
+        let (hooks, misses) = st.hook_stats(now);
+        let ms = |d: Duration| d.as_millis() as u64;
         let mut seats: Vec<Value> = st
             .seats
             .iter()
@@ -2161,6 +2245,17 @@ impl Node {
             "connected": st.connected,
             "server": self.cfg.url,
             "uptime_s": self.started.elapsed().as_secs(),
+            // Round trips to the server lately, the time a hook now waits
+            // for it, and the hooks of the last 10 minutes that asked the
+            // server for mail, with how many got no answer in time.
+            "latency": {
+                "rtt_ms": latency.last.map(ms),
+                "rtt_max_ms": latency.max.map(ms),
+                "samples": latency.samples,
+                "hook_budget_ms": ms(budget),
+                "hooks_10m": hooks,
+                "hook_misses_10m": misses,
+            },
             // Registrations of sessions that are running now (others are
             // kept only so a sleeping or stopped seat can resume).
             "registered_sessions": st

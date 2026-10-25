@@ -2,16 +2,18 @@
 //!
 //! It forwards stdin and a few environment variables to the node and prints
 //! the node's answer. It never fails: if the node is not running, is slow
-//! (default budget 300 ms, `AMAIL_HOOK_TIMEOUT_MS`), or answers something
+//! (default wait 2 s, `AMAIL_HOOK_TIMEOUT_MS`), or answers something
 //! unexpected, it prints nothing and exits 0, so a hook can never block or
 //! break the agent. All decisions are made in the node.
 //!
 //! Plain blocking std I/O, no async runtime: this runs on the hook hot path.
 //!
 //! Timeouts, from inner to outer, each clearly below the next:
-//! - the node's server calls for one hook: 150 ms in total
-//!   ([`crate::server::HOOK_SERVER_TIMEOUT`], also capped by our budget);
-//! - this client's wait for the node: 300 ms ([`DEFAULT_TIMEOUT`]); it sends
+//! - the node's server calls for one hook: the node's hook budget, from
+//!   150 ms ([`crate::server::HOOK_SERVER_TIMEOUT`]) up to 1.5 s by default,
+//!   following the latency the node measures (`Node::hook_budget`); also
+//!   capped by our remaining budget;
+//! - this client's wait for the node: 2 s ([`DEFAULT_TIMEOUT`]); it sends
 //!   the node its remaining budget, and the node keeps (rather than sends) an
 //!   answer it cannot deliver in time;
 //! - the harness's own hook timeout: 5 s (3 s for Codex `SessionEnd` and
@@ -25,7 +27,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 pub const TIMEOUT_ENV: &str = "AMAIL_HOOK_TIMEOUT_MS";
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(300);
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_millis(2000);
 /// Hook inputs larger than this are not forwarded.
 const MAX_INPUT: u64 = 32 << 20;
 

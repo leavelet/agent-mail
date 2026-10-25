@@ -152,6 +152,15 @@ The first public version.
   node state) is applied again when the session is resumed or woken.
 - `POST /messages/{id}/deliveries/{seat}/cancel` is accepted as an alias of
   `…/withdraw`.
+- The time a hook waits for the mail server follows the measured latency
+  (twice the slowest answer of the last five minutes, between 150 ms and
+  1.5 s; `hook_budget_max` in the node configuration) instead of a fixed
+  150 ms, and the hook client waits up to 2 s for the node instead of
+  300 ms. With a server reached over a slow network every hook used to miss
+  its budget, so mail arrived one hook late every time. `amail node status`
+  shows the round trips, the budget and the hooks of the last ten minutes
+  that missed it; when five or more (and 30%) missed, the user gets a
+  system mail once an hour.
 
 
 - `amail node`: a per-host daemon that injects mail into running Claude

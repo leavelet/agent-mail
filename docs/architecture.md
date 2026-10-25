@@ -58,7 +58,7 @@ person are refused to sessions (see
 **Hook client (`amail hook <harness>`).** The command the harnesses run on
 their hook events. It forwards the hook's input to the node over the Unix
 socket and prints the node's answer. It never fails the harness: if the node
-is down or slow (300 ms, `AMAIL_HOOK_TIMEOUT_MS`), it prints nothing.
+is down or slow (2 s, `AMAIL_HOOK_TIMEOUT_MS`), it prints nothing.
 
 **Adapters.** One per harness, inside the node: how to launch or resume a
 session (flags, settings, system prompt with the mail instructions and the
@@ -130,8 +130,23 @@ resumes them when mail arrives. See [team files](teams.md).
    `read` or `acked`, which the sender can see.
 
 Timeouts nest so that nothing blocks a harness: the node's server calls for
-one hook take at most 150 ms in total, the hook client waits 300 ms, and
-the harnesses allow their hooks several seconds.
+one hook take at most the hook budget in total, the hook client waits 2 s,
+and the harnesses allow their hooks several seconds.
+
+The hook budget follows the server's measured latency: twice the slowest
+answer of the last five minutes plus 50 ms, at least 150 ms and at most
+1.5 s (`hook_server_timeout` and `hook_budget_max` in the node's
+configuration). A fixed short budget made every hook miss a server reached
+over a slow network, and mail then arrived one hook late every time; a long
+fixed budget would slow every tool call of an agent with mail waiting. Only
+hooks with mail to fetch spend the budget: the node's pending counts say
+when there is none, and no server call is made. A claim whose answer misses
+the budget is retried in the background with the same key, and what it took
+is kept for the next hook. `amail node status` shows the measured round
+trips, the budget, and the hooks of the last ten minutes that asked the
+server with how many missed; when at least five hooks (and 30% of them) in
+ten minutes missed, the node tells the user by system mail, at most once an
+hour.
 
 ## What is guaranteed
 

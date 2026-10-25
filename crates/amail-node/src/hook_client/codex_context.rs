@@ -770,12 +770,9 @@ mod tests {
         std::fs::remove_file(&image.path).unwrap();
         std::fs::copy(&image.retained, &image.path).unwrap();
         let observed = process(image.child.id()).unwrap();
-        assert!(
-            observed
-                .executable
-                .to_string_lossy()
-                .ends_with(" (deleted)")
-        );
+        // Whether the exe link of the replaced binary says " (deleted)"
+        // depends on the kernel and file system (it does not on the CI
+        // runner); the check that matters is the one on the file objects.
         assert!(
             !same_executable(
                 &observed.executable_image,

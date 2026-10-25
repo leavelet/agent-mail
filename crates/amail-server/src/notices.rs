@@ -303,6 +303,30 @@ fn render(n: &NodeNotice, host: &str, seats: &HashSet<String>) -> Section {
                 ),
             }
         }
+        NodeNotice::SlowServer {
+            hooks,
+            misses,
+            rtt_ms,
+            budget_ms,
+            window_min,
+        } => Section {
+            subject: format!("Hooks on host {host} do not get mail in time"),
+            intro: format!(
+                "In the last {window_min} minutes, {misses} of the {hooks} hooks on host \
+                 {host} that asked this server for mail got no answer within their budget \
+                 of {budget_ms} ms. The slowest answer the node measured in that time took \
+                 {rtt_ms} ms. No mail is lost: the node keeps what such a claim took and \
+                 shows it with the seat's next hook, so mail reaches the agents one hook \
+                 late."
+            ),
+            items: Vec::new(),
+            outro: "The budget follows the measured latency (twice the slowest recent answer, \
+                    between the node's floor and its cap, 1.5 s by default). If this repeats, \
+                    the server is slow for that host: check the network path, the server's \
+                    database and its load (amail admin stats), or run a server closer to the \
+                    host.\n"
+                .into(),
+        },
     }
 }
 
@@ -417,6 +441,22 @@ fn check(report: &NodeNotices) -> ApiResult<()> {
                 crate::directory::check_text("harness", harness.as_deref(), 32)?;
                 // Cut when shown; refuse only what is far too long.
                 crate::directory::check_text("error", Some(error), 4000)?;
+            }
+            NodeNotice::SlowServer {
+                hooks,
+                misses,
+                rtt_ms,
+                budget_ms,
+                window_min,
+            } => {
+                if *misses > *hooks
+                    || *hooks > 1_000_000
+                    || *rtt_ms > 3_600_000
+                    || *budget_ms > 600_000
+                    || !(1..=1440).contains(window_min)
+                {
+                    return Err(ApiError::bad_request("slow-server notice out of range"));
+                }
             }
         }
     }

@@ -47,6 +47,8 @@ node_tests!(
     focus_holds_mail,
     digest_at_natural_points,
     lost_claim_answer_is_recovered,
+    hook_budget_follows_server_latency,
+    slow_server_is_reported_once,
     socket_checks_callers,
     transcript_paths_are_checked,
     open_policy_serves_sessions_and_reports_them,
@@ -1587,6 +1589,120 @@ async fn digest_at_natural_points(b: Backend) {
     // Digest mail stays unread (it was only summarized).
     let st = h.api.get(&format!("/messages/{d3}/status")).await;
     assert_eq!(st["recipients"][0]["state"], "notified");
+}
+
+/// The time a hook waits for the server follows the measured latency: a
+/// claim whose answer misses the floor budget is kept for the next hook,
+/// and once the retry has measured the slow answer, the next hook waits
+/// long enough to show mail at once.
+async fn hook_budget_follows_server_latency(b: Backend) {
+    let opts = Opts {
+        slow_claims: Some((1000, Duration::from_millis(600))),
+        // The production floor (the test harness raises it elsewhere).
+        tweak: Some(|c| c.hook_server_timeout = amail_node::server::HOOK_SERVER_TIMEOUT),
+        ..Default::default()
+    };
+    let Some(h) = setup(b, "hook_budget_follows_server_latency", opts).await else {
+        return;
+    };
+    h.seat("w1", "claude").await;
+    let inbox = FakeInbox::start(h.dir.path().join("cc.sock"), None);
+    let env = claude_env("w1", &inbox.path);
+    h.hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    let m1 = h.api.send(&["w1"], &[], "slow one", false).await;
+    h.wait_pending("w1", 1, 0, 0).await;
+    // Nothing measured yet: the floor budget (150 ms) misses the 600 ms
+    // answer, and the hook shows nothing.
+    assert_eq!(
+        h.hook("claude", env.clone(), claude("PostToolUse")).await,
+        Value::Null
+    );
+    let st = h.status().await;
+    assert_eq!(st["latency"]["hooks_10m"], 1, "{st}");
+    assert_eq!(st["latency"]["hook_misses_10m"], 1, "{st}");
+    // The retry of that claim measures the slow answer; the budget grows to
+    // twice the slowest answer (capped at 1.5 s).
+    h.wait("budget", || async {
+        h.status().await["latency"]["hook_budget_ms"]
+            .as_u64()
+            .is_some_and(|b| (1000..=1500).contains(&b))
+    })
+    .await;
+    h.wait_pending("w1", 0, 0, 0).await;
+    let m2 = h.api.send(&["w1"], &[], "slow two", false).await;
+    h.wait_pending("w1", 1, 0, 0).await;
+    // The next hook waits for the slow claim: both the kept message and the
+    // new one are shown.
+    let v = h.hook("claude", env.clone(), claude("PostToolUse")).await;
+    assert_eq!(injected_ids(&hook_text(&v).unwrap()), vec![m1, m2]);
+    let st = h.status().await;
+    assert_eq!(st["latency"]["hooks_10m"], 2, "{st}");
+    assert_eq!(st["latency"]["hook_misses_10m"], 1, "{st}");
+}
+
+/// A server slower than the budget's cap makes every hook miss; after five
+/// misses the user is told once, by system mail.
+async fn slow_server_is_reported_once(b: Backend) {
+    let opts = Opts {
+        slow_claims: Some((1000, Duration::from_millis(1200))),
+        notices: true,
+        tweak: Some(|c| {
+            c.hook_server_timeout = amail_node::server::HOOK_SERVER_TIMEOUT;
+            c.hook_budget_max = Duration::from_millis(400);
+        }),
+        ..Default::default()
+    };
+    let Some(h) = setup(b, "slow_server_is_reported_once", opts).await else {
+        return;
+    };
+    h.seat("w1", "claude").await;
+    let inbox = FakeInbox::start(h.dir.path().join("cc.sock"), None);
+    let env = claude_env("w1", &inbox.path);
+    h.hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    for i in 0..5 {
+        // Each hook claims the new message, misses the budget (the answer
+        // takes 1.2 s) and shows what the previous retry kept.
+        h.api.send(&["w1"], &[], &format!("late {i}"), false).await;
+        h.wait_pending("w1", 1, 0, 0).await;
+        h.hook("claude", env.clone(), claude("PostToolUse")).await;
+        h.wait("miss counted", || async {
+            h.status().await["latency"]["hook_misses_10m"] == json!(i + 1)
+        })
+        .await;
+    }
+    h.wait("notice", || async {
+        system_mail(&h)
+            .await
+            .iter()
+            .any(|(s, _)| s.starts_with("Hooks on host"))
+    })
+    .await;
+    let mail = system_mail(&h).await;
+    let notices: Vec<_> = mail
+        .iter()
+        .filter(|(s, _)| s.starts_with("Hooks on host"))
+        .collect();
+    assert_eq!(notices.len(), 1, "{mail:?}");
+    assert!(
+        notices[0].1.contains("5 of the 5 hooks") && notices[0].1.contains("400 ms"),
+        "{}",
+        notices[0].1
+    );
+    // More misses within the hour add no second notice.
+    h.api.send(&["w1"], &[], "late 5", false).await;
+    h.wait_pending("w1", 1, 0, 0).await;
+    h.hook("claude", env.clone(), claude("PostToolUse")).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        system_mail(&h)
+            .await
+            .iter()
+            .filter(|(s, _)| s.starts_with("Hooks on host"))
+            .count(),
+        1
+    );
 }
 
 /// A claim whose answer never reaches the node (it times out) is retried

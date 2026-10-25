@@ -250,6 +250,33 @@ impl Node {
 
     /// Send what is due; keep it for the next try if the server does not
     /// take it.
+    /// Tell the user when hooks keep missing their budget for the server
+    /// (see `Node::hook_budget`): at least [`SLOW_NOTICE_MISSES`] misses
+    /// and 30% of the hooks in the window, once per [`SLOW_NOTICE_EVERY`].
+    fn slow_server_notice(&self, st: &mut State, now: Instant) -> Option<NodeNotice> {
+        let (hooks, misses) = st.hook_stats(now);
+        if misses < SLOW_NOTICE_MISSES
+            || misses * 10 < hooks * 3
+            || st
+                .slow_notice_at
+                .is_some_and(|t| now < t + SLOW_NOTICE_EVERY)
+        {
+            return None;
+        }
+        st.slow_notice_at = Some(now);
+        Some(NodeNotice::SlowServer {
+            hooks: hooks as u32,
+            misses: misses as u32,
+            rtt_ms: self
+                .server
+                .latency()
+                .max
+                .map_or(0, |d| d.as_millis() as u64),
+            budget_ms: self.hook_budget().as_millis() as u64,
+            window_min: (HOOK_WINDOW.as_secs() / 60) as u32,
+        })
+    }
+
     pub(super) async fn send_notices(&self) {
         if !self.lock().connected {
             // Kept until the server is reachable again.
@@ -282,6 +309,11 @@ impl Node {
                 .min(MAX_NODE_NOTICES.saturating_sub(notices.len()));
             let turn_notices: Vec<NodeNotice> = st.turn_notices.drain(..n).collect();
             notices.extend(turn_notices.iter().cloned());
+            if notices.len() < MAX_NODE_NOTICES
+                && let Some(n) = self.slow_server_notice(&mut st, now)
+            {
+                notices.push(n);
+            }
             let mut sessions = Vec::new();
             for (key, p) in st.notices.iter_mut() {
                 if notices.len() >= MAX_NODE_NOTICES {

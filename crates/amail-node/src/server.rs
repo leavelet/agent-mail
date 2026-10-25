@@ -7,11 +7,53 @@ use amail_proto::{
 };
 use anyhow::{Context, Result, bail};
 use futures::StreamExt;
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
-/// Total time the node spends on server calls for one hook; well below the
-/// hook client's 300 ms wait (see [`crate::hook_client`]).
+/// The least total time the node spends on server calls for one hook. The
+/// budget grows with the latency the node measures (see `Node::hook_budget`),
+/// and stays well below the hook client's wait (see [`crate::hook_client`]).
 pub const HOOK_SERVER_TIMEOUT: Duration = Duration::from_millis(150);
+
+/// How long a measured round trip counts for the hook budget.
+pub const LATENCY_WINDOW: Duration = Duration::from_secs(300);
+
+/// Round trips of answered requests, kept for [`LATENCY_WINDOW`].
+#[derive(Default)]
+struct Latency {
+    samples: VecDeque<(Instant, Duration)>,
+}
+
+impl Latency {
+    fn record(&mut self, now: Instant, took: Duration) {
+        self.samples.push_back((now, took));
+        self.trim(now);
+        // Bound memory under a flood of requests.
+        while self.samples.len() > 4096 {
+            self.samples.pop_front();
+        }
+    }
+
+    fn trim(&mut self, now: Instant) {
+        while self
+            .samples
+            .front()
+            .is_some_and(|(t, _)| now.duration_since(*t) > LATENCY_WINDOW)
+        {
+            self.samples.pop_front();
+        }
+    }
+}
+
+/// What the node measured about the server's answers lately.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LatencyStats {
+    /// The slowest answered request in the window.
+    pub max: Option<Duration>,
+    /// The most recent one.
+    pub last: Option<Duration>,
+    pub samples: usize,
+}
 
 /// An HTTP error answer from the server.
 #[derive(Debug)]
@@ -63,8 +105,10 @@ pub struct ServerClient {
     /// waits until that body ends; behind the event stream, whose body does
     /// not end, it would wait until its timeout.
     stream_http: reqwest::Client,
-    /// Timeout of requests made while a hook waits.
+    /// Timeout of requests made while a hook waits, when the caller gives
+    /// none.
     fast: Duration,
+    latency: std::sync::Arc<std::sync::Mutex<Latency>>,
 }
 
 /// How long the event stream's request waits for the answer's head.
@@ -128,7 +172,19 @@ impl ServerClient {
             http: client()?,
             stream_http: client()?,
             fast,
+            latency: Default::default(),
         })
+    }
+
+    /// Round trips of the requests the server answered lately.
+    pub fn latency(&self) -> LatencyStats {
+        let mut l = self.latency.lock().unwrap();
+        l.trim(Instant::now());
+        LatencyStats {
+            max: l.samples.iter().map(|(_, d)| *d).max(),
+            last: l.samples.back().map(|(_, d)| *d),
+            samples: l.samples.len(),
+        }
     }
 
     pub fn base(&self) -> &str {
@@ -141,7 +197,25 @@ impl ServerClient {
             .bearer_auth(&self.token)
     }
 
-    async fn json<T: serde::de::DeserializeOwned>(rb: reqwest::RequestBuilder) -> Result<T> {
+    /// Send and decode; an answered request (success or an HTTP error) is a
+    /// measured round trip.
+    async fn json<T: serde::de::DeserializeOwned>(&self, rb: reqwest::RequestBuilder) -> Result<T> {
+        let started = Instant::now();
+        let r = Self::json_inner(rb).await;
+        if r.is_ok()
+            || r.as_ref()
+                .err()
+                .is_some_and(|e| e.downcast_ref::<HttpError>().is_some())
+        {
+            self.latency
+                .lock()
+                .unwrap()
+                .record(Instant::now(), started.elapsed());
+        }
+        r
+    }
+
+    async fn json_inner<T: serde::de::DeserializeOwned>(rb: reqwest::RequestBuilder) -> Result<T> {
         let resp = rb.send().await?;
         let status = resp.status();
         if !status.is_success() {
@@ -157,7 +231,7 @@ impl ServerClient {
             Some(s) => format!("/pending?seat={}", enc(s)),
             None => "/pending".into(),
         };
-        Self::json(
+        self.json(
             self.req(reqwest::Method::GET, &path)
                 .timeout(Duration::from_secs(10)),
         )
@@ -189,7 +263,7 @@ impl ServerClient {
             key: Some(key.to_string()),
             preview_chars: spec.digest.then_some(crate::inject::PREVIEW_CHARS),
         };
-        Self::json(
+        self.json(
             self.req(reqwest::Method::POST, &format!("/claim?seat={}", enc(seat)))
                 .timeout(timeout.unwrap_or(self.fast))
                 .json(&body),
@@ -209,7 +283,7 @@ impl ServerClient {
             key: key.to_string(),
             messages: messages.to_vec(),
         };
-        Self::json(
+        self.json(
             self.req(
                 reqwest::Method::POST,
                 &format!("/claim/release?seat={}", enc(seat)),
@@ -220,13 +294,13 @@ impl ServerClient {
         .await
     }
 
-    pub async fn unread(&self, seat: &str, limit: u32) -> Result<InboxResponse> {
-        Self::json(
+    pub async fn unread(&self, seat: &str, limit: u32, timeout: Duration) -> Result<InboxResponse> {
+        self.json(
             self.req(
                 reqwest::Method::GET,
                 &format!("/inbox?seat={}&unread=1&limit={limit}", enc(seat)),
             )
-            .timeout(self.fast),
+            .timeout(timeout),
         )
         .await
     }
@@ -266,7 +340,7 @@ impl ServerClient {
         seat: &str,
         post: &amail_proto::TranscriptPost,
     ) -> Result<amail_proto::TranscriptPostResponse> {
-        Self::json(
+        self.json(
             self.req(
                 reqwest::Method::POST,
                 &format!("/seats/{}/transcript", enc(seat)),
@@ -278,7 +352,7 @@ impl ServerClient {
     }
 
     pub async fn launch(&self, seat: &str) -> Result<LaunchInfo> {
-        Self::json(
+        self.json(
             self.req(
                 reqwest::Method::GET,
                 &format!("/seats/{}/launch", enc(seat)),

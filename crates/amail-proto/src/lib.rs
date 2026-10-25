@@ -1606,6 +1606,18 @@ pub enum NodeNotice {
         harness: Option<String>,
         error: String,
     },
+    /// Hooks on the node's host kept missing their budget for the server:
+    /// in the last `window_min` minutes, `misses` of the `hooks` hooks that
+    /// asked the server for mail got no answer in time (the mail was kept
+    /// and shown by the next hook). `rtt_ms` is the slowest answer the node
+    /// measured in that time; `budget_ms` the time a hook now waits.
+    SlowServer {
+        hooks: u32,
+        misses: u32,
+        rtt_ms: u64,
+        budget_ms: u64,
+        window_min: u32,
+    },
 }
 
 /// Body of `POST /v1/node/notices` (node tokens).
