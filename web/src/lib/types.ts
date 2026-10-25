@@ -179,6 +179,8 @@ export interface ThreadResponse {
   participants?: Card[];
   /** Older messages were left out. */
   truncated?: boolean;
+  /** Tasks of the org linked to this thread, or whose discussion thread it is. */
+  tasks?: TaskRef[];
 }
 
 /** Response of `DELETE /v1/threads/{id}`. */
@@ -514,4 +516,146 @@ export interface OperatorStats {
   mail_last_5min: number;
   mail_last_hour: number;
   list: OrgStat[];
+}
+
+// --- Tasks (`/v1/tasks…`), see crates/amail-proto/src/tasks.rs ---
+
+/** The shown state: `ready` is an `open` task whose blockers are all closed. */
+export type TaskState = 'ready' | 'open' | 'doing' | 'blocked' | 'review' | 'done' | 'cancelled';
+/** A state that can be stored (and set): every shown state but `ready`. */
+export type StoredTaskState = Exclude<TaskState, 'ready'>;
+export type TaskPriority = 'urgent' | 'high' | 'normal' | 'low';
+
+export interface Task {
+  num: number;
+  title: string;
+  /** Empty in listings. */
+  body?: string;
+  state: TaskState;
+  stored_state: StoredTaskState;
+  priority: TaskPriority;
+  rank: number;
+  reporter: string;
+  assignee?: string;
+  team?: string;
+  parent?: number;
+  labels?: string[];
+  due?: string;
+  waiting_on?: string;
+  blocked_reason?: string;
+  thread?: number;
+  /** Blockers that are not closed yet, lowest first. */
+  waits_on?: number[];
+  created_at: string;
+  updated_at: string;
+  closed_at?: string;
+}
+
+export interface TaskRef {
+  num: number;
+  title: string;
+  state: TaskState;
+  assignee?: string;
+}
+
+export interface TaskLink {
+  thread_id: number;
+  linked_by?: string;
+  linked_at: string;
+}
+
+export type TaskEventKind =
+  | 'created'
+  | 'changed'
+  | 'assigned'
+  | 'linked'
+  | 'unlinked'
+  | 'dependency_added'
+  | 'dependency_removed'
+  | 'commented'
+  | 'reminder_sent'
+  | 'unblocked';
+
+export interface TaskEvent {
+  seq: number;
+  at: string;
+  actor?: string;
+  written_by?: string;
+  kind: TaskEventKind | string;
+  field?: string;
+  from?: string;
+  to?: string;
+  note?: string;
+  message_id?: number;
+}
+
+export interface TaskDetail {
+  task: Task;
+  blockers: TaskRef[];
+  blocked: TaskRef[];
+  children: TaskRef[];
+  links: TaskLink[];
+  events: TaskEvent[];
+  event_count: number;
+  events_compacted: number;
+}
+
+export interface TaskEventsPage {
+  events: TaskEvent[];
+  next_after_seq?: number;
+  events_compacted: number;
+}
+
+export interface TaskList {
+  tasks: Task[];
+  next_before?: number;
+  truncated?: boolean;
+}
+
+export interface OwedItem {
+  task: Task;
+  seat?: string;
+  blocks?: TaskRef;
+}
+
+export interface OwedList {
+  items: OwedItem[];
+  truncated?: boolean;
+}
+
+export interface BoardColumn {
+  state: TaskState;
+  count: number;
+  tasks: Task[];
+}
+
+export interface SeatLoad {
+  seat: string;
+  doing: number;
+  ready: number;
+  blocked: number;
+  waiting?: number;
+  review?: number;
+}
+
+export interface TaskBoard {
+  team?: string;
+  columns: BoardColumn[];
+  load: SeatLoad[];
+  stale: Task[];
+  overdue: Task[];
+  chains: { num: number; waits_on: number[] }[];
+}
+
+/** Payload of a server-sent `task` event: a task of the org changed. */
+export interface TaskBusEvent {
+  num: number;
+  change: string;
+  fields?: string[];
+}
+
+export interface TaskCommentResponse {
+  id: number;
+  thread_id: number;
+  task: number;
 }
