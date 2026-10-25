@@ -215,6 +215,36 @@ worker commits on its branch and sends a merge request with
 root merges into main and reports back to you. Every step is a message you
 can read.
 
+### Tasks
+
+Mail says what was asked; the org's task board records what is to be done,
+by whom, and what is in the way. Every seat of the org sees every task.
+You, or a lead, create tasks and assign them:
+
+```sh
+amail task new "Count words in stdin" --assignee app-1 -m "wordcount.py reads stdin"
+amail task new "Unit tests for count()" --assignee app-1
+amail task dep t2 --on t1        # t2 can start when t1 is done
+amail task assign t2 app-1       # assign (or reassign) later
+amail task board                 # columns, load per seat, what waits on what
+```
+
+The assignee gets a reminder by mail. Agents see their open tasks when a
+session starts (`[amail] you have 2 open task(s), 1 ready: amail task
+mine`) and work through them:
+
+```sh
+amail task next                  # what I can start now: t1 (t2 waits on t1)
+amail task start t1
+amail task done t1               # t2 becomes ready
+amail task comment t2 -m "Edge case: empty input counts as 0 words."
+```
+
+A comment is mail in the task's discussion thread (subject `[t2] Unit tests
+for count()`) to its assignee and reporter; replies in that thread are
+comments too. `amail task waiting` and `amail task owed` show whom a seat
+waits for and who waits for it.
+
 ## 7. Answer a question
 
 When an agent needs a decision, it writes to you (the user seat, `owner`).

@@ -230,6 +230,8 @@ impl Config {
 
 const RESERVATION_TTL_MS: i64 = 15 * 60 * 1000;
 const SUMMARY_LIMIT: u32 = 20;
+/// Open tasks counted at session start (more show as `200+`).
+const TASKS_LIMIT: u32 = 200;
 /// Digest mail one hook takes at most (shown one line per thread).
 const DIGEST_LIMIT: u32 = 100;
 /// An answer that would reach the hook client less than this before its
@@ -648,6 +650,8 @@ struct Plan {
     digest: bool,
     /// Show unread headers (nothing claimed).
     summary: bool,
+    /// Show the count of the seat's open tasks (session start).
+    tasks: bool,
     /// Messages the session was shown already; left out of the summary.
     listed: HashSet<i64>,
     /// Mail claimed earlier whose injection was lost.
@@ -661,7 +665,8 @@ impl Plan {
             || self.claim_urgent
             || self.claim_urgent_all
             || self.digest
-            || self.summary)
+            || self.summary
+            || self.tasks)
             && self.stash.is_empty()
     }
 }
@@ -1668,6 +1673,7 @@ impl Node {
                     // A new (or resumed) session has seen nothing yet.
                     st.seat(seat).listed.clear();
                     plan.summary = connected;
+                    plan.tasks = connected;
                     // Ask the server again (see `recheck_pending`).
                     recheck = true;
                 }
@@ -1801,7 +1807,7 @@ impl Node {
         if plan.digest {
             calls.push(spec(&[To, Cc, List], false, true));
         }
-        let made_calls = !calls.is_empty() || plan.summary;
+        let made_calls = !calls.is_empty() || plan.summary || plan.tasks;
         // A server answer that came after the deadline: the mail is shown
         // one hook late.
         let mut timed_out = false;
@@ -1838,7 +1844,13 @@ impl Node {
                 self.retry_claim(seat, spec, key);
             }
         }
-        let summary = if plan.summary && !failed {
+        // The unread summary and the seat's open tasks (one line), at the
+        // same time; each shows nothing on an error or after the deadline.
+        // The second value says whether the deadline passed.
+        let summary_call = async {
+            if !(plan.summary && !failed) {
+                return (Vec::new(), false);
+            }
             let left = deadline.saturating_duration_since(Instant::now());
             let call = self.server.unread(seat, SUMMARY_LIMIT, left);
             match tokio::time::timeout_at(deadline.into(), call).await {
@@ -1847,7 +1859,8 @@ impl Node {
                     // Mail still waiting to be notified is injected in full by
                     // the next claim; listing it here too would show it twice.
                     // Mail this session was shown before is not listed again.
-                    r.entries
+                    let v = r
+                        .entries
                         .into_iter()
                         .filter(|e| !seen.contains(&e.message.id))
                         .filter(|e| !plan.listed.contains(&e.message.id))
@@ -1855,16 +1868,29 @@ impl Node {
                             e.delivery.notified_at.is_some()
                                 || e.delivery.mode != amail_proto::DeliveryMode::Immediate
                         })
-                        .collect()
+                        .collect();
+                    (v, false)
                 }
-                _ => {
-                    timed_out |= Instant::now() >= deadline;
-                    Vec::new()
-                }
+                _ => (Vec::new(), Instant::now() >= deadline),
             }
-        } else {
-            Vec::new()
         };
+        let tasks_call = async {
+            if !(plan.tasks && !failed) {
+                return (None, false);
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            let call = self.server.tasks_mine(seat, TASKS_LIMIT, left);
+            match tokio::time::timeout_at(deadline.into(), call).await {
+                Ok(Ok(r)) => (crate::inject::tasks_summary(&r.tasks, r.truncated), false),
+                Ok(Err(e)) => {
+                    tracing::debug!("open tasks of {seat}: {e:#}");
+                    (None, Instant::now() >= deadline)
+                }
+                Err(_) => (None, true),
+            }
+        };
+        let ((summary, late1), (tasks, late2)) = tokio::join!(summary_call, tasks_call);
+        timed_out |= late1 || late2;
 
         // 3. Apply the outcome.
         {
@@ -1935,6 +1961,12 @@ impl Node {
                 text.push_str("\n\n");
             }
             text.push_str(&crate::inject::unread_summary(seat, &summary, rest));
+        }
+        if let Some(t) = tasks {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(&t);
         }
         let out = if text.is_empty() {
             Output::None

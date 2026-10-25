@@ -233,10 +233,20 @@ async fn row(h: &Harness, seat: &str) -> PsRow {
     rows.into_iter().find(|r| r.seat == seat).unwrap()
 }
 
+/// Wait for `state`; for `idle` of a Claude seat, also for the fake
+/// session's first turn to be over (the session is idle between its
+/// SessionStart and that turn, as in `tests/team.rs`).
 async fn wait_state(h: &Harness, seat: &str, state: &str) {
     let t0 = Instant::now();
     loop {
-        if row(h, seat).await.state == state {
+        let r = row(h, seat).await;
+        let first_turn_done = state != "idle"
+            || r.harness != "claude"
+            || std::fs::read_to_string(h.fake.join(format!("{seat}.ready")))
+                .ok()
+                .and_then(|p| p.trim().parse::<u32>().ok())
+                == r.pid;
+        if r.state == state && first_turn_done {
             return;
         }
         if t0.elapsed() > Duration::from_secs(20) {

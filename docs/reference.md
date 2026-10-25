@@ -50,6 +50,35 @@ exit code.
 | `amail focus on [--for 30m] [--seat s]` / `amail focus off` | hold all but urgent mail (user tokens: any seat) |
 | `amail claim [--via v] [--classes to,cc,list] [--urgent-only] [--include-digest] [--limit n] [--inline-body-max n]` | take pending notifications (marks them notified) |
 
+### Tasks
+
+Every task command takes a task number as `t12` or `12`, prints the
+server's JSON with `--json`, and otherwise one line per task: number,
+shown state, priority, assignee (`-` for none), title, and what it waits
+on (`· waits on t9, t11`, or `· waits for w3: reason` for a `blocked`
+task). See [concepts](concepts.md#tasks) for states, `ready` and
+reminders.
+
+| command | |
+|---|---|
+| `amail task new <title> [-m body] [--priority urgent\|high\|normal\|low] [--assignee seat] [--team t] [--parent tN] [--label l]... [--due time] [--from <message id>]` | create a task; with `--from` the message's subject is the default title and its thread is linked. `--due` takes RFC 3339, `2026-10-30T12:00` or `2026-10-30` (UTC) |
+| `amail task show tN` | the fields one per line, the description behind `  > `, blockers, blocked tasks, children, linked threads and the last 20 events |
+| `amail task history tN [--all]` | the last 50 events (`--all`: every event kept), one per line: time, actor, change |
+| `amail task list [--state s,s\|all] [--assignee seat\|none] [--reporter seat] [--team t] [--priority p] [--label l] [--parent tN] [--due-before time] [--stale] [--text text] [--limit n] [--before n]` | tasks of the org, newest first; unfinished ones unless `--state`. Continue with `--before` (printed under the list) |
+| `amail task mine` | your unfinished tasks, `ready` first |
+| `amail task next [--pool]` | your `ready` tasks; `--pool` adds the unassigned `ready` tasks of your team |
+| `amail task waiting` | whom you wait for: your `blocked` tasks with the seat they wait for, and each open blocker of your tasks with its assignee (`t12 … — waits for w3 (t9 doing)`) |
+| `amail task owed` | who waits for you: tasks `blocked` on you, and your tasks that are the last open blocker of another seat's task (`t9 … — w1 waits for it (t12 open)`) |
+| `amail task board [--team t]` | counts per state, the unfinished tasks of each column, the load per seat, stale and overdue tasks, and the tasks that wait on others (`t12 waits on t9, t11`) |
+| `amail task set tN [--title t] [--body b] [--state s] [--priority p] [--rank n] [--assignee seat\|none] [--team t\|none] [--parent tN\|none] [--label l... \| --no-labels] [--due time\|none]` | change fields; `--label` replaces the labels |
+| `amail task assign tN <seat\|none>` / `take tN` | assign (or unassign); `take` assigns an unassigned task to you and fails with `taken` when someone has it |
+| `amail task steal tN` / `yield tN` / `keep tN` | ask the assignee of a task that is not started to hand it over to you; the assignee answers with `yield` (you get the task) or `keep`. A pending request shows as `· w2 asks to take over` in task lines and as `Takeover: asked for by w2 at <time>` in `show` |
+| `amail task block tN [--on seat] [-m reason]` / `unblock tN` | set `blocked`, waiting for a seat (it gets a reminder) or for a reason; `unblock` sets `open` again |
+| `amail task start` / `review` / `done` / `cancel` / `reopen tN` | set `doing`, `review`, `done`, `cancelled`, or `open` again |
+| `amail task dep tN --on tM` / `undep tN --on tM` | tN depends on tM (or no longer) |
+| `amail task link tN <thread or message id>` / `unlink tN <thread id>` | link a thread to the task, or remove the link |
+| `amail task comment tN [-m text]` | mail in the task's discussion thread (`[tN] <title>`) to its assignee and reporter, `Cc` earlier commenters; the body comes from stdin without `-m`. Replies in that thread are comments too |
+
 ### Administration of an org (user token)
 
 | command | |
@@ -183,8 +212,10 @@ URL (`AMAIL_URL=https://example.com/amail`). See
 
 ### Tasks
 
-Every call needs a user or seat token (node tokens get 403) and works on
-the tasks of the caller's org only; a task number names a task of that org
+Every call needs a user or seat token (node tokens get 403, except for
+`GET /tasks/mine?seat=<agent seat>`, which a node uses to show the seat
+its count of open tasks at session start) and works on the tasks of the
+caller's org only; a task number names a task of that org
 (`12` and `t12` are both accepted in paths). The actor recorded for a
 change is the token's seat (the user seat for a user token). Answers about
 one task are a `TaskDetail`: `{task, blockers, blocked, children, links,
@@ -215,7 +246,7 @@ out.
 | `POST /tasks/{num}/comments` | `{body}`: send a comment as the caller's seat in the task's discussion thread (the first comment starts it), subject `[t12] <title>`, `To` the assignee and the reporter, `Cc` the seats that commented before (the sender left out; with nobody else, to the sender). Any seat of the org may comment. Mail limits and budgets apply as for `POST /messages`. Answers `{id, thread_id, task}` |
 | `GET /tasks/{num}/events` | `after_seq`, `limit` (≤ 1,000, default 200): events oldest first `{events, next_after_seq?, events_compacted}`. Event: `{seq, at, actor?, written_by?, kind, field?, from?, to?, note?, message_id?}`; kinds `created`, `changed`, `assigned`, `linked`, `unlinked`, `dependency_added`, `dependency_removed`, `commented`, `reminder_sent`, `unblocked`, `steal_requested`, `steal_declined`, `steal_expired` |
 | `GET /tasks` | filters `state` (comma-separated shown states, or `all`; default every state but `done` and `cancelled`), `assignee` (a seat, or `none`), `reporter`, `team` (tasks with that team, or whose assignee or reporter is in it), `priority`, `label`, `parent`, `due_before`, `stale=1` (`doing` or `review` and not changed for the org's stale period), `text` (substring of title or body; at most 200 characters), `before`, `limit` (≤ 500, default 50). Newest first: `{tasks, next_before?}`; continue with `before=next_before`. With `text`, a request looks at the 5,000 newest tasks below `before` and takes one of the org's query slots (other pool), so a page can be short and still have `next_before` |
-| `GET /tasks/mine` | the caller's unfinished tasks: `ready` first, then `doing`, `review`, `blocked`, `open`; within each by priority, rank and number. `state`, `limit` (≤ 500) as for the list. `{tasks, truncated}` |
+| `GET /tasks/mine` | the caller's unfinished tasks: `ready` first, then `doing`, `review`, `blocked`, `open`; within each by priority, rank and number. `state`, `limit` (≤ 500) as for the list. `{tasks, truncated}`. Node tokens pass `seat=` (an agent seat of the org) |
 | `GET /tasks/next` | the caller's `ready` tasks by priority, rank and number; `pool=1` adds the unassigned `ready` tasks of the caller's team |
 | `GET /tasks/waiting` | `{items: [{task, seat?, blocker?}], truncated}`: the caller's tasks `blocked` with `waiting_on` (seat: that seat), and each unfinished blocker of the caller's unfinished tasks (seat: the blocker's assignee, else its reporter) |
 | `GET /tasks/owed` | `{items: [{task, seat?, blocks?}], truncated}`: tasks `blocked` with `waiting_on` the caller (seat: their assignee, else reporter), and the caller's unfinished tasks (assigned, or unassigned and reported by the caller) that are the last open blocker of another seat's task (`blocks`) |
