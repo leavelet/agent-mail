@@ -59,7 +59,23 @@ mode=$(cat "$D/$seat.mode" 2>/dev/null)
 sid=""
 resumed=""
 last=""
-[ "$kind" = codex ] && [ "$1" = resume ] && resumed=1
+# `codex resume [options] <id> [prompt]`: the first word that is not an
+# option (or an option's value) is the thread, the next one its prompt.
+cprompt=""
+if [ "$kind" = codex ] && [ "$1" = resume ]; then
+    resumed=1
+    skip=""
+    first=1
+    for a in "$@"; do
+        if [ -n "$first" ]; then first=""; continue; fi
+        if [ -n "$skip" ]; then skip=""; continue; fi
+        case "$a" in
+        -m | -a | -s | -c | -p | -i) skip=1; continue ;;
+        -*) continue ;;
+        esac
+        if [ -z "$sid" ]; then sid=$a; else cprompt=$a; fi
+    done
+fi
 for a in "$@"; do last=$a; done
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -68,7 +84,6 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
-if [ "$kind" = codex ] && [ -n "$resumed" ]; then sid=$last; fi
 
 case "$mode" in
 trust)
@@ -166,6 +181,12 @@ else
         turn "\"$marker\""
     else
         echo "$seat" > "$D/thread-$sid.seat"
+        if [ -n "$cprompt" ]; then
+            # A prompt with the resume starts a turn at once.
+            hook "{\"hook_event_name\":\"SessionStart\",\"session_id\":\"$sid\",\"source\":\"resume\"}" > /dev/null
+            resumed=""
+            turn "$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$cprompt")"
+        fi
     fi
 fi
 

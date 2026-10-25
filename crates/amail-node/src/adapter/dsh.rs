@@ -769,7 +769,13 @@ impl Adapter for Dsh {
             args.extend(["--model".into(), m.to_string()]);
         }
         match ctx.resume {
-            Some(id) => args.extend(["--resume".into(), id.to_string()]),
+            Some(id) => {
+                args.extend(["--resume".into(), id.to_string()]);
+                // The host sends this prompt to the loaded session.
+                if ctx.adopted {
+                    args.extend(["--prompt".into(), adopted_prompt(info)]);
+                }
+            }
             None => {
                 let start = if ctx.context_lost {
                     CONTEXT_LOST

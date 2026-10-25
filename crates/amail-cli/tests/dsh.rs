@@ -151,6 +151,7 @@ async fn launch(h: &Harness, seat: &str, cwd: &Path) -> Value {
             permission_mode: Some(amail_proto::PermissionMode::Unattended),
             git_access: None,
             dsh_jail: None,
+            session: None,
         })
         .await;
     assert!(plan.get("error").is_none(), "{plan}");
@@ -200,6 +201,7 @@ async fn dsh_hooks_and_wake(b: Backend) {
             permission_mode: Some(amail_proto::PermissionMode::Unattended),
             git_access: None,
             dsh_jail: Some(false),
+            session: None,
         })
         .await;
     let off_args: Vec<String> = serde_json::from_value(off["args"].clone()).unwrap();
