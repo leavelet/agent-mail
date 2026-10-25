@@ -2647,8 +2647,12 @@ async fn node_under_path_prefix(b: Backend) {
         session.env_remove(k);
     }
     let mut session = session.spawn().unwrap();
-    h.wait("w1 started", || async { h.state("w1").await == "idle" })
-        .await;
+    // Idle after its first turn (it is idle between SessionStart and that
+    // turn too, and the turn would take the mail below).
+    h.wait("w1 started", || async {
+        h.state("w1").await == "idle" && h.fake.join("w1.ready").exists()
+    })
+    .await;
 
     // Mail arrives over the node's event stream.
     h.api.send(&["w1"], &[], "under a prefix", false).await;
