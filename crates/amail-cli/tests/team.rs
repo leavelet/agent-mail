@@ -2343,7 +2343,10 @@ harness = "codex"
     // Again: nothing to adopt, nothing restarted.
     let out = up(&h, &[]).await;
     assert!(!out.contains("adopts session"), "{out}");
-    // The intro is given once: the next start of x just resumes.
+    // The intro is given once: the next start of x just resumes. (Only
+    // after the adopted session's first turn sent its hooks: a session
+    // stopped before any hook would be told again at its next start.)
+    wait_for("x's first turn", || h.fake.join("x.ready").exists()).await;
     let (ok, out) = cli(&h, &["sleep", "x"]).await;
     assert!(ok, "{out}");
     let (ok, out) = cli(&h, &["wake", "x"]).await;

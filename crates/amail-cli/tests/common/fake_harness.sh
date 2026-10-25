@@ -15,7 +15,8 @@
 #                    (Claude: via the inbox socket; Codex: `codex queue`)
 #   <seat>.injected  every hook answer the node gave
 #   <seat>.started   "<unix ms> <pid>" when a Claude session sent SessionStart
-#   <seat>.ready     "<pid>" once a Claude session's first turn has ended (or
+#   <seat>.ready     "<pid>" once a Claude session's first turn has ended, or a
+#                    resumed Codex session's turn on the prompt it was given (or
 #                    at once in mode noturn): before that, mail sent to the
 #                    seat is shown by that turn's hooks, not by a wake-up
 #   sock/<seat>.sock the seat's inbox socket (served by the test)
@@ -186,6 +187,8 @@ else
             hook "{\"hook_event_name\":\"SessionStart\",\"session_id\":\"$sid\",\"source\":\"resume\"}" > /dev/null
             resumed=""
             turn "$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$cprompt")"
+            # As for Claude: the first turn is done.
+            echo "$$" > "$D/$seat.ready"
         fi
     fi
 fi
