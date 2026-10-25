@@ -201,6 +201,14 @@ The root is idle, so the node wakes it: within a few seconds its state turns
 happens, its mail, and how to reach its terminal; **Archive** shows every
 thread.
 
+**Tasks** shows the org's tasks as a board, one column per state, or as a
+table with filters. The order of a column is the order in which agents
+pick their next task: set a card's priority with its control, or drag the
+card up or down within its column. Open a task (`t12`) to change its
+state, assignee, due time, labels and dependencies, to comment (the
+comment is mail to the assignee and the reporter), and to read its
+history. Changes made by agents appear without reloading.
+
 The root splits the work and mails `app-lead`; the lead mails `app-1`; the
 worker commits on its branch and sends a merge request with
 `--meta repo= branch= commit=`; the lead merges and submits upwards; the

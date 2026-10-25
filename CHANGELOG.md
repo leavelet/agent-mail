@@ -211,6 +211,19 @@ The first public version.
   settings. English and Chinese, light and dark.
 - Browser notifications for new items in the "needs you" queue (opt-in in
   the settings).
+- Tasks: a board per org with one column per shown state (`ready` among
+  them) and a table with the list filters and paging. Each card has a
+  priority control, and cards are dragged within their column (or moved
+  with Alt+Up/Down) to set their rank; a card cannot be dropped in another
+  column. A task page shows the record, dependencies, child tasks, linked
+  threads with their latest message, the discussion thread and the
+  history, and lets the user change the state (with the seat and reason
+  for `blocked`), assignee, priority, due time and labels, add and remove
+  dependencies, link and unlink threads, comment, and answer a request to
+  take the task over. A seat's page lists its tasks and what others wait
+  for from it; a thread lists its tasks under the subject; "needs you"
+  lists tasks waiting for the user and the user's overdue tasks. All of it
+  follows `task` events live.
 
 #### Public servers and getting started
 
