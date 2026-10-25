@@ -175,4 +175,14 @@
       display: none;
     }
   }
+  /* Phone width: the bar wraps instead of making the page scroll sideways. */
+  @media (max-width: 720px) {
+    .top {
+      flex-wrap: wrap;
+      height: auto;
+      min-height: 42px;
+      padding: 4px 12px;
+      row-gap: 4px;
+    }
+  }
 </style>

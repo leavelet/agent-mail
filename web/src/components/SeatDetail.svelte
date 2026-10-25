@@ -15,6 +15,7 @@
   import StateBadge from './StateBadge.svelte';
   import Transcript from './Transcript.svelte';
   import MailList from './MailList.svelte';
+  import SeatTasks from './SeatTasks.svelte';
 
   let { name }: { name: string } = $props();
 
@@ -219,6 +220,8 @@
       <summary>{t('seat.role')}</summary>
       {#if seat.role}<pre><Vis text={seat.role} /></pre>{:else}<p class="faint">{t('seat.noRole')}</p>{/if}
     </details>
+
+    <SeatTasks seat={seat.name} />
 
     <div class="tabs" role="tablist">
       {#if seat.kind === 'agent'}

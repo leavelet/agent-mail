@@ -10,6 +10,7 @@
   import { go, href } from '../lib/router.svelte';
   import type { DeleteMailResponse, ThreadResponse } from '../lib/types';
   import MessageCard from '../components/MessageCard.svelte';
+  import TaskRefRow from '../components/TaskRefRow.svelte';
 
   let { id, focus }: { id: number; focus?: number } = $props();
   let data = $state.raw<ThreadResponse | null>(null);
@@ -91,6 +92,11 @@
       <span class="parts">{#each participants as p}<a class="mono chip neutral" title={cardOf(p)} href={p.includes('@') ? undefined : href(['org', p])}>{p}</a>{/each}</span>
       <button class="small danger" disabled={deleting} onclick={remove}>{t('thread.delete')}</button>
     </div>
+    {#if data.tasks?.length}
+      <ul class="tasks" data-testid="thread-tasks" aria-label={t('thread.tasks')}>
+        {#each data.tasks as x (x.num)}<TaskRefRow num={x.num} title={x.title} state={x.state} note={x.assignee} />{/each}
+      </ul>
+    {/if}
     <div class="msgs">
       {#each data.messages as m (m.id)}
         <div>
@@ -116,6 +122,14 @@
     display: flex;
     flex-direction: column;
     gap: 10px;
+  }
+  .tasks {
+    list-style: none;
+    margin: -4px 0 10px;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
   }
   .parts {
     display: flex;
