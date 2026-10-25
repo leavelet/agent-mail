@@ -361,7 +361,7 @@
         </section>
 
         <section class="discussion">
-          <h2>{t('task.discussion')}{#if task.thread} <a class="small" href={href(['thread', task.thread])}>{t('task.openThread')}</a>{/if}</h2>
+          <h2 class="row">{t('task.discussion')}{#if task.thread}<a class="sublink" href={href(['thread', task.thread])}>{t('task.openThread')}</a>{/if}</h2>
           {#if discussionError}<p class="error">{discussionError}</p>{/if}
           {#if !task.thread}
             <p class="faint">{t('task.noDiscussion')}</p>
@@ -531,6 +531,10 @@
   }
   .short {
     width: 90px;
+  }
+  .sublink {
+    font-size: 12px;
+    font-weight: 400;
   }
   .msgs {
     display: flex;
