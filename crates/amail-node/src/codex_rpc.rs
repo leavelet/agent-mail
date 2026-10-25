@@ -10,6 +10,36 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
 const CALL_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Keep the structured error for callers that need a narrow recovery rule.
+#[derive(Debug)]
+pub(crate) struct RpcError {
+    pub code: Option<i64>,
+    pub message: String,
+    value: Value,
+}
+
+impl RpcError {
+    pub(crate) fn new(value: Value) -> Self {
+        Self {
+            code: value.get("code").and_then(Value::as_i64),
+            message: value
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .into(),
+            value,
+        }
+    }
+}
+
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "app-server error: {}", self.value)
+    }
+}
+
+impl std::error::Error for RpcError {}
+
 fn init_params() -> Value {
     json!({
         "clientInfo": {"name": "amail-node", "version": env!("CARGO_PKG_VERSION")},
@@ -23,7 +53,7 @@ fn response(msg: &Value, id: u64) -> Option<Result<Value>> {
         return None;
     }
     if let Some(e) = msg.get("error") {
-        return Some(Err(anyhow::anyhow!("app-server error: {e}")));
+        return Some(Err(RpcError::new(e.clone()).into()));
     }
     Some(Ok(msg.get("result").cloned().unwrap_or(Value::Null)))
 }

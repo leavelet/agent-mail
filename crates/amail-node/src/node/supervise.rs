@@ -66,6 +66,45 @@ pub(super) struct SupRt {
     old_screen: Option<String>,
 }
 
+impl SupRt {
+    /// Read-only visibility of existing barriers, without held messages or
+    /// session routing/authorization material.
+    pub(super) fn quiet_recovery_diagnostics(&self) -> serde_json::Value {
+        serde_json::json!({
+            "blocked": self.quiet_recovery_blocked(),
+            "queued": self.queued,
+            "opening": self.opening,
+            "starting": self.starting_since.is_some(),
+            "slot": self.holds_slot,
+            "stopping": self.stopping.is_some(),
+            "retry": self.retry_at.is_some(),
+            "exiting": self.exiting,
+            "probing": self.probing,
+            "support_block": self.blocked.is_some(),
+        })
+    }
+
+    pub(super) fn quiet_recovery_blocked(&self) -> bool {
+        self.queued
+            || self.opening
+            || self.starting_since.is_some()
+            || self.holds_slot
+            || self.stopping.is_some()
+            || self.retry_at.is_some()
+            || self.exiting
+            || self.probing
+            || self.blocked.is_some()
+    }
+
+    #[cfg(test)]
+    pub(super) fn stopping_for_test(intent: Intent) -> Self {
+        Self {
+            stopping: Some((intent, Instant::now(), false)),
+            ..Self::default()
+        }
+    }
+}
+
 pub fn uuid_v4() -> String {
     let mut b: [u8; 16] = rand::random();
     b[6] = (b[6] & 0x0f) | 0x40;
@@ -186,6 +225,13 @@ pub(super) fn attention_of(st: &State, name: &str) -> Option<(String, String)> {
             format!("wake-ups are not answered; look at the pane (amail attach {name})"),
         ));
     }
+    if attention.is_none() && s.is_some_and(|s| s.restore_pending) {
+        attention = Some((
+            "recovery-unverified".into(),
+            "surviving session has no proven normal completion; automatic mail wakes are held"
+                .into(),
+        ));
+    }
     attention
 }
 
@@ -198,12 +244,20 @@ pub(super) fn restore(st: &mut State, harness: impl Fn(&str) -> Option<Harness>)
             && alive(pid, m.pid_start)
         {
             if s.state == SeatState::Offline {
-                s.state = SeatState::Idle;
+                s.restore_pending = s.harness == Some(Harness::Codex);
+                s.state = if s.restore_pending {
+                    SeatState::Busy
+                } else {
+                    SeatState::Idle
+                };
             }
             let sess = s.session.get_or_insert_with(SessionRt::default);
             sess.pid = Some((pid, m.pid_start));
             if sess.id.is_none() {
                 sess.id = m.resume.clone();
+            }
+            if s.restore_pending && sess.target.is_none() {
+                sess.target = m.resume.clone();
             }
             st.sup.entry(name.clone()).or_default().hooked = true;
         } else if m.dormant {
@@ -808,6 +862,23 @@ impl Node {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
+        // A launcher, configuration or authentication error can also exit
+        // before the first hook. It does not mean the saved session is gone.
+        // Only the harness's concrete diagnostic for this exact Claude
+        // session allows the supervisor to replace it on the next start.
+        let missing_resume = if intent.is_none()
+            && status.flatten() == Some(1)
+            && m.harness == "claude"
+            && let (Some(p), Some(sid)) = (m.pane, m.resume.as_deref())
+        {
+            let expected = format!("No conversation found with session ID: {sid}");
+            self.mux
+                .screen(&m.mux_session, p)
+                .await
+                .is_ok_and(|screen| screen.lines().any(|line| line.trim() == expected))
+        } else {
+            false
+        };
         let mut st = self.lock();
         let rt = st.sup.entry(seat.to_string()).or_default();
         let lived = rt.launched_at.map(|t| t.elapsed());
@@ -857,8 +928,10 @@ impl Node {
                     .get(seat)
                     .is_some_and(|s| s.state == SeatState::Busy);
                 st.set_state(seat, SeatState::Offline);
-                let resume_failed =
-                    resumed && !hooked && lived.is_some_and(|l| l < self.cfg.resume_grace);
+                let resume_failed = missing_resume
+                    && resumed
+                    && !hooked
+                    && lived.is_some_and(|l| l < self.cfg.resume_grace);
                 if resume_failed {
                     tracing::warn!(
                         "seat {seat}: resuming its session failed; the next start is a new session"
@@ -995,6 +1068,7 @@ impl Node {
                 up: false,
                 dormant: false,
                 resume: None,
+                codex_effort: None,
                 context_lost: false,
                 failures: 0,
                 failed: false,
@@ -1386,6 +1460,47 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quiet_recovery_rejects_each_supervisor_transition() {
+        assert!(!SupRt::default().quiet_recovery_blocked());
+        for barrier in [
+            "queued", "opening", "starting", "slot", "stopping", "retry", "exiting", "probing",
+            "blocked",
+        ] {
+            let mut s = SupRt::default();
+            match barrier {
+                "queued" => s.queued = true,
+                "opening" => s.opening = true,
+                "starting" => s.starting_since = Some(Instant::now()),
+                "slot" => s.holds_slot = true,
+                "stopping" => s.stopping = Some((Intent::Sleep, Instant::now(), false)),
+                "retry" => s.retry_at = Some(Instant::now()),
+                "exiting" => s.exiting = true,
+                "probing" => s.probing = true,
+                "blocked" => s.blocked = Some(("blocked".into(), "needs person".into())),
+                _ => unreachable!(),
+            }
+            assert!(s.quiet_recovery_blocked(), "{barrier}");
+            let report = s.quiet_recovery_diagnostics();
+            let key = if barrier == "blocked" {
+                "support_block"
+            } else {
+                barrier
+            };
+            assert_eq!(report["blocked"], true);
+            assert_eq!(report[key], true, "diagnostic lost {barrier}");
+            assert_eq!(
+                report
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .filter(|v| v.as_bool() == Some(true))
+                    .count(),
+                2
+            );
+        }
+    }
 
     #[test]
     fn screens_that_need_a_person() {

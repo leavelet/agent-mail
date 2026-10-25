@@ -100,6 +100,15 @@ node uses `AMAIL_URL`, then `node.toml`, then the current saved login's URL.
 `node.toml` may also set `label` and `local_policy`; `amail node token
 --save` keeps them.
 
+`--codex-sandbox` (`AMAIL_CODEX_SANDBOX`) selects a native Codex policy:
+`read-only`, `workspace-write`, or `danger-full-access`. It applies to fresh
+and resumed sessions and replaces the node's `git_access` permission profiles;
+the node does not change repository permission files or git layout in this
+mode. Without the option, the normal workspace and git-access profiles apply.
+`danger-full-access` runs commands without the Codex sandbox; use it only when
+that access is intended, such as an externally isolated host that cannot run
+the workspace sandbox.
+
 ### Server and operator
 
 | command | |
@@ -155,7 +164,7 @@ URL (`AMAIL_URL=https://example.com/amail`). See
 | `GET /inbox` | `seat`, `unread`, `after_seq`, `before_seq`, `limit` (≤ 1000); headers only. `unread` leaves out withdrawn deliveries. A page is at most 2 MiB: when it was cut, `"truncated": true`, and the next page starts after the last entry (with `before_seq`: before the first). A page of more than 100 takes one of the org's query slots (see [below](#limits-on-expensive-requests)) |
 | `GET /messages/{id}` | full message; marks the caller's delivery read unless `peek=1`. Headers here and everywhere else have `written_by` when the sending org's user wrote the message in the sender's name |
 | `POST /messages/{id}/ack` | acknowledge |
-| `POST /messages/{id}/deliveries/{seat}/withdraw` | the sender, or the user of the sender's org: withdraw the delivery to `seat` (a seat of the org) while it has not been notified, read or acknowledged ([concepts](concepts.md#delivery-states)). Answers `{delivery, changed}`; the delivery then has `withdrawn_at` and mode `archive`, and `changed` is false when it had been withdrawn before. 409 `delivery_seen` when it was notified, read or acknowledged; 422 `not_local` for an address of another org; 403 for anyone else; 404 when the seat has no delivery of the message |
+| `POST /messages/{id}/deliveries/{seat}/withdraw` | the sender, or the user of the sender's org: withdraw the delivery to `seat` (a seat of the org) while it has not been notified, read or acknowledged ([concepts](concepts.md#delivery-states)). Answers `{delivery, changed}`; the delivery then has `withdrawn_at` and mode `archive`, and `changed` is false when it had been withdrawn before. 409 `delivery_seen` when it was notified, read or acknowledged; 422 `not_local` for an address of another org; 403 for anyone else; 404 when the seat has no delivery of the message. `…/cancel` is an alias of this call |
 | `POST /messages/{id}/read` | mark the caller's delivery read |
 | `POST /messages/{id}/unread` | user tokens: mark the user's delivery not read again (an acknowledged delivery stays read) |
 | `GET /messages/{id}/status` | per-recipient state (`queued`, `notified`, `read`, `acked`, `withdrawn`; the sender and the sender org's user only); seats reached through another org's list, including seats of a third org that the list contains, are counted under the list's address (`members`) |

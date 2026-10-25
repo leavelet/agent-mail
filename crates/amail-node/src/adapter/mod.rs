@@ -103,6 +103,7 @@ pub struct AdapterEnv {
     pub server_url: String,
     pub claude_bin: String,
     pub codex_bin: String,
+    pub codex_sandbox: Option<codex::SandboxMode>,
     pub dsh_bin: String,
     /// Environment given only to dsh hosts.
     pub dsh_env: BTreeMap<String, String>,
@@ -150,6 +151,8 @@ pub struct LaunchCtx<'a> {
     pub nonce: &'a str,
     /// Resume this harness session instead of starting a new one.
     pub resume: Option<&'a str>,
+    /// Explicit effort retained in the managed Codex seat, if any.
+    pub codex_effort: Option<&'a str>,
     /// For a new session of a harness that accepts one: its id.
     pub new_session_id: Option<&'a str>,
     /// The seat had a session whose context is gone; tell the new one.
@@ -259,6 +262,16 @@ pub trait Adapter: Send + Sync + 'static {
         Ok(Vec::new())
     }
 
+    /// Prove normal completion after a history error, or at startup (None).
+    /// Never infer success from silence or an idle label alone.
+    async fn completed_quiet_turn(
+        &self,
+        _probe: &QuietTurnContext,
+        _history_error: Option<&anyhow::Error>,
+    ) -> Result<Option<QuietTurnProof>> {
+        Ok(None)
+    }
+
     /// Whether a turn can end without any hook in a way the node must find
     /// itself (Claude Code fires no hook when a person interrupts a turn):
     /// the node then looks at the end of the session's transcript
@@ -310,6 +323,62 @@ pub struct TurnInfo {
     pub started_at: Option<i64>,
     /// The harness's turn id, if known.
     pub id: Option<String>,
+}
+
+/// A registered session and its last node observation, captured before I/O.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuietTurnContext {
+    pub target: String,
+    pub transcript: PathBuf,
+    pub busy_since: i64,
+    pub last_hook: i64,
+    /// Startup has not observed a real hook for this surviving session. The
+    /// restored mtime/since values are not timestamps of a new running turn.
+    pub restoring: bool,
+}
+
+/// Normal completion plus the exact file observation supporting it. The node
+/// must recheck this observation at the state-commit boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuietTurnProof {
+    pub turn: TurnInfo,
+    pub file: QuietFileProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuietFileProof {
+    path: PathBuf,
+    stamp: (u64, u64, u64, i64, i64, i64, i64),
+}
+
+impl QuietFileProof {
+    pub(crate) fn new(path: PathBuf, meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            path,
+            stamp: (
+                meta.dev(),
+                meta.ino(),
+                meta.len(),
+                meta.mtime(),
+                meta.mtime_nsec(),
+                meta.ctime(),
+                meta.ctime_nsec(),
+            ),
+        }
+    }
+
+    /// No transcript content is read while the node lock is held. Reject a
+    /// changed registered path, replacement, append, truncation or symlink.
+    pub(crate) fn still_current(&self, registered: &std::path::Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        registered.canonicalize().ok().as_ref() == Some(&self.path)
+            && std::fs::symlink_metadata(&self.path).is_ok_and(|meta| {
+                meta.is_file()
+                    && meta.uid() == unsafe { libc::geteuid() }
+                    && Self::new(self.path.clone(), &meta) == *self
+            })
+    }
 }
 
 pub fn str_field<'a>(v: &'a Value, key: &str) -> Option<&'a str> {

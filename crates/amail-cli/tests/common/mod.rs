@@ -208,6 +208,7 @@ impl Default for Opts {
 }
 
 pub const FAKE_HARNESS: &str = include_str!("fake_harness.sh");
+const FAKE_APP_SERVER: &str = include_str!("fake_app_server.py");
 
 impl Harness {
     pub async fn start(backend: Backend, test: &str, opts: Opts) -> Option<Harness> {
@@ -268,14 +269,19 @@ impl Harness {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("run").join("node.sock");
         let codex_log = dir.path().join("codex.log");
+        // Both fake codex binaries answer `app-server` with this script, so
+        // that the node's check of the managed hooks' trust passes.
+        let app_server = dir.path().join("fake_app_server.py");
+        std::fs::write(&app_server, FAKE_APP_SERVER).unwrap();
         let fake = dir.path().join("fake-codex");
         std::fs::write(
             &fake,
             format!(
-                "#!/bin/sh\n# Stand-in for codex: records calls; no daemon, no app-server.\n\
+                "#!/bin/sh\n# Stand-in for codex: records calls; no daemon; `app-server` only lists hooks.\n\
                  printf '%s\\n' \"$*\" >> '{}'\n\
-                 case \"$1\" in queue) exit 0;; esac\nexit 1\n",
-                codex_log.display()
+                 case \"$1\" in queue) exit 0;; app-server) [ $# -eq 1 ] && exec python3 '{}';; esac\nexit 1\n",
+                codex_log.display(),
+                app_server.display()
             ),
         )
         .unwrap();
@@ -322,6 +328,7 @@ impl Harness {
         let mut mux = None;
         if opts.supervise {
             std::fs::create_dir_all(fake_dir.join("sock")).unwrap();
+            std::fs::write(fake_dir.join("fake_app_server.py"), FAKE_APP_SERVER).unwrap();
             for name in ["claude", "codex"] {
                 let p = fake_dir.join(name);
                 std::fs::write(&p, FAKE_HARNESS).unwrap();

@@ -120,6 +120,38 @@ The first public version.
   characters the agent never ran `amail read` on) was listed again at every
   turn and taken for new mail. A new or resumed session still gets the
   whole list once at `SessionStart`.
+- `amail node --codex-sandbox read-only|workspace-write|danger-full-access`
+  (`AMAIL_CODEX_SANDBOX`) runs Codex seats under a native Codex sandbox
+  policy instead of the node's `git_access` permission profiles; the node
+  then changes no repository permission files.
+- The Codex hook command carries the node's state directory and socket
+  (`amail hook codex --node-state-dir … --node-socket …`). A hook started by
+  a Codex daemon that does not have the node's environment (one started
+  before the node, or by a person's own session in the same `CODEX_HOME`)
+  finds the node through them, after checking that its parent is that
+  home's app-server and that the socket's peer is this node binary. A
+  failed check of the managed hooks' trust is now a launch error with its
+  reason, instead of a warning.
+- Codex seats whose turn history cannot be read (the app-server's thread
+  store answered `database disk image is malformed`) no longer stay busy
+  for good: the node proves a normal completion from the session's rollout
+  file (a complete `task_started`/`task_complete` pair, no error, no later
+  input, the thread idle with an empty queue) and only then marks the seat
+  idle. After a node restart, a Codex session that is still running is held
+  (`recovery-unverified` in `ps`, no automatic wake-ups) until a hook or
+  that proof shows its last turn ended normally; before, it was assumed
+  idle.
+- A resumed session that exits with status 1 before its first hook is
+  treated as a failed resume (and replaced by a new session) only when the
+  pane shows Claude Code's `No conversation found with session ID`; a
+  launcher or configuration error keeps the saved session.
+- Presence hints are cut to their limit before they are sent, so a long
+  turn-failure reason no longer makes the server refuse the whole presence
+  update.
+- A Codex seat's `effort` saved with its resume id (`codex_effort` in the
+  node state) is applied again when the session is resumed or woken.
+- `POST /messages/{id}/deliveries/{seat}/cancel` is accepted as an alias of
+  `…/withdraw`.
 
 
 - `amail node`: a per-host daemon that injects mail into running Claude

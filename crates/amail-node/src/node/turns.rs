@@ -33,7 +33,7 @@
 //! until a turn ends normally.
 
 use super::*;
-use crate::adapter::{TranscriptTurn, TurnInfo, TurnStatus};
+use crate::adapter::{QuietTurnContext, QuietTurnProof, TranscriptTurn, TurnInfo, TurnStatus};
 use crate::persist::{Release, TurnTrack};
 use amail_proto::{NodeNotice, TurnFailure};
 
@@ -403,7 +403,8 @@ impl Node {
                     };
                     let adapter = self.adapter(h);
                     let quiet_for = (now_wall - s.last_activity).max(0) as u64;
-                    let due = s.state == SeatState::Busy
+                    let due = (s.state == SeatState::Busy
+                        || (s.restore_pending && s.state == SeatState::Idle))
                         && quiet_for >= quiet.as_millis() as u64
                         && s.turn_quiet_checked.is_none_or(|t| now >= t + quiet);
                     if adapter.finds_interrupts() {
@@ -444,10 +445,26 @@ impl Node {
                 }
             }
             for (seat, h, target, deferred) in todo {
+                if !deferred
+                    && self
+                        .lock()
+                        .seats
+                        .get(&seat)
+                        .is_some_and(|s| s.restore_pending)
+                {
+                    self.recover_completed_quiet_turn(&seat, h, &target, None)
+                        .await;
+                    continue;
+                }
                 let turns = match self.adapter(h).last_turns(&target).await {
                     Ok(t) => Some(t),
                     Err(e) => {
                         tracing::debug!("seat {seat}: asking how its turn ended: {e:#}");
+                        if !deferred {
+                            self.recover_completed_quiet_turn(&seat, h, &target, Some(&e))
+                                .await;
+                            continue;
+                        }
                         None
                     }
                 };
@@ -682,12 +699,36 @@ impl Node {
         if adapter.checks_turns()
             && let Some(target) = target
         {
+            if self
+                .lock()
+                .seats
+                .get(seat)
+                .is_some_and(|s| s.restore_pending)
+            {
+                return if self
+                    .recover_completed_quiet_turn(seat, h, &target, None)
+                    .await
+                {
+                    "restored session has proven normal completion; now idle".into()
+                } else {
+                    "restored session completion is not yet proven; automatic mail wakes remain held".into()
+                };
+            }
             for i in 0..2 {
                 if i > 0 {
                     tokio::time::sleep(Duration::from_millis(1000)).await;
                 }
-                let Ok(turns) = adapter.last_turns(&target).await else {
-                    break;
+                let turns = match adapter.last_turns(&target).await {
+                    Ok(turns) => turns,
+                    Err(e) => {
+                        if self
+                            .recover_completed_quiet_turn(seat, h, &target, Some(&e))
+                            .await
+                        {
+                            return "was busy, but its normal completion is independently evidenced; now idle".into();
+                        }
+                        return "busy: turn history is unavailable and completion is not yet proven".into();
+                    }
                 };
                 let Some(t) = turns.first() else {
                     break;
@@ -704,6 +745,34 @@ impl Node {
             return format!("busy: its turn is running (last hook {quiet_s} s ago)");
         }
         format!("busy: its turn is running (last hook {quiet_s} s ago)")
+    }
+
+    /// Use the adapter's narrow fallback, then revalidate the original
+    /// registration, process identities and hook snapshot under the node lock.
+    /// The existing quiet_check still requires two positive observations.
+    async fn recover_completed_quiet_turn(
+        &self,
+        seat: &str,
+        harness: Harness,
+        target: &str,
+        error: Option<&anyhow::Error>,
+    ) -> bool {
+        let probe = {
+            let mut st = self.lock();
+            let Some(probe) = QuietRecovery::capture(&st, seat, harness, target) else {
+                clear_quiet_verdict(&mut st, seat);
+                return false;
+            };
+            probe
+        };
+        let result = self
+            .adapter(harness)
+            .completed_quiet_turn(&probe.context, error)
+            .await;
+        let mut st = self.lock();
+        probe.commit(&mut st, seat, harness, result, |st, turn| {
+            self.quiet_check(st, seat, turn)
+        })
     }
 
     /// Settle a deferred check with what the harness says.
@@ -741,11 +810,9 @@ impl Node {
     /// that has just started and is not listed yet does not count as the
     /// end of the one before it. Returns true if the turn was ended.
     fn quiet_check(&self, st: &mut State, seat: &str, last: &TurnInfo) -> bool {
-        let Some(s) = st
-            .seats
-            .get_mut(seat)
-            .filter(|s| s.state == SeatState::Busy)
-        else {
+        let Some(s) = st.seats.get_mut(seat).filter(|s| {
+            s.state == SeatState::Busy || (s.restore_pending && s.state == SeatState::Idle)
+        }) else {
             return false;
         };
         let end = match &last.status {
@@ -766,6 +833,7 @@ impl Node {
             }
         }
         tracing::info!("seat {seat}: its last turn ended without a hook ({end:?})");
+        st.seat(seat).restore_pending = false;
         st.set_state(seat, SeatState::Idle);
         let shown = match st.saved.turns.get_mut(seat) {
             Some(t) => std::mem::take(&mut t.shown),
@@ -815,6 +883,120 @@ pub(super) struct QuietProbe {
     pane: Option<(String, u32)>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QuietRecovery {
+    context: QuietTurnContext,
+    session_pid: Option<(u32, Option<u64>)>,
+    managed_pid: Option<(Option<u32>, Option<u64>)>,
+}
+
+/// Local eligibility only. No RPC, transcript read, state change, failure
+/// reset, or delivery action is performed by this diagnostic.
+pub(super) fn quiet_recovery_diagnostics(st: &State, seat: &str) -> serde_json::Value {
+    let Some(s) = st
+        .seats
+        .get(seat)
+        .filter(|s| s.harness == Some(Harness::Codex))
+    else {
+        return serde_json::Value::Null;
+    };
+    let eligible = s
+        .session
+        .as_ref()
+        .and_then(|s| s.target.as_deref())
+        .is_some_and(|target| QuietRecovery::capture(st, seat, Harness::Codex, target).is_some());
+    serde_json::json!({
+        "capture_eligible": eligible,
+        "turn_check_pending": s.turn_check.is_some(),
+        "wake_in_flight": s.wake_out.is_some(),
+        "has_first_observation": s.quiet.verdict.is_some(),
+        "supervisor": st.sup.get(seat).map(|s| s.quiet_recovery_diagnostics()),
+    })
+}
+
+impl QuietRecovery {
+    fn capture(st: &State, seat: &str, harness: Harness, target: &str) -> Option<Self> {
+        let s = st.seats.get(seat)?;
+        if !(s.state == SeatState::Busy || (s.restore_pending && s.state == SeatState::Idle))
+            || s.harness != Some(harness)
+            || s.turn_check.is_some()
+            || s.wake_out.is_some()
+            || st.sup.get(seat).is_some_and(|s| s.quiet_recovery_blocked())
+            || st.saved.turns.get(seat).is_some_and(|t| {
+                t.failures != 0 || t.reason.is_some() || t.failed_at.is_some() || t.manual_retry
+            })
+        {
+            return None;
+        }
+        let session = s.session.as_ref()?;
+        if session.id.as_deref() != Some(target) || session.target.as_deref() != Some(target) {
+            return None;
+        }
+        let (pid, Some(start)) = session.pid? else {
+            return None;
+        };
+        if !alive(pid, Some(start)) {
+            return None;
+        }
+        let managed_pid = match st.saved.managed.get(seat) {
+            Some(m)
+                if !m.up
+                    || m.dormant
+                    || m.failed
+                    || m.failures != 0
+                    || m.held.is_some()
+                    || m.context_lost
+                    || m.pid.is_none() =>
+            {
+                return None;
+            }
+            Some(m) if m.pid != Some(pid) || m.pid_start != Some(start) => return None,
+            Some(m) => Some((m.pid, m.pid_start)),
+            None => None,
+        };
+        Some(Self {
+            context: QuietTurnContext {
+                target: target.into(),
+                transcript: PathBuf::from(&st.saved.transcripts.get(seat)?.path),
+                busy_since: s.since,
+                last_hook: s.last_activity,
+                restoring: s.restore_pending,
+            },
+            session_pid: session.pid,
+            managed_pid,
+        })
+    }
+
+    /// Called under the node lock immediately before quiet_check. A rejected
+    /// second observation also discards the first; it can never reach the
+    /// completion callback (which changes presence and schedules mail wakes).
+    fn commit(
+        &self,
+        st: &mut State,
+        seat: &str,
+        harness: Harness,
+        result: Result<Option<QuietTurnProof>>,
+        complete: impl FnOnce(&mut State, &TurnInfo) -> bool,
+    ) -> bool {
+        if Self::capture(st, seat, harness, &self.context.target).as_ref() == Some(self)
+            && let Ok(Some(proof)) = result
+            && proof.turn.status == TurnStatus::Completed
+            && proof.turn.id.as_ref().is_some_and(|id| !id.is_empty())
+            && proof.file.still_current(&self.context.transcript)
+        {
+            return complete(st, &proof.turn);
+        }
+        clear_quiet_verdict(st, seat);
+        false
+    }
+}
+
+fn clear_quiet_verdict(st: &mut State, seat: &str) {
+    if let Some(s) = st.seats.get_mut(seat) {
+        s.quiet.verdict = None;
+    }
+}
+
 fn status_word(s: &TurnStatus) -> &'static str {
     match s {
         TurnStatus::InProgress => "running",
@@ -827,6 +1009,219 @@ fn status_word(s: &TurnStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Seed the first positive observation, then create the second adapter
+    // proof. Tests interleave changes after this return and before commit.
+    fn ready_recovery(path: &std::path::Path) -> (State, QuietRecovery, QuietTurnProof) {
+        let mut st = State::default();
+        let pid = std::process::id();
+        let start = proc_start(pid).unwrap();
+        let s = st.seat("cx");
+        s.harness = Some(Harness::Codex);
+        s.state = SeatState::Busy;
+        s.since = 10;
+        s.last_activity = 20;
+        s.session = Some(SessionRt {
+            id: Some("session".into()),
+            target: Some("session".into()),
+            pid: Some((pid, Some(start))),
+        });
+        s.quiet.verdict = Some(((Some("turn".into()), TurnEnd::Normal), 30));
+        st.saved.transcripts.insert(
+            "cx".into(),
+            crate::persist::TranscriptRef {
+                harness: "codex".into(),
+                path: path.to_string_lossy().into_owned(),
+                session_id: Some("session".into()),
+                base: None,
+            },
+        );
+        let managed = serde_json::from_value(serde_json::json!({
+            "harness":"codex", "cwd":"/fixture", "mux_session":"fixture", "tab":"cx",
+            "up":true, "pid":pid, "pid_start":start
+        }))
+        .unwrap();
+        st.saved.managed.insert("cx".into(), managed);
+        st.saved.turns.entry("cx".into()).or_default().shown = vec![41];
+        let probe = QuietRecovery::capture(&st, "cx", Harness::Codex, "session").unwrap();
+        let proof = QuietTurnProof {
+            turn: TurnInfo {
+                status: TurnStatus::Completed,
+                started_at: Some(0),
+                id: Some("turn".into()),
+            },
+            file: crate::adapter::QuietFileProof::new(
+                path.canonicalize().unwrap(),
+                &std::fs::metadata(path).unwrap(),
+            ),
+        };
+        (st, probe, proof)
+    }
+
+    fn assert_recovery_rejected(st: &mut State, probe: &QuietRecovery, proof: QuietTurnProof) {
+        assert!(st.seats["cx"].quiet.verdict.is_some());
+        assert!(
+            !probe.commit(st, "cx", Harness::Codex, Ok(Some(proof)), |_, _| {
+                panic!("stale completion reached quiet_check/presence/wake callback")
+            })
+        );
+        assert_eq!(st.seats["cx"].state, SeatState::Busy);
+        assert!(st.seats["cx"].quiet.verdict.is_none());
+        assert_eq!(st.seats["cx"].last_activity, 20);
+        assert_eq!(st.seats["cx"].wakes, 0);
+        assert_eq!(st.saved.turns["cx"].shown, vec![41]);
+        assert!(!st.save_dirty);
+    }
+
+    #[test]
+    fn quiet_diagnostics_report_eligibility_without_completing_or_clearing_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        std::fs::write(&path, "fixture\n").unwrap();
+        let (mut st, probe, _) = ready_recovery(&path);
+        let before = serde_json::to_value(&st.saved).unwrap();
+        let verdict = st.seats["cx"].quiet.verdict.clone();
+        let report = quiet_recovery_diagnostics(&st, "cx");
+        assert_eq!(report["capture_eligible"], true);
+        assert_eq!(report["turn_check_pending"], false);
+        assert_eq!(report["wake_in_flight"], false);
+        assert_eq!(report["has_first_observation"], true);
+        assert_eq!(st.seats["cx"].state, SeatState::Busy);
+        assert_eq!(st.seats["cx"].quiet.verdict, verdict);
+        assert_eq!(serde_json::to_value(&st.saved).unwrap(), before);
+        assert_eq!(
+            QuietRecovery::capture(&st, "cx", Harness::Codex, "session"),
+            Some(probe)
+        );
+
+        st.saved.turns.get_mut("cx").unwrap().failures = 1;
+        let failed = serde_json::to_value(&st.saved).unwrap();
+        assert_eq!(
+            quiet_recovery_diagnostics(&st, "cx")["capture_eligible"],
+            false
+        );
+        assert_eq!(serde_json::to_value(&st.saved).unwrap(), failed);
+        assert_eq!(st.seats["cx"].state, SeatState::Busy);
+        assert_eq!(st.seats["cx"].quiet.verdict, verdict);
+    }
+
+    #[test]
+    fn quiet_recovery_rejects_file_changes_after_adapter_before_commit() {
+        use std::io::Write;
+        for change in ["append", "replace", "truncate", "symlink"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("rollout.jsonl");
+            std::fs::write(&path, "completed\n").unwrap();
+            let (mut st, probe, proof) = ready_recovery(&path);
+            // A current second observation can reach the completion callback.
+            assert!(probe.commit(
+                &mut st,
+                "cx",
+                Harness::Codex,
+                Ok(Some(proof.clone())),
+                |_, _| true
+            ));
+            match change {
+                "append" => {
+                    let mut f = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(&path)
+                        .unwrap();
+                    f.write_all(b"new task_started\n").unwrap();
+                }
+                "replace" => {
+                    let replacement = dir.path().join("replacement.jsonl");
+                    std::fs::write(&replacement, "completed\n").unwrap();
+                    std::fs::rename(replacement, &path).unwrap();
+                }
+                "truncate" => {
+                    std::fs::write(&path, "").unwrap();
+                }
+                "symlink" => {
+                    let moved = dir.path().join("moved.jsonl");
+                    std::fs::rename(&path, &moved).unwrap();
+                    std::os::unix::fs::symlink(moved, &path).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            // PID, hook and registration are unchanged: only the final file
+            // check can reject this exact interleaving.
+            assert_eq!(
+                QuietRecovery::capture(&st, "cx", Harness::Codex, "session"),
+                Some(probe.clone())
+            );
+            assert_recovery_rejected(&mut st, &probe, proof);
+        }
+    }
+
+    #[test]
+    fn quiet_recovery_rejects_stop_or_hold_while_original_pid_is_alive() {
+        use super::super::supervise::{Intent, SupRt};
+        for barrier in ["sleep", "down", "restart", "held", "retry", "lost"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("rollout.jsonl");
+            std::fs::write(&path, "completed\n").unwrap();
+            let (mut st, probe, proof) = ready_recovery(&path);
+            match barrier {
+                "sleep" | "down" | "restart" => {
+                    let intent = match barrier {
+                        "sleep" => Intent::Sleep,
+                        "down" => Intent::Down,
+                        _ => Intent::Restart,
+                    };
+                    st.sup.insert("cx".into(), SupRt::stopping_for_test(intent));
+                }
+                "held" => st.saved.managed.get_mut("cx").unwrap().held = Some(42),
+                "retry" => st.saved.managed.get_mut("cx").unwrap().failures = 1,
+                "lost" => st.saved.managed.get_mut("cx").unwrap().context_lost = true,
+                _ => unreachable!(),
+            }
+            let (pid, start) = st.seats["cx"].session.as_ref().unwrap().pid.unwrap();
+            assert!(alive(pid, start));
+            assert!(proof.file.still_current(&path));
+            assert_recovery_rejected(&mut st, &probe, proof);
+        }
+    }
+
+    #[test]
+    fn quiet_recovery_does_not_clear_failed_or_replaced_sessions() {
+        let mut st = State::default();
+        let pid = std::process::id();
+        let start = proc_start(pid).unwrap();
+        let s = st.seat("cx");
+        s.harness = Some(Harness::Codex);
+        s.state = SeatState::Busy;
+        s.since = 10;
+        s.last_activity = 20;
+        s.session = Some(SessionRt {
+            id: Some("session".into()),
+            target: Some("session".into()),
+            pid: Some((pid, Some(start))),
+        });
+        st.saved.transcripts.insert(
+            "cx".into(),
+            crate::persist::TranscriptRef {
+                harness: "codex".into(),
+                path: "/unused/rollout.jsonl".into(),
+                session_id: Some("session".into()),
+                base: None,
+            },
+        );
+        let original = QuietRecovery::capture(&st, "cx", Harness::Codex, "session").unwrap();
+        st.saved.turns.entry("cx".into()).or_default().failures = 3;
+        assert!(QuietRecovery::capture(&st, "cx", Harness::Codex, "session").is_none());
+        st.saved.turns.remove("cx");
+        st.seat("cx").session.as_mut().unwrap().pid = Some((pid, Some(start + 1)));
+        assert!(QuietRecovery::capture(&st, "cx", Harness::Codex, "session").is_none());
+        st.seat("cx").session.as_mut().unwrap().pid = Some((pid, Some(start)));
+        st.seat("cx").last_activity += 1;
+        assert_ne!(
+            QuietRecovery::capture(&st, "cx", Harness::Codex, "session"),
+            Some(original)
+        );
+        st.seat("cx").session.as_mut().unwrap().target = Some("replacement".into());
+        assert!(QuietRecovery::capture(&st, "cx", Harness::Codex, "session").is_none());
+    }
 
     #[test]
     fn reasons_are_one_short_line() {

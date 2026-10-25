@@ -204,6 +204,11 @@ pub fn router(state: AppState) -> Router {
             "/messages/{id}/deliveries/{seat}/withdraw",
             post(mail::withdraw),
         )
+        // Compatibility for existing local bridge clients; use upstream withdrawal semantics.
+        .route(
+            "/messages/{id}/deliveries/{seat}/cancel",
+            post(mail::withdraw),
+        )
         .route("/messages/{id}/status", get(mail::status))
         .route("/messages/{id}/read", post(ui::mark_read))
         .route("/messages/{id}/unread", post(ui::mark_unread))
