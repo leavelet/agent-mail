@@ -484,6 +484,9 @@ pub mod limits {
     /// Highest `task_stale_hours` an org may set (0 turns stale reminders
     /// off).
     pub const MAX_TASK_STALE_HOURS: i64 = 24 * 365;
+    /// Hours after which a request to take over a task (`steal`) that the
+    /// assignee did not answer expires.
+    pub const STEAL_REQUEST_HOURS: i64 = 24;
     /// Bytes counted against the storage quota for each task, on top of
     /// its texts (title, body, labels, reason).
     pub const STORED_BYTES_PER_TASK: i64 = 512;

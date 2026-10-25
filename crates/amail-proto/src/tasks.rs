@@ -61,6 +61,9 @@ string_enum!(
         Commented => "commented",
         ReminderSent => "reminder_sent",
         Unblocked => "unblocked",
+        StealRequested => "steal_requested",
+        StealDeclined => "steal_declined",
+        StealExpired => "steal_expired",
     }
 );
 
@@ -106,6 +109,12 @@ pub struct Task {
     /// t11`), lowest first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub waits_on: Vec<i64>,
+    /// A pending request of this seat to take the task over (see
+    /// `POST /tasks/{num}/steal`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steal_requested_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steal_requested_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -151,7 +160,9 @@ pub struct TaskEvent {
     /// `changed`: the field (`title`, `body`, `state`, `priority`, `rank`,
     /// `team`, `parent`, `labels`, `due`, `waiting_on`,
     /// `blocked_reason`). `reminder_sent`: the reminder (`assigned`,
-    /// `unblocked`, `waiting`, `closed`, `urgent`, `stale`, `due`).
+    /// `unblocked`, `waiting`, `closed`, `urgent`, `stale`, `due`, `steal`,
+    /// `steal_declined`, `steal_expired`). `steal_*`: `from` is the
+    /// assignee, `to` the requesting seat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub field: Option<String>,
     /// The value before (`changed`, `assigned`). A body is not repeated:
@@ -447,7 +458,8 @@ pub struct TaskBoard {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskBusEvent {
     pub num: i64,
-    /// `created`, `changed`, `assigned`, `dependency`, `link`, `commented`.
+    /// `created`, `changed`, `assigned`, `dependency`, `link`, `commented`,
+    /// `reminder`, `steal`.
     pub change: String,
     /// `changed`: the fields that changed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

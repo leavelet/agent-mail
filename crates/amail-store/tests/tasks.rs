@@ -48,6 +48,7 @@ conformance!(
     storage_quota,
     reminders_claimed_once,
     org_and_team_deletion,
+    steal_requests,
 );
 
 struct Org1 {
@@ -953,4 +954,116 @@ async fn org_and_team_deletion(s: S) {
     // The name can be taken again; the new org starts at t1.
     let o2 = setup(&s, "alpha").await;
     assert_eq!(new(&s, &o2, "fresh", None).await.num, 1);
+}
+
+async fn steal_requests(s: S) {
+    let o = setup(&s, "alpha").await;
+    let c = s
+        .create_seat(
+            o.org.id,
+            &NewSeat {
+                name: "c".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    // Unassigned: take it instead.
+    let free = new(&s, &o, "free", None).await;
+    let e = s.steal_task(&w(&o, free.num, &o.b)).await.unwrap_err();
+    assert_eq!(code(e), "not_assigned");
+    let t = new(&s, &o, "x", Some(&o.a)).await;
+    let e = s.steal_task(&w(&o, t.num, &o.a)).await.unwrap_err();
+    assert_eq!(code(e), "own_task");
+    // A request; asking again changes nothing; a second seat waits.
+    let ch = s.steal_task(&w(&o, t.num, &o.b)).await.unwrap();
+    assert_eq!(ch.task.steal_requested_by.as_deref(), Some("b"));
+    assert!(ch.task.steal_requested_at.is_some());
+    assert!(
+        s.steal_task(&w(&o, t.num, &o.b))
+            .await
+            .unwrap()
+            .fields
+            .is_empty()
+    );
+    let e = s.steal_task(&w(&o, t.num, &c)).await.unwrap_err();
+    assert_eq!(code(e), "steal_pending");
+    // Only the assignee (or the user) answers.
+    let e = s
+        .answer_task_steal(&w(&o, t.num, &c), true, false)
+        .await
+        .unwrap_err();
+    assert_eq!(code(e), "not_assignee");
+    // Keep: cleared.
+    let ch = s
+        .answer_task_steal(&w(&o, t.num, &o.a), false, false)
+        .await
+        .unwrap();
+    assert_eq!(ch.task.steal_requested_by, None);
+    assert_eq!(ch.task.assignee.as_deref(), Some("a"));
+    let e = s
+        .answer_task_steal(&w(&o, t.num, &o.a), false, false)
+        .await
+        .unwrap_err();
+    assert!(matches!(e, StoreError::NotFound(_)));
+    // Yield (by the user): the requester has it.
+    s.steal_task(&w(&o, t.num, &c)).await.unwrap();
+    let ch = s
+        .answer_task_steal(&w(&o, t.num, &o.user), true, true)
+        .await
+        .unwrap();
+    assert_eq!(ch.task.assignee.as_deref(), Some("c"));
+    assert_eq!(ch.task.steal_requested_by, None);
+    let ev = events(&s, &o, t.num).await;
+    let kinds: Vec<K> = ev.iter().map(|e| e.kind).collect();
+    assert!(kinds.contains(&K::StealRequested) && kinds.contains(&K::StealDeclined));
+    let last = ev.last().unwrap();
+    assert_eq!(last.kind, K::Assigned);
+    assert_eq!(last.note.as_deref(), Some("yielded to c on request"));
+    // Assigning by hand clears a request.
+    s.steal_task(&w(&o, t.num, &o.b)).await.unwrap();
+    let ch = s
+        .change_task(
+            &w(&o, t.num, &o.user),
+            &TaskChange {
+                assignee_id: Some(Some(o.a.id)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(ch.task.steal_requested_by, None);
+    assert!(ch.fields.contains(&"steal".to_string()));
+    let last = events(&s, &o, t.num).await.pop().unwrap();
+    assert_eq!(last.kind, K::StealDeclined);
+    assert!(last.note.unwrap().starts_with("cleared"));
+    // So does starting it; a started task cannot be asked for.
+    s.steal_task(&w(&o, t.num, &o.b)).await.unwrap();
+    let ch = set_state(&s, &o, t.num, St::Doing).await;
+    assert_eq!(ch.task.steal_requested_by, None);
+    let e = s.steal_task(&w(&o, t.num, &o.b)).await.unwrap_err();
+    assert_eq!(code(e), "started");
+    // Expiry: each request once.
+    set_state(&s, &o, t.num, St::Open).await;
+    s.steal_task(&w(&o, t.num, &o.b)).await.unwrap();
+    let now = amail_store::now_ms();
+    assert!(
+        s.expire_task_steals(now - 3_600_000, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let (x, y) = tokio::join!(
+        s.expire_task_steals(now + 1, 10),
+        s.expire_task_steals(now + 1, 10)
+    );
+    let mut all = x.unwrap();
+    all.extend(y.unwrap());
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].requester, "b");
+    assert_eq!(all[0].task.steal_requested_by, None);
+    assert_eq!(
+        events(&s, &o, t.num).await.pop().unwrap().kind,
+        K::StealExpired
+    );
 }
