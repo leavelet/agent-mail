@@ -75,6 +75,12 @@
         return t('task.ev.reminder', { kind: value(e.field), seat: value(e.to) });
       case 'unblocked':
         return t('task.ev.unblocked');
+      case 'steal_requested':
+        return t('task.ev.stealRequested', { seat: value(e.to), from: value(e.from) });
+      case 'steal_declined':
+        return t('task.ev.stealDeclined', { seat: value(e.to), from: value(e.from) });
+      case 'steal_expired':
+        return t('task.ev.stealExpired', { seat: value(e.to) });
       default:
         return e.kind;
     }

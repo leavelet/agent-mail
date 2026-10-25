@@ -202,6 +202,28 @@ test('the task page follows changes made elsewhere', async ({ page }) => {
   await expect(page.locator(`li[data-ref="${nums.index}"]`)).toContainText('done');
 });
 
+test('a request to take over shows on the card and the page hands the task over', async ({ page }) => {
+  const s = state();
+  const n = await create(s.userToken, { title: 'Result caching', assignee: 'fe-1' });
+  await login(page, s.userToken, { lang: 'en' });
+  await page.goto(`${s.base}/#/tasks`);
+  await expect(card(page, n)).toBeVisible();
+  await expect(card(page, n).getByTestId('steal')).toHaveCount(0);
+  // fe-2 asks through the API: the card shows it without a reload.
+  await api(s.seatTokens['fe-2'], 'POST', `/tasks/${n}/steal`);
+  await expect(card(page, n).getByTestId('steal')).toContainText('fe-2 asks to take over');
+  await page.goto(`${s.base}/#/tasks/t${n}`);
+  const box = page.getByTestId('task-steal');
+  await expect(box).toContainText('fe-2 asks to take over');
+  await expect(box.getByRole('button', { name: 'Keep with fe-1' })).toBeVisible();
+  await box.getByRole('button', { name: 'Hand over to fe-2' }).click();
+  await expect(page.getByTestId('task-steal')).toHaveCount(0);
+  await expect(page.getByLabel('Assignee')).toHaveValue('fe-2');
+  const after = await api<{ task: { assignee?: string; steal_requested_by?: string } }>(s.userToken, 'GET', `/tasks/${n}`);
+  expect(after.task.assignee).toBe('fe-2');
+  expect(after.task.steal_requested_by).toBeUndefined();
+});
+
 test('seat view, needs you: the task lists', async ({ page }) => {
   const s = state();
   await login(page, s.userToken, { lang: 'en' });

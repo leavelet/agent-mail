@@ -45,6 +45,9 @@
       {#if task.blocked_reason}<span class="reason">· <Vis text={task.blocked_reason} /></span>{/if}
     </div>
   {/if}
+  {#if task.steal_requested_by}
+    <div class="steal" data-testid="steal">{t('task.steal.asks', { seat: task.steal_requested_by })} · {shortTime(task.steal_requested_at, ui.now, ui.lang)}</div>
+  {/if}
   {#if task.labels?.length}
     <div class="labels">{#each task.labels as l}<span class="chip neutral"><Vis text={l} /></span>{/each}</div>
   {/if}
@@ -126,6 +129,11 @@
   }
   .reason {
     color: var(--muted);
+  }
+  .steal {
+    font-size: 12px;
+    color: var(--notice);
+    font-weight: 600;
   }
   .labels {
     display: flex;

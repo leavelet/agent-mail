@@ -274,6 +274,14 @@
       <span class="spacer"></span>
       {#if !editing}<button class="small" onclick={startEdit}>{t('task.edit')}</button>{/if}
     </div>
+    {#if task.steal_requested_by}
+      <div class="stealbox card" data-testid="task-steal">
+        <span>{t('task.steal.asks', { seat: task.steal_requested_by })} · <span title={fullTime(task.steal_requested_at, ui.lang)}>{shortTime(task.steal_requested_at, ui.now, ui.lang)}</span></span>
+        <span class="spacer"></span>
+        <button class="small primary" disabled={busy} onclick={() => act(() => post<TaskDetail>(taskPath(num, '/yield')))}>{t('task.steal.yield', { seat: task.steal_requested_by })}</button>
+        <button class="small" disabled={busy} onclick={() => act(() => post<TaskDetail>(taskPath(num, '/keep')))}>{t('task.steal.keep', { seat: task.assignee ?? '—' })}</button>
+      </div>
+    {/if}
     {#if error}<p class="error" role="alert" data-testid="task-error">{error}</p>{/if}
     {#if note}<p class="ok" role="status">{note}</p>{/if}
 
@@ -531,6 +539,17 @@
   }
   .short {
     width: 90px;
+  }
+  .stealbox {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+    padding: 8px 12px;
+    margin-bottom: 10px;
+    background: var(--notice-weak);
+    color: var(--notice);
+    font-weight: 600;
   }
   .sublink {
     font-size: 12px;

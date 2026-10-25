@@ -747,6 +747,17 @@ const en = {
   'needs.tasksOverdue': 'Your overdue tasks',
   'needs.dueAt': 'due {time}',
   'thread.tasks': 'Tasks of this thread',
+  'task.steal.asks': '{seat} asks to take over',
+  'task.steal.yield': 'Hand over to {seat}',
+  'task.steal.keep': 'Keep with {seat}',
+  'task.ev.stealRequested': '{seat} asked to take over from {from}',
+  'task.ev.stealDeclined': 'request of {seat} declined; stays with {from}',
+  'task.ev.stealExpired': 'request of {seat} expired without an answer',
+  'task.err.steal_pending': 'Another seat has already asked to take over this task.',
+  'task.err.not_assigned': 'The task has no assignee: take it instead.',
+  'task.err.own_task': 'The task is already yours.',
+  'task.err.started': 'Only a task that has not started (open) can be taken over.',
+  'task.err.not_assignee': 'Only the assignee or the user can answer the request.',
 };
 
 export type Key = keyof typeof en;
@@ -1498,6 +1509,17 @@ const zh: Record<Key, string> = {
   'needs.tasksOverdue': '你已逾期的任务',
   'needs.dueAt': '截止 {time}',
   'thread.tasks': '本会话的任务',
+  'task.steal.asks': '{seat} 请求接手',
+  'task.steal.yield': '交给 {seat}',
+  'task.steal.keep': '留给 {seat}',
+  'task.ev.stealRequested': '{seat} 请求从 {from} 接手',
+  'task.ev.stealDeclined': '拒绝了 {seat} 的请求；仍由 {from} 负责',
+  'task.ev.stealExpired': '{seat} 的请求无人回答，已过期',
+  'task.err.steal_pending': '已有另一个席位请求接手这个任务。',
+  'task.err.not_assigned': '任务没有负责人：请直接领取。',
+  'task.err.own_task': '任务已经是你的。',
+  'task.err.started': '只有尚未开始（待处理）的任务可以被接手。',
+  'task.err.not_assignee': '只有负责人或用户可以回答这个请求。',
 };
 
 export const dictionaries: Record<Lang, Record<Key, string>> = { en, zh };

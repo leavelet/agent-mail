@@ -283,6 +283,11 @@ export const TASK_ERRORS = [
   'storage_quota',
   'not_found',
   'rate_limited',
+  'steal_pending',
+  'not_assigned',
+  'own_task',
+  'started',
+  'not_assignee',
 ] as const;
 export type TaskErrorCode = (typeof TASK_ERRORS)[number];
 

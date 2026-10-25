@@ -546,6 +546,9 @@ export interface Task {
   thread?: number;
   /** Blockers that are not closed yet, lowest first. */
   waits_on?: number[];
+  /** A pending request of this seat to take the task over. */
+  steal_requested_by?: string;
+  steal_requested_at?: string;
   created_at: string;
   updated_at: string;
   closed_at?: string;
@@ -574,7 +577,10 @@ export type TaskEventKind =
   | 'dependency_removed'
   | 'commented'
   | 'reminder_sent'
-  | 'unblocked';
+  | 'unblocked'
+  | 'steal_requested'
+  | 'steal_declined'
+  | 'steal_expired';
 
 export interface TaskEvent {
   seq: number;
