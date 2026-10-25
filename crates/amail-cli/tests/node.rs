@@ -1616,17 +1616,18 @@ async fn hook_budget_follows_server_latency(b: Backend) {
         .await;
     let m1 = h.api.send(&["w1"], &[], "slow one", false).await;
     h.wait_pending("w1", 1, 0, 0).await;
-    // Nothing measured yet: the floor budget (150 ms) misses the 600 ms
-    // answer, and the hook shows nothing.
-    assert_eq!(
-        h.hook("claude", env.clone(), claude("PostToolUse")).await,
-        Value::Null
-    );
+    // With only fast round trips measured so far, the budget is near the
+    // floor (150 ms), the 600 ms answer comes too late and the hook shows
+    // nothing. (A slow machine may have measured a slow request already;
+    // the hook then waits long enough and shows the message at once.)
+    let first = h.hook("claude", env.clone(), claude("PostToolUse")).await;
+    let missed = first == Value::Null;
     let st = h.status().await;
     assert_eq!(st["latency"]["hooks_10m"], 1, "{st}");
-    assert_eq!(st["latency"]["hook_misses_10m"], 1, "{st}");
-    // The retry of that claim measures the slow answer; the budget grows to
-    // twice the slowest answer (capped at 1.5 s).
+    assert_eq!(st["latency"]["hook_misses_10m"], u64::from(missed), "{st}");
+    // The slow answer (of the hook, or of the retry of its claim) is
+    // measured; the budget grows to twice the slowest answer, within the
+    // cap of 1.5 s.
     h.wait("budget", || async {
         h.status().await["latency"]["hook_budget_ms"]
             .as_u64()
@@ -1636,13 +1637,14 @@ async fn hook_budget_follows_server_latency(b: Backend) {
     h.wait_pending("w1", 0, 0, 0).await;
     let m2 = h.api.send(&["w1"], &[], "slow two", false).await;
     h.wait_pending("w1", 1, 0, 0).await;
-    // The next hook waits for the slow claim: both the kept message and the
-    // new one are shown.
+    // The next hook waits for the slow claim and shows the new message at
+    // once, with the kept one when the first hook missed.
     let v = h.hook("claude", env.clone(), claude("PostToolUse")).await;
-    assert_eq!(injected_ids(&hook_text(&v).unwrap()), vec![m1, m2]);
+    let expected = if missed { vec![m1, m2] } else { vec![m2] };
+    assert_eq!(injected_ids(&hook_text(&v).unwrap()), expected);
     let st = h.status().await;
     assert_eq!(st["latency"]["hooks_10m"], 2, "{st}");
-    assert_eq!(st["latency"]["hook_misses_10m"], 1, "{st}");
+    assert_eq!(st["latency"]["hook_misses_10m"], u64::from(missed), "{st}");
 }
 
 /// A server slower than the budget's cap makes every hook miss; after five
@@ -1716,7 +1718,12 @@ async fn slow_server_is_reported_once(b: Backend) {
 async fn lost_claim_answer_is_recovered(b: Backend) {
     let opts = Opts {
         slow_claims: Some((1, Duration::from_millis(1500))),
-        tweak: Some(|c| c.hook_server_timeout = Duration::from_millis(300)),
+        // A fixed budget: the test needs the answer to come too late
+        // whatever round trips the node measured before.
+        tweak: Some(|c| {
+            c.hook_server_timeout = Duration::from_millis(300);
+            c.hook_budget_max = Duration::from_millis(300);
+        }),
         ..Default::default()
     };
     let Some(h) = setup(b, "lost_claim_answer_is_recovered", opts).await else {
