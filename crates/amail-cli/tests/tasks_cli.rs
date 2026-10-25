@@ -211,7 +211,7 @@ async fn run(backend: Backend) {
     let t6 = lead.new_task(&["Get the keys", "--assignee", "w2"]);
     let t7 = lead.new_task(&["Tidy the docs", "--team", "core", "--priority", "low"]);
     let t8 = lead.new_task(&["Set up CI", "--assignee", "lead"]);
-    assert_eq!((t1, t8), (1, 8));
+    assert_eq!([t1, t2, t3, t4, t5, t6, t7, t8], [1, 2, 3, 4, 5, 6, 7, 8]);
     lead.run(&["task", "dep", "t2", "--on", "t1"]);
     lead.run(&["task", "dep", "3", "--on", "2"]);
     lead.run(&["task", "dep", "t5", "--on", "t4"]);
