@@ -463,6 +463,14 @@ Nothing of a task crosses orgs: a linked thread may contain seats of other
 orgs, but the task, its links and its history are visible only inside its
 org. A comment that reaches another org's seat is ordinary mail to it.
 
+### Tasks in an agent's context
+
+The seat introduction in an agent's system prompt names the task commands
+(`amail task mine`, `next`, `waiting`, `owed`, `comment`). When a session
+starts and the seat has unfinished tasks, the node adds one line:
+`[amail] you have N open task(s), M ready: amail task mine`. Hooks do not
+show task changes otherwise; reminders arrive as mail.
+
 ### History
 
 Every change is an event: who made it (the seat of the token; the user

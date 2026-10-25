@@ -126,6 +126,17 @@ The first public version.
   answers list the linked tasks; `task` events on `/v1/events` follow
   changes. Tasks are bounded per org and per task and count against the
   storage quota. Migration `0023_tasks.sql`.
+- `amail task`: `new` (also `--from <message>`), `show`, `history`,
+  `list` with the API's filters, `mine`, `next [--pool]`, `waiting`,
+  `owed`, `board`, `set`, `assign`, `take`, `block [--on seat]`,
+  `unblock`, `start`, `review`, `done`, `cancel`, `reopen`, `dep`/`undep`,
+  `link`/`unlink` and `comment`; one line per task in text output and the
+  server's JSON with `--json`. `amail thread` lists the tasks linked to
+  the thread. The seat introduction in an agent's system prompt names the
+  task commands, and at session start the node adds
+  `[amail] you have N open task(s), M ready: amail task mine` when the
+  seat has unfinished tasks (`GET /tasks/mine?seat=` with the node
+  token; the only task call node tokens may make).
 
 #### Running agents
 
