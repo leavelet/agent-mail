@@ -11,6 +11,9 @@
 //!   (trust hashes cover the binary and the explicit node-context paths).
 //! - Wake-up: `codex queue --thread <session id> --message ...`, which starts
 //!   a turn on an idle thread and fires `UserPromptSubmit`.
+//! - MCP: `[mcp_servers.amail]` in the same `config.toml` runs `amail mcp
+//!   --node`, which finds the seat from the thread id Codex sends with each
+//!   tool call (see `apply_mcp`).
 //! - Launch flags are limited to ones that keep the session attached to the
 //!   shared daemon (`-m`, `-a`, `-s`, `-C`).
 
@@ -709,6 +712,7 @@ impl Codex {
         }
         hooks.insert("state".into(), V::Table(state));
         t.insert("hooks".into(), V::Table(hooks));
+        self.apply_mcp(t);
         // Agents' `amail` commands reach the server over loopback. Without
         // network access the Codex sandbox refuses `socket(AF_INET)` and also
         // `connect()` on Unix sockets (EPERM, even inside the workspace), so
@@ -736,6 +740,48 @@ impl Codex {
         );
         for name in [PERMISSIONS_PROFILE, FULL_PROFILE, OFF_PROFILE] {
             profile_fs(t, name);
+        }
+    }
+
+    /// Register `amail mcp --node` in `[mcp_servers.amail]` (other servers
+    /// are kept). The app-server daemon starts it for each thread with only
+    /// the variables Codex passes to MCP servers: `env` names the node
+    /// socket, and `env_vars` passes on the node's Codex pass from the
+    /// daemon's environment, so the file holds no secret. Codex puts the
+    /// thread id in the `_meta` of every tool call; the server asks the
+    /// node for that thread's seat with the pass. The hook trust hashes
+    /// cover only the hooks, so this entry does not change them.
+    fn apply_mcp(&self, t: &mut toml::Table) {
+        use toml::Value as V;
+        let socket = std::path::absolute(&self.env.node_socket)
+            .unwrap_or_else(|_| self.env.node_socket.clone());
+        let mut env = toml::Table::new();
+        env.insert(
+            crate::paths::SOCK_ENV.into(),
+            V::String(socket.to_string_lossy().into_owned()),
+        );
+        let mut server = toml::Table::new();
+        server.insert(
+            "command".into(),
+            V::String(self.env.amail_exe.to_string_lossy().into_owned()),
+        );
+        server.insert(
+            "args".into(),
+            V::Array(vec![V::String("mcp".into()), V::String("--node".into())]),
+        );
+        server.insert("env".into(), V::Table(env));
+        server.insert(
+            "env_vars".into(),
+            V::Array(vec![V::String(crate::wire::CODEX_PASS_ENV.into())]),
+        );
+        let servers = t
+            .entry("mcp_servers")
+            .or_insert_with(|| V::Table(toml::Table::new()));
+        if !servers.is_table() {
+            *servers = V::Table(toml::Table::new());
+        }
+        if let V::Table(servers) = servers {
+            servers.insert(MCP_SERVER.into(), V::Table(server));
         }
     }
 

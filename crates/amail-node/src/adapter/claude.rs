@@ -10,6 +10,10 @@
 //!   (needed for socket messages to reach bypass-mode sessions) and
 //!   `skipDangerousModePermissionPrompt`; these two only take effect when
 //!   given through `--settings`.
+//! - MCP: `--mcp-config` with a file that registers `amail mcp --node`.
+//!   Claude Code starts the server as its child with the session's
+//!   environment, so the server takes the seat from `AMAIL_TOKEN`; the file
+//!   holds no credential and is the same for every seat.
 
 use super::*;
 use amail_proto::PermissionMode;
@@ -53,6 +57,23 @@ impl Claude {
         self.env.state_dir.join("claude").join("settings.json")
     }
 
+    /// The MCP configuration given with `--mcp-config`.
+    pub fn mcp_config_path(&self) -> PathBuf {
+        self.env.state_dir.join("claude").join("mcp.json")
+    }
+
+    pub fn mcp_config(&self) -> Value {
+        json!({
+            "mcpServers": {
+                MCP_SERVER: {
+                    "type": "stdio",
+                    "command": self.env.amail_exe.to_string_lossy(),
+                    "args": ["mcp", "--node"],
+                }
+            }
+        })
+    }
+
     /// Fixed sender address for wake-ups (nothing listens there).
     fn sender_address(&self) -> String {
         let dir = self
@@ -82,6 +103,10 @@ impl Claude {
             "hooks": hooks,
             "crossSessionInbound": "accept",
             "skipDangerousModePermissionPrompt": true,
+            // The amail MCP tools run without a permission prompt, as the
+            // hooks do; `amail` shell commands still follow the session's
+            // permission mode.
+            "permissions": {"allow": [format!("mcp__{MCP_SERVER}")]},
         })
     }
 
@@ -256,6 +281,8 @@ impl Adapter for Claude {
         tokio::fs::create_dir_all(dir).await?;
         let text = serde_json::to_string_pretty(&self.settings())?;
         crate::persist::write_atomic(&path, text.as_bytes(), 0o600)?;
+        let text = serde_json::to_string_pretty(&self.mcp_config())?;
+        crate::persist::write_atomic(&self.mcp_config_path(), text.as_bytes(), 0o600)?;
         Ok(())
     }
 
@@ -269,6 +296,9 @@ impl Adapter for Claude {
         let mut args = vec![
             "--settings".to_string(),
             self.settings_path().to_string_lossy().into_owned(),
+            // `--mcp-config` takes several values: an option must follow it.
+            "--mcp-config".into(),
+            self.mcp_config_path().to_string_lossy().into_owned(),
             "--append-system-prompt".into(),
             prompt,
             "--name".into(),

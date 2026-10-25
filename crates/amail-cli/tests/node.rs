@@ -574,6 +574,53 @@ async fn codex_registration_and_rows(b: Backend) {
     assert!(config.contains("trusted_hash = \"sha256:"), "{config}");
     assert!(config.contains("developer_instructions"), "{config}");
     assert!(config.contains("trust_level = \"trusted\""), "{config}");
+    // The MCP server: `amail mcp --node` with the node socket, and the
+    // node's Codex pass passed on from the daemon's environment (not
+    // written in the file). The hooks and their trust are unchanged.
+    let table: toml::Table = config.parse().unwrap();
+    let server = &table["mcp_servers"]["amail"];
+    assert!(
+        server["command"].as_str().unwrap().ends_with("amail"),
+        "{config}"
+    );
+    assert_eq!(
+        server["args"].as_array().unwrap(),
+        &vec![toml::Value::from("mcp"), toml::Value::from("--node")]
+    );
+    assert_eq!(
+        server["env"]["AMAIL_NODE_SOCK"].as_str(),
+        Some(h.sock.to_str().unwrap()),
+        "{config}"
+    );
+    assert_eq!(
+        server["env_vars"].as_array().unwrap(),
+        &vec![toml::Value::from("AMAIL_CODEX_PASS")]
+    );
+    assert!(!config.contains(&pass), "the pass is not in the file");
+    let hook_cmd = format!(
+        "{} hook codex --node-state-dir {} --node-socket {}",
+        server["command"].as_str().unwrap(),
+        h.dir.path().join("state").display(),
+        h.sock.display()
+    );
+    let hooks = table["hooks"].as_table().unwrap();
+    let mut handlers = 0;
+    for (name, groups) in hooks {
+        if name == "state" {
+            continue;
+        }
+        for g in groups.as_array().unwrap() {
+            for hd in g["hooks"].as_array().unwrap() {
+                assert_eq!(hd["command"].as_str(), Some(hook_cmd.as_str()), "{config}");
+                handlers += 1;
+            }
+        }
+    }
+    assert_eq!(
+        handlers,
+        hooks["state"].as_table().unwrap().len(),
+        "{config}"
+    );
 
     // SessionStart comes before the first prompt and is still unregistered.
     let start = with(codex("SessionStart"), &[("session_id", json!(sid))]);
@@ -590,6 +637,38 @@ async fn codex_registration_and_rows(b: Backend) {
     assert_eq!(v["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit");
     assert_eq!(injected_ids(&hook_text(&v).unwrap()), vec![m1]);
     assert_eq!(h.state("cx").await, "busy");
+
+    // `amail mcp --node`, as the Codex daemon starts it: the seat comes
+    // from the thread id in the call's `_meta`, through the node.
+    {
+        let sock = h.sock.to_string_lossy().into_owned();
+        let pass = pass.clone();
+        let (seat, unknown, no_pass) = tokio::task::spawn_blocking(move || {
+            let mut m = McpProc::start(
+                &["--node"],
+                &[("AMAIL_NODE_SOCK", &sock), ("AMAIL_CODEX_PASS", &pass)],
+            );
+            m.initialize();
+            let seat = m.call_meta("status", json!({}), Some(json!({"threadId": sid})));
+            let unknown = m.call_meta("status", json!({}), Some(json!({"threadId": "nope"})));
+            // Without the pass the node gives no credentials.
+            let mut m2 = McpProc::start(&["--node"], &[("AMAIL_NODE_SOCK", &sock)]);
+            m2.initialize();
+            let no_pass = m2.call_meta("status", json!({}), Some(json!({"threadId": sid})));
+            (seat, unknown, no_pass)
+        })
+        .await
+        .unwrap();
+        assert_eq!(seat["isError"], false, "{seat}");
+        assert_eq!(seat["structuredContent"]["whoami"]["seat"], "cx", "{seat}");
+        for v in [unknown, no_pass] {
+            assert_eq!(v["isError"], true, "{v}");
+            assert_eq!(
+                v["structuredContent"]["error"]["code"], "no_identity",
+                "{v}"
+            );
+        }
+    }
     // The nonce is single-use: another session with the same prompt is ignored.
     let other = with(first.clone(), &[("session_id", json!("someone-else"))]);
     assert_eq!(h.hook("codex", env.clone(), other).await, Value::Null);
@@ -2007,6 +2086,35 @@ env -u AMAIL_TOKEN CODEX_THREAD_ID={tid} AMAIL_CODEX_PASS={pass} timeout 10 "$B"
     )
     .await;
     assert!(plan["env"]["AMAIL_TOKEN"].is_string(), "{plan}");
+    // The session gets the amail MCP server through `--mcp-config`, a file
+    // the node writes (no credential in it), and its tools are allowed.
+    let args: Vec<String> = serde_json::from_value(plan["args"].clone()).unwrap();
+    let at = args
+        .iter()
+        .position(|a| a == "--mcp-config")
+        .expect("--mcp-config");
+    assert!(
+        args[at + 2].starts_with("--"),
+        "an option must end the list: {args:?}"
+    );
+    let mcp: Value =
+        serde_json::from_str(&std::fs::read_to_string(&args[at + 1]).unwrap()).unwrap();
+    let server = &mcp["mcpServers"]["amail"];
+    assert_eq!(server["args"], json!(["mcp", "--node"]), "{mcp}");
+    assert!(
+        server["command"].as_str().unwrap().ends_with("amail"),
+        "{mcp}"
+    );
+    assert!(server.get("env").is_none(), "{mcp}");
+    let settings: Value = serde_json::from_str(
+        &std::fs::read_to_string(h.dir.path().join("state/claude/settings.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        settings["permissions"]["allow"],
+        json!(["mcp__amail"]),
+        "{settings}"
+    );
     // Agents use `$TMPDIR`: a session gets one when the node has none.
     let tmp = std::env::var("TMPDIR").ok().filter(|t| !t.is_empty());
     assert_eq!(
