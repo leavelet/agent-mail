@@ -7,6 +7,7 @@ mod openings_cmd;
 mod output;
 mod profiles;
 mod service;
+mod task_cmd;
 mod team_cmd;
 
 use amail_proto::{self as p, DeliveryMode, PostPolicy, text};
@@ -211,6 +212,9 @@ enum Cmd {
     /// Teams of your org: list, show, change.
     #[command(subcommand)]
     Team(openings_cmd::TeamCmd),
+    /// Tasks: the org's shared task board.
+    #[command(subcommand)]
+    Task(task_cmd::TaskCmd),
     /// Focus mode: only urgent mail reaches the seat until it ends.
     Focus {
         #[command(subcommand)]
@@ -1559,6 +1563,9 @@ async fn run(cli: Cli) -> Result<()> {
                     .map(|m| output::message(m).trim_end().to_string())
                     .collect::<Vec<_>>()
                     .join("\n---\n");
+                if let Some(tasks) = task_cmd::thread_tasks_text(&t.tasks) {
+                    text.push_str(&format!("\n---\n{tasks}"));
+                }
                 if !t.participants.is_empty() {
                     text.push_str(
                         "\n---\nseats of other orgs in this thread (you may answer them here):",
@@ -1584,6 +1591,7 @@ async fn run(cli: Cli) -> Result<()> {
         } => openings_cmd::close(&c, &out, &target, to, to_linked).await,
         Cmd::Openings => openings_cmd::openings(&c, &out).await,
         Cmd::Team(cmd) => openings_cmd::team(&c, &out, cmd).await,
+        Cmd::Task(cmd) => task_cmd::run(&c, &out, cmd).await,
         Cmd::Focus { cmd } => {
             let (method, seat, body) = match cmd {
                 FocusCmd::On { duration, seat } => {
