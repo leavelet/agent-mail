@@ -351,7 +351,37 @@ pub fn seat_intro(info: &LaunchInfo) -> String {
         out.push_str("\n\nYour role:\n");
         out.push_str(&text::multiline(r.trim()));
     }
+    out.push_str("\n\n");
+    out.push_str(TASK_INSTRUCTIONS);
     out
+}
+
+/// The task lines of the seat introduction.
+pub const TASK_INSTRUCTIONS: &str = "\
+# Tasks
+
+Your org has a shared task board; a task is named by its number (`t12`).
+`amail task mine` (your tasks), `amail task next` (what you can start now), \
+`amail task waiting` (whom you wait for), `amail task owed` (who waits for you).
+`amail task comment t12 -m \"...\"` discusses a task by mail with its assignee and reporter.";
+
+/// At session start, when the seat has unfinished tasks: how many, and
+/// how many of them can be started now. `more`: the server had more than
+/// `tasks` holds.
+pub fn tasks_summary(tasks: &[amail_proto::Task], more: bool) -> Option<String> {
+    if tasks.is_empty() {
+        return None;
+    }
+    let ready = tasks
+        .iter()
+        .filter(|t| t.state == amail_proto::TaskState::Ready)
+        .count();
+    Some(format!(
+        "[amail] you have {}{} open task(s), {ready}{} ready: amail task mine",
+        tasks.len(),
+        if more { "+" } else { "" },
+        if more { "+" } else { "" },
+    ))
 }
 
 #[cfg(test)]
@@ -591,9 +621,9 @@ mod tests {
         };
         let intro = seat_intro(&info);
         assert!(
-            intro.ends_with(
-                "Build things.\nok\\u{202e}evil\\u{200b}\\u{feff}\\u{2066}\\u{e0041}\\u{1b}[31m"
-            ),
+            intro.ends_with(&format!(
+                "Build things.\nok\\u{{202e}}evil\\u{{200b}}\\u{{feff}}\\u{{2066}}\\u{{e0041}}\\u{{1b}}[31m\n\n{TASK_INSTRUCTIONS}"
+            )),
             "{intro}"
         );
     }

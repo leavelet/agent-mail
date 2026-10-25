@@ -305,6 +305,24 @@ impl ServerClient {
         .await
     }
 
+    /// The unfinished tasks assigned to `seat` (`GET /tasks/mine`), for the
+    /// count shown at session start.
+    pub async fn tasks_mine(
+        &self,
+        seat: &str,
+        limit: u32,
+        timeout: Duration,
+    ) -> Result<amail_proto::TaskList> {
+        self.json(
+            self.req(
+                reqwest::Method::GET,
+                &format!("/tasks/mine?seat={}&limit={limit}", enc(seat)),
+            )
+            .timeout(timeout),
+        )
+        .await
+    }
+
     pub async fn presence(&self, report: &PresenceReport) -> Result<()> {
         let resp = self
             .req(reqwest::Method::POST, "/presence")

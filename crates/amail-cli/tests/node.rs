@@ -56,6 +56,7 @@ node_tests!(
     lost_mailbox_event_is_recovered_at_turn_end,
     withdrawn_mail_neither_wakes_nor_is_injected,
     node_under_path_prefix,
+    session_start_shows_open_tasks,
 );
 
 use amail_store::testutil::Backend;
@@ -2689,4 +2690,102 @@ async fn node_under_path_prefix(b: Backend) {
     let _ = stand_in.wait();
     let _ = session.kill();
     let _ = session.wait();
+}
+
+/// At session start the node adds one line with the seat's open tasks when
+/// it has any, after the unread summary.
+async fn session_start_shows_open_tasks(b: Backend) {
+    let Some(h) = setup(b, "session_start_shows_open_tasks", Opts::default()).await else {
+        return;
+    };
+    let _w1 = h.seat("w1", "claude").await;
+    let _w2 = h.seat("w2", "claude").await;
+    let inbox = FakeInbox::start(h.dir.path().join("cc.sock"), None);
+    let env = claude_env("w1", &inbox.path);
+    // No tasks: nothing.
+    assert_eq!(
+        h.hook("claude", env.clone(), claude("SessionStart")).await,
+        Value::Null
+    );
+    // Tasks of other seats and closed tasks do not count.
+    h.api
+        .post("/tasks", json!({"title": "theirs", "assignee": "w2"}))
+        .await;
+    let closed = h
+        .api
+        .post("/tasks", json!({"title": "finished", "assignee": "w1"}))
+        .await;
+    h.api
+        .call(
+            reqwest::Method::PATCH,
+            &format!("/tasks/{}", closed["task"]["num"]),
+            Some(json!({"state": "done"})),
+        )
+        .await;
+    assert_eq!(
+        h.hook("claude", env.clone(), claude("SessionStart")).await,
+        Value::Null
+    );
+    // Two open tasks of w1, one of them waiting on the other.
+    let first = h
+        .api
+        .post("/tasks", json!({"title": "first", "assignee": "w1"}))
+        .await["task"]["num"]
+        .as_i64()
+        .unwrap();
+    let second = h
+        .api
+        .post("/tasks", json!({"title": "second", "assignee": "w1"}))
+        .await["task"]["num"]
+        .as_i64()
+        .unwrap();
+    h.api
+        .post(
+            &format!("/tasks/{second}/deps"),
+            json!({"blocked_by": first}),
+        )
+        .await;
+    let v = h.hook("claude", env.clone(), claude("SessionStart")).await;
+    assert_eq!(
+        hook_text(&v).unwrap(),
+        "[amail] you have 2 open task(s), 1 ready: amail task mine"
+    );
+    // With unread mail, the line comes after the summary.
+    h.hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    let long = h
+        .api
+        .post(
+            "/messages",
+            json!({"to": ["w1"], "subject": "long one", "body": "x".repeat(1000)}),
+        )
+        .await["id"]
+        .as_i64()
+        .unwrap();
+    h.wait_pending("w1", 1, 0, 0).await;
+    let v = h
+        .hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    assert_eq!(injected_ids(&hook_text(&v).unwrap()), vec![long]);
+    let v = h
+        .hook(
+            "claude",
+            env.clone(),
+            with(claude("SessionStart"), &[("source", json!("resume"))]),
+        )
+        .await;
+    let text = hook_text(&v).unwrap();
+    assert!(
+        text.starts_with("[amail] w1 has 1 unread message(s):"),
+        "{text}"
+    );
+    assert!(
+        text.ends_with("\n\n[amail] you have 2 open task(s), 1 ready: amail task mine"),
+        "{text}"
+    );
+    // A turn does not repeat it.
+    let v = h
+        .hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    assert!(!hook_text(&v).unwrap_or_default().contains("open task"));
 }
