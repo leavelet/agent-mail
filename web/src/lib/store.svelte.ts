@@ -28,6 +28,7 @@ import type {
   Seat,
   SeatCounts,
   ServerInfo,
+  TaskBusEvent,
   WhoAmI,
 } from './types';
 
@@ -59,6 +60,12 @@ class Store {
   /** What the server says about itself (public mode, retention). */
   info = $state.raw<ServerInfo | null>(null);
   loadError = $state<string | null>(null);
+  /** Counts the rounds of `task` events (and stream openings): views that
+   * show tasks reload when it changes. */
+  taskSeq = $state(0);
+  /** The tasks changed in the last round; null when anything may have
+   * changed (the stream was opened again). */
+  taskChanged = $state.raw<Set<number> | null>(null);
 
   seatMap = $derived(new Map(this.seats.map((s) => [s.name, s])));
 
@@ -178,6 +185,8 @@ class Store {
       // of the seats and this (re)connection would be missed, so load the
       // seats again once the stream is open.
       this.coalescer.add('d:seats');
+      // Task events are not replayed either: views that show tasks reload.
+      this.coalescer.add('t:*');
     };
     es.addEventListener('mailbox', (e) => {
       try {
@@ -205,6 +214,16 @@ class Store {
         if (d.kind === 'list') this.coalescer.add('d:lists');
         else this.coalescer.add('d:seats');
         if (d.kind === 'team' || d.kind === 'grant') this.coalescer.add('d:openings');
+      } catch {
+        // Ignore malformed events.
+      }
+    });
+    // A task of the org changed: views that show it reload (merged with
+    // the other updates of the same second).
+    es.addEventListener('task', (e) => {
+      try {
+        const ev = JSON.parse((e as MessageEvent).data) as TaskBusEvent;
+        if (typeof ev.num === 'number') this.coalescer.add(`t:${ev.num}`);
       } catch {
         // Ignore malformed events.
       }
@@ -253,9 +272,21 @@ class Store {
     const mail = new Set<string>();
     let presenceChanged = false;
     const jobs: Promise<unknown>[] = [];
+    let tasks: Set<number> | null = new Set();
+    let anyTask = false;
     for (const k of keys) {
       if (k.startsWith('m:')) mail.add(k.slice(2));
       else if (k.startsWith('p:')) presenceChanged = true;
+      else if (k.startsWith('t:')) {
+        anyTask = true;
+        const n = Number(k.slice(2));
+        if (k === 't:*' || !Number.isFinite(n)) tasks = null;
+        else tasks?.add(n);
+      }
+    }
+    if (anyTask) {
+      this.taskChanged = tasks;
+      this.taskSeq++;
     }
     if (keys.has('d:seats')) {
       // The new list replaces the seats; presence updates of this round are
