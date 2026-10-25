@@ -4,3 +4,6 @@ target/
 .env
 node_modules/
 dist/
+
+# Worktrees of helper agents
+/.claude/
