@@ -23,8 +23,10 @@ export function setRank(num: number, rank: number): Promise<TaskDetail> {
   return patchTask(num, { rank });
 }
 
-export function addDep(num: number, blockedBy: number): Promise<TaskDetail> {
-  return post<TaskDetail>(taskPath(num, '/deps'), { blocked_by: blockedBy });
+export function addDep(num: number, blockedBy: number, needsOk?: boolean): Promise<TaskDetail> {
+  const body: Record<string, unknown> = { blocked_by: blockedBy };
+  if (needsOk !== undefined) body.needs_ok = needsOk;
+  return post<TaskDetail>(taskPath(num, '/deps'), body);
 }
 
 export function removeDep(num: number, other: number): Promise<TaskDetail> {

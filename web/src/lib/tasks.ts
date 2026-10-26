@@ -194,6 +194,8 @@ export interface TaskFilters {
   due_before: string;
   stale: boolean;
   text: string;
+  /** '', `ok`, `rejected` or `none`. */
+  result: string;
 }
 
 export const NO_FILTERS: TaskFilters = {
@@ -207,6 +209,7 @@ export const NO_FILTERS: TaskFilters = {
   due_before: '',
   stale: false,
   text: '',
+  result: '',
 };
 
 /** Saved filters, with unknown or malformed fields left at their defaults. */
@@ -240,6 +243,7 @@ export function filterParams(f: TaskFilters): Record<string, string | undefined>
     due_before: f.due_before ? localToIso(f.due_before) : undefined,
     stale: f.stale ? '1' : undefined,
     text: f.text.trim() || undefined,
+    result: f.result || undefined,
   };
 }
 
@@ -288,6 +292,9 @@ export const TASK_ERRORS = [
   'own_task',
   'started',
   'not_assignee',
+  'children_open',
+  'not_done',
+  'stale',
 ] as const;
 export type TaskErrorCode = (typeof TASK_ERRORS)[number];
 
@@ -298,6 +305,20 @@ export function taskErrorCode(status: number, code: string): TaskErrorCode | nul
   if (status === 429) return 'rate_limited';
   return null;
 }
+
+/** `t9, t11 (ok needed)`: blockers a task waits on, marking those whose
+ * dependency needs an ok result with `okNeeded`. */
+export function waitsList(task: Pick<Task, 'waits_on' | 'waits_on_ok'>, okNeeded: string): string {
+  return (task.waits_on ?? []).map((n) => (task.waits_on_ok?.includes(n) ? `${taskId(n)} (${okNeeded})` : taskId(n))).join(', ');
+}
+
+/** The children of a task that are not closed. */
+export function openChildren(children: TaskRef[]): TaskRef[] {
+  return children.filter((c) => !isClosed(c.state));
+}
+
+/** The order of the report's sections. */
+export const REPORT_SECTIONS = ['not_started', 'in_progress', 'review', 'rejected', 'approved', 'parents', 'blocked'] as const;
 
 /** Whether a `task` event for `changed` (task numbers; `null`: everything
  * may have changed) concerns a view that shows the tasks `shown`. */

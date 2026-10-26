@@ -1,9 +1,10 @@
 <script lang="ts">
-  // The org's tasks: a board (one column per shown state) or a table with
-  // the list filters. The view, the team and the filters are remembered in
-  // this browser.
+  // The org's tasks: a board (one column per shown state), a table with
+  // the list filters, or the lead's report. The view, the team and the
+  // filters are remembered in this browser.
   import TaskBoard from '../components/TaskBoard.svelte';
   import TaskTable from '../components/TaskTable.svelte';
+  import TaskReport from '../components/TaskReport.svelte';
   import { get, qs } from '../lib/api';
   import { store } from '../lib/store.svelte';
   import { t } from '../lib/ui.svelte';
@@ -13,8 +14,9 @@
   import { taskError } from '../lib/taskops';
   import type { Task, TaskBoard as Board } from '../lib/types';
 
-  type View = 'board' | 'table';
-  let view = $state<View>(loadPref('amail.tasks.view') === 'table' ? 'table' : 'board');
+  type View = 'board' | 'table' | 'report';
+  const savedView = loadPref('amail.tasks.view');
+  let view = $state<View>(savedView === 'table' || savedView === 'report' ? savedView : 'board');
   let team = $state(loadPref('amail.tasks.team') ?? '');
   const saved = parseFilters(loadPref('amail.tasks.filters'));
   let filters = $state(saved);
@@ -93,9 +95,10 @@
     <div class="tabs" role="tablist" aria-label={t('tasks.view')}>
       <button role="tab" aria-selected={view === 'board'} onclick={() => (view = 'board')}>{t('tasks.board')}</button>
       <button role="tab" aria-selected={view === 'table'} onclick={() => (view = 'table')}>{t('tasks.table')}</button>
+      <button role="tab" aria-selected={view === 'report'} onclick={() => (view = 'report')}>{t('tasks.report')}</button>
     </div>
     <span class="spacer"></span>
-    {#if view === 'board'}
+    {#if view !== 'table'}
       <label class="row team">{t('task.team')}
         <select bind:value={team} aria-label={t('task.team')}>
           <option value="">{t('tasks.allTeams')}</option>
@@ -103,11 +106,15 @@
         </select>
       </label>
     {/if}
-    <input type="search" class="search" data-search placeholder={view === 'board' ? t('tasks.searchBoard') : t('tasks.search')} aria-label={t('tasks.search')} bind:value={search} />
+    {#if view !== 'report'}
+      <input type="search" class="search" data-search placeholder={view === 'board' ? t('tasks.searchBoard') : t('tasks.search')} aria-label={t('tasks.search')} bind:value={search} />
+    {/if}
     <a class="btnlike" href={href(['tasks', 'new'])}>{t('tasks.new')}</a>
   </div>
-  <p class="muted intro">{t('tasks.intro')}</p>
-  {#if view === 'board'}
+  <p class="muted intro">{view === 'report' ? t('tasks.report.intro') : t('tasks.intro')}</p>
+  {#if view === 'report'}
+    <TaskReport {team} />
+  {:else if view === 'board'}
     {#if error}<p class="error" role="alert">{error}</p>{/if}
     {#if !board && !error}
       <p class="faint">{t('app.loading')}</p>

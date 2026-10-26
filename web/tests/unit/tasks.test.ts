@@ -20,6 +20,8 @@ import {
   sortTasks,
   stateTone,
   taskErrorCode,
+  openChildren,
+  waitsList,
 } from '../../src/lib/tasks';
 import type { Task, TaskPriority, TaskState } from '../../src/lib/types';
 
@@ -199,5 +201,27 @@ describe('filters', () => {
     expect(concerns(null, [])).toBe(true);
     expect(concerns(new Set([3]), [1, 3])).toBe(true);
     expect(concerns(new Set([4]), [1, 3])).toBe(false);
+  });
+});
+
+describe('M8.1 helpers', () => {
+  it('marks blockers whose dependency needs an ok result', () => {
+    expect(waitsList({ waits_on: [9, 11], waits_on_ok: [11] }, 'ok needed')).toBe('t9, t11 (ok needed)');
+    expect(waitsList({}, 'ok needed')).toBe('');
+  });
+  it('lists the children that are not closed', () => {
+    const kids = [
+      { num: 2, title: 'a', state: 'done' as TaskState },
+      { num: 3, title: 'b', state: 'doing' as TaskState },
+      { num: 4, title: 'c', state: 'cancelled' as TaskState },
+    ];
+    expect(openChildren(kids).map((k) => k.num)).toEqual([3]);
+  });
+  it('sends the result filter', () => {
+    expect(filterParams({ ...NO_FILTERS, result: 'none' }).result).toBe('none');
+    expect(filterParams(NO_FILTERS).result).toBeUndefined();
+    expect(parseFilters(JSON.stringify({ result: 'rejected' })).result).toBe('rejected');
+    expect(taskErrorCode(409, 'stale')).toBe('stale');
+    expect(taskErrorCode(409, 'children_open')).toBe('children_open');
   });
 });

@@ -525,6 +525,8 @@ export type TaskState = 'ready' | 'open' | 'doing' | 'blocked' | 'review' | 'don
 /** A state that can be stored (and set): every shown state but `ready`. */
 export type StoredTaskState = Exclude<TaskState, 'ready'>;
 export type TaskPriority = 'urgent' | 'high' | 'normal' | 'low';
+/** The result of a done task. */
+export type TaskResult = 'ok' | 'rejected';
 
 export interface Task {
   num: number;
@@ -544,8 +546,21 @@ export interface Task {
   waiting_on?: string;
   blocked_reason?: string;
   thread?: number;
-  /** Blockers that are not closed yet, lowest first. */
+  /** Blockers that do not satisfy their dependency yet, lowest first. */
   waits_on?: number[];
+  /** Those of `waits_on` whose dependency needs an ok result. */
+  waits_on_ok?: number[];
+  /** The revision: the sequence number of the newest event. */
+  rev?: number;
+  /** With child tasks: done of not cancelled. */
+  progress?: { done: number; total: number };
+  result?: TaskResult;
+  result_ref?: string;
+  result_note?: string;
+  result_by?: string;
+  result_at?: string;
+  /** The id of the record the task was imported from. */
+  import_key?: string;
   /** A pending request of this seat to take the task over. */
   steal_requested_by?: string;
   steal_requested_at?: string;
@@ -559,6 +574,9 @@ export interface TaskRef {
   title: string;
   state: TaskState;
   assignee?: string;
+  result?: TaskResult;
+  /** In `blockers`: the dependency needs an ok result. */
+  needs_ok?: boolean;
 }
 
 export interface TaskLink {
@@ -580,7 +598,9 @@ export type TaskEventKind =
   | 'unblocked'
   | 'steal_requested'
   | 'steal_declined'
-  | 'steal_expired';
+  | 'steal_expired'
+  | 'result_withdrawn'
+  | 'imported';
 
 export interface TaskEvent {
   seq: number;
@@ -603,7 +623,8 @@ export interface TaskDetail {
   links: TaskLink[];
   events: TaskEvent[];
   event_count: number;
-  events_compacted: number;
+  /** `POST /tasks` with a client key used before: nothing was created. */
+  existing?: boolean;
 }
 
 export interface TaskEventsPage {
@@ -651,6 +672,27 @@ export interface TaskBoard {
   stale: Task[];
   overdue: Task[];
   chains: { num: number; waits_on: number[] }[];
+}
+
+/** One task of a report section. */
+export interface ReportItem {
+  task: Task;
+  seat?: string;
+  waiting_for?: string[];
+  dependents?: TaskRef[];
+}
+
+export interface ReportSection {
+  /** `not_started`, `in_progress`, `review`, `rejected`, `approved`, `parents`, `blocked`. */
+  name: string;
+  count: number;
+  items: ReportItem[];
+}
+
+/** `GET /v1/tasks/report`. */
+export interface TaskReport {
+  team?: string;
+  sections: ReportSection[];
 }
 
 /** Payload of a server-sent `task` event: a task of the org changed. */

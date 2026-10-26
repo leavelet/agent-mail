@@ -242,6 +242,56 @@ test('seat view, needs you: the task lists', async ({ page }) => {
   await expect(page.getByTestId('seat-tasks').locator('[data-list="owed"]')).toContainText(`t${nums.page}`);
 });
 
+test('child progress on a card, a result set on the task page, the report view', async ({ page }) => {
+  const s = state();
+  const u = s.userToken;
+  const parent = await create(u, { title: 'Search release', assignee: 'be-lead' });
+  const c1 = await create(u, { title: 'Release notes draft', assignee: 'fe-1', parent });
+  await create(u, { title: 'Release checklist', assignee: 'fe-2', parent });
+  await api(s.seatTokens['fe-1'], 'PATCH', `/tasks/${c1}`, { state: 'done' });
+  const reviewed = await create(u, { title: 'Review the ranking change', assignee: 'be-2' });
+  await api(s.seatTokens['be-2'], 'PATCH', `/tasks/${reviewed}`, { state: 'done' });
+
+  // The parent's card shows the progress of its children.
+  await login(page, u, { lang: 'en' });
+  await page.goto(`${s.base}/#/tasks`);
+  await expect(card(page, parent).getByTestId('progress')).toHaveText('1/2');
+
+  // The task page sets a result on a done task.
+  await page.goto(`${s.base}/#/tasks/t${reviewed}`);
+  const box = page.getByTestId('task-result');
+  await expect(box).toContainText('No result.');
+  const form = page.getByTestId('result-form');
+  await form.getByLabel('Result').selectOption('rejected');
+  await form.getByLabel('Version (commit, tag or URL)').fill('abc123');
+  await form.getByLabel('Note').fill('Fails on the long queries');
+  await form.getByRole('button', { name: 'Set result' }).click();
+  await expect(page.getByTestId('result-value')).toHaveText('rejected');
+  await expect(page.getByTestId('result-ref')).toHaveText('abc123');
+  await expect(box).toContainText('Fails on the long queries');
+  const after = await api<{ task: { result?: string; result_ref?: string; result_by?: string } }>(u, 'GET', `/tasks/${reviewed}`);
+  expect(after.task).toMatchObject({ result: 'rejected', result_ref: 'abc123', result_by: 'owner' });
+  await expect(page.getByTestId('task-history')).toContainText('result: — → rejected');
+  await shot(page, 'web-task-result');
+
+  // The parent's page shows the progress; closing it needs "close anyway".
+  await page.goto(`${s.base}/#/tasks/t${parent}`);
+  await expect(page.getByTestId('task-progress')).toHaveText('1/2 done');
+
+  // The report view.
+  await page.goto(`${s.base}/#/tasks`);
+  await page.getByRole('tab', { name: 'Report' }).click();
+  const report = page.getByTestId('task-report');
+  await expect(report.locator('[data-section="rejected"]')).toContainText('Review the ranking change');
+  await expect(report.locator('[data-section="rejected"] h2')).toContainText('Rejected');
+  await expect(report.locator(`[data-section="parents"] li[data-task="${parent}"]`)).toContainText('1/2');
+  await expect(report.locator('[data-section="not_started"]')).toContainText('fe-2');
+  await shot(page, 'web-tasks-report');
+  // The rejected badge on the card; back to the board for the next tests.
+  await page.getByRole('tab', { name: 'Board' }).click();
+  await expect(card(page, reviewed).getByTestId('rejected')).toHaveText('rejected');
+});
+
 test('the board works at phone width without horizontal page scroll', async ({ page }) => {
   const s = state();
   await page.setViewportSize({ width: 390, height: 844 });

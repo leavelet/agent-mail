@@ -1,8 +1,10 @@
 <script lang="ts">
-  // One task: the record, its dependencies, children, linked threads with
-  // their latest message, the discussion thread and the history, with the
-  // user's actions (state, assignee, priority, due, labels, dependencies,
-  // links, comments). Changes made elsewhere are shown live.
+  // One task: the record, its result, its dependencies, children, linked
+  // threads with their latest message, the discussion thread and the
+  // history, with the user's actions (state, result, assignee, priority,
+  // due, labels, dependencies, links, comments). Changes made elsewhere are
+  // shown live; an edit of the title or body is refused when the task
+  // changed since it was loaded.
   import Vis from '../components/Vis.svelte';
   import MessageCard from '../components/MessageCard.svelte';
   import TaskHistory from '../components/TaskHistory.svelte';
@@ -18,14 +20,16 @@
     isoToLocal,
     localToIso,
     nextStates,
+    openChildren,
     overdue,
     parseLabels,
     parseTaskNum,
     stateTone,
     taskId,
+    waitsList,
   } from '../lib/tasks';
   import { addDep, getTask, patchTask, removeDep, taskError, taskPath } from '../lib/taskops';
-  import type { Message, StoredTaskState, TaskCommentResponse, TaskDetail, TaskPriority, TaskRef, ThreadResponse } from '../lib/types';
+  import type { Message, StoredTaskState, TaskCommentResponse, TaskDetail, TaskPriority, TaskRef, TaskResult, ThreadResponse } from '../lib/types';
 
   let { num }: { num: number } = $props();
 
@@ -102,6 +106,13 @@
   let editing = $state(false);
   let titleDraft = $state('');
   let bodyDraft = $state('');
+  let editRev = $state<number | undefined>(undefined);
+  let forceDraft = $state(false);
+  let depNeedsOk = $state(false);
+  let resultDraft = $state<TaskResult>('ok');
+  let refDraft = $state('');
+  let resultNote = $state('');
+  let withdrawReason = $state('');
 
   function resetDrafts() {
     stateDraft = '';
@@ -113,6 +124,33 @@
     linkDraft = '';
     comment = '';
     editing = false;
+    forceDraft = false;
+    depNeedsOk = false;
+    resultDraft = 'ok';
+    refDraft = '';
+    resultNote = '';
+    withdrawReason = '';
+  }
+
+  const openKids = $derived(detail ? openChildren(detail.children) : []);
+  const closing = $derived(stateDraft === 'done' || stateDraft === 'cancelled');
+
+  async function setResult(e: SubmitEvent) {
+    e.preventDefault();
+    const body: Record<string, unknown> = { result: resultDraft };
+    if (refDraft.trim()) body.result_ref = refDraft.trim();
+    if (resultNote.trim()) body.result_note = resultNote.trim();
+    if (await act(() => patchTask(num, body))) {
+      refDraft = '';
+      resultNote = '';
+    }
+  }
+
+  async function withdrawResult(e: SubmitEvent) {
+    e.preventDefault();
+    const body: Record<string, unknown> = { result: null };
+    if (withdrawReason.trim()) body.note = withdrawReason.trim();
+    if (await act(() => patchTask(num, body))) withdrawReason = '';
   }
 
   async function setState(e: SubmitEvent) {
@@ -123,10 +161,12 @@
       body.waiting_on = waitingDraft || null;
       body.blocked_reason = reasonDraft.trim() || null;
     }
+    if (closing && forceDraft) body.force = true;
     if (await act(() => patchTask(num, body))) {
       stateDraft = '';
       waitingDraft = '';
       reasonDraft = '';
+      forceDraft = false;
     }
   }
 
@@ -155,7 +195,10 @@
       error = t('task.err.badNumber');
       return;
     }
-    if (await act(() => addDep(num, other))) depDraft = '';
+    if (await act(() => addDep(num, other, depNeedsOk || undefined))) {
+      depDraft = '';
+      depNeedsOk = false;
+    }
   }
 
   async function link(e: SubmitEvent) {
@@ -194,6 +237,7 @@
     if (!task) return;
     titleDraft = task.title;
     bodyDraft = task.body ?? '';
+    editRev = task.rev;
     editing = true;
   }
 
@@ -207,7 +251,10 @@
       editing = false;
       return;
     }
+    // Refused (`stale`) when someone changed the task since the edit began.
+    if (editRev !== undefined) body.if_rev = editRev;
     if (await act(() => patchTask(num, body))) editing = false;
+    else editRev = detail?.task.rev;
   }
 
   // Linked threads with their latest message (loaded again when the links change).
@@ -252,10 +299,10 @@
       .catch((e) => (discussionError = taskError(e)));
   });
 
-  const refList = (label: string, list: TaskRef[], removable = false) => ({ label, list, removable });
+  const refList = (label: string, list: TaskRef[], removable = false, children = false) => ({ label, list, removable, children });
   const groups = $derived(
     detail
-      ? [refList(t('task.blockers'), detail.blockers, true), refList(t('task.blocked'), detail.blocked), refList(t('task.children'), detail.children)]
+      ? [refList(t('task.blockers'), detail.blockers, true), refList(t('task.blocked'), detail.blocked), refList(t('task.children'), detail.children, false, true)]
       : [],
   );
 </script>
@@ -302,8 +349,41 @@
           <p class="faint">{t('task.noBody')}</p>
         {/if}
 
+        <section class="result card" data-testid="task-result">
+          <h2>{t('task.result')}</h2>
+          {#if task.result}
+            <p class="row wrap">
+              <span class="chip {task.result === 'ok' ? 'ok' : 'tone-danger'}" data-testid="result-value">{t(`task.result.${task.result}`)}</span>
+              {#if task.result_ref}<span class="mono" data-testid="result-ref"><Vis text={task.result_ref} /></span>{/if}
+              {#if task.result_by}<span class="faint" title={fullTime(task.result_at, ui.lang)}>{t('task.result.by', { seat: task.result_by, time: shortTime(task.result_at, ui.now, ui.lang) })}</span>{/if}
+            </p>
+            {#if task.result_note}<p class="rnote"><Vis text={task.result_note} /></p>{/if}
+          {:else}
+            <p class="faint">{t('task.result.none')}</p>
+          {/if}
+          {#if task.stored_state === 'done'}
+            <form class="row wrap" onsubmit={setResult} data-testid="result-form">
+              <select bind:value={resultDraft} aria-label={t('task.result')}>
+                <option value="ok">{t('task.result.ok')}</option>
+                <option value="rejected">{t('task.result.rejected')}</option>
+              </select>
+              <input class="mono" placeholder={t('task.result.ref')} aria-label={t('task.result.ref')} maxlength="200" bind:value={refDraft} />
+              <input placeholder={t('task.result.note')} aria-label={t('task.result.note')} maxlength="2000" bind:value={resultNote} />
+              <button class="small" type="submit" disabled={busy}>{t('task.result.set')}</button>
+            </form>
+            {#if task.result}
+              <form class="row wrap" onsubmit={withdrawResult} data-testid="result-withdraw">
+                <input placeholder={t('task.result.reason')} aria-label={t('task.result.reason')} maxlength="2000" bind:value={withdrawReason} />
+                <button class="small" type="submit" disabled={busy}>{t('task.result.withdraw')}</button>
+              </form>
+            {/if}
+          {:else}
+            <p class="faint hint">{t('task.result.onlyDone')}</p>
+          {/if}
+        </section>
+
         {#if task.state === 'open' && task.waits_on?.length}
-          <p class="waits">{t('task.waitsOn', { list: task.waits_on.map(taskId).join(', ') })}</p>
+          <p class="waits">{t('task.waitsOn', { list: waitsList(task, t('task.okNeeded')) })}</p>
         {/if}
         {#if task.stored_state === 'blocked'}
           <p class="waits blocked" data-testid="task-blocked">
@@ -314,10 +394,13 @@
 
         {#each groups as g}
           <section class="refs">
-            <h2>{g.label} <span class="count">{g.list.length}</span></h2>
+            <h2>{g.label} <span class="count">{g.list.length}</span>
+              {#if g.children && task.progress}<span class="faint progress" data-testid="task-progress">{t('task.progress', { done: task.progress.done, total: task.progress.total })}</span>{/if}
+            </h2>
             {#if g.removable}
               <form class="row wrap" onsubmit={addDependency}>
                 <input class="mono short" placeholder="t9" aria-label={t('task.addBlocker')} bind:value={depDraft} />
+                <label class="check"><input type="checkbox" bind:checked={depNeedsOk} />{t('task.needsOk')}</label>
                 <button class="small" type="submit" disabled={busy}>{t('task.addBlocker')}</button>
               </form>
             {/if}
@@ -329,6 +412,8 @@
                     <a href={href(['tasks', taskId(r.num)])}><Vis text={r.title} /></a>
                     <span class="chip tone-{stateTone(r.state)}">{t(`task.state.${r.state}`)}</span>
                     {#if r.assignee}<span class="mono faint">{r.assignee}</span>{/if}
+                    {#if r.result}<span class="chip {r.result === 'ok' ? 'ok' : 'tone-danger'}">{t(`task.result.${r.result}`)}</span>{/if}
+                    {#if r.needs_ok}<span class="chip neutral" data-testid="needs-ok">{t('task.okNeeded')}</span>{/if}
                     {#if g.removable}
                       <button class="small ghost" disabled={busy} title={t('task.removeBlocker')} aria-label={t('task.removeBlocker')} onclick={() => act(() => removeDep(num, r.num))}>✕</button>
                     {/if}
@@ -420,6 +505,9 @@
               {#if stateDraft === 'open'}
                 <span class="faint hint">{t('task.readyHint')}</span>
               {/if}
+              {#if closing && openKids.length}
+                <label class="check"><input type="checkbox" bind:checked={forceDraft} data-testid="force" />{t('task.force')} ({openKids.map((c) => taskId(c.num)).join(', ')})</label>
+              {/if}
             </form>
           </dd>
           <dt>{t('task.priority')}</dt>
@@ -467,6 +555,12 @@
             <dt>{t('task.closed')}</dt>
             <dd title={fullTime(task.closed_at, ui.lang)}>{shortTime(task.closed_at, ui.now, ui.lang)}</dd>
           {/if}
+          {#if task.import_key}
+            <dt>{t('task.importedAs')}</dt>
+            <dd class="mono"><Vis text={task.import_key} /></dd>
+          {/if}
+          <dt>{t('task.revision')}</dt>
+          <dd class="mono faint">{task.rev ?? 0}</dd>
         </dl>
       </aside>
     </div>
@@ -539,6 +633,34 @@
   }
   .short {
     width: 90px;
+  }
+  .result {
+    padding: 8px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .result h2 {
+    margin: 0;
+  }
+  .result p {
+    margin: 0;
+  }
+  .rnote {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .progress {
+    font-size: 12px;
+    font-weight: 400;
+  }
+  label.check {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--muted);
   }
   .stealbox {
     display: flex;

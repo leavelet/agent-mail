@@ -7,7 +7,7 @@
   import { href } from '../lib/router.svelte';
   import { shortTime } from '../lib/time';
   import { untrack } from 'svelte';
-  import { PRIORITIES, TASK_STATES, filterParams, overdue, stateTone, taskId, type TaskFilters } from '../lib/tasks';
+  import { PRIORITIES, TASK_STATES, filterParams, overdue, stateTone, taskId, waitsList, type TaskFilters } from '../lib/tasks';
   import { listTasks, taskError } from '../lib/taskops';
   import type { Task } from '../lib/types';
 
@@ -97,6 +97,14 @@
   <label>{t('task.label')}<input class="short" bind:value={filters.label} /></label>
   <label>{t('task.parent')}<input class="short mono" placeholder="t12" bind:value={filters.parent} /></label>
   <label>{t('task.filter.dueBefore')}<input type="datetime-local" bind:value={filters.due_before} /></label>
+  <label>{t('task.filter.result')}
+    <select bind:value={filters.result}>
+      <option value="">{t('task.filter.any')}</option>
+      <option value="ok">{t('task.result.ok')}</option>
+      <option value="rejected">{t('task.result.rejected')}</option>
+      <option value="none">{t('task.filter.noResult')}</option>
+    </select>
+  </label>
   <label class="check"><input type="checkbox" bind:checked={filters.stale} />{t('task.filter.stale')}</label>
 </form>
 {#if error}<p class="error" role="alert">{error}</p>{/if}
@@ -114,7 +122,9 @@
           <td class="mono"><a href={href(['tasks', taskId(task.num)])}>{taskId(task.num)}</a></td>
           <td class="title">
             <a href={href(['tasks', taskId(task.num)])}><Vis text={task.title} /></a>
-            {#if task.state === 'open' && task.waits_on?.length}<div class="sub warn">{t('task.waitsOn', { list: task.waits_on.map(taskId).join(', ') })}</div>{/if}
+            {#if task.progress}<span class="chip neutral" data-testid="progress">{task.progress.done}/{task.progress.total}</span>{/if}
+            {#if task.result === 'rejected'}<span class="chip tone-danger" data-testid="rejected">{t('task.result.rejected')}</span>{/if}
+            {#if task.state === 'open' && task.waits_on?.length}<div class="sub warn">{t('task.waitsOn', { list: waitsList(task, t('task.okNeeded')) })}</div>{/if}
             {#if task.state === 'blocked' && task.waiting_on}<div class="sub danger">{t('task.waitsFor', { seat: task.waiting_on })}</div>{/if}
           </td>
           <td><span class="chip tone-{stateTone(task.state)}">{t(`task.state.${task.state}`)}</span></td>

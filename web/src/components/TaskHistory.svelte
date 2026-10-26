@@ -81,6 +81,10 @@
         return t('task.ev.stealDeclined', { seat: value(e.to), from: value(e.from) });
       case 'steal_expired':
         return t('task.ev.stealExpired', { seat: value(e.to) });
+      case 'result_withdrawn':
+        return t('task.ev.resultWithdrawn', { from: value(e.from) });
+      case 'imported':
+        return t('task.ev.imported');
       default:
         return e.kind;
     }

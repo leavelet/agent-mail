@@ -1,11 +1,12 @@
 <script lang="ts">
   // One card of the board: number, title, assignee, priority (a control
-  // that sets it), due time and what the task waits for.
+  // that sets it), due time, what the task waits for, the progress of its
+  // child tasks and a `rejected` result.
   import Vis from './Vis.svelte';
   import { href } from '../lib/router.svelte';
   import { t, ui } from '../lib/ui.svelte';
   import { shortTime } from '../lib/time';
-  import { PRIORITIES, overdue, taskId } from '../lib/tasks';
+  import { PRIORITIES, overdue, taskId, waitsList } from '../lib/tasks';
   import type { Task, TaskPriority } from '../lib/types';
 
   let {
@@ -36,9 +37,11 @@
     </select>
     {#if task.assignee}<a class="mono who" href={href(['org', task.assignee])}>{task.assignee}</a>{:else}<span class="faint who">{t('task.unassigned')}</span>{/if}
     {#if task.due}<span class="due" class:late title={t('task.due')}>{late ? '⚠ ' : ''}{shortTime(task.due, ui.now, ui.lang)}</span>{/if}
+    {#if task.progress}<span class="chip neutral progress" data-testid="progress" title={t('task.progress', { done: task.progress.done, total: task.progress.total })}>{task.progress.done}/{task.progress.total}</span>{/if}
+    {#if task.result === 'rejected'}<span class="chip tone-danger" data-testid="rejected">{t('task.result.rejected')}</span>{/if}
   </div>
   {#if task.state === 'open' && task.waits_on?.length}
-    <div class="wait" data-testid="waits-on">{t('task.waitsOn', { list: task.waits_on.map(taskId).join(', ') })}</div>
+    <div class="wait" data-testid="waits-on">{t('task.waitsOn', { list: waitsList(task, t('task.okNeeded')) })}</div>
   {:else if task.state === 'blocked'}
     <div class="wait blocked" data-testid="waits-for" title={task.blocked_reason ?? ''}>
       {#if task.waiting_on}{t('task.waitsFor', { seat: task.waiting_on })}{:else}{t('task.blockedNoSeat')}{/if}
@@ -134,6 +137,9 @@
     font-size: 12px;
     color: var(--notice);
     font-weight: 600;
+  }
+  .progress {
+    font-variant-numeric: tabular-nums;
   }
   .labels {
     display: flex;
