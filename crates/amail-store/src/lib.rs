@@ -618,8 +618,8 @@ pub trait Store: Send + Sync + 'static {
         to: &str,
         message_id: i64,
     ) -> Result<()>;
-    /// Events after `after_seq`, oldest first, and how many were
-    /// compacted; `None` when there is no such task.
+    /// Events after `after_seq`, oldest first, and how many earlier builds
+    /// deleted (`events_compacted`); `None` when there is no such task.
     async fn task_events(
         &self,
         org_id: i64,
@@ -627,6 +627,9 @@ pub trait Store: Send + Sync + 'static {
         after_seq: i64,
         limit: i64,
     ) -> Result<Option<(Vec<TaskEventRec>, i64)>>;
+    /// The seats that commented on a task, in the order of their first
+    /// comment.
+    async fn task_commenters(&self, org_id: i64, num: i64) -> Result<Vec<String>>;
     /// Tasks by [`TaskQuery`] (without bodies).
     async fn tasks(&self, q: &TaskQuery) -> Result<TaskPage>;
     /// The seat's waiting list: its tasks `blocked` with `waiting_on`

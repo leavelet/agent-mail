@@ -714,7 +714,7 @@ pub async fn run(c: &Client, out: &Out, cmd: TaskCmd) -> Result<()> {
                         None,
                     )
                     .await?;
-                (v, after - d.events_compacted)
+                (v, after)
             };
             out.show(&v, || {
                 let page: p::TaskEventsPage = crate::parse(&v)?;

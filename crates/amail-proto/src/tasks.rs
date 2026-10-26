@@ -165,8 +165,8 @@ pub struct TaskEvent {
     /// assignee, `to` the requesting seat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub field: Option<String>,
-    /// The value before (`changed`, `assigned`). A body is not repeated:
-    /// its events carry its size.
+    /// The value before (`changed`, `assigned`). A change of the body
+    /// carries the whole old and new text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
     /// The value after; `dependency_*`: the other task (`t9`);
@@ -199,13 +199,9 @@ pub struct TaskDetail {
     /// oldest first.
     #[serde(default)]
     pub events: Vec<TaskEvent>,
-    /// Events in all, kept or compacted.
+    /// Events in all (every event is kept).
     #[serde(default)]
     pub event_count: i64,
-    /// Old events that were deleted beyond
-    /// [`crate::limits::MAX_TASK_EVENTS`] (counted only).
-    #[serde(default)]
-    pub events_compacted: i64,
 }
 
 /// Body of `POST /v1/tasks`.
@@ -339,7 +335,8 @@ pub struct TaskEventsPage {
     /// Pass as `after_seq` for the next page.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_after_seq: Option<i64>,
-    /// Old events deleted and counted only.
+    /// Events deleted by earlier builds of M8, which kept at most 1,000
+    /// per task; 0 otherwise. Events are no longer deleted.
     #[serde(default)]
     pub events_compacted: i64,
 }

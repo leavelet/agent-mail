@@ -4926,6 +4926,10 @@ macro_rules! impl_store_common {
                 run!(self.read, |c| tq::events(c, org_id, num, after_seq, limit).await)
             }
 
+            async fn task_commenters(&self, org_id: i64, num: i64) -> $crate::Result<Vec<String>> {
+                run!(self.read, |c| tq::commenters(c, org_id, num).await)
+            }
+
             async fn tasks(&self, query: &$crate::TaskQuery) -> $crate::Result<$crate::TaskPage> {
                 let query = query.clone();
                 run!(self.read_query, |c| tq::list(c, &query).await)

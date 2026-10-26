@@ -26,7 +26,7 @@ use crate::error::{ApiError, ApiResult, Json, Path, Query};
 use crate::limits::Pool;
 use crate::render;
 use amail_proto::limits::*;
-use amail_proto::{self as p, TaskEventKind, TaskPriority, TaskState, TokenScope};
+use amail_proto::{self as p, TaskPriority, TaskState, TokenScope};
 use amail_store::{
     NewDelivery, NewMessage, NewTaskRec, Org, Seat, StoreError, TaskChange, TaskChanged,
     TaskDetailRec, TaskEventRec, TaskOrder, TaskQuery, TaskRec, TaskWaitRec, TaskWrite,
@@ -157,7 +157,6 @@ fn detail_out(d: &TaskDetailRec) -> p::TaskDetail {
             .collect(),
         events: d.events.iter().map(event_out).collect(),
         event_count: d.task.event_seq,
-        events_compacted: d.task.events_compacted,
     }
 }
 
@@ -763,19 +762,9 @@ pub async fn comment(
         }
     }
     let mut cc: Vec<String> = Vec::new();
-    if let Some((evs, _)) = st
-        .store
-        .task_events(auth.org.id, num, 0, MAX_TASK_EVENTS)
-        .await?
-    {
-        for e in evs.iter().filter(|e| e.kind == TaskEventKind::Commented) {
-            if let Some(a) = &e.actor
-                && *a != me.name
-                && !to.contains(a)
-                && !cc.contains(a)
-            {
-                cc.push(a.clone());
-            }
+    for a in st.store.task_commenters(auth.org.id, num).await? {
+        if a != me.name && !to.contains(&a) && !cc.contains(&a) {
+            cc.push(a);
         }
     }
     // Seats that were deleted meanwhile are left out.
@@ -840,7 +829,7 @@ pub async fn events(
 ) -> ApiResult<Json<p::TaskEventsPage>> {
     actor(&auth)?;
     let num = parse_num(&num)?;
-    let limit = q.limit.unwrap_or(200).clamp(1, MAX_TASK_EVENTS);
+    let limit = q.limit.unwrap_or(200).clamp(1, MAX_TASK_EVENTS_PAGE);
     let (evs, compacted) = st
         .store
         .task_events(auth.org.id, num, q.after_seq.unwrap_or(0), limit + 1)

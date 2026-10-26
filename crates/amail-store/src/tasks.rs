@@ -265,13 +265,7 @@ pub(crate) fn field_events(a: &TaskRec, b: &TaskRec) -> (Vec<&'static str>, Vec<
             } else {
                 TaskEventKind::Changed
             };
-            let e = Ev::new(kind).field(name);
-            evs.push(if name == "body" {
-                e.from(from.map(|s| format!("{} bytes", s.len())))
-                    .to(to.map(|s| format!("{} bytes", s.len())))
-            } else {
-                e.from(from).to(to)
-            });
+            evs.push(Ev::new(kind).field(name).from(from).to(to));
         }
     };
     ch("title", Some(a.title.clone()), Some(b.title.clone()));
@@ -411,16 +405,14 @@ macro_rules! impl_task_queries {
                 Ok(sqlx::query_scalar(sql).bind(id).fetch_all(&mut *c).await?)
             }
 
-            /// Write one event on `task_id` and compact old ones; returns the
-            /// bytes it adds (negative when compaction freed more).
+            /// Write one event on `task_id`; returns the bytes it adds.
+            /// Events are never deleted: the org's storage quota bounds them.
             pub async fn event(c: &mut Conn, task_id: i64, org_id: i64, actor: Option<i64>, written_by: Option<&str>, at: i64, e: Ev) -> Result<i64> {
-                let (seq, compacted): (i64, i64) = sqlx::query_as(
-                    "UPDATE tasks SET event_seq = event_seq + 1 WHERE id = $1 RETURNING event_seq, events_compacted",
-                )
-                .bind(task_id)
-                .fetch_one(&mut *c)
-                .await?;
-                let mut bytes = e.bytes(written_by);
+                let seq: i64 = sqlx::query_scalar("UPDATE tasks SET event_seq = event_seq + 1 WHERE id = $1 RETURNING event_seq")
+                    .bind(task_id)
+                    .fetch_one(&mut *c)
+                    .await?;
+                let bytes = e.bytes(written_by);
                 sqlx::query(
                     "INSERT INTO task_events (task_id, seq, org_id, at, actor_id, written_by, kind, field, \
                      from_value, to_value, note, message_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
@@ -439,31 +431,6 @@ macro_rules! impl_task_queries {
                 .bind(e.message_id)
                 .execute(&mut *c)
                 .await?;
-                if seq - compacted > MAX_TASK_EVENTS {
-                    let upto = seq - MAX_TASK_EVENTS;
-                    let freed: i64 = sqlx::query_scalar(
-                        "SELECT CAST(COALESCE(SUM($3 + COALESCE(octet_length(from_value), 0) \
-                         + COALESCE(octet_length(to_value), 0) + COALESCE(octet_length(note), 0) \
-                         + COALESCE(octet_length(written_by), 0)), 0) AS BIGINT) \
-                         FROM task_events WHERE task_id = $1 AND seq <= $2",
-                    )
-                    .bind(task_id)
-                    .bind(upto)
-                    .bind(STORED_BYTES_PER_TASK_EVENT)
-                    .fetch_one(&mut *c)
-                    .await?;
-                    sqlx::query("DELETE FROM task_events WHERE task_id = $1 AND seq <= $2")
-                        .bind(task_id)
-                        .bind(upto)
-                        .execute(&mut *c)
-                        .await?;
-                    sqlx::query("UPDATE tasks SET events_compacted = $2 WHERE id = $1")
-                        .bind(task_id)
-                        .bind(upto)
-                        .execute(&mut *c)
-                        .await?;
-                    bytes -= freed;
-                }
                 Ok(bytes)
             }
 
@@ -1283,6 +1250,21 @@ macro_rules! impl_task_queries {
                 let rows: Vec<EventRow> = sqlx::query_as(&sql).bind(t.id).bind(after).bind(limit).fetch_all(&mut *c).await?;
                 let evs = rows.into_iter().map(EventRow::into_rec).collect::<Result<Vec<_>>>()?;
                 Ok(Some((evs, t.events_compacted)))
+            }
+
+            /// The seats that commented on the task, in the order of their
+            /// first comment.
+            pub async fn commenters(c: &mut Conn, org_id: i64, num: i64) -> Result<Vec<String>> {
+                let rows: Vec<(String, i64)> = sqlx::query_as(
+                    "SELECT s.name, MIN(e.seq) AS first FROM task_events e JOIN tasks t ON t.id = e.task_id \
+                     JOIN seats s ON s.id = e.actor_id WHERE t.org_id = $1 AND t.num = $2 AND e.kind = 'commented' \
+                     GROUP BY s.name ORDER BY first LIMIT 500",
+                )
+                .bind(org_id)
+                .bind(num)
+                .fetch_all(&mut *c)
+                .await?;
+                Ok(rows.into_iter().map(|r| r.0).collect())
             }
 
             pub async fn detail(c: &mut Conn, org_id: i64, num: i64, nevents: i64) -> Result<Option<TaskDetailRec>> {

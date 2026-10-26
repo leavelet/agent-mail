@@ -456,9 +456,9 @@ pub mod limits {
     pub const MAX_OPEN_TASKS: i64 = 20_000;
     /// Tasks of one org in all (numbers are never reused).
     pub const MAX_TASKS: i64 = 200_000;
-    /// Events kept in full per task; older ones are deleted and counted
-    /// (`events_compacted`).
-    pub const MAX_TASK_EVENTS: i64 = 1_000;
+    /// Largest page of `GET /tasks/{num}/events`. Every event of a task is
+    /// kept; the org's storage quota bounds them.
+    pub const MAX_TASK_EVENTS_PAGE: i64 = 1_000;
     /// Threads linked to one task.
     pub const MAX_TASK_LINKS: i64 = 50;
     /// Blockers of one task (`blocked_by` edges).

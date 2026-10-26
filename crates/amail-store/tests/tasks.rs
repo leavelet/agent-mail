@@ -41,7 +41,7 @@ conformance!(
     take_race,
     links,
     events_for_every_change,
-    events_are_compacted,
+    events_are_kept,
     parents,
     queries,
     other_orgs_see_nothing,
@@ -533,11 +533,11 @@ async fn events_for_every_change(s: S) {
     assert_eq!(page.iter().map(|e| e.seq).collect::<Vec<_>>(), [4, 5]);
 }
 
-async fn events_are_compacted(s: S) {
+async fn events_are_kept(s: S) {
     let o = setup(&s, "alpha").await;
     let t = new(&s, &o, "x", None).await;
-    let max = amail_proto::limits::MAX_TASK_EVENTS;
-    for i in 0..max + 5 {
+    let n = 1_205;
+    for i in 0..n {
         s.record_task_reminder(o.org.id, t.id, "stale", &format!("r{i}"), i)
             .await
             .unwrap();
@@ -547,13 +547,29 @@ async fn events_are_compacted(s: S) {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(ev.len() as i64, max);
-    assert_eq!(compacted, 6);
-    assert_eq!(ev[0].seq, 7);
+    // The `created` event and every reminder.
+    assert_eq!(ev.len() as i64, n + 1);
+    assert_eq!(compacted, 0);
+    assert_eq!(ev[0].seq, 1);
     let d = s.task_detail(o.org.id, t.num, 20).await.unwrap().unwrap();
     assert_eq!(d.events.len(), 20);
-    assert_eq!(d.events.last().unwrap().seq, max + 6);
-    assert_eq!(d.task.events_compacted, 6);
+    assert_eq!(d.events.last().unwrap().seq, n + 1);
+    assert_eq!(d.task.event_seq, n + 1);
+    // A change of the body records the whole old and new text.
+    let body = "line one\nline two".to_string();
+    s.change_task(
+        &w(&o, t.num, &o.a),
+        &TaskChange {
+            body: Some(body.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let e = events(&s, &o, t.num).await.pop().unwrap();
+    assert_eq!(e.field.as_deref(), Some("body"));
+    assert_eq!(e.from.as_deref(), Some(""));
+    assert_eq!(e.to.as_deref(), Some(body.as_str()));
 }
 
 async fn parents(s: S) {
