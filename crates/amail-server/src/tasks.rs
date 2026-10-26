@@ -22,7 +22,7 @@
 
 use crate::AppState;
 use crate::auth::Auth;
-use crate::error::{ApiError, ApiResult, Json, Path, Query};
+use crate::error::{ApiError, ApiResult, Json, OptJson, Path, Query};
 use crate::limits::Pool;
 use crate::render;
 use amail_proto::limits::*;
@@ -108,6 +108,17 @@ pub fn task_out(t: &TaskRec) -> p::Task {
         blocked_reason: t.blocked_reason.clone(),
         thread: t.thread_id,
         waits_on: t.waits_on.clone(),
+        waits_on_ok: t.waits_on_ok.clone(),
+        rev: t.event_seq,
+        progress: t
+            .progress
+            .map(|(done, total)| p::TaskProgress { done, total }),
+        result: t.result,
+        result_ref: t.result_ref.clone(),
+        result_note: t.result_note.clone(),
+        result_by: t.result_by.clone(),
+        result_at: t.result_at.map(render::ts),
+        import_key: t.import_key.clone(),
         steal_requested_by: t.steal_requested_by.clone(),
         steal_requested_at: t.steal_requested_at.map(render::ts),
         created_at: render::ts(t.created_at),
@@ -122,6 +133,8 @@ pub fn task_ref(t: &TaskRec) -> p::TaskRef {
         title: t.title.clone(),
         state: t.shown_state(),
         assignee: t.assignee.clone(),
+        result: t.result,
+        needs_ok: false,
     }
 }
 
@@ -143,7 +156,14 @@ fn event_out(e: &TaskEventRec) -> p::TaskEvent {
 fn detail_out(d: &TaskDetailRec) -> p::TaskDetail {
     p::TaskDetail {
         task: task_out(&d.task),
-        blockers: d.blockers.iter().map(task_ref).collect(),
+        blockers: d
+            .blockers
+            .iter()
+            .map(|b| p::TaskRef {
+                needs_ok: d.blockers_needs_ok.contains(&b.num),
+                ..task_ref(b)
+            })
+            .collect(),
         blocked: d.blocked.iter().map(task_ref).collect(),
         children: d.children.iter().map(task_ref).collect(),
         links: d
@@ -157,6 +177,7 @@ fn detail_out(d: &TaskDetailRec) -> p::TaskDetail {
             .collect(),
         events: d.events.iter().map(event_out).collect(),
         event_count: d.task.event_seq,
+        existing: false,
     }
 }
 
@@ -170,14 +191,81 @@ fn actor(auth: &Auth) -> ApiResult<&Seat> {
     auth.mail_seat()
 }
 
-fn write_ctx(st: &AppState, auth: &Auth, num: i64) -> ApiResult<TaskWrite> {
+fn write_ctx(st: &AppState, auth: &Auth, num: i64, if_rev: Option<i64>) -> ApiResult<TaskWrite> {
     Ok(TaskWrite {
         org_id: auth.org.id,
         num,
         actor_id: Some(actor(auth)?.id),
         written_by: None,
         quota: st.config.limits.org_storage_bytes,
+        if_rev,
     })
+}
+
+#[derive(Deserialize, Default)]
+pub struct RevParams {
+    if_rev: Option<i64>,
+}
+
+/// The error of a refused write to one task. `stale` (the task is not at
+/// the revision `if_rev` names) is 409 with the task and the events since
+/// that revision: `{error, rev, task, since}`.
+async fn write_failed(st: &AppState, w: &TaskWrite, e: StoreError) -> ApiError {
+    let StoreError::Refused("stale", msg) = e else {
+        return store_err(st, e);
+    };
+    let mut err = ApiError::new(StatusCode::CONFLICT, "stale", msg);
+    let since = w.if_rev.unwrap_or(0);
+    let detail = st
+        .store
+        .task_detail(w.org_id, w.num, TASK_SHOWN_EVENTS)
+        .await;
+    let events = st
+        .store
+        .task_events(w.org_id, w.num, since, MAX_TASK_EVENTS_PAGE)
+        .await;
+    if let (Ok(Some(d)), Ok(Some((evs, _)))) = (detail, events) {
+        let mut extra = serde_json::Map::new();
+        extra.insert("rev".into(), serde_json::json!(d.task.event_seq));
+        extra.insert(
+            "task".into(),
+            serde_json::to_value(detail_out(&d)).unwrap_or_default(),
+        );
+        extra.insert(
+            "since".into(),
+            serde_json::to_value(evs.iter().map(event_out).collect::<Vec<_>>()).unwrap_or_default(),
+        );
+        err.extra = Some(extra);
+    }
+    err
+}
+
+fn check_result_ref(s: &str) -> ApiResult<String> {
+    let t = s.trim();
+    if !one_line(t) {
+        return Err(ApiError::unprocessable(
+            "invalid_ref",
+            "result_ref must be a single line without control characters",
+        ));
+    }
+    if t.chars().count() > MAX_TASK_RESULT_REF_CHARS {
+        return Err(ApiError::unprocessable(
+            "ref_too_long",
+            format!("result_ref is limited to {MAX_TASK_RESULT_REF_CHARS} characters"),
+        ));
+    }
+    Ok(t.to_string())
+}
+
+fn check_result_note(field: &str, s: &str) -> ApiResult<String> {
+    let t = s.trim();
+    if t.chars().count() > MAX_TASK_RESULT_NOTE_CHARS {
+        return Err(ApiError::unprocessable(
+            "note_too_long",
+            format!("{field} is limited to {MAX_TASK_RESULT_NOTE_CHARS} characters"),
+        ));
+    }
+    Ok(t.to_string())
 }
 
 /// `12` or `t12`.
@@ -307,6 +395,10 @@ fn store_err(st: &AppState, e: StoreError) -> ApiError {
         StoreError::Refused("not_assignee", m) => {
             ApiError::new(StatusCode::FORBIDDEN, "not_assignee", m)
         }
+        StoreError::Refused("children_open", m) => {
+            ApiError::new(StatusCode::CONFLICT, "children_open", m)
+        }
+        StoreError::Refused("stale", m) => ApiError::new(StatusCode::CONFLICT, "stale", m),
         StoreError::Refused(code, m) => ApiError::unprocessable(code, m),
         StoreError::StorageQuota(stored) => {
             let mut e = ApiError::storage_quota(stored, st.config.limits.org_storage_bytes);
@@ -393,9 +485,20 @@ pub async fn create(
         None => None,
     };
     let due = req.due.as_deref().map(parse_due).transpose()?;
-    let t = st
+    if let Some(k) = &req.client_key {
+        let n = k.chars().count();
+        if n == 0 || n > MAX_TASK_CLIENT_KEY_CHARS || k.chars().any(char::is_control) {
+            return Err(ApiError::unprocessable(
+                "invalid_client_key",
+                format!(
+                    "client_key is 1 to {MAX_TASK_CLIENT_KEY_CHARS} characters without control characters"
+                ),
+            ));
+        }
+    }
+    let (t, existing) = st
         .store
-        .create_task(&NewTaskRec {
+        .create_task_once(&NewTaskRec {
             org_id: org.id,
             reporter_id: me.id,
             written_by: None,
@@ -409,9 +512,15 @@ pub async fn create(
             due,
             link_thread,
             quota: st.config.limits.org_storage_bytes,
+            client_key: req.client_key.clone(),
         })
         .await
         .map_err(|e| store_err(&st, e))?;
+    if existing {
+        let mut d = detail(&st, org.id, t.num).await?;
+        d.existing = true;
+        return Ok((StatusCode::OK, Json(d)));
+    }
     publish(&st, org.id, t.num, "created", &[]);
     if let Some(a) = t.assignee_id
         && a != me.id
@@ -446,7 +555,7 @@ pub async fn patch(
     Json(req): Json<p::TaskPatch>,
 ) -> ApiResult<Json<p::TaskDetail>> {
     let num = parse_num(&num)?;
-    let w = write_ctx(&st, &auth, num)?;
+    let w = write_ctx(&st, &auth, num, req.if_rev)?;
     let org = &auth.org;
     if req.state == Some(TaskState::Ready) {
         return Err(ApiError::bad_request(
@@ -493,11 +602,31 @@ pub async fn patch(
             None => None,
         });
     }
-    let changed = st
-        .store
-        .change_task(&w, &ch)
-        .await
-        .map_err(|e| store_err(&st, e))?;
+    if !matches!(req.result, Some(Some(_)))
+        && (req.result_ref.is_some() || req.result_note.is_some())
+    {
+        return Err(ApiError::bad_request(
+            "result_ref and result_note go with result (ok or rejected)",
+        ));
+    }
+    ch.result = req.result;
+    ch.result_ref = match &req.result_ref {
+        Some(r) => Some(check_result_ref(r)?).filter(|r| !r.is_empty()),
+        None => None,
+    };
+    ch.result_note = match &req.result_note {
+        Some(n) => Some(check_result_note("result_note", n)?).filter(|n| !n.is_empty()),
+        None => None,
+    };
+    ch.note = match &req.note {
+        Some(n) => Some(check_result_note("note", n)?).filter(|n| !n.is_empty()),
+        None => None,
+    };
+    ch.force = req.force;
+    let changed = match st.store.change_task(&w, &ch).await {
+        Ok(c) => c,
+        Err(e) => return Err(write_failed(&st, &w, e).await),
+    };
     after_change(&st, org, w.actor_id, &changed, "changed").await;
     Ok(Json(detail(&st, org.id, num).await?))
 }
@@ -511,7 +640,7 @@ pub async fn steal(
     Path(num): Path<String>,
 ) -> ApiResult<Json<p::TaskDetail>> {
     let num = parse_num(&num)?;
-    let w = write_ctx(&st, &auth, num)?;
+    let w = write_ctx(&st, &auth, num, None)?;
     let ch = st
         .store
         .steal_task(&w)
@@ -549,7 +678,7 @@ async fn answer(
     give: bool,
 ) -> ApiResult<Json<p::TaskDetail>> {
     let num = parse_num(&num)?;
-    let w = write_ctx(&st, &auth, num)?;
+    let w = write_ctx(&st, &auth, num, None)?;
     let ch = st
         .store
         .answer_task_steal(&w, give, auth.is_user())
@@ -620,14 +749,14 @@ pub async fn take(
     State(st): State<AppState>,
     auth: Auth,
     Path(num): Path<String>,
+    OptJson(req): OptJson<p::TaskRevRequest>,
 ) -> ApiResult<Json<p::TaskDetail>> {
     let num = parse_num(&num)?;
-    let w = write_ctx(&st, &auth, num)?;
-    let changed = st
-        .store
-        .take_task(&w)
-        .await
-        .map_err(|e| store_err(&st, e))?;
+    let w = write_ctx(&st, &auth, num, req.and_then(|r| r.if_rev))?;
+    let changed = match st.store.take_task(&w).await {
+        Ok(c) => c,
+        Err(e) => return Err(write_failed(&st, &w, e).await),
+    };
     after_change(&st, &auth.org, w.actor_id, &changed, "assigned").await;
     Ok(Json(detail(&st, auth.org.id, num).await?))
 }
@@ -640,16 +769,26 @@ pub async fn add_dep(
     Json(req): Json<p::TaskDepRequest>,
 ) -> ApiResult<Json<p::TaskDetail>> {
     let num = parse_num(&num)?;
-    let w = write_ctx(&st, &auth, num)?;
-    let changed = st
+    let w = write_ctx(&st, &auth, num, req.if_rev)?;
+    let changed = match st
         .store
-        .add_task_dep(&w, req.blocked_by)
+        .set_task_dep(&w, req.blocked_by, req.needs_ok)
         .await
-        .map_err(|e| store_err(&st, e))?;
+    {
+        Ok(c) => c,
+        Err(e) => return Err(write_failed(&st, &w, e).await),
+    };
     if !changed.fields.is_empty() {
         publish(&st, auth.org.id, num, "dependency", &changed.fields);
         publish(&st, auth.org.id, req.blocked_by, "dependency", &[]);
     }
+    let rs = unblocked_reminders(&changed, |_| {
+        format!(
+            "t{} is no longer blocked: any close of t{} satisfies it now",
+            num, req.blocked_by
+        )
+    });
+    remind(&st, &auth.org, w.actor_id, rs).await;
     Ok(Json(detail(&st, auth.org.id, num).await?))
 }
 
@@ -658,33 +797,22 @@ pub async fn remove_dep(
     State(st): State<AppState>,
     auth: Auth,
     Path((num, other)): Path<(String, String)>,
+    Query(q): Query<RevParams>,
 ) -> ApiResult<Json<p::TaskDetail>> {
     let (num, other) = (parse_num(&num)?, parse_num(&other)?);
-    let w = write_ctx(&st, &auth, num)?;
-    let changed = st
-        .store
-        .remove_task_dep(&w, other)
-        .await
-        .map_err(|e| store_err(&st, e))?;
+    let w = write_ctx(&st, &auth, num, q.if_rev)?;
+    let changed = match st.store.remove_task_dep(&w, other).await {
+        Ok(c) => c,
+        Err(e) => return Err(write_failed(&st, &w, e).await),
+    };
     publish(&st, auth.org.id, num, "dependency", &changed.fields);
     publish(&st, auth.org.id, other, "dependency", &[]);
-    let rs: Vec<Reminder> = changed
-        .unblocked
-        .iter()
-        .map(|t| {
-            let (id, name) = t.responsible();
-            Reminder::new(
-                id,
-                name.to_string(),
-                "unblocked",
-                t,
-                format!(
-                    "t{} is no longer blocked: dependency on t{other} removed",
-                    t.num
-                ),
-            )
-        })
-        .collect();
+    let rs = unblocked_reminders(&changed, |t| {
+        format!(
+            "t{} is no longer blocked: dependency on t{other} removed",
+            t.num
+        )
+    });
     remind(&st, &auth.org, w.actor_id, rs).await;
     Ok(Json(detail(&st, auth.org.id, num).await?))
 }
@@ -697,14 +825,13 @@ pub async fn add_link(
     Json(req): Json<p::TaskLinkRequest>,
 ) -> ApiResult<Json<p::TaskDetail>> {
     let num = parse_num(&num)?;
-    let w = write_ctx(&st, &auth, num)?;
+    let w = write_ctx(&st, &auth, num, req.if_rev)?;
     let thread = visible_thread(&st, &auth, &req).await?;
-    if st
-        .store
-        .add_task_link(&w, thread, false, None)
-        .await
-        .map_err(|e| store_err(&st, e))?
-    {
+    let linked = match st.store.add_task_link(&w, thread, false, None).await {
+        Ok(l) => l,
+        Err(e) => return Err(write_failed(&st, &w, e).await),
+    };
+    if linked {
         publish(&st, auth.org.id, num, "link", &[]);
     }
     Ok(Json(detail(&st, auth.org.id, num).await?))
@@ -715,15 +842,15 @@ pub async fn remove_link(
     State(st): State<AppState>,
     auth: Auth,
     Path((num, thread)): Path<(String, i64)>,
+    Query(q): Query<RevParams>,
 ) -> ApiResult<Json<p::TaskDetail>> {
     let num = parse_num(&num)?;
-    let w = write_ctx(&st, &auth, num)?;
-    if !st
-        .store
-        .remove_task_link(&w, thread)
-        .await
-        .map_err(|e| store_err(&st, e))?
-    {
+    let w = write_ctx(&st, &auth, num, q.if_rev)?;
+    let removed = match st.store.remove_task_link(&w, thread).await {
+        Ok(r) => r,
+        Err(e) => return Err(write_failed(&st, &w, e).await),
+    };
+    if !removed {
         return Err(ApiError::not_found(format!(
             "thread {thread} is not linked to t{num}"
         )));
@@ -800,7 +927,7 @@ pub async fn comment(
         },
     )
     .await?;
-    let w = write_ctx(&st, &auth, num)?;
+    let w = write_ctx(&st, &auth, num, None)?;
     let t = st
         .store
         .record_task_comment(&w, sent.id, sent.thread_id)
@@ -865,6 +992,10 @@ pub struct ListParams {
     pool: Option<String>,
     /// `mine` with a node token: the agent seat.
     seat: Option<String>,
+    /// `ok`, `rejected` or `none`.
+    result: Option<String>,
+    /// The task imported from the record with this id.
+    import_key: Option<String>,
 }
 
 fn flag(v: &Option<String>) -> bool {
@@ -933,6 +1064,19 @@ pub async fn list(
     }
     if let Some(d) = &q.due_before {
         query.due_before = Some(parse_due(d)?);
+    }
+    if let Some(r) = q.result.as_deref().map(str::trim) {
+        query.result = Some(match r {
+            "none" => None,
+            r => Some(r.parse::<p::TaskResult>().map_err(ApiError::bad_request)?),
+        });
+    }
+    if let Some(k) = &q.import_key {
+        query.import_key = Some(k.clone());
+        // An imported task is found in every state.
+        if q.state.is_none() {
+            query.states = Vec::new();
+        }
     }
     if flag(&q.stale) {
         match stale_cut(org) {
@@ -1134,6 +1278,302 @@ pub async fn board(
     }))
 }
 
+/// `GET /v1/tasks/report[?team=]`: the lead's report.
+pub async fn report(
+    State(st): State<AppState>,
+    auth: Auth,
+    Query(q): Query<ListParams>,
+) -> ApiResult<Json<p::TaskReport>> {
+    actor(&auth)?;
+    let team = match &q.team {
+        Some(t) => Some(team_id(&st, &auth.org, t).await?),
+        None => None,
+    };
+    let (store, org_id) = (st.store.clone(), auth.org.id);
+    let r = crate::mail::limited(&st, &auth, Pool::Other, async move {
+        Ok(store.task_report(org_id, team, MAX_TASK_PAGE).await?)
+    })
+    .await?;
+    Ok(Json(p::TaskReport {
+        team: q.team.clone(),
+        sections: r
+            .sections
+            .into_iter()
+            .map(|(name, count, items)| p::ReportSection {
+                name: name.to_string(),
+                count,
+                items: items
+                    .iter()
+                    .map(|i| p::ReportItem {
+                        task: task_out(&i.task),
+                        seat: i.seat.clone(),
+                        waiting_for: i.waiting_for.clone(),
+                        dependents: i.dependents.iter().map(task_ref).collect(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    }))
+}
+
+/// The fields of an import record (others are ignored with a warning).
+const IMPORT_FIELDS: &[&str] = &[
+    "id",
+    "title",
+    "body",
+    "state",
+    "priority",
+    "assignee",
+    "reporter",
+    "labels",
+    "due",
+    "parent",
+    "depends_on",
+    "result",
+    "created_at",
+    "updated_at",
+    "history",
+];
+
+/// A name or text of an import record: one line, at most `max`
+/// characters.
+fn import_line(what: &str, s: &str, max: usize) -> Result<String, String> {
+    let t = s.trim();
+    if t.is_empty() || !one_line(t) || t.chars().count() > max {
+        return Err(format!("{what} must be one line of 1 to {max} characters"));
+    }
+    Ok(t.to_string())
+}
+
+/// Check one import record and resolve its seats.
+async fn import_record(
+    st: &AppState,
+    org: &Org,
+    v: &serde_json::Value,
+    warnings: &mut Vec<String>,
+) -> Result<amail_store::ImportTaskRec, String> {
+    let Some(obj) = v.as_object() else {
+        return Err("not a JSON object".into());
+    };
+    let id = match obj.get("id") {
+        Some(serde_json::Value::String(s)) => import_line("id", s, MAX_TASK_IMPORT_ID_CHARS)?,
+        Some(serde_json::Value::Number(n)) => n.to_string(),
+        _ => return Err("id is required (a string)".into()),
+    };
+    for k in obj.keys().filter(|k| !IMPORT_FIELDS.contains(&k.as_str())) {
+        warnings.push(format!("{id}: unknown field {k:?} ignored"));
+    }
+    let mut v = v.clone();
+    v["id"] = serde_json::json!(id);
+    if let Some(serde_json::Value::String(s)) = v.get("state")
+        && s == "ready"
+    {
+        v["state"] = serde_json::json!("open");
+    }
+    let r: p::TaskImportRecord = serde_json::from_value(v).map_err(|e| format!("{id}: {e}"))?;
+    let at = |what: &str, s: &str| {
+        render::parse_ts(s.trim()).ok_or_else(|| format!("{id}: {what} must be an RFC 3339 time"))
+    };
+    let title = check_title(&r.title).map_err(|e| format!("{id}: {}", e.message))?;
+    if let Some(b) = &r.body {
+        check_body(b).map_err(|e| format!("{id}: {}", e.message))?;
+    }
+    let labels = r
+        .labels
+        .as_deref()
+        .map(check_labels)
+        .transpose()
+        .map_err(|e| format!("{id}: {}", e.message))?;
+    let seat = |name: &str| {
+        let name = name.trim().to_string();
+        async move { st.store.seat_by_name(org.id, &name).await }
+    };
+    let assignee_id = match r.assignee.as_deref().map(str::trim) {
+        None => None,
+        Some("") | Some("none") => Some(None),
+        Some(n) => match seat(n).await.map_err(|e| e.to_string())? {
+            Some(s) if s.kind != p::SeatKind::System => Some(Some(s.id)),
+            _ => {
+                warnings.push(format!("{id}: no seat {n:?}; the task is left unassigned"));
+                Some(None)
+            }
+        },
+    };
+    let reporter_id = match r.reporter.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(n) => match seat(n).await.map_err(|e| e.to_string())? {
+            Some(s) if s.kind != p::SeatKind::System => Some(s.id),
+            _ => {
+                warnings.push(format!(
+                    "{id}: no seat {n:?}; the importing user is the reporter"
+                ));
+                None
+            }
+        },
+    };
+    let result = match &r.result {
+        None => None,
+        Some(x) => Some(amail_store::ImportResultRec {
+            result: x.value,
+            result_ref: x
+                .ref_
+                .as_deref()
+                .map(check_result_ref)
+                .transpose()
+                .map_err(|e| format!("{id}: {}", e.message))?
+                .filter(|s| !s.is_empty()),
+            note: x
+                .note
+                .as_deref()
+                .map(|n| check_result_note("result note", n))
+                .transpose()
+                .map_err(|e| format!("{id}: {}", e.message))?
+                .filter(|s| !s.is_empty()),
+            by: x
+                .by
+                .as_deref()
+                .map(|b| import_line("result by", b, 200))
+                .transpose()
+                .map_err(|e| format!("{id}: {e}"))?,
+            at: x.at.as_deref().map(|a| at("result at", a)).transpose()?,
+        }),
+    };
+    let mut history = Vec::new();
+    let now = amail_store::now_ms();
+    for h in &r.history {
+        let text = check_result_note("history text", &h.text)
+            .map_err(|e| format!("{id}: {}", e.message))?;
+        history.push(amail_store::ImportHistoryRec {
+            at: h
+                .at
+                .as_deref()
+                .map(|a| at("history at", a))
+                .transpose()?
+                .unwrap_or(now),
+            by: h
+                .by
+                .as_deref()
+                .map(|b| import_line("history by", b, 200))
+                .transpose()
+                .map_err(|e| format!("{id}: {e}"))?,
+            text,
+        });
+    }
+    Ok(amail_store::ImportTaskRec {
+        key: id.clone(),
+        title,
+        body: r.body.clone(),
+        state: r.state,
+        priority: r.priority,
+        assignee_id,
+        reporter_id,
+        labels,
+        due: r
+            .due
+            .as_deref()
+            .map(|d| at("due", d))
+            .transpose()?
+            .map(Some),
+        parent: r.parent.clone(),
+        deps: r
+            .depends_on
+            .iter()
+            .map(|d| (d.id.clone(), d.needs_ok))
+            .collect(),
+        result,
+        created_at: r
+            .created_at
+            .as_deref()
+            .map(|a| at("created_at", a))
+            .transpose()?,
+        updated_at: r
+            .updated_at
+            .as_deref()
+            .map(|a| at("updated_at", a))
+            .transpose()?,
+        history,
+    })
+}
+
+/// `POST /v1/tasks/import` (user token): create or update tasks from the
+/// records of a JSON Lines file. Nothing is mailed.
+pub async fn import(
+    State(st): State<AppState>,
+    auth: Auth,
+    Json(req): Json<p::TaskImportRequest>,
+) -> ApiResult<Json<p::TaskImportResponse>> {
+    auth.require_user()?;
+    let me = actor(&auth)?.clone();
+    if req.records.is_empty() {
+        return Err(ApiError::bad_request("no records"));
+    }
+    if req.records.len() > MAX_TASK_IMPORT_RECORDS {
+        return Err(ApiError::unprocessable(
+            "too_many_records",
+            format!("an import has at most {MAX_TASK_IMPORT_RECORDS} records"),
+        ));
+    }
+    let mut warnings = Vec::new();
+    let mut records = Vec::with_capacity(req.records.len());
+    let mut seen = std::collections::HashSet::new();
+    for (i, v) in req.records.iter().enumerate() {
+        let r = import_record(&st, &auth.org, v, &mut warnings)
+            .await
+            .map_err(|m| {
+                ApiError::unprocessable("invalid_import", format!("record {}: {m}", i + 1))
+            })?;
+        if !seen.insert(r.key.clone()) {
+            return Err(ApiError::unprocessable(
+                "invalid_import",
+                format!("record {}: id {:?} is used twice in the file", i + 1, r.key),
+            ));
+        }
+        records.push(r);
+    }
+    let res = st
+        .store
+        .import_tasks(&amail_store::TaskImportRec {
+            org_id: auth.org.id,
+            actor_id: me.id,
+            quota: st.config.limits.org_storage_bytes,
+            dry_run: req.dry_run,
+            records,
+        })
+        .await
+        .map_err(|e| store_err(&st, e))?;
+    warnings.extend(res.warnings);
+    if !req.dry_run {
+        for (_, num, action) in &res.results {
+            if let (Some(n), "created" | "updated") = (num, *action) {
+                publish(
+                    &st,
+                    auth.org.id,
+                    *n,
+                    if *action == "created" {
+                        "created"
+                    } else {
+                        "changed"
+                    },
+                    &[],
+                );
+            }
+        }
+    }
+    Ok(Json(p::TaskImportResponse {
+        results: res
+            .results
+            .into_iter()
+            .map(|(id, num, action)| p::TaskImportOutcome {
+                id,
+                num,
+                action: action.to_string(),
+            })
+            .collect(),
+        warnings,
+        dry_run: req.dry_run,
+    }))
+}
+
 /// Tasks of the viewer's org linked to a thread (or whose discussion
 /// thread it is), for thread answers.
 pub async fn thread_refs(st: &AppState, org_id: i64, thread_id: i64) -> Vec<p::TaskRef> {
@@ -1187,6 +1627,7 @@ pub async fn after_send(
         actor_id: Some(sender.id),
         written_by: written_by.map(str::to_string),
         quota: None,
+        if_rev: None,
     };
     if msg.thread_id.is_some() {
         match st.store.thread_tasks(org.id, sent.thread_id).await {
@@ -1226,7 +1667,9 @@ pub async fn after_send(
 pub struct Reminder {
     seat_id: i64,
     seat: String,
-    /// `assigned`, `unblocked`, `waiting`, `closed`, `urgent`, `stale`, `due`.
+    /// `assigned`, `unblocked`, `waiting`, `closed`, `urgent`, `stale`, `due`,
+    /// `steal`, `steal_declined`, `steal_expired`, `children_done`,
+    /// `blocker_rejected`.
     kind: &'static str,
     task: TaskRec,
     line: String,
@@ -1292,17 +1735,46 @@ fn change_reminders(ch: &TaskChanged) -> Vec<Reminder> {
         ));
     }
     out.extend(steal_ended(ch));
-    if t.state.is_closed() && !b.state.is_closed() {
-        for d in &ch.unblocked {
-            let (id, name) = d.responsible();
-            out.push(Reminder::new(
-                id,
-                name.to_string(),
-                "unblocked",
-                d,
-                format!("t{} is no longer blocked: t{} {}", d.num, t.num, t.state),
-            ));
-        }
+    let closed_now = t.state.is_closed() && !b.state.is_closed();
+    out.extend(unblocked_reminders(ch, |d| match t.result {
+        Some(r) if !closed_now => format!(
+            "t{} is no longer blocked: t{} done with result {r}",
+            d.num, t.num
+        ),
+        _ => format!("t{} is no longer blocked: t{} {}", d.num, t.num, t.state),
+    }));
+    for d in &ch.needs_ok_waiting {
+        let (id, name) = d.responsible();
+        let line = if t.result == Some(p::TaskResult::Rejected) {
+            format!(
+                "t{} was closed as rejected; t{} waits for an ok result",
+                t.num, d.num
+            )
+        } else {
+            format!(
+                "t{}'s ok result was withdrawn; t{} waits for an ok result",
+                t.num, d.num
+            )
+        };
+        out.push(Reminder::new(
+            id,
+            name.to_string(),
+            "blocker_rejected",
+            d,
+            line,
+        ));
+    }
+    if let Some((parent, n)) = &ch.children_done {
+        let (id, name) = parent.responsible();
+        out.push(Reminder::new(
+            id,
+            name.to_string(),
+            "children_done",
+            parent,
+            format!("t{}: all {n} child tasks are closed", parent.num),
+        ));
+    }
+    if closed_now {
         // The reporter is told; assignees of tasks that still wait on other
         // blockers are not (they could not start anyway, and a reminder in
         // `To` wakes them).
@@ -1315,6 +1787,18 @@ fn change_reminders(ch: &TaskChanged) -> Vec<Reminder> {
         ));
     }
     out
+}
+
+/// `unblocked` reminders for the tasks a write made startable, to their
+/// assignees (else reporters).
+fn unblocked_reminders(ch: &TaskChanged, line: impl Fn(&TaskRec) -> String) -> Vec<Reminder> {
+    ch.unblocked
+        .iter()
+        .map(|d| {
+            let (id, name) = d.responsible();
+            Reminder::new(id, name.to_string(), "unblocked", d, line(d))
+        })
+        .collect()
 }
 
 /// Publish a change and send its reminders.
@@ -1368,6 +1852,9 @@ fn reminder_body(org: &Org, rs: &[&Reminder]) -> String {
         }
         if let Some(d) = t.due {
             body.push_str(&format!("  Due: {}", render::ts(d)));
+        }
+        if let Some(r) = t.result {
+            body.push_str(&format!("  Result: {r}"));
         }
         body.push_str(&format!("\nShow it: amail task show t{}\n", t.num));
     }

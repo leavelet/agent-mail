@@ -4855,7 +4855,7 @@ macro_rules! impl_store_common {
 
             // --- tasks (see `tasks.rs`) ---
 
-            async fn create_task(&self, task: &$crate::NewTaskRec) -> $crate::Result<$crate::TaskRec> {
+            async fn create_task_once(&self, task: &$crate::NewTaskRec) -> $crate::Result<($crate::TaskRec, bool)> {
                 let task = task.clone();
                 run!(self.write, |c| tq::create(c, &task).await)
             }
@@ -4892,9 +4892,9 @@ macro_rules! impl_store_common {
                 run!(self.write, |c| tq::take(c, &w).await)
             }
 
-            async fn add_task_dep(&self, w: &$crate::TaskWrite, blocker: i64) -> $crate::Result<$crate::TaskChanged> {
+            async fn set_task_dep(&self, w: &$crate::TaskWrite, blocker: i64, needs_ok: Option<bool>) -> $crate::Result<$crate::TaskChanged> {
                 let w = w.clone();
-                run!(self.write, |c| tq::add_dep(c, &w, blocker).await)
+                run!(self.write, |c| tq::add_dep(c, &w, blocker, needs_ok).await)
             }
 
             async fn remove_task_dep(&self, w: &$crate::TaskWrite, blocker: i64) -> $crate::Result<$crate::TaskChanged> {
@@ -4945,6 +4945,18 @@ macro_rules! impl_store_common {
 
             async fn task_board(&self, org_id: i64, team_id: Option<i64>, stale_hours: i64, now: i64) -> $crate::Result<$crate::TaskBoardRec> {
                 run!(self.read_query, |c| tq::board(c, org_id, team_id, stale_hours, now).await)
+            }
+
+            async fn import_tasks(&self, imp: &$crate::TaskImportRec) -> $crate::Result<$crate::TaskImportRes> {
+                let imp = imp.clone();
+                match run!(self.write, |c| tq::import(c, &imp).await) {
+                    Err($crate::StoreError::ImportDryRun(r)) => Ok(*r),
+                    r => r,
+                }
+            }
+
+            async fn task_report(&self, org_id: i64, team_id: Option<i64>, limit: i64) -> $crate::Result<$crate::TaskReportRec> {
+                run!(self.read_query, |c| tq::report(c, org_id, team_id, limit).await)
             }
 
             async fn thread_tasks(&self, org_id: i64, thread_id: i64) -> $crate::Result<Vec<$crate::TaskRec>> {

@@ -53,6 +53,9 @@ task_tests!(
     storage_quota_and_request_limit,
     reminder_cap,
     work_stealing,
+    revisions_and_client_keys,
+    children_results_and_reminders,
+    import_and_report,
 );
 
 struct Server {
@@ -1123,4 +1126,365 @@ async fn work_stealing(srv: Server) {
     // Every mail went to the right seat once.
     // (assigned, w2's request, w3's request, assigned again, w2's request)
     assert_eq!(w1.reminders().await.len(), 5, "{:?}", w1.reminders().await);
+}
+
+// --- M8.1 -------------------------------------------------------------------
+
+async fn revisions_and_client_keys(srv: Server) {
+    let org = srv.org("alpha").await;
+    let w1 = org.seat("w1").await;
+    let d = org
+        .call(
+            Method::POST,
+            "/tasks",
+            Some(json!({ "title": "spec", "assignee": "w1", "client_key": "k-1" })),
+        )
+        .await;
+    assert_eq!(d.0, StatusCode::CREATED);
+    let rev = d.1["task"]["rev"].as_i64().unwrap();
+    // The same key again: the same task, 200, nothing created or mailed.
+    let again = org
+        .call(
+            Method::POST,
+            "/tasks",
+            Some(json!({ "title": "spec", "assignee": "w1", "client_key": "k-1" })),
+        )
+        .await;
+    assert_eq!(again.0, StatusCode::OK);
+    assert_eq!(again.1["existing"], true);
+    assert_eq!(again.1["task"]["num"], 1);
+    assert_eq!(w1.reminders().await.len(), 1);
+    let (s, c) = org
+        .refused(
+            Method::POST,
+            "/tasks",
+            json!({ "title": "x", "client_key": "k".repeat(65) }),
+        )
+        .await;
+    assert_eq!(
+        (s, c.as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, "invalid_client_key")
+    );
+    // A write at the right revision passes; one at an old revision is
+    // refused with the task and what changed since.
+    let d = w1
+        .patch(1, json!({ "title": "spec v2", "if_rev": rev }))
+        .await;
+    let rev2 = d["task"]["rev"].as_i64().unwrap();
+    assert!(rev2 > rev);
+    let (s, v) = org
+        .call(
+            Method::PATCH,
+            "/tasks/1",
+            Some(json!({ "body": "mine", "if_rev": rev })),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert_eq!(v["error"]["code"], "stale");
+    assert_eq!(v["rev"], rev2);
+    assert_eq!(v["task"]["task"]["title"], "spec v2");
+    let since = v["since"].as_array().unwrap();
+    assert_eq!(since[0]["field"], "title");
+    assert_eq!(since[0]["to"], "spec v2");
+    assert!(org.get("/tasks/1").await["task"].get("body").is_none());
+    // `take` (body) and the DELETE calls (query) check it too.
+    let t2 = org.task(json!({ "title": "pool" })).await;
+    let (s, v) = w1
+        .call(
+            Method::POST,
+            &format!("/tasks/{t2}/take"),
+            Some(json!({ "if_rev": 0 })),
+        )
+        .await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (StatusCode::CONFLICT, Some("stale"))
+    );
+    org.post(&format!("/tasks/{t2}/deps"), json!({ "blocked_by": 1 }))
+        .await;
+    let (s, _) = org
+        .call(
+            Method::DELETE,
+            &format!("/tasks/{t2}/deps/1?if_rev=1"),
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    // A body change records the whole text.
+    w1.patch(1, json!({ "body": "line one\nline two" })).await;
+    let evs = org.get("/tasks/1/events").await;
+    let e = evs["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rfind(|e| e["field"] == "body")
+        .unwrap()
+        .clone();
+    assert_eq!(e["to"], "line one\nline two");
+    assert!(org.get("/tasks/1").await.get("events_compacted").is_none());
+}
+
+async fn children_results_and_reminders(srv: Server) {
+    let org = srv.org("alpha").await;
+    let w1 = org.seat("w1").await;
+    let w2 = org.seat("w2").await;
+    let w3 = org.seat("w3").await;
+    let parent = org.task(json!({ "title": "epic", "assignee": "w1" })).await;
+    let c1 = org
+        .task(json!({ "title": "part one", "parent": parent, "assignee": "w2" }))
+        .await;
+    let c2 = org
+        .task(json!({ "title": "part two", "parent": parent, "assignee": "w2" }))
+        .await;
+    let d = org.get(&format!("/tasks/{parent}")).await;
+    assert_eq!(d["task"]["progress"], json!({ "done": 0, "total": 2 }));
+    // Closing the parent with open children: 409 naming them; force closes.
+    let (s, v) = w1
+        .call(
+            Method::PATCH,
+            &format!("/tasks/{parent}"),
+            Some(json!({ "state": "done" })),
+        )
+        .await;
+    assert_eq!(
+        (s, v["error"]["code"].as_str()),
+        (StatusCode::CONFLICT, Some("children_open"))
+    );
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("t{c1}"))
+    );
+    w2.patch(c1, json!({ "state": "done" })).await;
+    assert!(
+        !w1.reminders()
+            .await
+            .iter()
+            .any(|r| r.contains("child tasks"))
+    );
+    w2.patch(c2, json!({ "state": "cancelled" })).await;
+    let line = format!("t{parent}: all 2 child tasks are closed");
+    assert_eq!(
+        w1.reminders().await.iter().filter(|r| **r == line).count(),
+        1,
+        "{:?}",
+        w1.reminders().await
+    );
+    assert_eq!(
+        org.get(&format!("/tasks/{parent}")).await["task"]["progress"],
+        json!({ "done": 1, "total": 1 })
+    );
+    // Results: only on a done task.
+    let review = org
+        .task(json!({ "title": "review", "assignee": "w2" }))
+        .await;
+    let integ = org
+        .task(json!({ "title": "integrate", "assignee": "w3" }))
+        .await;
+    let d = org
+        .post(
+            &format!("/tasks/{integ}/deps"),
+            json!({ "blocked_by": review, "needs_ok": true }),
+        )
+        .await;
+    assert_eq!(d["blockers"][0]["needs_ok"], true);
+    assert_eq!(d["task"]["waits_on_ok"], json!([review]));
+    let (s, c) = w2
+        .refused(
+            Method::PATCH,
+            &format!("/tasks/{review}"),
+            json!({ "result": "ok" }),
+        )
+        .await;
+    assert_eq!(
+        (s, c.as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, "not_done")
+    );
+    let (s, c) = w2
+        .refused(
+            Method::PATCH,
+            &format!("/tasks/{review}"),
+            json!({ "state": "done", "result": "ok", "result_ref": "x".repeat(201) }),
+        )
+        .await;
+    assert_eq!(
+        (s, c.as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, "ref_too_long")
+    );
+    // Closed as rejected: w3 is told once; the task still waits.
+    let d = w2
+        .patch(
+            review,
+            json!({ "state": "done", "result": "rejected", "result_ref": "abc123", "result_note": "fails" }),
+        )
+        .await;
+    assert_eq!(d["task"]["result"], "rejected");
+    assert_eq!(d["task"]["result_by"], "w2");
+    let rejected = format!("t{review} was closed as rejected; t{integ} waits for an ok result");
+    let count = |v: &[String], s: &str| v.iter().filter(|r| r.as_str() == s).count();
+    assert_eq!(count(&w3.reminders().await, &rejected), 1);
+    assert_eq!(
+        org.get(&format!("/tasks/{integ}")).await["task"]["state"],
+        "open"
+    );
+    // A new ok result: w3 is told the task is no longer blocked.
+    w2.patch(review, json!({ "result": "ok", "result_ref": "def456" }))
+        .await;
+    assert_eq!(
+        org.get(&format!("/tasks/{integ}")).await["task"]["state"],
+        "ready"
+    );
+    let unblocked = format!("t{integ} is no longer blocked: t{review} done with result ok");
+    assert_eq!(count(&w3.reminders().await, &unblocked), 1);
+    // Withdrawn: w3 is told once more.
+    w2.patch(review, json!({ "result": null, "note": "wrong commit" }))
+        .await;
+    let withdrawn = format!("t{review}'s ok result was withdrawn; t{integ} waits for an ok result");
+    assert_eq!(count(&w3.reminders().await, &withdrawn), 1);
+    let evs = org.get(&format!("/tasks/{review}/events")).await;
+    let last = evs["events"].as_array().unwrap().last().unwrap().clone();
+    assert_eq!(last["kind"], "result_withdrawn");
+    assert_eq!(last["from"], "ok def456");
+    // The list filter.
+    let l = org.get("/tasks?state=all&result=none").await;
+    assert!(nums(&l).contains(&integ) && nums(&l).contains(&review));
+    w2.patch(review, json!({ "result": "rejected" })).await;
+    assert_eq!(
+        nums(&org.get("/tasks?state=all&result=rejected").await),
+        [review]
+    );
+    assert!(nums(&org.get("/tasks?state=all&result=ok").await).is_empty());
+}
+
+async fn import_and_report(srv: Server) {
+    let org = srv.org("alpha").await;
+    let w1 = org.seat("w1").await;
+    let mut records = Vec::new();
+    for i in 0..10 {
+        records.push(json!({
+            "id": format!("ISSUE-{i}"),
+            "title": format!("issue {i}"),
+            "state": if i < 2 { "done" } else if i == 2 { "ready" } else { "doing" },
+            "assignee": if i == 3 { "nobody" } else { "w1" },
+            "depends_on": if i == 5 { json!([{ "id": "ISSUE-0", "needs_ok": true }]) } else { json!([]) },
+            "result": if i == 0 { json!({ "value": "rejected", "ref": "v1" }) } else { Value::Null },
+            "history": [{ "at": "2026-10-20T10:00:00Z", "by": "old-lead", "text": format!("note {i}") }],
+            "colour": "red",
+        }));
+    }
+    records[9]["parent"] = json!("ISSUE-8");
+    for r in records.iter_mut() {
+        if r["result"].is_null() {
+            r.as_object_mut().unwrap().remove("result");
+        }
+    }
+    // Only the user imports.
+    let (s, _) = w1
+        .call(
+            Method::POST,
+            "/tasks/import",
+            Some(json!({ "records": records })),
+        )
+        .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let dry = org
+        .post(
+            "/tasks/import",
+            json!({ "records": records, "dry_run": true }),
+        )
+        .await;
+    assert_eq!(dry["dry_run"], true);
+    assert_eq!(dry["results"].as_array().unwrap().len(), 10);
+    assert!(
+        org.get("/tasks?state=all").await["tasks"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let r = org
+        .post("/tasks/import", json!({ "records": records }))
+        .await;
+    let res = r["results"].as_array().unwrap();
+    assert!(res.iter().all(|x| x["action"] == "created"), "{r}");
+    let warnings: Vec<&str> = r["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w.as_str().unwrap())
+        .collect();
+    assert!(
+        warnings.contains(&"ISSUE-3: no seat \"nobody\"; the task is left unassigned"),
+        "{warnings:?}"
+    );
+    assert!(
+        warnings.contains(&"ISSUE-0: unknown field \"colour\" ignored"),
+        "{warnings:?}"
+    );
+    // Nothing is mailed.
+    assert!(w1.reminders().await.is_empty());
+    let again = org
+        .post("/tasks/import", json!({ "records": records }))
+        .await;
+    assert!(
+        again["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|x| x["action"] == "same"),
+        "{again}"
+    );
+    assert_eq!(
+        org.get("/tasks?state=all").await["tasks"]
+            .as_array()
+            .unwrap()
+            .len(),
+        10
+    );
+    let found = org.get("/tasks?import_key=ISSUE-0").await;
+    assert_eq!(found["tasks"][0]["import_key"], "ISSUE-0");
+    assert_eq!(found["tasks"][0]["result"], "rejected");
+    // Refusals: a missing title, an id used twice.
+    let (s, c) = org
+        .refused(
+            Method::POST,
+            "/tasks/import",
+            json!({ "records": [{ "id": "A" }] }),
+        )
+        .await;
+    assert_eq!(
+        (s, c.as_str()),
+        (StatusCode::UNPROCESSABLE_ENTITY, "invalid_import")
+    );
+    let (_, c) = org
+        .refused(
+            Method::POST,
+            "/tasks/import",
+            json!({ "records": [{ "id": "A", "title": "a" }, { "id": "A", "title": "b" }] }),
+        )
+        .await;
+    assert_eq!(c, "invalid_import");
+    // The report.
+    let rep = org.get("/tasks/report").await;
+    let sec = |name: &str| {
+        rep["sections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == name)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(sec("rejected")["count"], 1);
+    assert_eq!(sec("in_progress")["count"], 7);
+    assert_eq!(sec("not_started")["count"], 1);
+    assert!(
+        sec("in_progress")["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["seat"] == "w1")
+    );
+    assert_eq!(sec("blocked")["count"], 0);
+    assert_eq!(sec("parents")["count"], 1);
 }

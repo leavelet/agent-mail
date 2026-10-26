@@ -10,7 +10,7 @@
 
 use crate::model::*;
 use crate::{Result, StoreError};
-use amail_proto::{TaskEventKind, TaskPriority, TaskState};
+use amail_proto::{TaskEventKind, TaskPriority, TaskResult, TaskState};
 use std::collections::HashMap;
 
 /// Columns and joins of [`TaskRow`]; `$body` is `t.body` or `''`
@@ -25,7 +25,8 @@ macro_rules! task_select {
              pt.num AS parent_num, t.labels, t.due, t.waiting_on_id, ws.name AS waiting_on, \
              t.blocked_reason, t.thread_id, t.created_at, t.updated_at, t.closed_at, t.event_seq, \
              t.events_compacted, t.steal_requested_by AS steal_by_id, sb.name AS steal_by, \
-             t.steal_requested_at AS steal_at FROM tasks t JOIN seats rs ON rs.id = t.reporter_id \
+             t.steal_requested_at AS steal_at, t.result, t.result_ref, t.result_note, t.result_by, t.result_at, \
+             t.import_key FROM tasks t JOIN seats rs ON rs.id = t.reporter_id \
              LEFT JOIN seats asg ON asg.id = t.assignee_id LEFT JOIN teams tm ON tm.id = t.team_id \
              LEFT JOIN tasks pt ON pt.id = t.parent_id LEFT JOIN seats ws ON ws.id = t.waiting_on_id \
              LEFT JOIN seats sb ON sb.id = t.steal_requested_by"
@@ -33,9 +34,49 @@ macro_rules! task_select {
     };
 }
 
-/// True for task `t` when one of its blockers is not closed.
-pub(crate) const OPEN_BLOCKER: &str = "EXISTS (SELECT 1 FROM task_deps od JOIN tasks ob ON ob.id = od.blocker_id \
-     WHERE od.task_id = t.id AND ob.state NOT IN ('done', 'cancelled'))";
+/// SQL that is true when the dependency `$d` (a `task_deps` row) on
+/// blocker `$b` (a `tasks` row) is not satisfied: the blocker is not
+/// closed, or the dependency needs an ok result and the blocker is not
+/// `done` with `ok`.
+macro_rules! unmet {
+    ($d:literal, $b:literal) => {
+        concat!(
+            "(",
+            $b,
+            ".state NOT IN ('done', 'cancelled') OR (",
+            $d,
+            ".needs_ok AND (",
+            $b,
+            ".state <> 'done' OR ",
+            $b,
+            ".result IS NULL OR ",
+            $b,
+            ".result <> 'ok')))"
+        )
+    };
+}
+
+/// True for task `t` when one of its dependencies is not satisfied.
+pub(crate) const OPEN_BLOCKER: &str = concat!(
+    "EXISTS (SELECT 1 FROM task_deps od JOIN tasks ob ON ob.id = od.blocker_id WHERE od.task_id = t.id AND ",
+    unmet!("od", "ob"),
+    ")"
+);
+
+/// Refuse a write with `stale` when the task is not at the revision the
+/// writer expects.
+pub(crate) fn check_rev(w: &TaskWrite, t: &TaskRec) -> Result<()> {
+    match w.if_rev {
+        Some(r) if r != t.event_seq => Err(refused(
+            "stale",
+            format!(
+                "t{} changed since rev {r}: it is at rev {}",
+                t.num, t.event_seq
+            ),
+        )),
+        _ => Ok(()),
+    }
+}
 
 /// Sort key of the shown state of `t` for [`TaskOrder::Personal`].
 pub(crate) fn personal_key() -> String {
@@ -87,6 +128,12 @@ pub(crate) struct TaskRow {
     steal_by_id: Option<i64>,
     steal_by: Option<String>,
     steal_at: Option<i64>,
+    result: Option<String>,
+    result_ref: Option<String>,
+    result_note: Option<String>,
+    result_by: Option<String>,
+    result_at: Option<i64>,
+    import_key: Option<String>,
 }
 
 impl TaskRow {
@@ -123,6 +170,18 @@ impl TaskRow {
             steal_requested_by_id: self.steal_by_id,
             steal_requested_by: self.steal_by,
             steal_requested_at: self.steal_at,
+            progress: None,
+            result: self
+                .result
+                .as_deref()
+                .map(crate::common::parse::<TaskResult>)
+                .transpose()?,
+            result_ref: self.result_ref,
+            result_note: self.result_note,
+            result_by: self.result_by,
+            result_at: self.result_at,
+            import_key: self.import_key,
+            waits_on_ok: Vec::new(),
         })
     }
 }
@@ -160,7 +219,7 @@ impl EventRow {
     }
 }
 
-pub(crate) const EVENT_SELECT: &str = "SELECT e.task_id, e.seq, e.at, s.name AS actor, e.written_by, e.kind, \
+pub(crate) const EVENT_SELECT: &str = "SELECT e.task_id, e.seq, e.at, COALESCE(s.name, e.actor_name) AS actor, e.written_by, e.kind, \
      e.field, e.from_value, e.to_value, e.note, e.message_id FROM task_events e \
      LEFT JOIN seats s ON s.id = e.actor_id";
 
@@ -188,7 +247,11 @@ pub(crate) fn task_bytes(t: &TaskRec) -> i64 {
         + (t.title.len()
             + t.body.len()
             + labels_to_db(&t.labels).len()
-            + t.blocked_reason.as_deref().map_or(0, str::len)) as i64
+            + t.blocked_reason.as_deref().map_or(0, str::len)
+            + t.result_ref.as_deref().map_or(0, str::len)
+            + t.result_note.as_deref().map_or(0, str::len)
+            + t.result_by.as_deref().map_or(0, str::len)
+            + t.import_key.as_deref().map_or(0, str::len)) as i64
 }
 
 /// One event to write.
@@ -200,6 +263,8 @@ pub(crate) struct Ev {
     pub to: Option<String>,
     pub note: Option<String>,
     pub message_id: Option<i64>,
+    /// Imported events: the actor's name as the file gives it.
+    pub actor_name: Option<String>,
 }
 
 impl Ev {
@@ -232,7 +297,7 @@ impl Ev {
     /// The bytes this event counts against the storage quota.
     pub(crate) fn bytes(&self, written_by: Option<&str>) -> i64 {
         amail_proto::limits::STORED_BYTES_PER_TASK_EVENT
-            + [&self.from, &self.to, &self.note]
+            + [&self.from, &self.to, &self.note, &self.actor_name]
                 .iter()
                 .map(|v| v.as_deref().map_or(0, str::len) as i64)
                 .sum::<i64>()
@@ -340,21 +405,39 @@ macro_rules! impl_task_queries {
                 Ok(())
             }
 
-            /// Fill in `waits_on`.
+            /// Fill in `waits_on`, `waits_on_ok` and `progress`.
             pub async fn fill(c: &mut Conn, recs: &mut [TaskRec]) -> Result<()> {
                 for chunk in recs.chunks_mut(500) {
                     let sql = format!(
-                        "SELECT d.task_id, b.num FROM task_deps d JOIN tasks b ON b.id = d.blocker_id \
-                         WHERE d.task_id IN ({}) AND b.state NOT IN {CLOSED} ORDER BY b.num",
-                        placeholders(1, chunk.len())
+                        "SELECT d.task_id, b.num, d.needs_ok FROM task_deps d JOIN tasks b ON b.id = d.blocker_id \
+                         WHERE d.task_id IN ({}) AND {} ORDER BY b.num",
+                        placeholders(1, chunk.len()),
+                        unmet!("d", "b")
                     );
-                    let mut q = sqlx::query_as::<Db, (i64, i64)>(&sql);
+                    let mut q = sqlx::query_as::<Db, (i64, i64, bool)>(&sql);
                     for t in chunk.iter() {
                         q = q.bind(t.id);
                     }
-                    let mut m = group_waits(q.fetch_all(&mut *c).await?);
+                    let rows = q.fetch_all(&mut *c).await?;
+                    let ok: Vec<(i64, i64)> = rows.iter().filter(|r| r.2).map(|r| (r.0, r.1)).collect();
+                    let mut m = group_waits(rows.into_iter().map(|r| (r.0, r.1)).collect());
+                    let mut m_ok = group_waits(ok);
+                    let sql = format!(
+                        "SELECT parent_id, CAST(SUM(CASE WHEN state = 'done' THEN 1 ELSE 0 END) AS BIGINT), \
+                         CAST(SUM(CASE WHEN state <> 'cancelled' THEN 1 ELSE 0 END) AS BIGINT) \
+                         FROM tasks WHERE parent_id IN ({}) GROUP BY parent_id",
+                        placeholders(1, chunk.len())
+                    );
+                    let mut q = sqlx::query_as::<Db, (i64, i64, i64)>(&sql);
+                    for t in chunk.iter() {
+                        q = q.bind(t.id);
+                    }
+                    let progress: std::collections::HashMap<i64, (i64, i64)> =
+                        q.fetch_all(&mut *c).await?.into_iter().map(|(p, d, n)| (p, (d, n))).collect();
                     for t in chunk.iter_mut() {
                         t.waits_on = m.remove(&t.id).unwrap_or_default();
+                        t.waits_on_ok = m_ok.remove(&t.id).unwrap_or_default();
+                        t.progress = progress.get(&t.id).copied();
                     }
                 }
                 Ok(())
@@ -415,7 +498,8 @@ macro_rules! impl_task_queries {
                 let bytes = e.bytes(written_by);
                 sqlx::query(
                     "INSERT INTO task_events (task_id, seq, org_id, at, actor_id, written_by, kind, field, \
-                     from_value, to_value, note, message_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                     from_value, to_value, note, message_id, actor_name) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
                 )
                 .bind(task_id)
                 .bind(seq)
@@ -429,6 +513,7 @@ macro_rules! impl_task_queries {
                 .bind(&e.to)
                 .bind(&e.note)
                 .bind(e.message_id)
+                .bind(&e.actor_name)
                 .execute(&mut *c)
                 .await?;
                 Ok(bytes)
@@ -528,8 +613,22 @@ macro_rules! impl_task_queries {
                 Ok(())
             }
 
-            pub async fn create(c: &mut Conn, n: &NewTaskRec) -> Result<TaskRec> {
+            pub async fn create(c: &mut Conn, n: &NewTaskRec) -> Result<(TaskRec, bool)> {
                 let now = now_ms();
+                if let Some(k) = &n.client_key {
+                    lock(c, n.org_id).await?;
+                    let num: Option<i64> = sqlx::query_scalar(
+                        "SELECT num FROM tasks WHERE org_id = $1 AND client_key = $2 AND created_at >= $3 ORDER BY num DESC LIMIT 1",
+                    )
+                    .bind(n.org_id)
+                    .bind(k)
+                    .bind(now - TASK_CLIENT_KEY_HOURS * 3_600_000)
+                    .fetch_optional(&mut *c)
+                    .await?;
+                    if let Some(num) = num {
+                        return Ok((must(c, n.org_id, num).await?, true));
+                    }
+                }
                 let num: Option<i64> = sqlx::query_scalar(
                     "UPDATE orgs SET org_task_seq = org_task_seq + 1 WHERE id = $1 AND deleted_at IS NULL RETURNING org_task_seq",
                 )
@@ -581,8 +680,8 @@ macro_rules! impl_task_queries {
                     .await?;
                 let id: i64 = sqlx::query_scalar(
                     "INSERT INTO tasks (org_id, num, title, body, state, priority, rank, reporter_id, assignee_id, \
-                     team_id, parent_id, labels, due, created_at, updated_at) \
-                     VALUES ($1, $2, $3, $4, 'open', $5, $6, $7, $8, $9, $10, $11, $12, $13, $13) RETURNING id",
+                     team_id, parent_id, labels, due, created_at, updated_at, client_key) \
+                     VALUES ($1, $2, $3, $4, 'open', $5, $6, $7, $8, $9, $10, $11, $12, $13, $13, $14) RETURNING id",
                 )
                 .bind(n.org_id)
                 .bind(num)
@@ -597,6 +696,7 @@ macro_rules! impl_task_queries {
                 .bind(labels_to_db(&n.labels))
                 .bind(n.due)
                 .bind(now)
+                .bind(&n.client_key)
                 .fetch_one(&mut *c)
                 .await?;
                 let actor = Some(n.reporter_id);
@@ -620,36 +720,54 @@ macro_rules! impl_task_queries {
                     bytes += event(c, id, n.org_id, actor, wb, now, Ev::new(TaskEventKind::Linked).to(Some(th.to_string()))).await?;
                 }
                 charge(c, n.org_id, bytes, n.quota).await?;
-                must(c, n.org_id, num).await
+                Ok((must(c, n.org_id, num).await?, false))
             }
 
-            /// After task `closed` was closed: its unfinished dependents,
-            /// and those whose last open blocker it was (with an
-            /// `unblocked` event each).
-            async fn after_close(c: &mut Conn, w: &TaskWrite, closed: &TaskRec, now: i64, bytes: &mut i64) -> Result<(Vec<TaskRec>, Vec<TaskRec>)> {
-                let ids: Vec<i64> = sqlx::query_scalar("SELECT d.task_id FROM task_deps d JOIN tasks x ON x.id = d.task_id \
-                     WHERE d.blocker_id = $1 AND x.state NOT IN ('done', 'cancelled')")
-                .bind(closed.id)
-                .fetch_all(&mut *c)
-                .await?;
-                let deps = by_ids(c, &ids).await?;
-                let mut unblocked = Vec::new();
-                for d in &deps {
-                    if d.waits_on.is_empty() {
-                        let e = Ev::new(TaskEventKind::Unblocked)
-                            .to(Some(tnum(closed.num)))
-                            .note(format!("t{} {}", closed.num, closed.state));
+            /// The unfinished tasks that depend on task `id` (with their
+            /// `waits_on`).
+            async fn dependents_of(c: &mut Conn, id: i64, needs_ok_only: bool) -> Result<Vec<TaskRec>> {
+                let sql = if needs_ok_only {
+                    "SELECT d.task_id FROM task_deps d JOIN tasks x ON x.id = d.task_id \
+                     WHERE d.blocker_id = $1 AND d.needs_ok AND x.state NOT IN ('done', 'cancelled')"
+                } else {
+                    "SELECT d.task_id FROM task_deps d JOIN tasks x ON x.id = d.task_id \
+                     WHERE d.blocker_id = $1 AND x.state NOT IN ('done', 'cancelled')"
+                };
+                let ids: Vec<i64> = sqlx::query_scalar(sql).bind(id).fetch_all(&mut *c).await?;
+                by_ids(c, &ids).await
+            }
+
+            /// After a write to blocker `b`: the dependents (as they were
+            /// before it, in `before`) that waited and wait no longer get an
+            /// `unblocked` event each; returns them as they are now.
+            async fn newly_unblocked(c: &mut Conn, w: &TaskWrite, b: &TaskRec, before: &[TaskRec], now: i64, bytes: &mut i64) -> Result<Vec<TaskRec>> {
+                let ids: Vec<i64> = before.iter().filter(|d| !d.waits_on.is_empty()).map(|d| d.id).collect();
+                let mut out = Vec::new();
+                for d in by_ids(c, &ids).await? {
+                    if d.waits_on.is_empty() && !d.state.is_closed() {
+                        let note = match b.result {
+                            Some(r) if b.state == TaskState::Done => format!("t{} done with result {r}", b.num),
+                            _ => format!("t{} {}", b.num, b.state),
+                        };
+                        let e = Ev::new(TaskEventKind::Unblocked).to(Some(tnum(b.num))).note(note);
                         *bytes += event(c, d.id, w.org_id, w.actor_id, w.written_by.as_deref(), now, e).await?;
-                        unblocked.push(d.clone());
+                        out.push(d);
                     }
                 }
-                Ok((deps, unblocked))
+                Ok(out)
+            }
+
+            /// The name of seat `id`.
+            async fn seat_name(c: &mut Conn, id: Option<i64>) -> Result<Option<String>> {
+                let Some(id) = id else { return Ok(None) };
+                Ok(sqlx::query_scalar("SELECT name FROM seats WHERE id = $1").bind(id).fetch_optional(&mut *c).await?)
             }
 
             pub async fn change(c: &mut Conn, w: &TaskWrite, ch: &TaskChange) -> Result<TaskChanged> {
                 lock(c, w.org_id).await?;
                 let now = now_ms();
                 let before = must(c, w.org_id, w.num).await?;
+                check_rev(w, &before)?;
                 let mut t = before.clone();
                 if let Some(s) = ch.state {
                     if s == TaskState::Ready {
@@ -668,6 +786,33 @@ macro_rules! impl_task_queries {
                         ));
                     }
                     t.state = s;
+                }
+                // A parent closes when its children are closed, or by force.
+                let mut close_note = None;
+                if t.state.is_closed() && !before.state.is_closed() {
+                    let open: Vec<i64> = sqlx::query_scalar(
+                        "SELECT num FROM tasks WHERE parent_id = $1 AND state NOT IN ('done', 'cancelled') ORDER BY num LIMIT 21",
+                    )
+                    .bind(before.id)
+                    .fetch_all(&mut *c)
+                    .await?;
+                    if !open.is_empty() {
+                        let mut names: Vec<String> = open.iter().take(20).map(|n| tnum(*n)).collect();
+                        if open.len() > 20 {
+                            names.push("...".into());
+                        }
+                        if !ch.force {
+                            return Err(refused(
+                                "children_open",
+                                format!(
+                                    "t{} has child tasks that are not closed: {}; close them first, or force the close",
+                                    before.num,
+                                    names.join(", ")
+                                ),
+                            ));
+                        }
+                        close_note = Some(format!("closed with open child tasks: {}", names.join(", ")));
+                    }
                 }
                 let blocked = t.state == TaskState::Blocked;
                 let sets_block = matches!(ch.waiting_on_id, Some(Some(_))) || matches!(ch.blocked_reason, Some(Some(_)));
@@ -723,15 +868,56 @@ macro_rules! impl_task_queries {
                 if t.state != before.state {
                     t.closed_at = if t.state.is_closed() { Some(now) } else { None };
                 }
+                // The result: set on a `done` task, withdrawn, or cleared
+                // when the task is reopened.
+                let withdrawn = matches!(ch.result, Some(None)) && before.result.is_some();
+                match ch.result {
+                    Some(Some(r)) => {
+                        if t.state != TaskState::Done {
+                            return Err(refused(
+                                "not_done",
+                                format!("t{} is {}: a result goes with the state done", before.num, t.state),
+                            ));
+                        }
+                        let same = before.result == Some(r) && before.result_ref == ch.result_ref && before.result_note == ch.result_note;
+                        if !same {
+                            t.result = Some(r);
+                            t.result_ref = ch.result_ref.clone();
+                            t.result_note = ch.result_note.clone();
+                            t.result_by = seat_name(c, w.actor_id).await?;
+                            t.result_at = Some(now);
+                        }
+                    }
+                    Some(None) => {}
+                    None if ch.result_ref.is_some() || ch.result_note.is_some() => {
+                        return Err(StoreError::Invalid("result_ref and result_note go with result".into()));
+                    }
+                    None => {}
+                }
+                let reopened = before.state == TaskState::Done && t.state != TaskState::Done;
+                if withdrawn || reopened {
+                    t.result = None;
+                    t.result_ref = None;
+                    t.result_note = None;
+                    t.result_by = None;
+                    t.result_at = None;
+                }
                 // A pending steal request ends when the assignee or the state changes.
                 let clear_steal = before.steal_requested_by_id.is_some()
                     && (t.assignee_id != before.assignee_id || t.state != before.state);
+                // Dependents whose readiness this write may change.
+                let watch = if t.state != before.state || t.result != before.result {
+                    dependents_of(c, before.id, false).await?
+                } else {
+                    Vec::new()
+                };
                 sqlx::query(
                     "UPDATE tasks SET title = $2, body = $3, state = $4, priority = $5, rank = $6, assignee_id = $7, \
                      team_id = $8, parent_id = $9, labels = $10, due = $11, waiting_on_id = $12, blocked_reason = $13, \
                      closed_at = $14, due_reminded_at = CASE WHEN $15 THEN NULL ELSE due_reminded_at END, \
                      steal_requested_by = CASE WHEN $16 THEN NULL ELSE steal_requested_by END, \
-                     steal_requested_at = CASE WHEN $16 THEN NULL ELSE steal_requested_at END WHERE id = $1",
+                     steal_requested_at = CASE WHEN $16 THEN NULL ELSE steal_requested_at END, \
+                     result = $17, result_ref = $18, result_note = $19, result_by = $20, result_at = $21 WHERE id = $1",
                 )
                 .bind(before.id)
                 .bind(&t.title)
@@ -749,14 +935,49 @@ macro_rules! impl_task_queries {
                 .bind(t.closed_at)
                 .bind(t.due != before.due)
                 .bind(clear_steal)
+                .bind(t.result.map(|r| r.as_str()))
+                .bind(&t.result_ref)
+                .bind(&t.result_note)
+                .bind(&t.result_by)
+                .bind(t.result_at)
                 .execute(&mut *c)
                 .await?;
                 let after = must(c, w.org_id, w.num).await?;
-                let (mut fields, evs) = field_events(&before, &after);
+                let (mut fields, mut evs) = field_events(&before, &after);
+                if let Some(n) = close_note
+                    && let Some(e) = evs.iter_mut().find(|e| e.field == Some("state"))
+                {
+                    e.note = Some(n);
+                }
                 let mut bytes = task_bytes(&after) - task_bytes(&before);
                 let wb = w.written_by.as_deref();
                 for e in evs {
                     bytes += event(c, before.id, w.org_id, w.actor_id, wb, now, e).await?;
+                }
+                // Result events.
+                let shown = |r: Option<amail_proto::TaskResult>| r.map(|r| r.to_string());
+                if withdrawn {
+                    let mut old = before.result.map(|r| r.to_string()).unwrap_or_default();
+                    if let Some(x) = &before.result_ref {
+                        old = format!("{old} {x}");
+                    }
+                    let mut e = Ev::new(TaskEventKind::ResultWithdrawn).field("result").from(Some(old));
+                    e.note = ch.note.clone();
+                    bytes += event(c, before.id, w.org_id, w.actor_id, wb, now, e).await?;
+                    fields.push("result");
+                } else if after.result != before.result || after.result_note != before.result_note {
+                    let mut e = Ev::new(TaskEventKind::Changed).field("result").from(shown(before.result)).to(shown(after.result));
+                    e.note = after.result_note.clone();
+                    bytes += event(c, before.id, w.org_id, w.actor_id, wb, now, e).await?;
+                    fields.push("result");
+                }
+                if !withdrawn && after.result_ref != before.result_ref {
+                    let e = Ev::new(TaskEventKind::Changed)
+                        .field("result_ref")
+                        .from(before.result_ref.clone())
+                        .to(after.result_ref.clone());
+                    bytes += event(c, before.id, w.org_id, w.actor_id, wb, now, e).await?;
+                    fields.push("result_ref");
                 }
                 if clear_steal {
                     let why = if after.assignee_id != before.assignee_id {
@@ -771,9 +992,41 @@ macro_rules! impl_task_queries {
                     bytes += event(c, before.id, w.org_id, w.actor_id, wb, now, e).await?;
                     fields.push("steal");
                 }
-                let (mut dependents, mut unblocked) = (Vec::new(), Vec::new());
-                if after.state.is_closed() && !before.state.is_closed() {
-                    (dependents, unblocked) = after_close(c, w, &after, now, &mut bytes).await?;
+                let unblocked = newly_unblocked(c, w, &after, &watch, now, &mut bytes).await?;
+                let dependents = if after.state.is_closed() && !before.state.is_closed() {
+                    let ids: Vec<i64> = watch.iter().map(|d| d.id).collect();
+                    by_ids(c, &ids).await?
+                } else {
+                    Vec::new()
+                };
+                // Seats whose dependency needs an ok result of this task.
+                let rejected = after.state == TaskState::Done
+                    && after.result == Some(amail_proto::TaskResult::Rejected)
+                    && before.result != after.result;
+                let ok_withdrawn = withdrawn && before.result == Some(amail_proto::TaskResult::Ok);
+                let needs_ok_waiting = if rejected || ok_withdrawn {
+                    dependents_of(c, before.id, true).await?
+                } else {
+                    Vec::new()
+                };
+                // The last open child of a parent closed.
+                let mut children_done = None;
+                if after.state.is_closed() && !before.state.is_closed()
+                    && let Some(pid) = after.parent_id
+                {
+                    let (open, all): (i64, i64) = sqlx::query_as(
+                        "SELECT CAST(COALESCE(SUM(CASE WHEN state NOT IN ('done', 'cancelled') THEN 1 ELSE 0 END), 0) AS BIGINT), \
+                         COUNT(*) FROM tasks WHERE parent_id = $1",
+                    )
+                    .bind(pid)
+                    .fetch_one(&mut *c)
+                    .await?;
+                    if open == 0
+                        && let Some(p) = by_ids(c, &[pid]).await?.pop()
+                        && !p.state.is_closed()
+                    {
+                        children_done = Some((p, all));
+                    }
                 }
                 if !fields.is_empty() {
                     sqlx::query("UPDATE tasks SET updated_at = $2 WHERE id = $1")
@@ -790,6 +1043,8 @@ macro_rules! impl_task_queries {
                     fields: fields.into_iter().map(str::to_string).collect(),
                     unblocked,
                     dependents,
+                    children_done,
+                    needs_ok_waiting,
                 })
             }
 
@@ -800,6 +1055,8 @@ macro_rules! impl_task_queries {
                     fields: Vec::new(),
                     unblocked: Vec::new(),
                     dependents: Vec::new(),
+                    children_done: None,
+                    needs_ok_waiting: Vec::new(),
                 }
             }
 
@@ -861,6 +1118,8 @@ macro_rules! impl_task_queries {
                     fields: vec!["steal".into()],
                     unblocked: Vec::new(),
                     dependents: Vec::new(),
+                    children_done: None,
+                    needs_ok_waiting: Vec::new(),
                 })
             }
 
@@ -916,6 +1175,8 @@ macro_rules! impl_task_queries {
                     fields: vec![if give { "assignee" } else { "steal" }.into()],
                     unblocked: Vec::new(),
                     dependents: Vec::new(),
+                    children_done: None,
+                    needs_ok_waiting: Vec::new(),
                 })
             }
 
@@ -964,6 +1225,7 @@ macro_rules! impl_task_queries {
                 lock(c, w.org_id).await?;
                 let now = now_ms();
                 let before = must(c, w.org_id, w.num).await?;
+                check_rev(w, &before)?;
                 let Some(actor) = w.actor_id else {
                     return Err(StoreError::Invalid("take needs a seat".into()));
                 };
@@ -996,25 +1258,66 @@ macro_rules! impl_task_queries {
                     fields: vec!["assignee".into()],
                     unblocked: Vec::new(),
                     dependents: Vec::new(),
+                    children_done: None,
+                    needs_ok_waiting: Vec::new(),
                 })
             }
 
-            pub async fn add_dep(c: &mut Conn, w: &TaskWrite, blocker: i64) -> Result<TaskChanged> {
+            pub async fn add_dep(c: &mut Conn, w: &TaskWrite, blocker: i64, needs_ok: Option<bool>) -> Result<TaskChanged> {
                 lock(c, w.org_id).await?;
                 let now = now_ms();
                 let before = must(c, w.org_id, w.num).await?;
+                check_rev(w, &before)?;
                 let b = must(c, w.org_id, blocker).await?;
                 if b.id == before.id {
                     return Err(refused("dependency_cycle", "a task cannot depend on itself"));
                 }
-                let exists: Option<i64> = sqlx::query_scalar("SELECT task_id FROM task_deps WHERE task_id = $1 AND blocker_id = $2")
+                let wb = w.written_by.as_deref();
+                let exists: Option<bool> = sqlx::query_scalar("SELECT needs_ok FROM task_deps WHERE task_id = $1 AND blocker_id = $2")
                     .bind(before.id)
                     .bind(b.id)
                     .fetch_optional(&mut *c)
                     .await?;
-                if exists.is_some() {
-                    return Ok(unchanged(before));
+                if let Some(cur) = exists {
+                    // Repeating the dependency changes whether it needs an ok result.
+                    let Some(want) = needs_ok.filter(|v| *v != cur) else {
+                        return Ok(unchanged(before));
+                    };
+                    sqlx::query("UPDATE task_deps SET needs_ok = $3 WHERE task_id = $1 AND blocker_id = $2")
+                        .bind(before.id)
+                        .bind(b.id)
+                        .bind(want)
+                        .execute(&mut *c)
+                        .await?;
+                    let e = Ev::new(TaskEventKind::Changed)
+                        .field("needs_ok")
+                        .from(Some(cur.to_string()))
+                        .to(Some(want.to_string()))
+                        .note(format!("dependency on t{}", b.num));
+                    let mut bytes = event(c, before.id, w.org_id, w.actor_id, wb, now, e).await?;
+                    touch(c, &[before.id], now).await?;
+                    let task = must(c, w.org_id, w.num).await?;
+                    let mut unblocked = Vec::new();
+                    if !before.waits_on.is_empty() && task.waits_on.is_empty() && !task.state.is_closed() {
+                        let e = Ev::new(TaskEventKind::Unblocked)
+                            .to(Some(tnum(b.num)))
+                            .note(format!("t{} {}: any close satisfies the dependency now", b.num, b.state));
+                        bytes += event(c, before.id, w.org_id, w.actor_id, wb, now, e).await?;
+                        unblocked.push(task);
+                    }
+                    charge(c, w.org_id, bytes, w.quota).await?;
+                    let task = must(c, w.org_id, w.num).await?;
+                    return Ok(TaskChanged {
+                        before,
+                        task,
+                        fields: vec!["blocked_by".into()],
+                        unblocked,
+                        dependents: Vec::new(),
+                        children_done: None,
+                        needs_ok_waiting: Vec::new(),
+                    });
                 }
+                let needs_ok = needs_ok.unwrap_or(false);
                 let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM task_deps WHERE task_id = $1")
                     .bind(before.id)
                     .fetch_one(&mut *c)
@@ -1055,16 +1358,19 @@ macro_rules! impl_task_queries {
                     level = next.into_iter().filter(|x| seen.insert(*x)).collect();
                     depth += 1;
                 }
-                sqlx::query("INSERT INTO task_deps (task_id, blocker_id, org_id, created_at) VALUES ($1, $2, $3, $4)")
+                sqlx::query("INSERT INTO task_deps (task_id, blocker_id, org_id, created_at, needs_ok) VALUES ($1, $2, $3, $4, $5)")
                     .bind(before.id)
                     .bind(b.id)
                     .bind(w.org_id)
                     .bind(now)
+                    .bind(needs_ok)
                     .execute(&mut *c)
                     .await?;
-                let wb = w.written_by.as_deref();
                 let mut bytes = STORED_BYTES_PER_TASK_EVENT;
-                let e = Ev::new(TaskEventKind::DependencyAdded).field("blocked_by").to(Some(tnum(b.num)));
+                let mut e = Ev::new(TaskEventKind::DependencyAdded).field("blocked_by").to(Some(tnum(b.num)));
+                if needs_ok {
+                    e = e.note("ok result needed");
+                }
                 bytes += event(c, before.id, w.org_id, w.actor_id, wb, now, e).await?;
                 let e = Ev::new(TaskEventKind::DependencyAdded).field("blocks").to(Some(tnum(before.num)));
                 bytes += event(c, b.id, w.org_id, w.actor_id, wb, now, e).await?;
@@ -1077,6 +1383,8 @@ macro_rules! impl_task_queries {
                     fields: vec!["blocked_by".into()],
                     unblocked: Vec::new(),
                     dependents: Vec::new(),
+                    children_done: None,
+                    needs_ok_waiting: Vec::new(),
                 })
             }
 
@@ -1091,6 +1399,7 @@ macro_rules! impl_task_queries {
                 lock(c, w.org_id).await?;
                 let now = now_ms();
                 let before = must(c, w.org_id, w.num).await?;
+                check_rev(w, &before)?;
                 let b = must(c, w.org_id, blocker).await?;
                 let n = sqlx::query("DELETE FROM task_deps WHERE task_id = $1 AND blocker_id = $2")
                     .bind(before.id)
@@ -1125,6 +1434,8 @@ macro_rules! impl_task_queries {
                     fields: vec!["blocked_by".into()],
                     unblocked,
                     dependents: Vec::new(),
+                    children_done: None,
+                    needs_ok_waiting: Vec::new(),
                 })
             }
 
@@ -1139,6 +1450,7 @@ macro_rules! impl_task_queries {
                     None if auto => return Ok(false),
                     None => return Err(StoreError::NotFound(format!("no task t{}", w.num))),
                 };
+                check_rev(w, &t)?;
                 if auto && t.thread_id == Some(thread_id) {
                     return Ok(false);
                 }
@@ -1182,6 +1494,7 @@ macro_rules! impl_task_queries {
                 lock(c, w.org_id).await?;
                 let now = now_ms();
                 let t = must(c, w.org_id, w.num).await?;
+                check_rev(w, &t)?;
                 let n = sqlx::query("DELETE FROM task_links WHERE task_id = $1 AND thread_id = $2")
                     .bind(t.id)
                     .bind(thread_id)
@@ -1238,6 +1551,8 @@ macro_rules! impl_task_queries {
                     "steal" => "steal",
                     "steal_declined" => "steal_declined",
                     "steal_expired" => "steal_expired",
+                    "children_done" => "children_done",
+                    "blocker_rejected" => "blocker_rejected",
                     _ => "other",
                 });
                 let bytes = event(c, task_id, org_id, None, None, now_ms(), e).await?;
@@ -1269,8 +1584,17 @@ macro_rules! impl_task_queries {
 
             pub async fn detail(c: &mut Conn, org_id: i64, num: i64, nevents: i64) -> Result<Option<TaskDetailRec>> {
                 let Some(task) = by_num(c, org_id, num).await? else { return Ok(None) };
-                let ids_b = ids(c, "SELECT blocker_id FROM task_deps WHERE task_id = $1", task.id).await?;
+                let deps: Vec<(i64, bool)> = sqlx::query_as("SELECT blocker_id, needs_ok FROM task_deps WHERE task_id = $1")
+                    .bind(task.id)
+                    .fetch_all(&mut *c)
+                    .await?;
+                let ids_b: Vec<i64> = deps.iter().map(|d| d.0).collect();
                 let blockers = by_ids(c, &ids_b).await?;
+                let blockers_needs_ok = blockers
+                    .iter()
+                    .filter(|b| deps.iter().any(|d| d.0 == b.id && d.1))
+                    .map(|b| b.num)
+                    .collect();
                 let ids_d = ids(c, "SELECT task_id FROM task_deps WHERE blocker_id = $1", task.id).await?;
                 let blocked = by_ids(c, &ids_d).await?;
                 let ids_c = ids(c, "SELECT id FROM tasks WHERE parent_id = $1 ORDER BY num LIMIT 500", task.id).await?;
@@ -1296,6 +1620,7 @@ macro_rules! impl_task_queries {
                         .map(|(thread_id, seat, created_at)| TaskLinkRec { thread_id, seat, created_at })
                         .collect(),
                     events,
+                    blockers_needs_ok,
                 }))
             }
 
@@ -1382,6 +1707,18 @@ macro_rules! impl_task_queries {
                 if let Some(p) = q.parent {
                     b.push(" AND pt.num = ").push_bind(p);
                 }
+                match q.result {
+                    Some(Some(r)) => {
+                        b.push(" AND t.result = ").push_bind(r.as_str());
+                    }
+                    Some(None) => {
+                        b.push(" AND t.result IS NULL");
+                    }
+                    None => {}
+                }
+                if let Some(k) = &q.import_key {
+                    b.push(" AND t.import_key = ").push_bind(k.clone());
+                }
                 if let Some(d) = q.due_before {
                     b.push(format!(" AND t.state NOT IN {CLOSED} AND t.due IS NOT NULL AND t.due < "));
                     b.push_bind(d);
@@ -1427,10 +1764,10 @@ macro_rules! impl_task_queries {
                 .bind(limit + 1)
                 .fetch_all(&mut *c)
                 .await?;
-                let pairs: Vec<(i64, i64)> = sqlx::query_as("SELECT d.task_id, d.blocker_id FROM task_deps d JOIN tasks t ON t.id = d.task_id \
+                let pairs: Vec<(i64, i64)> = sqlx::query_as(concat!("SELECT d.task_id, d.blocker_id FROM task_deps d JOIN tasks t ON t.id = d.task_id \
                      JOIN tasks b ON b.id = d.blocker_id WHERE t.org_id = $1 AND t.assignee_id = $2 \
-                     AND t.state NOT IN ('done', 'cancelled') AND b.state NOT IN ('done', 'cancelled') \
-                     ORDER BY t.num, b.num LIMIT $3")
+                     AND t.state NOT IN ('done', 'cancelled') AND ", unmet!("d", "b"), " \
+                     ORDER BY t.num, b.num LIMIT $3"))
                 .bind(org_id)
                 .bind(seat_id)
                 .bind(limit + 1)
@@ -1467,14 +1804,14 @@ macro_rules! impl_task_queries {
                 .bind(limit + 1)
                 .fetch_all(&mut *c)
                 .await?;
-                let pairs: Vec<(i64, i64)> = sqlx::query_as("SELECT d.blocker_id, d.task_id FROM task_deps d JOIN tasks b ON b.id = d.blocker_id \
+                let pairs: Vec<(i64, i64)> = sqlx::query_as(concat!("SELECT d.blocker_id, d.task_id FROM task_deps d JOIN tasks b ON b.id = d.blocker_id \
                      JOIN tasks x ON x.id = d.task_id WHERE b.org_id = $1 \
                      AND COALESCE(b.assignee_id, b.reporter_id) = $2 \
-                     AND b.state NOT IN ('done', 'cancelled') AND x.state NOT IN ('done', 'cancelled') \
+                     AND ", unmet!("d", "b"), " AND x.state NOT IN ('done', 'cancelled') \
                      AND COALESCE(x.assignee_id, x.reporter_id) <> $2 \
                      AND NOT EXISTS (SELECT 1 FROM task_deps d2 JOIN tasks b2 ON b2.id = d2.blocker_id \
-                       WHERE d2.task_id = x.id AND d2.blocker_id <> b.id AND b2.state NOT IN ('done', 'cancelled')) \
-                     ORDER BY b.num, x.num LIMIT $3")
+                       WHERE d2.task_id = x.id AND d2.blocker_id <> b.id AND ", unmet!("d2", "b2"), ") \
+                     ORDER BY b.num, x.num LIMIT $3"))
                 .bind(org_id)
                 .bind(seat_id)
                 .bind(limit + 1)
@@ -1552,6 +1889,301 @@ macro_rules! impl_task_queries {
                 out.overdue = list(c, &q).await?.tasks;
                 let q = TaskQuery { waiting_only: true, order: TaskOrder::Priority, limit: 200, ..base };
                 out.chains = list(c, &q).await?.tasks;
+                Ok(out)
+            }
+
+            /// The task imported from record `key`.
+            async fn by_import_key(c: &mut Conn, org_id: i64, key: &str) -> Result<Option<TaskRec>> {
+                let num: Option<i64> = sqlx::query_scalar("SELECT num FROM tasks WHERE org_id = $1 AND import_key = $2")
+                    .bind(org_id)
+                    .bind(key)
+                    .fetch_optional(&mut *c)
+                    .await?;
+                match num {
+                    Some(n) => by_num(c, org_id, n).await,
+                    None => Ok(None),
+                }
+            }
+
+            /// Bring task `num` to the state, fields and result of record
+            /// `r` (fields `r` does not give are kept); true when something
+            /// changed.
+            async fn import_fields(c: &mut Conn, w: &TaskWrite, r: &ImportTaskRec, warnings: &mut Vec<String>) -> Result<bool> {
+                let before = must(c, w.org_id, w.num).await?;
+                let mut ch = TaskChange { force: true, ..Default::default() };
+                if before.title != r.title {
+                    ch.title = Some(r.title.clone());
+                }
+                if let Some(b) = r.body.as_ref().filter(|b| **b != before.body) {
+                    ch.body = Some(b.clone());
+                }
+                if let Some(p) = r.priority.filter(|p| *p != before.priority) {
+                    ch.priority = Some(p);
+                }
+                if let Some(a) = r.assignee_id.filter(|a| *a != before.assignee_id) {
+                    ch.assignee_id = Some(a);
+                }
+                if let Some(l) = r.labels.as_ref().filter(|l| **l != before.labels) {
+                    ch.labels = Some(l.clone());
+                }
+                if let Some(d) = r.due.filter(|d| *d != before.due) {
+                    ch.due = Some(d);
+                }
+                let state = r.state.filter(|s| *s != before.state);
+                let done = r.state.unwrap_or(before.state) == TaskState::Done;
+                let mut result_set = false;
+                match &r.result {
+                    Some(x) if done => {
+                        if before.result != Some(x.result) || before.result_ref != x.result_ref || before.result_note != x.note {
+                            ch.result = Some(Some(x.result));
+                            ch.result_ref = x.result_ref.clone();
+                            ch.result_note = x.note.clone();
+                            result_set = true;
+                        }
+                    }
+                    Some(_) => warnings.push(format!("{}: the result is ignored: the task is not done", r.key)),
+                    None => {}
+                }
+                // A closed task changes to another closed state through `open`.
+                if let Some(s) = state {
+                    if before.state.is_closed() && s.is_closed() {
+                        let reopen = TaskChange { state: Some(TaskState::Open), ..Default::default() };
+                        change(c, w, &reopen).await?;
+                    }
+                    ch.state = Some(s);
+                }
+                let changed = change(c, w, &ch).await?;
+                if result_set && let Some(x) = &r.result {
+                    let by = match &x.by {
+                        Some(b) => Some(b.clone()),
+                        None => seat_name(c, w.actor_id).await?,
+                    };
+                    sqlx::query("UPDATE tasks SET result_by = $2, result_at = $3 WHERE id = $1")
+                        .bind(before.id)
+                        .bind(by)
+                        .bind(x.at.unwrap_or_else(now_ms))
+                        .execute(&mut *c)
+                        .await?;
+                }
+                Ok(!changed.fields.is_empty() || state.is_some())
+            }
+
+            /// Add the history entries of record `r` that task `id` does not
+            /// have yet (as `imported` events); true when it added one.
+            async fn import_history(c: &mut Conn, w: &TaskWrite, id: i64, r: &ImportTaskRec) -> Result<bool> {
+                let have: Vec<(i64, Option<String>, Option<String>)> = sqlx::query_as(
+                    "SELECT at, actor_name, note FROM task_events WHERE task_id = $1 AND kind = 'imported'",
+                )
+                .bind(id)
+                .fetch_all(&mut *c)
+                .await?;
+                let mut bytes = 0;
+                let mut added = false;
+                for h in &r.history {
+                    if have.iter().any(|x| x.0 == h.at && x.1 == h.by && x.2.as_deref() == Some(h.text.as_str())) {
+                        continue;
+                    }
+                    let mut e = Ev::new(TaskEventKind::Imported).note(h.text.clone());
+                    e.actor_name = h.by.clone();
+                    bytes += event(c, id, w.org_id, None, None, h.at, e).await?;
+                    added = true;
+                }
+                charge(c, w.org_id, bytes, w.quota).await?;
+                Ok(added)
+            }
+
+            pub async fn import(c: &mut Conn, imp: &TaskImportRec) -> Result<TaskImportRes> {
+                lock(c, imp.org_id).await?;
+                let mut res = TaskImportRes::default();
+                let mut nums: Vec<i64> = Vec::new();
+                let w = |num: i64| TaskWrite {
+                    org_id: imp.org_id,
+                    num,
+                    actor_id: Some(imp.actor_id),
+                    written_by: None,
+                    quota: imp.quota,
+                    if_rev: None,
+                };
+                // Pass 1: the tasks.
+                for r in &imp.records {
+                    let existing = by_import_key(c, imp.org_id, &r.key).await?;
+                    let (num, action) = match existing {
+                        Some(t) => {
+                            let changed = import_fields(c, &w(t.num), r, &mut res.warnings).await?;
+                            let added = import_history(c, &w(t.num), t.id, r).await?;
+                            (t.num, if changed || added { "updated" } else { "same" })
+                        }
+                        None => {
+                            let (t, _) = create(
+                                c,
+                                &NewTaskRec {
+                                    org_id: imp.org_id,
+                                    reporter_id: r.reporter_id.unwrap_or(imp.actor_id),
+                                    written_by: None,
+                                    title: r.title.clone(),
+                                    body: r.body.clone().unwrap_or_default(),
+                                    priority: r.priority,
+                                    assignee_id: r.assignee_id.flatten(),
+                                    team_id: None,
+                                    parent: None,
+                                    labels: r.labels.clone().unwrap_or_default(),
+                                    due: r.due.flatten(),
+                                    link_thread: None,
+                                    quota: imp.quota,
+                                    client_key: None,
+                                },
+                            )
+                            .await?;
+                            let key_bytes = r.key.len() as i64;
+                            sqlx::query("UPDATE tasks SET import_key = $2, created_at = COALESCE($3, created_at) WHERE id = $1")
+                                .bind(t.id)
+                                .bind(&r.key)
+                                .bind(r.created_at)
+                                .execute(&mut *c)
+                                .await?;
+                            charge(c, imp.org_id, key_bytes, imp.quota).await?;
+                            import_fields(c, &w(t.num), r, &mut res.warnings).await?;
+                            import_history(c, &w(t.num), t.id, r).await?;
+                            (t.num, "created")
+                        }
+                    };
+                    if let Some(u) = r.updated_at.filter(|_| action != "same") {
+                        sqlx::query("UPDATE tasks SET updated_at = $3 WHERE org_id = $1 AND num = $2")
+                            .bind(imp.org_id)
+                            .bind(num)
+                            .bind(u)
+                            .execute(&mut *c)
+                            .await?;
+                    }
+                    nums.push(num);
+                    res.results.push((r.key.clone(), Some(num), action));
+                }
+                // Pass 2: parents and dependencies, between tasks of the file
+                // or tasks imported before.
+                for (i, r) in imp.records.iter().enumerate() {
+                    let num = nums[i];
+                    let mut changed = false;
+                    if let Some(pk) = &r.parent {
+                        match by_import_key(c, imp.org_id, pk).await? {
+                            None => res.warnings.push(format!("{}: no task imported as {pk:?}; the parent is not set", r.key)),
+                            Some(p) => {
+                                let ch = TaskChange { parent: Some(Some(p.num)), ..Default::default() };
+                                let cur = must(c, imp.org_id, num).await?;
+                                if cur.parent != Some(p.num) {
+                                    match change(c, &w(num), &ch).await {
+                                        Ok(_) => changed = true,
+                                        Err(StoreError::Refused(_, m)) => res.warnings.push(format!("{}: parent {pk}: {m}", r.key)),
+                                        Err(e) => return Err(e),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    for (bk, needs_ok) in &r.deps {
+                        match by_import_key(c, imp.org_id, bk).await? {
+                            None => res.warnings.push(format!("{}: no task imported as {bk:?}; the dependency is not set", r.key)),
+                            Some(b) => match add_dep(c, &w(num), b.num, Some(*needs_ok)).await {
+                                Ok(ch) => changed |= !ch.fields.is_empty(),
+                                Err(StoreError::Refused(_, m)) => res.warnings.push(format!("{}: dependency on {bk}: {m}", r.key)),
+                                Err(e) => return Err(e),
+                            },
+                        }
+                    }
+                    if changed && res.results[i].2 == "same" {
+                        res.results[i].2 = "updated";
+                    }
+                }
+                if imp.dry_run {
+                    for x in res.results.iter_mut().filter(|x| x.2 == "created") {
+                        x.1 = None;
+                    }
+                    return Err(StoreError::ImportDryRun(Box::new(res)));
+                }
+                Ok(res)
+            }
+
+            /// One section of the report: tasks matching `cond`, by
+            /// `order`, with their count.
+            async fn report_section(c: &mut Conn, org_id: i64, team: Option<i64>, cond: &str, order: &str, limit: i64) -> Result<(i64, Vec<TaskRec>)> {
+                let mut b = sqlx::QueryBuilder::<Db>::new("SELECT COUNT(*) FROM tasks t WHERE t.org_id = ");
+                b.push_bind(org_id);
+                if let Some(team) = team {
+                    team_clause(&mut b, team);
+                }
+                b.push(format!(" AND {cond}"));
+                let count: i64 = b.build_query_scalar().fetch_one(&mut *c).await?;
+                if count == 0 {
+                    return Ok((0, Vec::new()));
+                }
+                let mut b = sqlx::QueryBuilder::<Db>::new(concat!(task_select!("''"), " WHERE t.org_id = "));
+                b.push_bind(org_id);
+                if let Some(team) = team {
+                    team_clause(&mut b, team);
+                }
+                b.push(format!(" AND {cond} ORDER BY {order} LIMIT "));
+                b.push_bind(limit);
+                let rows: Vec<TaskRow> = b.build_query_as().fetch_all(&mut *c).await?;
+                let mut tasks = rows.into_iter().map(TaskRow::into_rec).collect::<Result<Vec<_>>>()?;
+                fill(c, &mut tasks).await?;
+                Ok((count, tasks))
+            }
+
+            pub async fn report(c: &mut Conn, org_id: i64, team: Option<i64>, limit: i64) -> Result<TaskReportRec> {
+                let limit = limit.clamp(1, MAX_TASK_PAGE);
+                let by_prio = format!("{PRIORITY_KEY}, t.rank, t.num");
+                let mut out = TaskReportRec::default();
+                let item = |t: TaskRec, seat: Option<String>| ReportItemRec { task: t, seat, waiting_for: Vec::new(), dependents: Vec::new() };
+
+                let (n, v) = report_section(c, org_id, team, "t.state = 'open' AND t.assignee_id IS NOT NULL", &format!("asg.name, {by_prio}"), limit).await?;
+                out.sections.push(("not_started", n, v.into_iter().map(|t| { let s = t.assignee.clone(); item(t, s) }).collect()));
+
+                let (n, v) = report_section(c, org_id, team, "t.state = 'doing'", &format!("asg.name, {by_prio}"), limit).await?;
+                out.sections.push(("in_progress", n, v.into_iter().map(|t| { let s = t.assignee.clone(); item(t, s) }).collect()));
+
+                let (n, v) = report_section(c, org_id, team, "t.state = 'review'", &format!("rs.name, {by_prio}"), limit).await?;
+                out.sections.push(("review", n, v.into_iter().map(|t| { let s = Some(t.reporter.clone()); item(t, s) }).collect()));
+
+                let (n, v) = report_section(c, org_id, team, "t.state = 'done' AND t.result = 'rejected'", "t.closed_at DESC, t.num DESC", limit).await?;
+                out.sections.push(("rejected", n, v.into_iter().map(|t| { let s = t.assignee.clone(); item(t, s) }).collect()));
+
+                let cond = "t.state = 'done' AND t.result = 'ok' AND EXISTS (SELECT 1 FROM task_deps rd JOIN tasks rx ON rx.id = rd.task_id \
+                            WHERE rd.blocker_id = t.id AND rx.state NOT IN ('done', 'cancelled'))";
+                let (n, v) = report_section(c, org_id, team, cond, "t.closed_at DESC, t.num DESC", limit).await?;
+                let mut items = Vec::new();
+                for t in v {
+                    let deps = dependents_of(c, t.id, false).await?;
+                    let s = t.assignee.clone();
+                    items.push(ReportItemRec { dependents: deps, ..item(t, s) });
+                }
+                out.sections.push(("approved", n, items));
+
+                let cond = "t.state NOT IN ('done', 'cancelled') AND EXISTS (SELECT 1 FROM tasks rc WHERE rc.parent_id = t.id \
+                            AND rc.state NOT IN ('done', 'cancelled'))";
+                let (n, v) = report_section(c, org_id, team, cond, &by_prio, limit).await?;
+                out.sections.push(("parents", n, v.into_iter().map(|t| { let s = t.assignee.clone(); item(t, s) }).collect()));
+
+                let cond = format!("(t.state = 'blocked' OR (t.state = 'open' AND {OPEN_BLOCKER}))");
+                let (n, v) = report_section(c, org_id, team, &cond, &by_prio, limit).await?;
+                let mut items = Vec::new();
+                for t in v {
+                    let mut waiting_for: Vec<String> = t.waiting_on.iter().cloned().collect();
+                    let ids: Vec<i64> = sqlx::query_scalar(concat!(
+                        "SELECT b.id FROM task_deps d JOIN tasks b ON b.id = d.blocker_id WHERE d.task_id = $1 AND ",
+                        unmet!("d", "b")
+                    ))
+                    .bind(t.id)
+                    .fetch_all(&mut *c)
+                    .await?;
+                    for b in by_ids(c, &ids).await? {
+                        let name = b.responsible().1.to_string();
+                        if !waiting_for.contains(&name) {
+                            waiting_for.push(name);
+                        }
+                    }
+                    let s = t.assignee.clone();
+                    items.push(ReportItemRec { waiting_for, ..item(t, s) });
+                }
+                out.sections.push(("blocked", n, items));
                 Ok(out)
             }
 

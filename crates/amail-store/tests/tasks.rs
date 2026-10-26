@@ -49,6 +49,13 @@ conformance!(
     reminders_claimed_once,
     org_and_team_deletion,
     steal_requests,
+    rev_check,
+    idempotent_create,
+    children_and_progress,
+    results,
+    needs_ok_readiness,
+    import_twice,
+    report,
 );
 
 struct Org1 {
@@ -575,7 +582,8 @@ async fn events_are_kept(s: S) {
 async fn parents(s: S) {
     let o = setup(&s, "alpha").await;
     let mut prev: Option<i64> = None;
-    for i in 0..5 {
+    // A top task and 8 levels below it.
+    for i in 0..9 {
         let t = s
             .create_task(&NewTaskRec {
                 org_id: o.org.id,
@@ -589,7 +597,7 @@ async fn parents(s: S) {
         assert_eq!(t.parent, prev);
         prev = Some(t.num);
     }
-    // A sixth level is refused.
+    // A ninth level below the top is refused.
     let e = s
         .create_task(&NewTaskRec {
             org_id: o.org.id,
@@ -613,7 +621,7 @@ async fn parents(s: S) {
         .await
         .unwrap_err();
     assert_eq!(code(e), "parent_cycle");
-    // Moving a subtree (t2 has three levels below it) under a task that
+    // Moving a subtree (t2 has seven levels below it) under a task that
     // has a parent is refused too.
     let top = new(&s, &o, "top", None).await;
     let lone = s
@@ -1082,4 +1090,619 @@ async fn steal_requests(s: S) {
         events(&s, &o, t.num).await.pop().unwrap().kind,
         K::StealExpired
     );
+}
+
+// --- M8.1 -------------------------------------------------------------------
+
+async fn rev_check(s: S) {
+    let o = setup(&s, "alpha").await;
+    let t = new(&s, &o, "x", Some(&o.a)).await;
+    // `created` and `assigned`.
+    assert_eq!(t.event_seq, 2);
+    let stale = TaskWrite {
+        if_rev: Some(1),
+        ..w(&o, t.num, &o.a)
+    };
+    let title = |v: &str| TaskChange {
+        title: Some(v.into()),
+        ..Default::default()
+    };
+    let e = s.change_task(&stale, &title("y")).await.unwrap_err();
+    assert_eq!(code(e), "stale");
+    // Nothing changed.
+    assert_eq!(s.task(o.org.id, t.num).await.unwrap().unwrap().title, "x");
+    let fresh = TaskWrite {
+        if_rev: Some(2),
+        ..w(&o, t.num, &o.a)
+    };
+    let c = s.change_task(&fresh, &title("y")).await.unwrap();
+    assert_eq!(c.task.event_seq, 3);
+    // The other single-task writes check it too.
+    let other = new(&s, &o, "other", None).await;
+    assert_eq!(
+        code(s.set_task_dep(&stale, other.num, None).await.unwrap_err()),
+        "stale"
+    );
+    assert_eq!(
+        code(s.remove_task_dep(&stale, other.num).await.unwrap_err()),
+        "stale"
+    );
+    assert_eq!(
+        code(s.add_task_link(&stale, 99, false, None).await.unwrap_err()),
+        "stale"
+    );
+    assert_eq!(
+        code(s.remove_task_link(&stale, 99).await.unwrap_err()),
+        "stale"
+    );
+    let take = TaskWrite {
+        if_rev: Some(0),
+        ..w(&o, other.num, &o.b)
+    };
+    assert_eq!(code(s.take_task(&take).await.unwrap_err()), "stale");
+    // Without if_rev a write is not checked.
+    s.change_task(&w(&o, t.num, &o.b), &title("z"))
+        .await
+        .unwrap();
+}
+
+async fn idempotent_create(s: S) {
+    let o = setup(&s, "alpha").await;
+    let mk = |key: Option<&str>, title: &str| NewTaskRec {
+        org_id: o.org.id,
+        reporter_id: o.a.id,
+        title: title.into(),
+        client_key: key.map(str::to_string),
+        ..Default::default()
+    };
+    let (t1, existed) = s.create_task_once(&mk(Some("k1"), "first")).await.unwrap();
+    assert!(!existed);
+    let (again, existed) = s.create_task_once(&mk(Some("k1"), "second")).await.unwrap();
+    assert!(existed);
+    assert_eq!(again.num, t1.num);
+    assert_eq!(again.title, "first");
+    // Another key, or none, creates a task.
+    let (t2, existed) = s.create_task_once(&mk(Some("k2"), "first")).await.unwrap();
+    assert!(!existed && t2.num == t1.num + 1);
+    let (t3, existed) = s.create_task_once(&mk(None, "first")).await.unwrap();
+    assert!(!existed && t3.num == t2.num + 1);
+    // Keys are per org.
+    let other = setup(&s, "beta").await;
+    let (t, existed) = s
+        .create_task_once(&NewTaskRec {
+            org_id: other.org.id,
+            reporter_id: other.a.id,
+            title: "first".into(),
+            client_key: Some("k1".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(!existed && t.num == 1);
+}
+
+async fn children_and_progress(s: S) {
+    let o = setup(&s, "alpha").await;
+    let parent = new(&s, &o, "parent", Some(&o.a)).await;
+    let mut kids = Vec::new();
+    for i in 0..4 {
+        kids.push(
+            s.create_task(&NewTaskRec {
+                org_id: o.org.id,
+                reporter_id: o.user.id,
+                title: format!("child {i}"),
+                parent: Some(parent.num),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+    }
+    let p = s.task(o.org.id, parent.num).await.unwrap().unwrap();
+    assert_eq!(p.progress, Some((0, 4)));
+    assert_eq!(kids[0].progress, None);
+    let c = set_state(&s, &o, kids[0].num, St::Done).await;
+    assert!(c.children_done.is_none());
+    set_state(&s, &o, kids[1].num, St::Cancelled).await;
+    let p = s.task(o.org.id, parent.num).await.unwrap().unwrap();
+    // Cancelled children are left out of the total.
+    assert_eq!(p.progress, Some((1, 3)));
+    // Closing the parent while children are open is refused, naming them.
+    let close = TaskChange {
+        state: Some(St::Done),
+        ..Default::default()
+    };
+    let e = s
+        .change_task(&w(&o, parent.num, &o.a), &close)
+        .await
+        .unwrap_err();
+    let StoreError::Refused("children_open", msg) = e else {
+        panic!("{e:?}")
+    };
+    assert!(
+        msg.contains(&format!("t{}", kids[2].num)) && msg.contains(&format!("t{}", kids[3].num)),
+        "{msg}"
+    );
+    // The last open child closes: the parent is named once.
+    set_state(&s, &o, kids[2].num, St::Done).await;
+    let c = set_state(&s, &o, kids[3].num, St::Done).await;
+    let (pp, n) = c.children_done.expect("children done");
+    assert_eq!((pp.num, n), (parent.num, 4));
+    assert_eq!(pp.progress, Some((3, 3)));
+    // Reopen one and force the parent closed: the event names the child.
+    set_state(&s, &o, kids[3].num, St::Open).await;
+    let c = s
+        .change_task(
+            &w(&o, parent.num, &o.a),
+            &TaskChange {
+                force: true,
+                ..close.clone()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(c.task.state, St::Done);
+    let e = events(&s, &o, parent.num)
+        .await
+        .into_iter()
+        .rfind(|e| e.field.as_deref() == Some("state"))
+        .unwrap();
+    assert!(e.note.unwrap().contains(&format!("t{}", kids[3].num)));
+    // Closing the parent changed no child.
+    let k = s.task(o.org.id, kids[3].num).await.unwrap().unwrap();
+    assert_eq!(k.state, St::Open);
+    // The last child closing under a closed parent names nobody.
+    let c = set_state(&s, &o, kids[3].num, St::Done).await;
+    assert!(c.children_done.is_none());
+}
+
+async fn results(s: S) {
+    use amail_proto::TaskResult as R;
+    let o = setup(&s, "alpha").await;
+    let t = new(&s, &o, "review it", Some(&o.a)).await;
+    let res = |r: Option<R>, rf: Option<&str>, note: Option<&str>| TaskChange {
+        result: Some(r),
+        result_ref: rf.map(str::to_string),
+        result_note: note.map(str::to_string),
+        ..Default::default()
+    };
+    // Not on a task that is not done.
+    let e = s
+        .change_task(&w(&o, t.num, &o.a), &res(Some(R::Ok), None, None))
+        .await
+        .unwrap_err();
+    assert_eq!(code(e), "not_done");
+    // Together with closing.
+    let c = s
+        .change_task(
+            &w(&o, t.num, &o.a),
+            &TaskChange {
+                state: Some(St::Done),
+                ..res(Some(R::Rejected), Some("abc123"), Some("fails on arm"))
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(c.task.result, Some(R::Rejected));
+    assert_eq!(c.task.result_ref.as_deref(), Some("abc123"));
+    assert_eq!(c.task.result_by.as_deref(), Some("a"));
+    assert!(c.task.result_at.is_some());
+    let ev = events(&s, &o, t.num).await;
+    let r = ev
+        .iter()
+        .find(|e| e.field.as_deref() == Some("result"))
+        .unwrap();
+    assert_eq!(
+        (r.from.as_deref(), r.to.as_deref()),
+        (None, Some("rejected"))
+    );
+    assert_eq!(r.note.as_deref(), Some("fails on arm"));
+    let rf = ev
+        .iter()
+        .find(|e| e.field.as_deref() == Some("result_ref"))
+        .unwrap();
+    assert_eq!(rf.to.as_deref(), Some("abc123"));
+    // On a task already done; by another seat.
+    let c = s
+        .change_task(&w(&o, t.num, &o.b), &res(Some(R::Ok), Some("def456"), None))
+        .await
+        .unwrap();
+    assert_eq!(c.task.result, Some(R::Ok));
+    assert_eq!(c.task.result_by.as_deref(), Some("b"));
+    // The same again changes nothing.
+    let c = s
+        .change_task(&w(&o, t.num, &o.b), &res(Some(R::Ok), Some("def456"), None))
+        .await
+        .unwrap();
+    assert!(c.fields.is_empty());
+    // Withdraw: the task stays done.
+    let c = s
+        .change_task(
+            &w(&o, t.num, &o.b),
+            &TaskChange {
+                note: Some("wrong commit".into()),
+                ..res(None, None, None)
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(c.task.result, None);
+    assert_eq!(c.task.result_ref, None);
+    assert_eq!(c.task.state, St::Done);
+    let e = events(&s, &o, t.num).await.pop().unwrap();
+    assert_eq!(e.kind, K::ResultWithdrawn);
+    assert_eq!(e.from.as_deref(), Some("ok def456"));
+    assert_eq!(e.note.as_deref(), Some("wrong commit"));
+    // Reopening clears a result.
+    s.change_task(&w(&o, t.num, &o.b), &res(Some(R::Ok), None, None))
+        .await
+        .unwrap();
+    let c = set_state(&s, &o, t.num, St::Open).await;
+    assert_eq!(c.task.result, None);
+    let e = events(&s, &o, t.num)
+        .await
+        .into_iter()
+        .rfind(|e| e.field.as_deref() == Some("result"))
+        .unwrap();
+    assert_eq!(
+        (e.kind, e.from.as_deref(), e.to.as_deref()),
+        (K::Changed, Some("ok"), None)
+    );
+    // The list filter.
+    let q = |r: Option<Option<R>>| TaskQuery {
+        org_id: o.org.id,
+        result: r,
+        limit: 50,
+        ..Default::default()
+    };
+    let other = new(&s, &o, "other", None).await;
+    s.change_task(
+        &w(&o, other.num, &o.a),
+        &TaskChange {
+            state: Some(St::Done),
+            ..res(Some(R::Rejected), None, None)
+        },
+    )
+    .await
+    .unwrap();
+    let nums = |p: TaskPage| p.tasks.iter().map(|t| t.num).collect::<Vec<_>>();
+    assert_eq!(
+        nums(s.tasks(&q(Some(Some(R::Rejected)))).await.unwrap()),
+        [other.num]
+    );
+    assert!(nums(s.tasks(&q(Some(Some(R::Ok)))).await.unwrap()).is_empty());
+    assert_eq!(nums(s.tasks(&q(Some(None))).await.unwrap()), [t.num]);
+}
+
+async fn needs_ok_readiness(s: S) {
+    use amail_proto::TaskResult as R;
+    let o = setup(&s, "alpha").await;
+    let review = new(&s, &o, "review", Some(&o.b)).await;
+    let integ = new(&s, &o, "integrate", Some(&o.a)).await;
+    let c = s
+        .set_task_dep(&w(&o, integ.num, &o.user), review.num, Some(true))
+        .await
+        .unwrap();
+    assert_eq!(c.task.waits_on, [review.num]);
+    assert_eq!(c.task.waits_on_ok, [review.num]);
+    let d = s
+        .task_detail(o.org.id, integ.num, 20)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(d.blockers_needs_ok, [review.num]);
+    // Closed as rejected: still waiting, and the dependent is named.
+    let close = |r: R| TaskChange {
+        state: Some(St::Done),
+        result: Some(Some(r)),
+        ..Default::default()
+    };
+    let c = s
+        .change_task(&w(&o, review.num, &o.b), &close(R::Rejected))
+        .await
+        .unwrap();
+    assert!(c.unblocked.is_empty());
+    assert_eq!(
+        c.needs_ok_waiting.iter().map(|t| t.num).collect::<Vec<_>>(),
+        [integ.num]
+    );
+    let t = s.task(o.org.id, integ.num).await.unwrap().unwrap();
+    assert_eq!(t.shown_state(), St::Open);
+    // The waiting and owed queries follow the rule.
+    let (wl, _) = s.tasks_waiting(o.org.id, o.a.id, 50).await.unwrap();
+    assert_eq!(wl.len(), 1);
+    assert_eq!(wl[0].other.as_ref().unwrap().num, review.num);
+    let (ow, _) = s.tasks_owed(o.org.id, o.b.id, 50).await.unwrap();
+    assert_eq!(ow.len(), 1);
+    // A new ok result unblocks it, once.
+    let c = s
+        .change_task(
+            &w(&o, review.num, &o.b),
+            &TaskChange {
+                result: Some(Some(R::Ok)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        c.unblocked.iter().map(|t| t.num).collect::<Vec<_>>(),
+        [integ.num]
+    );
+    assert!(c.needs_ok_waiting.is_empty());
+    let t = s.task(o.org.id, integ.num).await.unwrap().unwrap();
+    assert!(t.ready());
+    let e = events(&s, &o, integ.num).await.pop().unwrap();
+    assert_eq!(e.kind, K::Unblocked);
+    // Withdrawing the ok result: waiting again, the dependent named.
+    let c = s
+        .change_task(
+            &w(&o, review.num, &o.b),
+            &TaskChange {
+                result: Some(None),
+                note: Some("found a bug".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(c.needs_ok_waiting.len(), 1);
+    assert!(!s.task(o.org.id, integ.num).await.unwrap().unwrap().ready());
+    // `--any-close` changes the dependency: any close satisfies it.
+    let c = s
+        .set_task_dep(&w(&o, integ.num, &o.user), review.num, Some(false))
+        .await
+        .unwrap();
+    assert!(c.task.ready());
+    assert_eq!(c.unblocked.len(), 1);
+    // Repeating it without a flag changes nothing.
+    let c = s
+        .set_task_dep(&w(&o, integ.num, &o.user), review.num, None)
+        .await
+        .unwrap();
+    assert!(c.fields.is_empty());
+    // A cancelled blocker does not satisfy a dependency that needs ok.
+    let other = new(&s, &o, "other", None).await;
+    s.set_task_dep(&w(&o, integ.num, &o.user), other.num, Some(true))
+        .await
+        .unwrap();
+    set_state(&s, &o, other.num, St::Cancelled).await;
+    let t = s.task(o.org.id, integ.num).await.unwrap().unwrap();
+    assert_eq!(t.waits_on, [other.num]);
+}
+
+fn import_file(o: &Org1) -> TaskImportRec {
+    use amail_proto::TaskResult as R;
+    let mut records = Vec::new();
+    for i in 0..10 {
+        records.push(ImportTaskRec {
+            key: format!("ISSUE-{i}"),
+            title: format!("issue {i}"),
+            body: Some(format!("body {i}")),
+            state: Some(if i < 3 { St::Done } else { St::Open }),
+            assignee_id: Some(if i % 2 == 0 { Some(o.a.id) } else { None }),
+            parent: (i >= 5).then(|| "ISSUE-4".to_string()),
+            deps: if i == 9 {
+                vec![
+                    ("ISSUE-2".to_string(), true),
+                    ("ISSUE-8".to_string(), false),
+                ]
+            } else {
+                Vec::new()
+            },
+            result: (i == 2).then(|| ImportResultRec {
+                result: R::Ok,
+                result_ref: Some("abc123".into()),
+                note: None,
+                by: Some("old-reviewer".into()),
+                at: Some(1_700_000_000_000),
+            }),
+            created_at: Some(1_600_000_000_000 + i),
+            history: vec![ImportHistoryRec {
+                at: 1_650_000_000_000,
+                by: Some("someone".into()),
+                text: format!("note {i}"),
+            }],
+            ..Default::default()
+        });
+    }
+    TaskImportRec {
+        org_id: o.org.id,
+        actor_id: o.user.id,
+        records,
+        ..Default::default()
+    }
+}
+
+async fn import_twice(s: S) {
+    use amail_proto::TaskResult as R;
+    let o = setup(&s, "alpha").await;
+    let imp = import_file(&o);
+    // A dry run keeps nothing.
+    let dry = s
+        .import_tasks(&TaskImportRec {
+            dry_run: true,
+            ..imp.clone()
+        })
+        .await
+        .unwrap();
+    assert!(
+        dry.results
+            .iter()
+            .all(|r| r.2 == "created" && r.1.is_none())
+    );
+    assert!(s.task(o.org.id, 1).await.unwrap().is_none());
+    let r = s.import_tasks(&imp).await.unwrap();
+    assert_eq!(r.results.len(), 10);
+    assert!(
+        r.results.iter().all(|r| r.2 == "created"),
+        "{:?}",
+        r.results
+    );
+    assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+    let page = s
+        .tasks(&TaskQuery {
+            org_id: o.org.id,
+            limit: 100,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.tasks.len(), 10);
+    let t2 = s
+        .tasks(&TaskQuery {
+            org_id: o.org.id,
+            import_key: Some("ISSUE-2".into()),
+            limit: 10,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .tasks
+        .pop()
+        .unwrap();
+    assert_eq!(t2.state, St::Done);
+    assert_eq!(t2.result, Some(R::Ok));
+    assert_eq!(t2.result_by.as_deref(), Some("old-reviewer"));
+    assert_eq!(t2.result_at, Some(1_700_000_000_000));
+    assert_eq!(t2.created_at, 1_600_000_000_002);
+    let t4 = r.results[4].1.unwrap();
+    let t9 = s
+        .task(o.org.id, r.results[9].1.unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(t9.parent, Some(t4));
+    // ISSUE-2 is done with ok; ISSUE-8 is open.
+    assert_eq!(t9.waits_on, [r.results[8].1.unwrap()]);
+    let p = s.task(o.org.id, t4).await.unwrap().unwrap();
+    assert_eq!(p.progress, Some((0, 5)));
+    let ev = events(&s, &o, t2.num).await;
+    let h = ev.iter().find(|e| e.kind == K::Imported).unwrap();
+    assert_eq!(h.actor.as_deref(), Some("someone"));
+    assert_eq!(h.note.as_deref(), Some("note 2"));
+    assert_eq!(h.at, 1_650_000_000_000);
+    // The same file again: the same tasks, nothing changed.
+    let again = s.import_tasks(&imp).await.unwrap();
+    assert!(
+        again.results.iter().all(|x| x.2 == "same"),
+        "{:?}",
+        again.results
+    );
+    assert_eq!(
+        again.results.iter().map(|x| x.1).collect::<Vec<_>>(),
+        r.results.iter().map(|x| x.1).collect::<Vec<_>>()
+    );
+    assert_eq!(events(&s, &o, t2.num).await.len(), ev.len());
+    let page = s
+        .tasks(&TaskQuery {
+            org_id: o.org.id,
+            limit: 100,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.tasks.len(), 10);
+    // A changed record updates its task.
+    let mut changed = imp.clone();
+    changed.records[3].title = "issue 3, renamed".into();
+    changed.records[3].state = Some(St::Doing);
+    let r3 = s.import_tasks(&changed).await.unwrap();
+    assert_eq!(r3.results[3].2, "updated");
+    assert_eq!(r3.results.iter().filter(|x| x.2 == "same").count(), 9);
+    let t3 = s
+        .task(o.org.id, r3.results[3].1.unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (t3.title.as_str(), t3.state),
+        ("issue 3, renamed", St::Doing)
+    );
+    // Unknown parents and blockers are warnings.
+    let mut bad = imp.clone();
+    bad.records[0].parent = Some("NOPE".into());
+    bad.records[1].deps = vec![("GONE".into(), false)];
+    let rb = s.import_tasks(&bad).await.unwrap();
+    assert_eq!(rb.warnings.len(), 2, "{:?}", rb.warnings);
+    assert!(rb.warnings[0].starts_with("ISSUE-0: no task imported as \"NOPE\""));
+}
+
+async fn report(s: S) {
+    use amail_proto::TaskResult as R;
+    let o = setup(&s, "alpha").await;
+    let not_started = new(&s, &o, "not started", Some(&o.a)).await;
+    let doing = new(&s, &o, "doing", Some(&o.b)).await;
+    set_state(&s, &o, doing.num, St::Doing).await;
+    let review = new(&s, &o, "review", Some(&o.b)).await;
+    set_state(&s, &o, review.num, St::Review).await;
+    let rejected = new(&s, &o, "rejected", Some(&o.a)).await;
+    let approved = new(&s, &o, "approved", Some(&o.a)).await;
+    let next = new(&s, &o, "next", Some(&o.b)).await;
+    s.set_task_dep(&w(&o, next.num, &o.user), approved.num, Some(true))
+        .await
+        .unwrap();
+    for (t, r) in [(&rejected, R::Rejected), (&approved, R::Ok)] {
+        s.change_task(
+            &w(&o, t.num, &o.a),
+            &TaskChange {
+                state: Some(St::Done),
+                result: Some(Some(r)),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+    let parent = new(&s, &o, "parent", None).await;
+    s.change_task(
+        &w(&o, not_started.num, &o.user),
+        &TaskChange {
+            parent: Some(Some(parent.num)),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let blocked = new(&s, &o, "blocked", Some(&o.a)).await;
+    s.change_task(
+        &w(&o, blocked.num, &o.a),
+        &TaskChange {
+            state: Some(St::Blocked),
+            waiting_on_id: Some(Some(o.b.id)),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let waits = new(&s, &o, "waits", Some(&o.a)).await;
+    s.add_task_dep(&w(&o, waits.num, &o.user), doing.num)
+        .await
+        .unwrap();
+    let r = s.task_report(o.org.id, None, 100).await.unwrap();
+    let sec = |name: &str| {
+        let x = r.sections.iter().find(|x| x.0 == name).unwrap();
+        (x.1, x.2.iter().map(|i| i.task.num).collect::<Vec<_>>())
+    };
+    // `next` is open and assigned too; `waits` as well.
+    let (n, v) = sec("not_started");
+    assert!(v.contains(&not_started.num) && v.contains(&next.num) && v.contains(&waits.num));
+    assert_eq!(n, v.len() as i64);
+    assert_eq!(sec("in_progress").1, [doing.num]);
+    assert_eq!(sec("review").1, [review.num]);
+    let ri = &r.sections.iter().find(|x| x.0 == "review").unwrap().2[0];
+    assert_eq!(ri.seat.as_deref(), Some("owner"));
+    assert_eq!(sec("rejected").1, [rejected.num]);
+    assert_eq!(sec("approved").1, [approved.num]);
+    let ai = &r.sections.iter().find(|x| x.0 == "approved").unwrap().2[0];
+    assert_eq!(
+        ai.dependents.iter().map(|t| t.num).collect::<Vec<_>>(),
+        [next.num]
+    );
+    assert_eq!(sec("parents").1, [parent.num]);
+    let (_, b) = sec("blocked");
+    assert_eq!(b, [blocked.num, waits.num]);
+    let bi = &r.sections.iter().find(|x| x.0 == "blocked").unwrap().2;
+    assert_eq!(bi[0].waiting_for, ["b"]);
+    assert_eq!(bi[1].waiting_for, ["b"]);
 }

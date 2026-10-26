@@ -243,6 +243,13 @@ pub fn router(state: AppState) -> Router {
         .route("/tasks/waiting", get(tasks::waiting))
         .route("/tasks/owed", get(tasks::owed))
         .route("/tasks/board", get(tasks::board))
+        .route("/tasks/report", get(tasks::report))
+        .route(
+            "/tasks/import",
+            post(tasks::import).layer(axum::extract::DefaultBodyLimit::max(
+                amail_proto::limits::MAX_TASK_IMPORT_BYTES,
+            )),
+        )
         .route("/tasks/{num}", get(tasks::get).patch(tasks::patch))
         .route("/tasks/{num}/take", post(tasks::take))
         .route("/tasks/{num}/steal", post(tasks::steal))

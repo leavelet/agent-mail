@@ -49,6 +49,12 @@ impl TaskPriority {
 }
 
 string_enum!(
+    /// The result of a closed task: what was concluded about the work
+    /// (see [`Task::result`]).
+    TaskResult { Ok => "ok", Rejected => "rejected" }
+);
+
+string_enum!(
     /// The kind of a task event (see [`TaskEvent`]).
     TaskEventKind {
         Created => "created",
@@ -64,6 +70,8 @@ string_enum!(
         StealRequested => "steal_requested",
         StealDeclined => "steal_declined",
         StealExpired => "steal_expired",
+        ResultWithdrawn => "result_withdrawn",
+        Imported => "imported",
     }
 );
 
@@ -105,10 +113,40 @@ pub struct Task {
     /// The discussion thread (created by the first comment).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread: Option<i64>,
-    /// Numbers of the blockers that are not closed yet (`waits on t9,
-    /// t11`), lowest first.
+    /// Numbers of the blockers that do not satisfy their dependency yet
+    /// (`waits on t9, t11`), lowest first: not closed, or, for a
+    /// dependency that needs an ok result, not `done` with `ok`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub waits_on: Vec<i64>,
+    /// The numbers in `waits_on` whose dependency needs an ok result
+    /// (`waits on t9 (ok needed)`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waits_on_ok: Vec<i64>,
+    /// The task's revision: the sequence number of its newest event. A
+    /// write with `if_rev` is refused with `stale` when it differs.
+    #[serde(default)]
+    pub rev: i64,
+    /// For a task with child tasks: how many are `done` of how many are not
+    /// `cancelled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<TaskProgress>,
+    /// The result of a `done` task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<TaskResult>,
+    /// The version the result is about: a commit, tag, URL or other name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_note: Option<String>,
+    /// The seat that set the result (for an imported result: the name the
+    /// file gives).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_at: Option<String>,
+    /// The id the task had in the file it was imported from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import_key: Option<String>,
     /// A pending request of this seat to take the task over (see
     /// `POST /tasks/{num}/steal`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -121,6 +159,15 @@ pub struct Task {
     pub closed_at: Option<String>,
 }
 
+/// How many child tasks of a task are done (see [`Task::progress`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskProgress {
+    /// Children in `done`.
+    pub done: i64,
+    /// Children that are not `cancelled`.
+    pub total: i64,
+}
+
 /// A task named from another task or a thread: its number, title, shown
 /// state and assignee.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,6 +177,11 @@ pub struct TaskRef {
     pub state: TaskState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignee: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<TaskResult>,
+    /// In `blockers`: the dependency needs an ok result of this task.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub needs_ok: bool,
 }
 
 /// A thread linked to a task.
@@ -202,6 +254,10 @@ pub struct TaskDetail {
     /// Events in all (every event is kept).
     #[serde(default)]
     pub event_count: i64,
+    /// Answer of `POST /tasks` with a `client_key` used before: the task
+    /// that key created; nothing was created.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub existing: bool,
 }
 
 /// Body of `POST /v1/tasks`.
@@ -234,6 +290,11 @@ pub struct NewTask {
     /// its thread is linked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_message: Option<i64>,
+    /// 1 to 64 characters. A second create with the same key in the same
+    /// org within 24 hours answers the task the first one created (200,
+    /// `existing`) and creates nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_key: Option<String>,
 }
 
 /// Body of `PATCH /v1/tasks/{num}`: a missing field is unchanged; `null`
@@ -293,6 +354,39 @@ pub struct TaskPatch {
         skip_serializing_if = "Option::is_none"
     )]
     pub blocked_reason: Option<Option<String>>,
+    /// The result, only for a task that is `done` (stored or set here);
+    /// replaces `result_ref` and `result_note` with the ones given.
+    /// `null` withdraws the result (the task stays `done`; `note` gives
+    /// the reason).
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub result: Option<Option<TaskResult>>,
+    /// With `result`: the version the result is about (at most 200
+    /// characters).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_ref: Option<String>,
+    /// With `result`: at most 2,000 characters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_note: Option<String>,
+    /// With `result: null`: why the result is withdrawn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Close a parent although some of its children are not closed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub force: bool,
+    /// Refuse the change with `stale` unless the task's `rev` is this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_rev: Option<i64>,
+}
+
+/// Body of `POST /v1/tasks/{num}/take` (optional).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaskRevRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_rev: Option<i64>,
 }
 
 /// Body of `POST /v1/tasks/{num}/deps`: the task `num` depends on
@@ -300,6 +394,13 @@ pub struct TaskPatch {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TaskDepRequest {
     pub blocked_by: i64,
+    /// Only a `done` blocker with result `ok` satisfies the dependency.
+    /// Given for an existing dependency, it changes the dependency; absent,
+    /// a new dependency is satisfied by any close.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs_ok: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_rev: Option<i64>,
 }
 
 /// Body of `POST /v1/tasks/{num}/links`: a thread, by its id or by one of
@@ -310,6 +411,19 @@ pub struct TaskLinkRequest {
     pub thread_id: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub if_rev: Option<i64>,
+}
+
+/// Body of a 409 `stale` answer: a write with `if_rev` found the task at
+/// another revision. `error` is the usual error; `since` are the events
+/// after `if_rev`, oldest first.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskStale {
+    pub error: crate::ErrorDetail,
+    pub rev: i64,
+    pub task: TaskDetail,
+    pub since: Vec<TaskEvent>,
 }
 
 /// Body of `POST /v1/tasks/{num}/comments`.
@@ -448,6 +562,148 @@ pub struct TaskBoard {
     pub overdue: Vec<Task>,
     /// Unfinished tasks with unfinished blockers (at most 200).
     pub chains: Vec<BoardChain>,
+}
+
+/// Body of `POST /v1/tasks/import` (user token): the records of a JSON
+/// Lines file, one object per task (see `docs/reference.md`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaskImportRequest {
+    pub records: Vec<serde_json::Value>,
+    /// Check and report what would happen; change nothing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dry_run: bool,
+}
+
+/// One record of an import file. Fields other than these are ignored with
+/// a warning.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaskImportRecord {
+    pub id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    /// A task state; `ready` is read as `open`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<TaskState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<TaskPriority>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reporter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub due: Option<String>,
+    /// The `id` of the parent record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<TaskImportDep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<TaskImportResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<TaskImportHistory>,
+}
+
+/// A dependency of an imported task.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaskImportDep {
+    /// The `id` of the blocker's record.
+    pub id: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub needs_ok: bool,
+}
+
+/// The result of an imported task.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskImportResult {
+    pub value: TaskResult,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "ref")]
+    pub ref_: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+}
+
+/// One entry of an imported task's history.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TaskImportHistory {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    #[serde(default)]
+    pub text: String,
+}
+
+/// What the import did with one record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskImportOutcome {
+    /// The record's `id`.
+    pub id: String,
+    /// The task's number (with `dry_run`, absent for a task that would be
+    /// created).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub num: Option<i64>,
+    /// `created`, `updated` or `same`.
+    pub action: String,
+}
+
+/// Answer of `POST /v1/tasks/import`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskImportResponse {
+    /// One per record, in the file's order.
+    pub results: Vec<TaskImportOutcome>,
+    /// One line each: `ISSUE-42: no seat "w9"; the task is left
+    /// unassigned`.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dry_run: bool,
+}
+
+/// One task of a report section, with what the section says about it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReportItem {
+    pub task: Task,
+    /// The seat the section groups by: the assignee; in `review`, the
+    /// reporter, who reviews.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat: Option<String>,
+    /// `blocked`: the seats the task waits for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waiting_for: Vec<String>,
+    /// `approved`: the unfinished tasks that depend on it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependents: Vec<TaskRef>,
+}
+
+/// One section of the lead's report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReportSection {
+    /// `not_started`, `in_progress`, `review`, `rejected`, `approved`,
+    /// `parents`, `blocked`.
+    pub name: String,
+    /// Tasks in the section (all of them).
+    pub count: i64,
+    /// The first [`crate::limits::MAX_TASK_PAGE`].
+    pub items: Vec<ReportItem>,
+}
+
+/// Answer of `GET /v1/tasks/report`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
+    pub sections: Vec<ReportSection>,
 }
 
 /// Payload of a server-sent `task` event (user and seat tokens): a task of

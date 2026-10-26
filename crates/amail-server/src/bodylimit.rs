@@ -27,7 +27,13 @@ pub async fn layer(req: Request, next: Next) -> Response {
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.trim().parse::<u64>().ok());
-    let Some(n) = declared.filter(|n| *n > crate::MAX_REQUEST_BYTES as u64) else {
+    // `POST /v1/tasks/import` takes a whole file of tasks.
+    let max = if req.uri().path().ends_with("/v1/tasks/import") {
+        amail_proto::limits::MAX_TASK_IMPORT_BYTES
+    } else {
+        crate::MAX_REQUEST_BYTES
+    };
+    let Some(n) = declared.filter(|n| *n > max as u64) else {
         return next.run(req).await;
     };
     if n <= DRAIN_MAX_BYTES {
@@ -36,10 +42,7 @@ pub async fn layer(req: Request, next: Next) -> Response {
     let mut r = ApiError::new(
         StatusCode::PAYLOAD_TOO_LARGE,
         "too_large",
-        format!(
-            "a request body is limited to {} bytes",
-            crate::MAX_REQUEST_BYTES
-        ),
+        format!("a request body is limited to {max} bytes"),
     )
     .into_response();
     r.headers_mut()

@@ -12,6 +12,9 @@ pub struct ApiError {
     pub message: String,
     pub retry_after_ms: Option<u64>,
     pub rejected: Vec<Rejected>,
+    /// More fields of the answer, next to `error` (the 409 `stale` answer
+    /// of task writes carries the task).
+    pub extra: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 pub type ApiResult<T> = Result<T, ApiError>;
@@ -24,6 +27,7 @@ impl ApiError {
             message: message.into(),
             retry_after_ms: None,
             rejected: Vec::new(),
+            extra: None,
         }
     }
     pub fn bad_request(msg: impl Into<String>) -> Self {
@@ -131,7 +135,14 @@ impl IntoResponse for ApiError {
                 rejected: self.rejected,
             },
         };
-        let mut resp = (self.status, axum::Json(body)).into_response();
+        let mut resp = match self.extra {
+            Some(mut extra) => {
+                let error = serde_json::to_value(&body.error).unwrap_or_default();
+                extra.insert("error".into(), error);
+                (self.status, axum::Json(serde_json::Value::Object(extra))).into_response()
+            }
+            None => (self.status, axum::Json(body)).into_response(),
+        };
         if let Some(ms) = retry {
             let secs = ms.div_ceil(1000).max(1);
             if let Ok(v) = HeaderValue::from_str(&secs.to_string()) {

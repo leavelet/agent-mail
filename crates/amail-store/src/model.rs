@@ -2,7 +2,7 @@
 
 use amail_proto::{
     DeliveryClass, DeliveryMode, LinkState, Meta, OrgVisibility, Outbound, PermissionMode,
-    PostPolicy, Priority, SeatKind, TaskEventKind, TaskPriority, TaskState, TokenScope,
+    PostPolicy, Priority, SeatKind, TaskEventKind, TaskPriority, TaskResult, TaskState, TokenScope,
 };
 
 pub use amail_proto::{NewList, NewSeat};
@@ -713,12 +713,26 @@ pub struct TaskRec {
     /// Events written in all (the last event's seq).
     pub event_seq: i64,
     pub events_compacted: i64,
-    /// Numbers of the blockers that are not closed, lowest first.
+    /// Numbers of the blockers that do not satisfy their dependency (not
+    /// closed, or not `done` with `ok` where the dependency needs it),
+    /// lowest first.
     pub waits_on: Vec<i64>,
+    /// The numbers in `waits_on` whose dependency needs an ok result.
+    pub waits_on_ok: Vec<i64>,
     /// A pending request to take the task over: the seat and when.
     pub steal_requested_by_id: Option<i64>,
     pub steal_requested_by: Option<String>,
     pub steal_requested_at: Option<i64>,
+    /// With child tasks: (children `done`, children not `cancelled`).
+    pub progress: Option<(i64, i64)>,
+    pub result: Option<TaskResult>,
+    pub result_ref: Option<String>,
+    pub result_note: Option<String>,
+    /// A seat name (imported results may name seats that do not exist).
+    pub result_by: Option<String>,
+    pub result_at: Option<i64>,
+    /// The id of the record the task was imported from.
+    pub import_key: Option<String>,
 }
 
 impl TaskRec {
@@ -778,6 +792,8 @@ pub struct TaskDetailRec {
     pub links: Vec<TaskLinkRec>,
     /// The newest events, oldest first.
     pub events: Vec<TaskEventRec>,
+    /// Numbers of the blockers whose dependency needs an ok result.
+    pub blockers_needs_ok: Vec<i64>,
 }
 
 /// A new task ([`crate::Store::create_task`]). Seat, team and parent are
@@ -800,6 +816,8 @@ pub struct NewTaskRec {
     pub due: Option<i64>,
     /// A thread to link.
     pub link_thread: Option<i64>,
+    /// See [`crate::Store::create_task_once`].
+    pub client_key: Option<String>,
     /// Refuse ([`crate::StoreError::StorageQuota`]) when the org's stored
     /// bytes and task bytes would exceed this.
     pub quota: Option<i64>,
@@ -816,6 +834,9 @@ pub struct TaskWrite {
     pub written_by: Option<String>,
     /// See [`NewTaskRec::quota`].
     pub quota: Option<i64>,
+    /// Refuse the write with [`crate::StoreError::Refused`] `stale` unless
+    /// the task's revision (`event_seq`) is this.
+    pub if_rev: Option<i64>,
 }
 
 /// Changes of a task's fields: a missing field is unchanged, `Some(None)`
@@ -836,6 +857,15 @@ pub struct TaskChange {
     pub due: Option<Option<i64>>,
     pub waiting_on_id: Option<Option<i64>>,
     pub blocked_reason: Option<Option<String>>,
+    /// `Some(Some(r))`: set the result (the task must be `done` after the
+    /// change) with `result_ref` and `result_note`; `Some(None)`: withdraw
+    /// it (`note` is the reason).
+    pub result: Option<Option<TaskResult>>,
+    pub result_ref: Option<String>,
+    pub result_note: Option<String>,
+    pub note: Option<String>,
+    /// Close a parent although some of its children are not closed.
+    pub force: bool,
 }
 
 /// What a task write did.
@@ -852,6 +882,13 @@ pub struct TaskChanged {
     /// When the task was closed by this write: the unfinished tasks it
     /// blocks (those in `unblocked` included).
     pub dependents: Vec<TaskRec>,
+    /// This write closed the last child of a parent that is not closed:
+    /// the parent and how many children it has.
+    pub children_done: Option<(TaskRec, i64)>,
+    /// The task got the result `rejected`, or its `ok` result was
+    /// withdrawn: the unfinished tasks whose dependency on it needs an ok
+    /// result.
+    pub needs_ok_waiting: Vec<TaskRec>,
 }
 
 /// The listing of [`crate::Store::tasks`].
@@ -885,6 +922,10 @@ pub struct TaskQuery {
     pub before: Option<i64>,
     pub limit: i64,
     pub order: TaskOrder,
+    /// `Some(None)`: tasks without a result.
+    pub result: Option<Option<TaskResult>>,
+    /// The task imported from the record with this id.
+    pub import_key: Option<String>,
 }
 
 /// The order of [`TaskQuery`].
@@ -928,6 +969,89 @@ pub struct StealExpiredRec {
     pub task: TaskRec,
     pub requester_id: i64,
     pub requester: String,
+}
+
+/// An import ([`crate::Store::import_tasks`]): records checked by the
+/// caller, seats resolved.
+#[derive(Debug, Clone, Default)]
+pub struct TaskImportRec {
+    pub org_id: i64,
+    /// The importing user's seat: the actor of the changes and the
+    /// reporter of records without a known one.
+    pub actor_id: i64,
+    pub quota: Option<i64>,
+    /// Do everything, report it, and keep nothing.
+    pub dry_run: bool,
+    pub records: Vec<ImportTaskRec>,
+}
+
+/// One record of an import. `None` fields are not given: a new task gets
+/// the default, an existing one keeps its value.
+#[derive(Debug, Clone, Default)]
+pub struct ImportTaskRec {
+    /// The record's `id` (stored as `import_key`).
+    pub key: String,
+    pub title: String,
+    pub body: Option<String>,
+    /// A stored state (not `ready`).
+    pub state: Option<TaskState>,
+    pub priority: Option<TaskPriority>,
+    /// `Some(None)`: unassigned.
+    pub assignee_id: Option<Option<i64>>,
+    /// Only for a new task; `None`: the importing user.
+    pub reporter_id: Option<i64>,
+    pub labels: Option<Vec<String>>,
+    pub due: Option<Option<i64>>,
+    /// The parent's record id.
+    pub parent: Option<String>,
+    /// Blockers' record ids, with `needs_ok`.
+    pub deps: Vec<(String, bool)>,
+    pub result: Option<ImportResultRec>,
+    pub created_at: Option<i64>,
+    pub updated_at: Option<i64>,
+    pub history: Vec<ImportHistoryRec>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportResultRec {
+    pub result: TaskResult,
+    pub result_ref: Option<String>,
+    pub note: Option<String>,
+    /// A name; `None`: the importing user.
+    pub by: Option<String>,
+    pub at: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImportHistoryRec {
+    pub at: i64,
+    pub by: Option<String>,
+    pub text: String,
+}
+
+/// What [`crate::Store::import_tasks`] did.
+#[derive(Debug, Clone, Default)]
+pub struct TaskImportRes {
+    /// Per record: its key, the task's number (none for a task a dry run
+    /// would create) and `created`, `updated` or `same`.
+    pub results: Vec<(String, Option<i64>, &'static str)>,
+    pub warnings: Vec<String>,
+}
+
+/// One task of a report section ([`crate::Store::task_report`]).
+#[derive(Debug, Clone)]
+pub struct ReportItemRec {
+    pub task: TaskRec,
+    pub seat: Option<String>,
+    pub waiting_for: Vec<String>,
+    pub dependents: Vec<TaskRec>,
+}
+
+/// [`crate::Store::task_report`]: per section its name, count and first
+/// tasks.
+#[derive(Debug, Clone, Default)]
+pub struct TaskReportRec {
+    pub sections: Vec<(&'static str, i64, Vec<ReportItemRec>)>,
 }
 
 /// One seat's load ([`crate::Store::task_board`]).

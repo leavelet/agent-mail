@@ -61,6 +61,11 @@ pub enum StoreError {
     /// a code for the API's error and a message.
     #[error("{1}")]
     Refused(&'static str, String),
+    /// Internal: a dry run of an import ends with this error so that its
+    /// transaction is rolled back; [`Store::import_tasks`] answers the
+    /// result.
+    #[error("dry run")]
+    ImportDryRun(Box<TaskImportRes>),
 }
 
 impl From<sqlx::Error> for StoreError {
@@ -543,7 +548,14 @@ pub trait Store: Send + Sync + 'static {
     /// Create a task with the next number of the org (and its `created`
     /// event, `assigned` when it has an assignee, `linked` for
     /// `link_thread`).
-    async fn create_task(&self, task: &NewTaskRec) -> Result<TaskRec>;
+    async fn create_task(&self, task: &NewTaskRec) -> Result<TaskRec> {
+        Ok(self.create_task_once(task).await?.0)
+    }
+    /// [`Store::create_task`], except that with a `client_key` that created
+    /// a task of the org in the last
+    /// [`amail_proto::limits::TASK_CLIENT_KEY_HOURS`] hours it creates
+    /// nothing and answers that task (true: it existed).
+    async fn create_task_once(&self, task: &NewTaskRec) -> Result<(TaskRec, bool)>;
     /// A task by number, with its body.
     async fn task(&self, org_id: i64, num: i64) -> Result<Option<TaskRec>>;
     /// A task with its blockers, the tasks it blocks, its children, its
@@ -557,7 +569,11 @@ pub trait Store: Send + Sync + 'static {
     /// Change fields. A closed task can only be reopened (`open` or
     /// `doing`); `waiting_on` and `blocked_reason` go with `blocked` and
     /// are cleared when the task leaves it. Closing a task writes an
-    /// `unblocked` event on each task whose last open blocker it was.
+    /// `unblocked` event on each task whose last unsatisfied dependency it
+    /// was (also when an ok result satisfies it). Closing a parent whose
+    /// children are not all closed is refused (`children_open`) unless
+    /// `force`; a result needs the state `done` (`not_done`); reopening
+    /// clears the result.
     async fn change_task(&self, w: &TaskWrite, change: &TaskChange) -> Result<TaskChanged>;
     /// The actor asks to take over a task assigned to another seat and not
     /// started (stored `open`): one pending request per task. Refused with
@@ -585,7 +601,20 @@ pub trait Store: Send + Sync + 'static {
     /// would make a cycle, when the chain of dependencies the check follows
     /// is longer than [`amail_proto::limits::MAX_TASK_DEP_DEPTH`], or over
     /// the fan-out bounds.
-    async fn add_task_dep(&self, w: &TaskWrite, blocker: i64) -> Result<TaskChanged>;
+    async fn add_task_dep(&self, w: &TaskWrite, blocker: i64) -> Result<TaskChanged> {
+        self.set_task_dep(w, blocker, None).await
+    }
+    /// [`Store::add_task_dep`] with `needs_ok`: `Some` sets whether only an
+    /// ok result of the blocker satisfies the dependency, also for an
+    /// existing dependency; `None` leaves an existing one as it is (a new
+    /// one: any close). A change that makes the task startable writes an
+    /// `unblocked` event.
+    async fn set_task_dep(
+        &self,
+        w: &TaskWrite,
+        blocker: i64,
+        needs_ok: Option<bool>,
+    ) -> Result<TaskChanged>;
     /// Remove a dependency; the task gets an `unblocked` event when it was
     /// its last open blocker.
     async fn remove_task_dep(&self, w: &TaskWrite, blocker: i64) -> Result<TaskChanged>;
@@ -664,6 +693,20 @@ pub trait Store: Send + Sync + 'static {
     ) -> Result<TaskBoardRec>;
     /// Tasks of the org whose discussion thread this is or that link it.
     async fn thread_tasks(&self, org_id: i64, thread_id: i64) -> Result<Vec<TaskRec>>;
+    /// Import records in one transaction: tasks first (a record whose key
+    /// names a task updates the fields that differ), then parents and
+    /// dependencies. Unknown parents or blockers and refused parents or
+    /// dependencies are warnings. With `dry_run` nothing is kept.
+    async fn import_tasks(&self, imp: &TaskImportRec) -> Result<TaskImportRes>;
+    /// The lead's report (see `docs/reference.md`): `not_started`,
+    /// `in_progress`, `review`, `rejected`, `approved`, `parents`,
+    /// `blocked`, each with its count and first `limit` tasks.
+    async fn task_report(
+        &self,
+        org_id: i64,
+        team_id: Option<i64>,
+        limit: i64,
+    ) -> Result<TaskReportRec>;
     /// Unfinished tasks whose due time passed and that were not reminded
     /// of it, marked reminded (at most `limit`; each once across
     /// instances).

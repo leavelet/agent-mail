@@ -451,7 +451,21 @@ pub mod limits {
     /// Characters of a blocked task's reason (one line).
     pub const MAX_TASK_REASON_CHARS: usize = 512;
     /// Ancestors a task may have (`parent`, its parent, ...).
-    pub const MAX_TASK_PARENT_DEPTH: usize = 4;
+    pub const MAX_TASK_PARENT_DEPTH: usize = 8;
+    /// Characters of a task's `result_ref`.
+    pub const MAX_TASK_RESULT_REF_CHARS: usize = 200;
+    /// Characters of a task's `result_note`.
+    pub const MAX_TASK_RESULT_NOTE_CHARS: usize = 2_000;
+    /// Characters of a `client_key` of `POST /tasks`.
+    pub const MAX_TASK_CLIENT_KEY_CHARS: usize = 64;
+    /// Hours a `client_key` names the task it created.
+    pub const TASK_CLIENT_KEY_HOURS: i64 = 24;
+    /// Records of one `POST /tasks/import`.
+    pub const MAX_TASK_IMPORT_RECORDS: usize = 5_000;
+    /// Characters of a record's `id` in an import.
+    pub const MAX_TASK_IMPORT_ID_CHARS: usize = 200;
+    /// Bytes of the body of `POST /tasks/import` (other requests: 2 MiB).
+    pub const MAX_TASK_IMPORT_BYTES: usize = 64 * 1024 * 1024;
     /// Tasks of one org that are not `done` or `cancelled`.
     pub const MAX_OPEN_TASKS: i64 = 20_000;
     /// Tasks of one org in all (numbers are never reused).
