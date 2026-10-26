@@ -524,3 +524,288 @@ async fn run(backend: Backend) {
     let err = w1.fail(&["task", "yield", "t5"]);
     assert!(err.starts_with("error: not_found: "), "{err}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tasks_m81_cli_sqlite() {
+    m81(Backend::Sqlite).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tasks_m81_cli_postgres() {
+    m81(Backend::Postgres).await;
+}
+
+/// M8.1: idempotent `task new`, revisions, results, child tasks,
+/// dependencies that need an ok result, the report, and import.
+async fn m81(backend: Backend) {
+    let Some((db, _guard)) = fresh_url(backend, "tasks_m81_cli").await else {
+        return;
+    };
+    let token = admin_create_org(&db, "acme");
+    let (_server, url) = start_server(&db).await;
+    let owner = Amail { url, token };
+    for s in ["lead", "w1", "w2"] {
+        owner.run(&["seat", "add", s, "--team", "core"]);
+    }
+    let lead = owner.with_token(&owner.run(&["seat", "token", "lead"]));
+    let w1 = owner.with_token(&owner.run(&["seat", "token", "w1"]));
+    let w2 = owner.with_token(&owner.run(&["seat", "token", "w2"]));
+
+    // The same `task new` twice: one task; `--new` makes another.
+    let epic = lead.new_task(&["Ship the release", "--assignee", "w1"]);
+    let out = lead.run(&["task", "new", "Ship the release", "--assignee", "w1"]);
+    assert!(
+        out.starts_with(&format!("t{epic}  ")) && out.contains("nothing new was created"),
+        "{out}"
+    );
+    let other = lead.new_task(&["Ship the release", "--assignee", "w1", "--new"]);
+    assert_eq!(other, epic + 1);
+    lead.run(&["task", "cancel", &other.to_string()]);
+
+    // Child tasks and progress.
+    let c1 = lead.new_task(&["Build", "--parent", &format!("t{epic}"), "--assignee", "w2"]);
+    let c2 = lead.new_task(&[
+        "Review the build",
+        "--parent",
+        &format!("t{epic}"),
+        "--assignee",
+        "w1",
+    ]);
+    let show = lead.run(&["task", "show", &format!("t{epic}")]);
+    assert!(show.contains("Children: 0/2 done\n"), "{show}");
+    let err = w1.fail(&["task", "done", &format!("t{epic}")]);
+    assert!(err.starts_with("error: children_open: "), "{err}");
+    assert!(err.contains(&format!("t{c1}")), "{err}");
+
+    // Revisions: `Rev:` in show; an old --if-rev is refused and shows what
+    // changed.
+    let d = w1.json(&["task", "show", &format!("t{c2}")]);
+    let rev = d["task"]["rev"].as_i64().unwrap();
+    let show = w1.run(&["task", "show", &format!("t{c2}")]);
+    assert!(show.contains(&format!("Rev: {rev}\n")), "{show}");
+    lead.run(&[
+        "task",
+        "set",
+        &format!("t{c2}"),
+        "--title",
+        "Review the build output",
+        "--if-rev",
+        &rev.to_string(),
+    ]);
+    let out = w1.try_run(&[
+        "task",
+        "set",
+        &format!("t{c2}"),
+        "--body",
+        "notes",
+        "--if-rev",
+        &rev.to_string(),
+    ]);
+    assert!(!out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.starts_with("error: stale: "), "{stderr}");
+    assert!(stdout.contains("Changes since then:\n"), "{stdout}");
+    assert!(
+        stdout.contains("changed title: Review the build -> Review the build output"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("t{c2} Review the build output\n")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("run the command again with --if-rev "),
+        "{stdout}"
+    );
+    // With --json the whole answer is printed.
+    let out = w1.try_run(&[
+        "--json",
+        "task",
+        "set",
+        &format!("t{c2}"),
+        "--body",
+        "notes",
+        "--if-rev",
+        &rev.to_string(),
+    ]);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["error"]["code"], "stale");
+    assert!(!v["since"].as_array().unwrap().is_empty(), "{v}");
+
+    // The integration child waits for an ok result of the review.
+    let line = lead.run(&[
+        "task",
+        "dep",
+        &format!("t{c1}"),
+        "--on",
+        &format!("t{c2}"),
+        "--needs-ok",
+    ]);
+    assert!(
+        line.trim_end()
+            .ends_with(&format!("· waits on t{c2} (ok needed)")),
+        "{line}"
+    );
+    let show = lead.run(&["task", "show", &format!("t{c1}")]);
+    assert!(show.contains("(ok needed)"), "{show}");
+    let line = w1.run(&[
+        "task",
+        "done",
+        &format!("t{c2}"),
+        "--result",
+        "rejected",
+        "--ref",
+        "abc123",
+        "-m",
+        "fails on arm",
+    ]);
+    assert!(line.trim_end().ends_with("  · rejected"), "{line}");
+    assert_eq!(w2.state(&format!("t{c1}")), "open");
+    let reminders = w2.run(&["inbox"]);
+    assert!(
+        reminders.contains(&format!(
+            "t{c2} was closed as rejected; t{c1} waits for an ok result"
+        )),
+        "{reminders}"
+    );
+    let show = w1.run(&["task", "show", &format!("t{c2}")]);
+    assert!(
+        show.contains("Result: rejected, ref abc123, by w1 at "),
+        "{show}"
+    );
+    assert!(show.contains("Result note: fails on arm\n"), "{show}");
+    let list = owner.run(&["task", "list", "--state", "all", "--result", "rejected"]);
+    assert!(
+        list.trim_end().ends_with("· rejected") && list.lines().count() == 1,
+        "{list}"
+    );
+    // A new ok result: the integration is ready.
+    let line = lead.run(&["task", "result", &format!("t{c2}"), "ok", "--ref", "def456"]);
+    assert!(line.trim_end().ends_with("  · ok"), "{line}");
+    assert_eq!(w2.state(&format!("t{c1}")), "ready");
+    let err = lead.fail(&["task", "result", "withdraw", &format!("t{c2}")]);
+    assert!(err.contains("give the reason"), "{err}");
+    lead.run(&[
+        "task",
+        "result",
+        "withdraw",
+        &format!("t{c2}"),
+        "-m",
+        "wrong build",
+    ]);
+    assert_eq!(w2.state(&format!("t{c1}")), "open");
+    let history = lead.run(&["task", "history", &format!("t{c2}")]);
+    assert!(
+        history.contains("result withdrawn: ok def456 (wrong build)"),
+        "{history}"
+    );
+    lead.run(&["task", "result", &format!("t{c2}"), "ok", "--ref", "def457"]);
+    let err = lead.fail(&["task", "result", &format!("t{c1}"), "ok"]);
+    assert!(err.starts_with("error: not_done: "), "{err}");
+    // `--any-close` sets the dependency back.
+    lead.run(&[
+        "task",
+        "dep",
+        &format!("t{c1}"),
+        "--on",
+        &format!("t{c2}"),
+        "--any-close",
+    ]);
+    let show = lead.run(&["task", "show", &format!("t{c1}")]);
+    assert!(!show.contains("(ok needed)"), "{show}");
+
+    // Progress in list lines and the board.
+    let list = owner.run(&["task", "list"]);
+    assert!(list.contains("Ship the release  · 1/2"), "{list}");
+    let board = owner.run(&["task", "board"]);
+    assert!(board.contains("Ship the release  · 1/2"), "{board}");
+
+    // The report.
+    let report = owner.run(&["task", "report"]);
+    for want in [
+        "assigned, not started (2):\n  w1:\n",
+        "approved, not taken further (1):",
+        "parents partly done (1):",
+        "Ship the release  · 1/2",
+    ] {
+        assert!(report.contains(want), "{want:?} not in\n{report}");
+    }
+    let raw = owner.json(&["task", "report"]);
+    let r: p::TaskReport = serde_json::from_value(raw.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&r).unwrap(), raw);
+
+    // Forcing the parent closed.
+    let line = w1.run(&["task", "done", &format!("t{epic}"), "--force"]);
+    assert!(line.contains(" done "), "{line}");
+
+    // Import: a dry run, the import, the same file again.
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("tasks.jsonl");
+    let map = dir.path().join("map.tsv");
+    std::fs::write(
+        &file,
+        concat!(
+            "{\"id\": \"ISSUE-1\", \"title\": \"Old bug\", \"state\": \"done\", \"assignee\": \"w1\",",
+            " \"result\": {\"value\": \"ok\", \"ref\": \"r1\", \"by\": \"old-qa\", \"at\": \"2026-10-01T00:00:00Z\"}}\n",
+            "\n",
+            "{\"id\": \"ISSUE-2\", \"title\": \"New feature\", \"state\": \"ready\", \"assignee\": \"w9\",",
+            " \"depends_on\": [{\"id\": \"ISSUE-1\", \"needs_ok\": true}], \"color\": \"red\",",
+            " \"history\": [{\"at\": \"2026-10-02T00:00:00Z\", \"by\": \"old-lead\", \"text\": \"asked for it\"}]}\n",
+        ),
+    )
+    .unwrap();
+    let f = file.to_str().unwrap();
+    let out = owner.run(&["task", "import", f, "--dry-run"]);
+    assert!(out.contains("ISSUE-1 -> (new) (created)\n"), "{out}");
+    assert!(out.contains("(dry run: nothing was changed)"), "{out}");
+    let err = owner.fail(&["task", "show", "ISSUE-1"]);
+    assert!(err.contains("nor the id of an imported task"), "{err}");
+    let out = owner.run(&["task", "import", f, "--map", map.to_str().unwrap()]);
+    let n1 = owner.json(&["task", "show", "ISSUE-1"])["task"]["num"]
+        .as_i64()
+        .unwrap();
+    let n2 = n1 + 1;
+    assert!(
+        out.contains(&format!("ISSUE-1 -> t{n1} (created)\n")),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("ISSUE-2 -> t{n2} (created)\n")),
+        "{out}"
+    );
+    assert!(
+        out.contains("warning: ISSUE-2: unknown field \"color\" ignored"),
+        "{out}"
+    );
+    assert!(
+        out.contains("warning: ISSUE-2: no seat \"w9\"; the task is left unassigned"),
+        "{out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&map).unwrap(),
+        format!("ISSUE-1\tt{n1}\nISSUE-2\tt{n2}\n")
+    );
+    let out = owner.run(&["task", "import", f]);
+    assert_eq!(
+        out,
+        format!(
+            "ISSUE-1 -> t{n1} (same)\nISSUE-2 -> t{n2} (same)\nwarning: ISSUE-2: unknown field \"color\" ignored\nwarning: ISSUE-2: no seat \"w9\"; the task is left unassigned\n"
+        )
+    );
+    let show = owner.run(&["task", "show", "ISSUE-2"]);
+    assert!(show.contains("Imported as: ISSUE-2\n"), "{show}");
+    assert!(show.contains("State: ready"), "{show}");
+    assert!(
+        show.contains("  old-lead  imported: asked for it"),
+        "{show}"
+    );
+    let show = owner.run(&["task", "show", "ISSUE-1"]);
+    assert!(
+        show.contains("Result: ok, ref r1, by old-qa at 2026-10-01 00:00Z"),
+        "{show}"
+    );
+    // Only the user imports.
+    let err = w1.fail(&["task", "import", f]);
+    assert!(err.starts_with("error: forbidden: "), "{err}");
+}

@@ -44,9 +44,15 @@ pub enum TaskCmd {
         /// linked.
         #[arg(long = "from", value_name = "MESSAGE")]
         from: Option<i64>,
+        /// Create a task even if the same one (reporter, title, body,
+        /// assignee, parent) was created in the last 24 hours. Without it,
+        /// running the same command again answers the task it created.
+        #[arg(long = "new")]
+        new: bool,
     },
     /// A task: its fields, blockers, blocked tasks, children, linked
-    /// threads and last events.
+    /// threads and last events. A task number, or the id of an imported
+    /// task.
     Show { task: String },
     /// The events of a task (the last 50; every event with --all).
     History {
@@ -81,6 +87,9 @@ pub enum TaskCmd {
         /// Text in the title or body.
         #[arg(long)]
         text: Option<String>,
+        /// ok, rejected, or none (no result).
+        #[arg(long)]
+        result: Option<String>,
         #[arg(long)]
         limit: Option<u32>,
         /// Continue an earlier listing (its `next_before`).
@@ -103,6 +112,13 @@ pub enum TaskCmd {
     /// The board: columns by state, load per seat, stale and overdue
     /// tasks, blocked chains.
     Board {
+        #[arg(long)]
+        team: Option<String>,
+    },
+    /// The lead's report: assigned but not started, in progress, waiting
+    /// for review, rejected, approved but not taken further, parents partly
+    /// done, blocked.
+    Report {
         #[arg(long)]
         team: Option<String>,
     },
@@ -139,11 +155,28 @@ pub enum TaskCmd {
         /// A time, or `none`.
         #[arg(long)]
         due: Option<String>,
+        /// With --state done or cancelled: close a parent although some
+        /// of its children are not closed.
+        #[arg(long)]
+        force: bool,
+        /// Refuse the change if the task changed since this revision
+        /// (`Rev:` of `task show`); pass it when changing the title or body.
+        #[arg(long, value_name = "REV")]
+        if_rev: Option<i64>,
     },
     /// Assign a task to a seat (`none` unassigns it).
-    Assign { task: String, seat: String },
+    Assign {
+        task: String,
+        seat: String,
+        #[arg(long, value_name = "REV")]
+        if_rev: Option<i64>,
+    },
     /// Assign an unassigned task to yourself (refused if someone has it).
-    Take { task: String },
+    Take {
+        task: String,
+        #[arg(long, value_name = "REV")]
+        if_rev: Option<i64>,
+    },
     /// Ask the assignee of a task that is not started to hand it over to
     /// you (they answer with `yield` or `keep`).
     Steal { task: String },
@@ -161,35 +194,126 @@ pub enum TaskCmd {
         /// The reason, one line.
         #[arg(short = 'm', long)]
         reason: Option<String>,
+        #[arg(long, value_name = "REV")]
+        if_rev: Option<i64>,
     },
     /// Back to `open` from `blocked`.
-    Unblock { task: String },
+    Unblock {
+        task: String,
+        #[arg(long, value_name = "REV")]
+        if_rev: Option<i64>,
+    },
     /// Set `doing`.
-    Start { task: String },
+    Start {
+        task: String,
+        #[arg(long, value_name = "REV")]
+        if_rev: Option<i64>,
+    },
     /// Set `review`.
-    Review { task: String },
-    /// Set `done`.
-    Done { task: String },
+    Review {
+        task: String,
+        #[arg(long, value_name = "REV")]
+        if_rev: Option<i64>,
+    },
+    /// Set `done`, with an optional result (what was concluded, for which
+    /// version).
+    Done {
+        task: String,
+        /// ok or rejected.
+        #[arg(long)]
+        result: Option<String>,
+        /// With --result: the version it is about (a commit, tag, URL).
+        #[arg(long = "ref", value_name = "REF", requires = "result")]
+        result_ref: Option<String>,
+        /// With --result: a note.
+        #[arg(short = 'm', long, requires = "result")]
+        note: Option<String>,
+        /// Close a parent although some of its children are not closed.
+        #[arg(long)]
+        force: bool,
+        #[arg(long, value_name = "REV")]
+        if_rev: Option<i64>,
+    },
     /// Set `cancelled`.
-    Cancel { task: String },
-    /// Reopen a closed task (`open`).
-    Reopen { task: String },
-    /// The task depends on another one (`dep t12 --on t9`).
+    Cancel {
+        task: String,
+        /// Close a parent although some of its children are not closed.
+        #[arg(long)]
+        force: bool,
+        #[arg(long, value_name = "REV")]
+        if_rev: Option<i64>,
+    },
+    /// Reopen a closed task (`open`); its result is cleared.
+    Reopen {
+        task: String,
+        #[arg(long, value_name = "REV")]
+        if_rev: Option<i64>,
+    },
+    /// The result of a done task: `result t12 ok|rejected [--ref r] [-m
+    /// note]`; `result withdraw t12 -m reason` clears it.
+    Result {
+        /// The task, or `withdraw`.
+        first: String,
+        /// ok or rejected; after `withdraw`, the task.
+        second: String,
+        /// The version the result is about (a commit, tag, URL).
+        #[arg(long = "ref", value_name = "REF")]
+        result_ref: Option<String>,
+        /// A note; for `withdraw`, the reason (required).
+        #[arg(short = 'm', long)]
+        note: Option<String>,
+        #[arg(long, value_name = "REV")]
+        if_rev: Option<i64>,
+    },
+    /// The task depends on another one (`dep t12 --on t9`). Repeat it with
+    /// --needs-ok or --any-close to change an existing dependency.
     Dep {
         task: String,
         #[arg(long, value_name = "TASK")]
         on: String,
+        /// Only a done result `ok` of the other task satisfies it.
+        #[arg(long, conflicts_with = "any_close")]
+        needs_ok: bool,
+        /// Any close of the other task satisfies it (the default).
+        #[arg(long)]
+        any_close: bool,
+        #[arg(long, value_name = "REV")]
+        if_rev: Option<i64>,
     },
     /// Remove a dependency.
     Undep {
         task: String,
         #[arg(long, value_name = "TASK")]
         on: String,
+        #[arg(long, value_name = "REV")]
+        if_rev: Option<i64>,
     },
     /// Link a thread (by thread id or the id of any message in it).
-    Link { task: String, id: i64 },
+    Link {
+        task: String,
+        id: i64,
+        #[arg(long, value_name = "REV")]
+        if_rev: Option<i64>,
+    },
     /// Unlink a thread.
-    Unlink { task: String, thread: i64 },
+    Unlink {
+        task: String,
+        thread: i64,
+        #[arg(long, value_name = "REV")]
+        if_rev: Option<i64>,
+    },
+    /// Import tasks from a JSON Lines file (user token): one object per
+    /// task with `id` and `title` (see the reference). Importing the same
+    /// file again updates the tasks it created.
+    Import {
+        file: std::path::PathBuf,
+        /// Check the file and print what would happen; change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Write the pairs `id<TAB>tN` to this file.
+        #[arg(long, value_name = "FILE")]
+        map: Option<std::path::PathBuf>,
+    },
     /// Comment: mail in the task's discussion thread to the assignee and
     /// reporter. The body comes from -m or stdin.
     Comment {
@@ -245,6 +369,47 @@ fn nums(v: &[i64]) -> String {
         .join(", ")
 }
 
+/// `t9 (ok needed), t11`: blockers, marking those whose dependency needs
+/// an ok result.
+fn waits(v: &[i64], ok: &[i64]) -> String {
+    v.iter()
+        .map(|n| {
+            if ok.contains(n) {
+                format!("t{n} (ok needed)")
+            } else {
+                format!("t{n}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The key `task new` sends by default: the first 32 hex digits of SHA-256
+/// over reporter, title, body, assignee and parent (and the message of
+/// `--from`, when given).
+pub fn default_client_key(
+    reporter: &str,
+    title: Option<&str>,
+    body: Option<&str>,
+    assignee: Option<&str>,
+    parent: Option<i64>,
+    from: Option<i64>,
+) -> String {
+    use sha2::Digest;
+    let mut v = json!([reporter, title, body, assignee, parent]);
+    if let (Some(m), Some(a)) = (from, v.as_array_mut()) {
+        a.push(json!(m));
+    }
+    let digest = sha2::Sha256::digest(v.to_string().as_bytes());
+    hex::encode(digest)[..32].to_string()
+}
+
+/// The caller's seat name, for [`default_client_key`].
+pub async fn reporter_name(c: &Client) -> Result<String> {
+    let me: p::WhoAmI = c.get("/whoami").await?;
+    Ok(me.seat.unwrap_or_else(|| format!("{}:user", me.org)))
+}
+
 fn seat_or_dash(s: &Option<String>) -> String {
     s.as_deref()
         .map(|s| l(s).into_owned())
@@ -274,7 +439,10 @@ fn base_line(t: &p::Task) -> String {
 pub fn task_line(t: &p::Task) -> String {
     let mut s = base_line(t);
     if !t.waits_on.is_empty() && !t.state.is_closed() {
-        s.push_str(&format!("  · waits on {}", nums(&t.waits_on)));
+        s.push_str(&format!(
+            "  · waits on {}",
+            waits(&t.waits_on, &t.waits_on_ok)
+        ));
     }
     if t.stored_state == TaskState::Blocked {
         match (&t.waiting_on, &t.blocked_reason) {
@@ -287,18 +455,32 @@ pub fn task_line(t: &p::Task) -> String {
     if let Some(w) = &t.steal_requested_by {
         s.push_str(&format!("  · {} asks to take over", l(w)));
     }
+    if let Some(p) = &t.progress {
+        s.push_str(&format!("  · {}/{}", p.done, p.total));
+    }
+    if let Some(r) = t.result {
+        s.push_str(&format!("  · {r}"));
+    }
     s
 }
 
-/// `t9   done    w2       Title`: a task named from another one.
+/// `t9   done    w2       Title`: a task named from another one, with
+/// its result and whether a dependency on it needs an ok result.
 fn ref_line(r: &p::TaskRef) -> String {
-    format!(
+    let mut s = format!(
         "{:<4} {:<7} {:<8} {}",
         format!("t{}", r.num),
         r.state.as_str(),
         seat_or_dash(&r.assignee),
         text::subject(&r.title)
-    )
+    );
+    if let Some(x) = r.result {
+        s.push_str(&format!("  · {x}"));
+    }
+    if r.needs_ok {
+        s.push_str("  (ok needed)");
+    }
+    s
 }
 
 fn list_text(tasks: &[p::Task], empty: &str) -> String {
@@ -343,12 +525,14 @@ pub fn event_line(e: &p::TaskEvent) -> String {
         K::StealRequested => format!("asked to take over from {}", v(&e.from)),
         K::StealDeclined => format!("request of {} to take over declined", v(&e.to)),
         K::StealExpired => format!("request of {} to take over expired", v(&e.to)),
+        K::ResultWithdrawn => format!("result withdrawn: {}", v(&e.from)),
+        K::Imported => format!("imported: {}", v(&e.note)),
     };
     if let Some(m) = e.message_id {
         what.push_str(&format!(" (#{m})"));
     }
     if let Some(n) = &e.note
-        && e.kind != K::Unblocked
+        && !matches!(e.kind, K::Unblocked | K::Imported)
     {
         what.push_str(&format!(" ({})", l(n)));
     }
@@ -366,6 +550,23 @@ pub fn detail_text(d: &p::TaskDetail) -> String {
         format!("{} (stored: {})", t.state, t.stored_state)
     };
     out.push(format!("State: {state}"));
+    out.push(format!("Rev: {}", t.rev));
+    if let Some(r) = t.result {
+        let mut s = format!("Result: {r}");
+        if let Some(x) = &t.result_ref {
+            s.push_str(&format!(", ref {}", l(x)));
+        }
+        if let Some(x) = &t.result_by {
+            s.push_str(&format!(", by {}", l(x)));
+        }
+        if let Some(x) = &t.result_at {
+            s.push_str(&format!(" at {}", short_time(x)));
+        }
+        out.push(s);
+        if let Some(n) = &t.result_note {
+            out.push(format!("Result note: {}", l(n)));
+        }
+    }
     out.push(format!("Priority: {} (rank {})", t.priority, t.rank));
     out.push(format!("Reporter: {}", l(&t.reporter)));
     out.push(format!("Assignee: {}", seat_or_dash(&t.assignee)));
@@ -401,7 +602,13 @@ pub fn detail_text(d: &p::TaskDetail) -> String {
         out.push(format!("Blocked: {}", l(x)));
     }
     if !t.waits_on.is_empty() {
-        out.push(format!("Waits on: {}", nums(&t.waits_on)));
+        out.push(format!("Waits on: {}", waits(&t.waits_on, &t.waits_on_ok)));
+    }
+    if let Some(p) = &t.progress {
+        out.push(format!("Children: {}/{} done", p.done, p.total));
+    }
+    if let Some(k) = &t.import_key {
+        out.push(format!("Imported as: {}", l(k)));
     }
     if let Some(x) = t.thread {
         out.push(format!("Discussion: thread {x}"));
@@ -590,6 +797,146 @@ fn board_text(b: &p::TaskBoard) -> String {
     out.join("\n")
 }
 
+/// The heading of a report section.
+fn section_title(name: &str) -> &str {
+    match name {
+        "not_started" => "assigned, not started",
+        "in_progress" => "in progress",
+        "review" => "delivered, waiting for review",
+        "rejected" => "rejected",
+        "approved" => "approved, not taken further",
+        "parents" => "parents partly done",
+        "blocked" => "blocked",
+        other => other,
+    }
+}
+
+/// The lead's report: one section per kind, with counts; tasks grouped by
+/// seat where the section is.
+pub fn report_text(r: &p::TaskReport) -> String {
+    let mut out = vec![match &r.team {
+        Some(t) => format!("report of team {}", l(t)),
+        None => "report".into(),
+    }];
+    for s in &r.sections {
+        out.push(String::new());
+        out.push(format!("{} ({}):", section_title(&s.name), s.count));
+        if s.items.is_empty() {
+            out.push("  none".into());
+        }
+        let mut seat: Option<&str> = None;
+        let grouped = matches!(s.name.as_str(), "not_started" | "in_progress" | "review");
+        for i in &s.items {
+            if grouped && i.seat.as_deref() != seat {
+                seat = i.seat.as_deref();
+                out.push(format!(
+                    "  {}:",
+                    i.seat
+                        .as_deref()
+                        .map(|x| l(x).into_owned())
+                        .unwrap_or("-".into())
+                ));
+            }
+            let indent = if grouped { "    " } else { "  " };
+            let mut line = format!("{indent}{}", task_line(&i.task));
+            if !i.waiting_for.is_empty() {
+                let w: Vec<String> = i.waiting_for.iter().map(|x| l(x).into_owned()).collect();
+                line.push_str(&format!(" — waits for {}", w.join(", ")));
+            }
+            if !i.dependents.is_empty() {
+                let d: Vec<String> = i.dependents.iter().map(|x| format!("t{}", x.num)).collect();
+                line.push_str(&format!(" — still open: {}", d.join(", ")));
+            }
+            out.push(line);
+        }
+        if s.count > s.items.len() as i64 {
+            out.push(format!("  ... and {} more", s.count - s.items.len() as i64));
+        }
+    }
+    out.join("\n")
+}
+
+/// `ok` or `rejected`.
+fn result_value(s: &str) -> Result<&'static str> {
+    match s.trim() {
+        "ok" => Ok("ok"),
+        "rejected" => Ok("rejected"),
+        other => bail!("{other:?} is not a result: ok or rejected"),
+    }
+}
+
+/// The records of a JSON Lines import file (blank lines and lines
+/// starting with `#` skipped).
+fn read_records(file: &std::path::Path) -> Result<Vec<Value>> {
+    let text =
+        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+    let mut out = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let v: Value = serde_json::from_str(line)
+            .with_context(|| format!("{}:{}: not a JSON object", file.display(), i + 1))?;
+        if !v.is_object() {
+            bail!("{}:{}: not a JSON object", file.display(), i + 1);
+        }
+        out.push(v);
+    }
+    Ok(out)
+}
+
+async fn import(
+    c: &Client,
+    out: &Out,
+    file: &std::path::Path,
+    dry_run: bool,
+    map: Option<&std::path::Path>,
+) -> Result<()> {
+    let records = read_records(file)?;
+    if records.is_empty() {
+        bail!("{}: no records", file.display());
+    }
+    let v = c
+        .raw(
+            Method::POST,
+            "/tasks/import",
+            Some(&json!({ "records": records, "dry_run": dry_run })),
+        )
+        .await?;
+    let r: p::TaskImportResponse = crate::parse(&v)?;
+    if let Some(m) = map
+        && !dry_run
+    {
+        let mut s = String::new();
+        for x in &r.results {
+            if let Some(n) = x.num {
+                s.push_str(&format!("{}\tt{n}\n", x.id));
+            }
+        }
+        std::fs::write(m, s).with_context(|| format!("writing {}", m.display()))?;
+    }
+    out.show(&v, || Ok(import_text(&r)))
+}
+
+fn import_text(r: &p::TaskImportResponse) -> String {
+    let mut out: Vec<String> = r
+        .results
+        .iter()
+        .map(|x| {
+            let to = x.num.map(|n| format!("t{n}")).unwrap_or("(new)".into());
+            format!("{} -> {to} ({})", l(&x.id), x.action)
+        })
+        .collect();
+    for w in &r.warnings {
+        out.push(format!("warning: {}", l(w)));
+    }
+    if r.dry_run {
+        out.push("(dry run: nothing was changed)".into());
+    }
+    out.join("\n")
+}
+
 /// Show the answer of a change: the task's line.
 fn changed(out: &Out, v: &Value) -> Result<()> {
     out.show(v, || {
@@ -598,25 +945,97 @@ fn changed(out: &Out, v: &Value) -> Result<()> {
     })
 }
 
-async fn patch(c: &Client, out: &Out, task: &str, body: Value) -> Result<()> {
+/// `body` with `if_rev` when given.
+fn with_rev(mut body: Value, if_rev: Option<i64>) -> Value {
+    if let (Some(r), Some(o)) = (if_rev, body.as_object_mut()) {
+        o.insert("if_rev".into(), json!(r));
+    }
+    body
+}
+
+/// `?if_rev=N` when given.
+fn rev_query(if_rev: Option<i64>) -> String {
+    if_rev.map(|r| format!("?if_rev={r}")).unwrap_or_default()
+}
+
+async fn patch(c: &Client, out: &Out, task: &str, body: Value, if_rev: Option<i64>) -> Result<()> {
     let n = num(task)?;
+    let body = with_rev(body, if_rev);
     let v = c
         .raw(Method::PATCH, &format!("/tasks/{n}"), Some(&body))
         .await?;
     changed(out, &v)
 }
 
-/// `POST /tasks/{num}/<action>` without a body.
-async fn post(c: &Client, out: &Out, task: &str, action: &str) -> Result<()> {
+/// `POST /tasks/{num}/<action>` without a body (or with `if_rev`).
+async fn post(c: &Client, out: &Out, task: &str, action: &str, if_rev: Option<i64>) -> Result<()> {
     let n = num(task)?;
+    let body = if_rev.map(|r| json!({ "if_rev": r }));
     let v = c
-        .raw(Method::POST, &format!("/tasks/{n}/{action}"), None)
+        .raw(Method::POST, &format!("/tasks/{n}/{action}"), body.as_ref())
         .await?;
     changed(out, &v)
 }
 
-async fn set_state(c: &Client, out: &Out, task: &str, state: &str) -> Result<()> {
-    patch(c, out, task, json!({ "state": state })).await
+async fn set_state(
+    c: &Client,
+    out: &Out,
+    task: &str,
+    state: &str,
+    if_rev: Option<i64>,
+) -> Result<()> {
+    patch(c, out, task, json!({ "state": state }), if_rev).await
+}
+
+/// A task number, or the id of an imported task (found by its import key).
+async fn resolve(c: &Client, task: &str) -> Result<i64> {
+    if let Ok(n) = num(task) {
+        return Ok(n);
+    }
+    let r: p::TaskList = c
+        .get(&format!("/tasks?state=all&import_key={}", enc(task.trim())))
+        .await?;
+    match r.tasks.first() {
+        Some(t) => Ok(t.num),
+        None => bail!("{task:?} is not a task number (t12 or 12) nor the id of an imported task"),
+    }
+}
+
+/// The text of a 409 `stale` answer: what changed since the revision the
+/// command named, and the task as it is now.
+pub fn stale_text(s: &p::TaskStale, if_rev_hint: bool) -> String {
+    let mut out = vec![format!(
+        "t{} changed since your revision; it is now at rev {}.",
+        s.task.task.num, s.rev
+    )];
+    if !s.since.is_empty() {
+        out.push("Changes since then:".into());
+        out.extend(s.since.iter().map(|e| format!("  {}", event_line(e))));
+    }
+    out.push(String::new());
+    out.push(detail_text(&s.task));
+    if if_rev_hint {
+        out.push(String::new());
+        out.push(format!(
+            "Nothing was changed. Check the changes above, then run the command again with --if-rev {}.",
+            s.rev
+        ));
+    }
+    out.join("\n")
+}
+
+/// Run a task command; a 409 `stale` prints the task as it is now (with
+/// `--json`, the whole answer) before the error.
+pub async fn run(c: &Client, out: &Out, cmd: TaskCmd) -> Result<()> {
+    let r = run_cmd(c, out, cmd).await;
+    if let Err(e) = &r
+        && let Some(api) = e.downcast_ref::<crate::client::ApiError>()
+        && api.body.error.code == "stale"
+        && let Ok(s) = serde_json::from_value::<p::TaskStale>(api.raw.clone())
+    {
+        out.show(&api.raw, || Ok(stale_text(&s, true)))?;
+    }
+    r
 }
 
 /// `k=v` pairs, encoded.
@@ -635,7 +1054,7 @@ fn query(pairs: &[(&str, Option<String>)]) -> String {
 /// The last events shown by `history` without `--all`.
 const HISTORY_TAIL: i64 = 50;
 
-pub async fn run(c: &Client, out: &Out, cmd: TaskCmd) -> Result<()> {
+async fn run_cmd(c: &Client, out: &Out, cmd: TaskCmd) -> Result<()> {
     match cmd {
         TaskCmd::New {
             title,
@@ -647,10 +1066,25 @@ pub async fn run(c: &Client, out: &Out, cmd: TaskCmd) -> Result<()> {
             label,
             due: d,
             from,
+            new,
         } => {
             if title.is_none() && from.is_none() {
                 bail!("give a title (or --from <message id>)");
             }
+            let parent_num = parent.as_deref().map(num).transpose()?;
+            let key = if new {
+                None
+            } else {
+                let me = reporter_name(c).await?;
+                Some(default_client_key(
+                    &me,
+                    title.as_deref(),
+                    body.as_deref(),
+                    assignee.as_deref(),
+                    parent_num,
+                    from,
+                ))
+            };
             let mut b = Map::new();
             let mut put = |k: &str, v: Option<Value>| {
                 if let Some(v) = v {
@@ -662,20 +1096,28 @@ pub async fn run(c: &Client, out: &Out, cmd: TaskCmd) -> Result<()> {
             put("priority", priority.map(Value::from));
             put("assignee", assignee.map(Value::from));
             put("team", team.map(Value::from));
-            put(
-                "parent",
-                parent.as_deref().map(num).transpose()?.map(Value::from),
-            );
+            put("parent", parent_num.map(Value::from));
             put("labels", (!label.is_empty()).then(|| json!(label)));
             put("due", d.as_deref().map(due).transpose()?.map(Value::from));
             put("from_message", from.map(Value::from));
+            put("client_key", key.map(Value::from));
             let v = c
                 .raw(Method::POST, "/tasks", Some(&Value::Object(b)))
                 .await?;
-            changed(out, &v)
+            out.show(&v, || {
+                let d: p::TaskDetail = crate::parse(&v)?;
+                let line = task_line(&d.task);
+                Ok(if d.existing {
+                    format!(
+                        "{line}\n(created before by the same command; nothing new was created: amail task new --new creates another)"
+                    )
+                } else {
+                    line
+                })
+            })
         }
         TaskCmd::Show { task } => {
-            let n = num(&task)?;
+            let n = resolve(c, &task).await?;
             let v = c.raw(Method::GET, &format!("/tasks/{n}"), None).await?;
             out.show(&v, || Ok(detail_text(&crate::parse(&v)?)))
         }
@@ -745,6 +1187,7 @@ pub async fn run(c: &Client, out: &Out, cmd: TaskCmd) -> Result<()> {
             due_before,
             stale,
             text: search,
+            result,
             limit,
             before,
         } => {
@@ -766,6 +1209,7 @@ pub async fn run(c: &Client, out: &Out, cmd: TaskCmd) -> Result<()> {
                 ("due_before", due_before.as_deref().map(due).transpose()?),
                 ("stale", stale.then(|| "1".into())),
                 ("text", search),
+                ("result", result),
                 ("limit", limit.map(|n| n.to_string())),
                 ("before", before.map(|n| n.to_string())),
             ]);
@@ -813,6 +1257,19 @@ pub async fn run(c: &Client, out: &Out, cmd: TaskCmd) -> Result<()> {
                 .await?;
             out.show(&v, || Ok(board_text(&crate::parse(&v)?)))
         }
+        TaskCmd::Report { team } => {
+            let v = c
+                .raw(
+                    Method::GET,
+                    &format!("/tasks/report{}", query(&[("team", team)])),
+                    None,
+                )
+                .await?;
+            out.show(&v, || Ok(report_text(&crate::parse(&v)?)))
+        }
+        TaskCmd::Import { file, dry_run, map } => {
+            import(c, out, &file, dry_run, map.as_deref()).await
+        }
         TaskCmd::Set {
             task,
             title,
@@ -826,6 +1283,8 @@ pub async fn run(c: &Client, out: &Out, cmd: TaskCmd) -> Result<()> {
             label,
             no_labels,
             due: d,
+            force,
+            if_rev,
         } => {
             let mut b = Map::new();
             if let Some(x) = title {
@@ -871,16 +1330,24 @@ pub async fn run(c: &Client, out: &Out, cmd: TaskCmd) -> Result<()> {
             if b.is_empty() {
                 bail!("nothing to change: give at least one option (see amail task set --help)");
             }
-            patch(c, out, &task, Value::Object(b)).await
+            if force {
+                b.insert("force".into(), json!(true));
+            }
+            patch(c, out, &task, Value::Object(b), if_rev).await
         }
-        TaskCmd::Assign { task, seat } => {
-            patch(c, out, &task, json!({ "assignee": or_null(&seat) })).await
+        TaskCmd::Assign { task, seat, if_rev } => {
+            patch(c, out, &task, json!({ "assignee": or_null(&seat) }), if_rev).await
         }
-        TaskCmd::Take { task } => post(c, out, &task, "take").await,
-        TaskCmd::Steal { task } => post(c, out, &task, "steal").await,
-        TaskCmd::Yield { task } => post(c, out, &task, "yield").await,
-        TaskCmd::Keep { task } => post(c, out, &task, "keep").await,
-        TaskCmd::Block { task, on, reason } => {
+        TaskCmd::Take { task, if_rev } => post(c, out, &task, "take", if_rev).await,
+        TaskCmd::Steal { task } => post(c, out, &task, "steal", None).await,
+        TaskCmd::Yield { task } => post(c, out, &task, "yield", None).await,
+        TaskCmd::Keep { task } => post(c, out, &task, "keep", None).await,
+        TaskCmd::Block {
+            task,
+            on,
+            reason,
+            if_rev,
+        } => {
             let mut b = json!({ "state": "blocked" });
             if let Some(s) = on {
                 b["waiting_on"] = json!(s);
@@ -888,44 +1355,132 @@ pub async fn run(c: &Client, out: &Out, cmd: TaskCmd) -> Result<()> {
             if let Some(r) = reason {
                 b["blocked_reason"] = json!(r);
             }
-            patch(c, out, &task, b).await
+            patch(c, out, &task, b, if_rev).await
         }
-        TaskCmd::Unblock { task } => set_state(c, out, &task, "open").await,
-        TaskCmd::Start { task } => set_state(c, out, &task, "doing").await,
-        TaskCmd::Review { task } => set_state(c, out, &task, "review").await,
-        TaskCmd::Done { task } => set_state(c, out, &task, "done").await,
-        TaskCmd::Cancel { task } => set_state(c, out, &task, "cancelled").await,
-        TaskCmd::Reopen { task } => set_state(c, out, &task, "open").await,
-        TaskCmd::Dep { task, on } => {
+        TaskCmd::Unblock { task, if_rev } => set_state(c, out, &task, "open", if_rev).await,
+        TaskCmd::Start { task, if_rev } => set_state(c, out, &task, "doing", if_rev).await,
+        TaskCmd::Review { task, if_rev } => set_state(c, out, &task, "review", if_rev).await,
+        TaskCmd::Done {
+            task,
+            result,
+            result_ref,
+            note,
+            force,
+            if_rev,
+        } => {
+            let mut b = json!({ "state": "done" });
+            if let Some(r) = result {
+                b["result"] = json!(result_value(&r)?);
+            }
+            if let Some(r) = result_ref {
+                b["result_ref"] = json!(r);
+            }
+            if let Some(n) = note {
+                b["result_note"] = json!(n);
+            }
+            if force {
+                b["force"] = json!(true);
+            }
+            patch(c, out, &task, b, if_rev).await
+        }
+        TaskCmd::Cancel {
+            task,
+            force,
+            if_rev,
+        } => {
+            let mut b = json!({ "state": "cancelled" });
+            if force {
+                b["force"] = json!(true);
+            }
+            patch(c, out, &task, b, if_rev).await
+        }
+        TaskCmd::Reopen { task, if_rev } => set_state(c, out, &task, "open", if_rev).await,
+        TaskCmd::Result {
+            first,
+            second,
+            result_ref,
+            note,
+            if_rev,
+        } => {
+            let b = if first == "withdraw" {
+                let Some(reason) = note else {
+                    bail!("give the reason: amail task result withdraw {second} -m \"...\"");
+                };
+                if result_ref.is_some() {
+                    bail!("--ref goes with ok or rejected, not with withdraw");
+                }
+                patch(
+                    c,
+                    out,
+                    &second,
+                    json!({ "result": null, "note": reason }),
+                    if_rev,
+                )
+                .await?;
+                return Ok(());
+            } else {
+                let mut b = json!({ "result": result_value(&second)? });
+                if let Some(r) = result_ref {
+                    b["result_ref"] = json!(r);
+                }
+                if let Some(n) = note {
+                    b["result_note"] = json!(n);
+                }
+                b
+            };
+            patch(c, out, &first, b, if_rev).await
+        }
+        TaskCmd::Dep {
+            task,
+            on,
+            needs_ok,
+            any_close,
+            if_rev,
+        } => {
+            let (n, m) = (num(&task)?, num(&on)?);
+            let mut b = json!({ "blocked_by": m });
+            if needs_ok {
+                b["needs_ok"] = json!(true);
+            } else if any_close {
+                b["needs_ok"] = json!(false);
+            }
+            let b = with_rev(b, if_rev);
+            let v = c
+                .raw(Method::POST, &format!("/tasks/{n}/deps"), Some(&b))
+                .await?;
+            changed(out, &v)
+        }
+        TaskCmd::Undep { task, on, if_rev } => {
             let (n, m) = (num(&task)?, num(&on)?);
             let v = c
                 .raw(
-                    Method::POST,
-                    &format!("/tasks/{n}/deps"),
-                    Some(&json!({ "blocked_by": m })),
+                    Method::DELETE,
+                    &format!("/tasks/{n}/deps/{m}{}", rev_query(if_rev)),
+                    None,
                 )
                 .await?;
             changed(out, &v)
         }
-        TaskCmd::Undep { task, on } => {
-            let (n, m) = (num(&task)?, num(&on)?);
-            let v = c
-                .raw(Method::DELETE, &format!("/tasks/{n}/deps/{m}"), None)
-                .await?;
-            changed(out, &v)
-        }
-        TaskCmd::Link { task, id } => {
+        TaskCmd::Link { task, id, if_rev } => {
             let n = num(&task)?;
             let path = format!("/tasks/{n}/links");
             // A thread id first; an id that names no thread the caller
             // sees is taken as a message id.
             let v = match c
-                .raw(Method::POST, &path, Some(&json!({ "thread_id": id })))
+                .raw(
+                    Method::POST,
+                    &path,
+                    Some(&with_rev(json!({ "thread_id": id }), if_rev)),
+                )
                 .await
             {
                 Err(e) if is_not_found(&e) => {
-                    c.raw(Method::POST, &path, Some(&json!({ "message_id": id })))
-                        .await?
+                    c.raw(
+                        Method::POST,
+                        &path,
+                        Some(&with_rev(json!({ "message_id": id }), if_rev)),
+                    )
+                    .await?
                 }
                 r => r?,
             };
@@ -940,10 +1495,18 @@ pub async fn run(c: &Client, out: &Out, cmd: TaskCmd) -> Result<()> {
                 ))
             })
         }
-        TaskCmd::Unlink { task, thread } => {
+        TaskCmd::Unlink {
+            task,
+            thread,
+            if_rev,
+        } => {
             let n = num(&task)?;
             let v = c
-                .raw(Method::DELETE, &format!("/tasks/{n}/links/{thread}"), None)
+                .raw(
+                    Method::DELETE,
+                    &format!("/tasks/{n}/links/{thread}{}", rev_query(if_rev)),
+                    None,
+                )
                 .await?;
             out.show(&v, || Ok(format!("unlinked thread {thread} from t{n}")))
         }
@@ -996,6 +1559,15 @@ mod tests {
             closed_at: None,
             steal_requested_by: None,
             steal_requested_at: None,
+            waits_on_ok: vec![11],
+            rev: 3,
+            progress: None,
+            result: None,
+            result_ref: None,
+            result_note: None,
+            result_by: None,
+            result_at: None,
+            import_key: None,
         }
     }
 
@@ -1022,8 +1594,17 @@ mod tests {
         let mut t = task();
         assert_eq!(
             task_line(&t),
-            "t12  open    high  w1       Fix the\\u{1b}[31m parser  · waits on t9, t11"
+            "t12  open    high  w1       Fix the\\u{1b}[31m parser  · waits on t9, t11 (ok needed)"
         );
+        t.progress = Some(p::TaskProgress { done: 3, total: 5 });
+        t.result = Some(p::TaskResult::Rejected);
+        assert!(
+            task_line(&t).ends_with("  · 3/5  · rejected"),
+            "{}",
+            task_line(&t)
+        );
+        t.progress = None;
+        t.result = None;
         t.state = TaskState::Ready;
         t.waits_on.clear();
         t.assignee = None;

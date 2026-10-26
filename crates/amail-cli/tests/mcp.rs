@@ -48,6 +48,8 @@ const TOOLS: &[&str] = &[
     "task_unlink",
     "task_comment",
     "task_history",
+    "task_result",
+    "task_report",
 ];
 
 /// `amail --json <args>` as the seat with `token`.
@@ -223,6 +225,112 @@ fn drive(url: &str, t1: &str, t2: &str) {
     // A started task cannot be asked for.
     let started = m1.call("task_steal", json!({"num": num}));
     assert_eq!(err_code(&started), "started", "{started}");
+
+    // M8.1: the same task_new twice creates one task.
+    let a = m1.call(
+        "task_new",
+        json!({"title": "review the parser", "assignee": "w2"}),
+    );
+    let review = ok(&a)["task"]["num"].as_i64().unwrap();
+    let b = m1.call(
+        "task_new",
+        json!({"title": "review the parser", "assignee": "w2"}),
+    );
+    assert_eq!(ok(&b)["task"]["num"], json!(review), "{b}");
+    assert_eq!(ok(&b)["existing"], true, "{b}");
+    let c = m1.call(
+        "task_new",
+        json!({"title": "review the parser", "assignee": "w2", "client_key": "another"}),
+    );
+    assert_ne!(ok(&c)["task"]["num"], json!(review), "{c}");
+    // if_rev: an old revision is refused with the task and the changes.
+    let rev = ok(&b)["task"]["rev"].as_i64().unwrap();
+    ok(&m2.call(
+        "task_set",
+        json!({"num": review, "title": "review the parser now", "if_rev": rev}),
+    ));
+    let stale = m1.call(
+        "task_set",
+        json!({"num": review, "body": "x", "if_rev": rev}),
+    );
+    assert_eq!(err_code(&stale), "stale", "{stale}");
+    assert_eq!(
+        stale["structuredContent"]["task"]["task"]["title"],
+        "review the parser now"
+    );
+    assert_eq!(stale["structuredContent"]["since"][0]["field"], "title");
+    assert!(
+        stale["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("changes since"),
+        "{stale}"
+    );
+    // A dependency that needs an ok result, results, and the report.
+    let integ = m1.call("task_new", json!({"title": "integrate", "assignee": "w1"}));
+    let integ = ok(&integ)["task"]["num"].as_i64().unwrap();
+    let dep = m1.call(
+        "task_dep",
+        json!({"num": integ, "blocked_by": review, "needs_ok": true}),
+    );
+    assert_eq!(ok(&dep)["blockers"][0]["needs_ok"], true, "{dep}");
+    assert!(
+        dep["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("(ok needed)"),
+        "{dep}"
+    );
+    let rejected = m2.call(
+        "task_set",
+        json!({"num": review, "state": "done", "result": "rejected", "result_ref": "abc123"}),
+    );
+    assert_eq!(ok(&rejected)["task"]["result"], "rejected", "{rejected}");
+    assert_eq!(
+        err_code(&m2.call("task_result", json!({"num": integ, "result": "ok"}))),
+        "not_done"
+    );
+    let okr = m2.call(
+        "task_result",
+        json!({"num": review, "result": "ok", "ref": "def456", "note": "fixed"}),
+    );
+    assert_eq!(ok(&okr)["task"]["result_ref"], "def456", "{okr}");
+    assert!(
+        okr["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("result: ok, ref def456"),
+        "{okr}"
+    );
+    let show = m1.call("task_show", json!({"num": integ}));
+    assert_eq!(ok(&show)["task"]["state"], "ready", "{show}");
+    let report = m1.call("task_report", json!({}));
+    assert_eq!(
+        ok(&report),
+        &cli_json(url, t1, &["task", "report"]),
+        "report"
+    );
+    assert!(
+        report["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("approved, not taken further (1):"),
+        "{report}"
+    );
+    let wd = m2.call(
+        "task_result",
+        json!({"num": review, "result": "withdraw", "note": "wrong commit"}),
+    );
+    assert!(ok(&wd)["task"].get("result").is_none(), "{wd}");
+    let list = m1.call("task_list", json!({"state": "all", "result": "none"}));
+    assert!(
+        ok(&list)["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["num"] == json!(review)),
+        "{list}"
+    );
 
     // Errors: an unknown task is the server's error as a tool error; bad
     // arguments too.

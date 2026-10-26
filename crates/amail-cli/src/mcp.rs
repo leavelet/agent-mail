@@ -238,11 +238,24 @@ fn structured(v: Value) -> Value {
 /// The structured and text forms of an error.
 fn error_value(e: &anyhow::Error) -> (Value, String) {
     if let Some(api) = e.downcast_ref::<ApiError>() {
-        let mut v = serde_json::to_value(&api.body).unwrap_or_else(|_| json!({}));
+        // The whole answer: a 409 `stale` carries the task and its changes.
+        let mut v = if api.raw.get("error").is_some() {
+            api.raw.clone()
+        } else {
+            serde_json::to_value(&api.body).unwrap_or_else(|_| json!({}))
+        };
         if let Some(o) = v.get_mut("error").and_then(Value::as_object_mut) {
             o.insert("status".into(), json!(api.status));
         }
-        return (v, api.to_string());
+        let text = match serde_json::from_value::<p::TaskStale>(api.raw.clone()) {
+            Ok(s) if api.body.error.code == "stale" => format!(
+                "{api}\n{}\nNothing was changed. Check the changes, then call again with if_rev {}.",
+                stale_text(&s),
+                s.rev
+            ),
+            _ => api.to_string(),
+        };
+        return (v, text);
     }
     let code = if e.downcast_ref::<ArgError>().is_some() {
         "invalid_arguments"
@@ -276,7 +289,10 @@ const INSTRUCTIONS: &str = "amail: mail between the agent seats of a team, and t
 shared tasks. These tools do what the `amail` command line does and answer the same JSON. \
 New mail is also shown to you by the session's hooks; use `inbox` and `read` to look at it, \
 `reply` to answer and `ack` when a message asks for an acknowledgement. Tasks are numbered \
-per org (t12); `task_mine` and `task_next` show your work.";
+per org (t12); `task_mine` and `task_next` show your work. Close a task with a result \
+(`task_set` state done with `result` ok or rejected and `result_ref`, the commit or version \
+it is about); split work into child tasks (`parent`) so that the parent shows progress; \
+pass the task's `rev` as `if_rev` when you change a title or body.";
 
 /// One tool: its name, description, input schema and whether it only reads.
 struct ToolDef {
@@ -307,6 +323,21 @@ fn task_num_only() -> Value {
 
 fn none() -> Value {
     obj(json!({}), &[])
+}
+
+const IF_REV: &str = "Refuse the change with `stale` if the task changed since this revision \
+(the task's `rev`); the answer then shows what changed. Pass it when changing a title or body.";
+
+fn if_rev_schema() -> Value {
+    json!({"type": "integer", "description": IF_REV})
+}
+
+/// `{num, if_rev}`.
+fn task_num_rev() -> Value {
+    obj(
+        json!({"num": num_schema(), "if_rev": if_rev_schema()}),
+        &["num"],
+    )
 }
 
 const TOOLS: &[ToolDef] = &[
@@ -472,7 +503,10 @@ const TOOLS: &[ToolDef] = &[
         name: "task_new",
         description: "Create a task in your org's shared task list. The assignee gets a \
             reminder by mail. `from_message` makes the message's subject the default title \
-            and links its thread. Answers the task with its number.",
+            and links its thread. Give `parent` to make it a child task: a parent shows how \
+            many of its children are done. Calling it again with the same fields within 24 \
+            hours answers the task created first (`existing`) instead of a duplicate; give a \
+            different `client_key` to create another. Answers the task with its number.",
         read_only: false,
         schema: || {
             obj(
@@ -486,6 +520,9 @@ const TOOLS: &[ToolDef] = &[
                     "labels": {"type": "array", "items": {"type": "string"}},
                     "due": {"type": "string", "description": "RFC 3339 time."},
                     "from_message": {"type": "integer"},
+                    "client_key": {"type": "string", "description": "1 to 64 characters; the \
+                        same key within 24 hours answers the same task. Default: derived from \
+                        you, title, body, assignee and parent."},
                 }),
                 &[],
             )
@@ -493,9 +530,9 @@ const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "task_show",
-        description: "Show one task: its fields, the tasks it depends on and that depend on \
-            it, child tasks, linked threads and its newest events. State `ready` means open \
-            with every dependency closed.",
+        description: "Show one task: its fields (with `rev`, its revision, and its result), \
+            the tasks it depends on and that depend on it, child tasks, linked threads and its \
+            newest events. State `ready` means open with every dependency satisfied.",
         read_only: true,
         schema: task_num_only,
     },
@@ -518,6 +555,7 @@ const TOOLS: &[ToolDef] = &[
                     "due_before": {"type": "string"},
                     "stale": {"type": "boolean"},
                     "text": {"type": "string", "description": "Substring of title or body."},
+                    "result": {"type": "string", "enum": ["ok", "rejected", "none"]},
                     "before": {"type": "integer"},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 500},
                 }),
@@ -574,7 +612,11 @@ const TOOLS: &[ToolDef] = &[
         description: "Change fields of a task. `state` is open, doing, blocked, review, done \
             or cancelled (not ready). `waiting_on` (a seat) and `blocked_reason` go with state \
             blocked. A null value clears assignee, team, parent, due, waiting_on or \
-            blocked_reason. `labels` replaces the labels.",
+            blocked_reason. `labels` replaces the labels. With state done (or on a done task), \
+            `result` ok or rejected records what was concluded, `result_ref` the commit, tag \
+            or URL it is about and `result_note` a note; `result: null` with `note` withdraws \
+            it. Closing a parent whose children are not all closed needs `force`. Pass \
+            `if_rev` (the task's `rev`) when changing the title or body.",
         read_only: false,
         schema: || {
             let opt_str = json!({"type": ["string", "null"]});
@@ -594,6 +636,12 @@ const TOOLS: &[ToolDef] = &[
                     "due": opt_str,
                     "waiting_on": opt_str,
                     "blocked_reason": opt_str,
+                    "result": {"type": ["string", "null"], "enum": ["ok", "rejected", null]},
+                    "result_ref": {"type": "string"},
+                    "result_note": {"type": "string"},
+                    "note": {"type": "string", "description": "With result null: why it is withdrawn."},
+                    "force": {"type": "boolean"},
+                    "if_rev": if_rev_schema(),
                 }),
                 &["num"],
             )
@@ -604,7 +652,7 @@ const TOOLS: &[ToolDef] = &[
         description: "Assign an unassigned task to yourself, atomically. Fails with `taken` \
             when another seat has it.",
         read_only: false,
-        schema: task_num_only,
+        schema: task_num_rev,
     },
     ToolDef {
         name: "task_steal",
@@ -634,11 +682,14 @@ const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "task_dep",
         description: "Make task `num` depend on task `blocked_by`: it is ready only when that \
-            task is done or cancelled. Refused when it would make a cycle.",
+            task is done or cancelled, or, with `needs_ok`, only when it is done with result \
+            ok. Given for an existing dependency, `needs_ok` changes it. Refused when it would \
+            make a cycle.",
         read_only: false,
         schema: || {
             obj(
-                json!({"num": num_schema(), "blocked_by": num_schema()}),
+                json!({"num": num_schema(), "blocked_by": num_schema(),
+                       "needs_ok": {"type": "boolean"}, "if_rev": if_rev_schema()}),
                 &["num", "blocked_by"],
             )
         },
@@ -649,10 +700,39 @@ const TOOLS: &[ToolDef] = &[
         read_only: false,
         schema: || {
             obj(
-                json!({"num": num_schema(), "blocked_by": num_schema()}),
+                json!({"num": num_schema(), "blocked_by": num_schema(), "if_rev": if_rev_schema()}),
                 &["num", "blocked_by"],
             )
         },
+    },
+    ToolDef {
+        name: "task_result",
+        description: "Record the result of a done task: `result` ok or rejected, `ref` the \
+            commit, tag, URL or version it is about, `note` a short note. `result` withdraw \
+            clears it (the task stays done; `note` gives the reason). A dependency that needs \
+            an ok result is satisfied only by ok.",
+        read_only: false,
+        schema: || {
+            obj(
+                json!({
+                    "num": num_schema(),
+                    "result": {"type": "string", "enum": ["ok", "rejected", "withdraw"]},
+                    "ref": {"type": "string"},
+                    "note": {"type": "string"},
+                    "if_rev": if_rev_schema(),
+                }),
+                &["num", "result"],
+            )
+        },
+    },
+    ToolDef {
+        name: "task_report",
+        description: "The lead's report, in sections with counts: assigned but not started, \
+            in progress, waiting for review, rejected, approved but not taken further, parents \
+            partly done (with progress), and blocked tasks with whom they wait for. Optionally \
+            for one team.",
+        read_only: true,
+        schema: || obj(json!({"team": {"type": "string"}}), &[]),
     },
     ToolDef {
         name: "task_link",
@@ -665,6 +745,7 @@ const TOOLS: &[ToolDef] = &[
                     "num": num_schema(),
                     "thread_id": {"type": "integer"},
                     "message_id": {"type": "integer"},
+                    "if_rev": if_rev_schema(),
                 }),
                 &["num"],
             )
@@ -676,7 +757,7 @@ const TOOLS: &[ToolDef] = &[
         read_only: false,
         schema: || {
             obj(
-                json!({"num": num_schema(), "thread_id": {"type": "integer"}}),
+                json!({"num": num_schema(), "thread_id": {"type": "integer"}, "if_rev": if_rev_schema()}),
                 &["num", "thread_id"],
             )
         },
@@ -1274,10 +1355,30 @@ async fn task(c: &Client, name: &str, a: &Args<'_>) -> Result<(Value, String)> {
             if let Some(m) = a.int("from_message")? {
                 body.insert("from_message".into(), json!(m));
             }
+            let key = match a.str("client_key")? {
+                Some(k) => k,
+                None => {
+                    let me = crate::task_cmd::reporter_name(c).await?;
+                    crate::task_cmd::default_client_key(
+                        &me,
+                        a.str("title")?.as_deref(),
+                        a.str("body")?.as_deref(),
+                        a.str("assignee")?.as_deref(),
+                        a.task("parent")?,
+                        a.int("from_message")?,
+                    )
+                }
+            };
+            body.insert("client_key".into(), json!(key));
             let v = c
                 .raw(Method::POST, "/tasks", Some(&Value::Object(body)))
                 .await?;
-            detail(v, "created ")
+            let verb = if v["existing"] == true {
+                "already created (nothing new): "
+            } else {
+                "created "
+            };
+            detail(v, verb)
         }
         "task_show" => {
             let n = a.req_task("num")?;
@@ -1298,6 +1399,7 @@ async fn task(c: &Client, name: &str, a: &Args<'_>) -> Result<(Value, String)> {
                     ("due_before", a.str("due_before")?),
                     ("stale", a.bool("stale")?.then(|| "1".to_string())),
                     ("text", a.str("text")?),
+                    ("result", a.str("result")?),
                     ("before", a.int("before")?.map(|x| x.to_string())),
                     ("limit", a.int("limit")?.map(|x| x.to_string())),
                 ])
@@ -1433,8 +1535,22 @@ async fn task(c: &Client, name: &str, a: &Args<'_>) -> Result<(Value, String)> {
             if a.has("labels") {
                 body.insert("labels".into(), json!(a.strings("labels")?));
             }
+            if a.has("result") {
+                body.insert("result".into(), json!(a.str("result")?));
+            }
+            for k in ["result_ref", "result_note", "note"] {
+                if let Some(s) = a.str(k)? {
+                    body.insert(k.into(), json!(s));
+                }
+            }
             if body.is_empty() {
                 return Err(arg_err("give at least one field to change".into()));
+            }
+            if a.bool("force")? {
+                body.insert("force".into(), json!(true));
+            }
+            if let Some(r) = a.int("if_rev")? {
+                body.insert("if_rev".into(), json!(r));
             }
             let v = c
                 .raw(
@@ -1447,10 +1563,43 @@ async fn task(c: &Client, name: &str, a: &Args<'_>) -> Result<(Value, String)> {
         }
         "task_take" => {
             let n = a.req_task("num")?;
+            let body = a.int("if_rev")?.map(|r| json!({"if_rev": r}));
             let v = c
-                .raw(Method::POST, &format!("/tasks/{n}/take"), None)
+                .raw(Method::POST, &format!("/tasks/{n}/take"), body.as_ref())
                 .await?;
             detail(v, "took ")
+        }
+        "task_result" => {
+            let n = a.req_task("num")?;
+            let mut body = match a.req_str("result")?.as_str() {
+                "withdraw" => {
+                    if a.has("ref") {
+                        return Err(arg_err("`ref` goes with ok or rejected".into()));
+                    }
+                    json!({"result": null, "note": a.str("note")?})
+                }
+                r @ ("ok" | "rejected") => {
+                    json!({"result": r, "result_ref": a.str("ref")?, "result_note": a.str("note")?})
+                }
+                _ => return Err(arg_err("`result` must be ok, rejected or withdraw".into())),
+            };
+            if let Some(o) = body.as_object_mut() {
+                o.retain(|k, v| k == "result" || !v.is_null());
+                if let Some(r) = a.int("if_rev")? {
+                    o.insert("if_rev".into(), json!(r));
+                }
+            }
+            let v = c
+                .raw(Method::PATCH, &format!("/tasks/{n}"), Some(&body))
+                .await?;
+            detail(v, "")
+        }
+        "task_report" => {
+            let path = format!("/tasks/report{}", query(&[("team", a.str("team")?)]));
+            let v = c.raw(Method::GET, &path, None).await?;
+            let r: p::TaskReport = parse(&v)?;
+            let t = crate::task_cmd::report_text(&r);
+            Ok((v, t))
         }
         "task_steal" | "task_yield" | "task_keep" => {
             let n = a.req_task("num")?;
@@ -1468,26 +1617,30 @@ async fn task(c: &Client, name: &str, a: &Args<'_>) -> Result<(Value, String)> {
         "task_dep" => {
             let n = a.req_task("num")?;
             let other = a.req_task("blocked_by")?;
+            let mut body = json!({"blocked_by": other});
+            if a.has("needs_ok") {
+                body["needs_ok"] = json!(a.bool("needs_ok")?);
+            }
+            if let Some(r) = a.int("if_rev")? {
+                body["if_rev"] = json!(r);
+            }
             let v = c
-                .raw(
-                    Method::POST,
-                    &format!("/tasks/{n}/deps"),
-                    Some(&json!({"blocked_by": other})),
-                )
+                .raw(Method::POST, &format!("/tasks/{n}/deps"), Some(&body))
                 .await?;
             detail(v, "")
         }
         "task_undep" => {
             let n = a.req_task("num")?;
             let other = a.req_task("blocked_by")?;
+            let q = query(&[("if_rev", a.int("if_rev")?.map(|r| r.to_string()))]);
             let v = c
-                .raw(Method::DELETE, &format!("/tasks/{n}/deps/{other}"), None)
+                .raw(Method::DELETE, &format!("/tasks/{n}/deps/{other}{q}"), None)
                 .await?;
             detail(v, "")
         }
         "task_link" => {
             let n = a.req_task("num")?;
-            let body = match (a.int("thread_id")?, a.int("message_id")?) {
+            let mut body = match (a.int("thread_id")?, a.int("message_id")?) {
                 (Some(t), None) => json!({"thread_id": t}),
                 (None, Some(m)) => json!({"message_id": m}),
                 _ => {
@@ -1496,6 +1649,9 @@ async fn task(c: &Client, name: &str, a: &Args<'_>) -> Result<(Value, String)> {
                     ));
                 }
             };
+            if let Some(r) = a.int("if_rev")? {
+                body["if_rev"] = json!(r);
+            }
             let v = c
                 .raw(Method::POST, &format!("/tasks/{n}/links"), Some(&body))
                 .await?;
@@ -1504,8 +1660,9 @@ async fn task(c: &Client, name: &str, a: &Args<'_>) -> Result<(Value, String)> {
         "task_unlink" => {
             let n = a.req_task("num")?;
             let t = a.req_int("thread_id")?;
+            let q = query(&[("if_rev", a.int("if_rev")?.map(|r| r.to_string()))]);
             let v = c
-                .raw(Method::DELETE, &format!("/tasks/{n}/links/{t}"), None)
+                .raw(Method::DELETE, &format!("/tasks/{n}/links/{t}{q}"), None)
                 .await?;
             detail(v, "")
         }
@@ -1566,6 +1723,7 @@ fn detail(v: Value, verb: &str) -> Result<(Value, String)> {
         lines.push(text::quote(&t.body));
     }
     let mut fields = vec![
+        format!("rev {}", t.rev),
         format!("reporter {}", output::l(&t.reporter)),
         format!("rank {}", t.rank),
     ];
@@ -1578,7 +1736,29 @@ fn detail(v: Value, verb: &str) -> Result<(Value, String)> {
     if let Some(x) = t.thread {
         fields.push(format!("discussion thread {x}"));
     }
+    if let Some(x) = &t.import_key {
+        fields.push(format!("imported as {}", output::l(x)));
+    }
     lines.push(fields.join(", "));
+    if let Some(r) = t.result {
+        let mut s = format!("result: {r}");
+        if let Some(x) = &t.result_ref {
+            s.push_str(&format!(", ref {}", output::l(x)));
+        }
+        if let Some(x) = &t.result_by {
+            s.push_str(&format!(", by {}", output::l(x)));
+        }
+        if let Some(x) = &t.result_at {
+            s.push_str(&format!(" at {}", output::short_time(x)));
+        }
+        if let Some(x) = &t.result_note {
+            s.push_str(&format!(": {}", output::l(x)));
+        }
+        lines.push(s);
+    }
+    if let Some(p) = &t.progress {
+        lines.push(format!("children: {}/{} done", p.done, p.total));
+    }
     if let Some(r) = &t.blocked_reason {
         lines.push(format!("blocked: {}", output::l(r)));
     }
@@ -1655,7 +1835,24 @@ fn task_line(t: &p::Task) -> String {
         s.push_str(&format!(" waiting on {}", output::l(w)));
     }
     if !t.waits_on.is_empty() {
-        s.push_str(&format!(" waits on {}", nums(&t.waits_on)));
+        let w: Vec<String> = t
+            .waits_on
+            .iter()
+            .map(|n| {
+                if t.waits_on_ok.contains(n) {
+                    format!("t{n} (ok needed)")
+                } else {
+                    format!("t{n}")
+                }
+            })
+            .collect();
+        s.push_str(&format!(" waits on {}", w.join(",")));
+    }
+    if let Some(p) = &t.progress {
+        s.push_str(&format!(" children {}/{}", p.done, p.total));
+    }
+    if let Some(r) = t.result {
+        s.push_str(&format!(" result {r}"));
     }
     if let Some(d) = &t.due {
         s.push_str(&format!(" due {}", output::short_time(d)));
@@ -1679,7 +1876,27 @@ fn task_ref(r: &p::TaskRef) -> String {
     if let Some(a) = &r.assignee {
         s.push_str(&format!(" @{}", output::l(a)));
     }
+    if let Some(x) = r.result {
+        s.push_str(&format!(" result {x}"));
+    }
+    if r.needs_ok {
+        s.push_str(" (ok needed)");
+    }
     s
+}
+
+/// A 409 `stale` answer: the changes since the caller's revision, then
+/// the task.
+fn stale_text(s: &p::TaskStale) -> String {
+    let mut lines = vec![format!(
+        "t{} is at rev {}; changes since:",
+        s.task.task.num, s.rev
+    )];
+    lines.extend(s.since.iter().map(|e| format!("  {}", event_line(e))));
+    if let Ok((_, t)) = detail(serde_json::to_value(&s.task).unwrap_or_default(), "now: ") {
+        lines.push(t);
+    }
+    lines.join("\n")
 }
 
 fn event_line(e: &p::TaskEvent) -> String {

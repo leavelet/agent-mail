@@ -363,7 +363,11 @@ pub const TASK_INSTRUCTIONS: &str = "\
 Your org has a shared task board; a task is named by its number (`t12`).
 `amail task mine` (your tasks), `amail task next` (what you can start now), \
 `amail task waiting` (whom you wait for), `amail task owed` (who waits for you).
-`amail task comment t12 -m \"...\"` discusses a task by mail with its assignee and reporter.";
+`amail task comment t12 -m \"...\"` discusses a task by mail with its assignee and reporter.
+Close finished work with a result and the version it is about: \
+`amail task done t12 --result ok --ref <commit>` (or `--result rejected`).
+Split larger work into child tasks (`amail task new \"...\" --parent t12`); the parent shows how many are done.
+Before changing a title or body, read `Rev:` from `amail task show t12` and pass `--if-rev N`.";
 
 /// At session start, when the seat has unfinished tasks: how many, and
 /// how many of them can be started now. `more`: the server had more than

@@ -27,6 +27,9 @@ pub struct Client {
 pub struct ApiError {
     pub status: u16,
     pub body: ErrorBody,
+    /// The whole answer (some errors carry more than `error`, such as the
+    /// task of a 409 `stale`).
+    pub raw: Value,
 }
 
 impl std::fmt::Display for ApiError {
@@ -151,6 +154,7 @@ impl Client {
             Ok(body) => Err(ApiError {
                 status: status.as_u16(),
                 body,
+                raw: serde_json::from_str(&text).unwrap_or(Value::Null),
             }
             .into()),
             Err(_) => bail!("HTTP {status}: {text}"),
