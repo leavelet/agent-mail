@@ -380,9 +380,9 @@ reference everyone uses, in commands and in mail subjects.
 A task has a title (one line), a description, a state, a priority
 (`urgent`, `high`, `normal`, `low`) and a rank (the order within a
 priority; new tasks go last), the seat that created it (its reporter), at
-most one assignee, a team, an optional parent task (tasks nest at most
-four levels), labels (at most ten), an optional due time, and its
-discussion thread.
+most one assignee, a team, an optional parent task (a task has at most
+eight ancestors), labels (at most ten), an optional due time, its
+discussion thread, a revision (`rev`), and, when it is done, a result.
 
 ### States and `ready`
 
@@ -391,11 +391,12 @@ The stored states are `open`, `doing`, `blocked`, `review`, `done` and
 `done` and `cancelled` close it, and a closed task can only be reopened to
 `open` or `doing`. Nothing forces a task through `review`.
 
-`ready` is not stored and nobody sets it: an `open` task whose blockers are
-all closed is shown as `ready`, and an `open` task with unfinished blockers
-is shown as `open` with them (`waits on t9, t11`). When the last blocker of
-a task closes, or its last dependency is removed, the history records an
-`unblocked` event, so a reader can see when work could have started.
+`ready` is not stored and nobody sets it: an `open` task whose
+dependencies are all satisfied is shown as `ready`, and an `open` task with
+unsatisfied dependencies is shown as `open` with their blockers
+(`waits on t9, t11`). When the last unsatisfied dependency of a task is
+satisfied, or removed, the history records an `unblocked` event, so a
+reader can see when work could have started.
 
 `blocked` is for an obstacle that is not another task: a person's
 decision, an outside event. It carries the seat whose action the task
@@ -409,6 +410,92 @@ dependencies say so.
 two tasks of the org. A dependency that would make a cycle is refused, and
 so is one whose chain the check would have to follow beyond 32 tasks. A
 task has at most 50 blockers and blocks at most 200 tasks.
+
+A dependency is satisfied when its blocker is closed (`done` or
+`cancelled`). A dependency marked `needs_ok` is satisfied only when its
+blocker is `done` with the result `ok` (see Results): a review task closed
+as `rejected`, or cancelled, keeps the task that depends on it waiting
+until the review is done with `ok`, or until the dependency is changed or
+removed. It is shown as `waits on t9 (ok needed)`. Adding the same
+dependency again with `needs_ok` true or false changes the mark. The
+`ready` state, the `unblocked` event, `waiting` and `owed` all use this
+rule.
+
+### Child tasks and progress
+
+A task with children shows its progress: `progress` is `{done, total}`,
+where `total` counts the children that are not `cancelled` and `done` the
+children in `done` (shown as `3/5`). Progress is meant to be tracked this
+way: split the work into child tasks and close them as they are finished.
+
+A parent whose children are not all closed cannot be closed: the change is
+refused with 409 `children_open`, which names the children that are still
+`open`, `doing`, `blocked` or `review`. With `force` it is closed anyway,
+and the state event's note names those children. Closing a parent changes
+no child. When the last unfinished child of an unfinished parent closes,
+the parent's assignee (its reporter when it has none) gets the reminder
+`t12: all 5 child tasks are closed`.
+
+### Results
+
+A `done` task can carry a result: what was concluded about the work, for
+which version, and by whom. The fields are `result` (`ok` or
+`rejected`), `result_ref` (at most 200 characters: a commit, tag, URL or
+other version name), `result_note` (at most 2,000 characters),
+`result_by` (the seat that set it) and `result_at`. A result is set
+together with closing the task (`task done t12 --result ok --ref abc123`)
+or later on a task that is already `done` (`task result t12 rejected`);
+on a task that is not `done` it is refused with 422 `not_done`. Setting a
+result replaces the previous one, with its ref and note.
+
+`task result withdraw t12 -m reason` clears a result; the task stays
+`done`, and the history records a `result_withdrawn` event with the old
+result and ref and the reason. Reopening a task clears its result as well
+(a `changed` event for the field `result`).
+
+When a task that others depend on with `needs_ok` gets the result
+`rejected`, or its `ok` result is withdrawn, the assignees (else
+reporters) of those unfinished tasks get the reminder
+`t11 was closed as rejected; t12 waits for an ok result` (or `t11's ok
+result was withdrawn; ...`).
+
+### Revisions
+
+`rev` is the sequence number of the task's newest event; every change
+raises it. Every write to one task (`PATCH /tasks/{num}`, `take`, adding
+or removing a dependency or a link) accepts `if_rev`: when the task's rev
+differs, nothing is changed and the answer is 409 `stale` with the task as
+it is now and the events since that revision, so the writer can see what
+it would overwrite. A write without `if_rev` is not checked; a change of
+one field is atomic either way. The agent instructions ask agents to pass
+the rev from `task show` when they change a title or a description, where
+one writer could replace another's text.
+
+### Creating a task once
+
+`POST /tasks` accepts a `client_key` (1 to 64 characters). A second create
+with the same key in the same org within 24 hours creates nothing and
+answers 200 with the task the first one created and `"existing": true`.
+The command line and the MCP server send a key by default: the first 32
+hexadecimal digits of SHA-256 over the reporter, title, body, assignee and
+parent (and the message of `--from`). Running the same `task new` twice,
+for example after a timeout, therefore gives one task; `task new --new`
+sends no key and creates another task with the same content.
+
+### Importing tasks
+
+Tasks kept in another tool are brought in with `amail task import
+<file>`, with the org's user token. The other side converts its data to a
+JSON Lines file, one object per task (the fields are listed in the
+reference). Each record's `id` is stored on the task as its `import_key`;
+importing a record whose `id` is already stored updates the fields that
+differ and creates nothing, so importing the same file twice gives one set
+of tasks. Parents and dependencies are set after all tasks exist, so a
+record may name a task that comes later in the file. History entries
+become `imported` events with their time, author name and text. Nothing is
+mailed: no reminders and no discussion threads. An unknown seat, parent or
+dependency is a warning, not an error. `task show ISSUE-42` finds an
+imported task by its id.
 
 ### Assignment
 
@@ -439,8 +526,14 @@ The server tells the seats concerned by system mail (source `system`),
 addressed in `To`, so an idle agent is woken:
 
 - a task is assigned (or reassigned): the new assignee;
-- the last blocker of a task closes, or its last dependency is removed:
-  the task's assignee (its reporter when it has none);
+- the last unsatisfied dependency of a task is satisfied (its blocker
+  closes, or gets an `ok` result where the dependency needs one) or
+  removed: the task's assignee (its reporter when it has none);
+- the last unfinished child of a parent closes: the parent's assignee
+  (`children_done`);
+- a blocker that a task depends on with `needs_ok` gets the result
+  `rejected` or its `ok` result is withdrawn: that task's assignee
+  (`blocker_rejected`);
 - a task is set `blocked` waiting on a seat: that seat;
 - a task is `done` or `cancelled`: its reporter (a task it was the last
   blocker of gets the reminder above);
@@ -482,7 +575,10 @@ org. A comment that reaches another org's seat is ordinary mail to it.
 ### Tasks in an agent's context
 
 The seat introduction in an agent's system prompt names the task commands
-(`amail task mine`, `next`, `waiting`, `owed`, `comment`). When a session
+(`amail task mine`, `next`, `waiting`, `owed`, `comment`), and asks agents
+to close work with a result and the version it is about, to split larger
+work into child tasks, and to pass `--if-rev` when changing a title or
+description. When a session
 starts and the seat has unfinished tasks, the node adds one line:
 `[amail] you have N open task(s), M ready: amail task mine`. Hooks do not
 show task changes otherwise; reminders arrive as mail.
@@ -492,9 +588,10 @@ show task changes otherwise; reminders arrive as mail.
 Every change is an event: who made it (the seat of the token; the user
 seat for a user token; for a reply written by the user in a seat's name,
 the seat with `written_by`), when, which field, the value before and
-after. Events are never changed. A task keeps its newest 1,000 events in
-full; older ones are deleted and counted. There is no deleting a task:
-`cancelled` is the end state (deleting the org deletes its tasks).
+after. A change of the description records the whole old and new text.
+Events are never changed or deleted; the org's storage quota, which counts
+them, bounds them. There is no deleting a task: `cancelled` is the end
+state (deleting the org deletes its tasks).
 
 ## The user's queue ("needs you")
 

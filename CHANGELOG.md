@@ -138,6 +138,42 @@ The first public version.
   `[amail] you have N open task(s), M ready: amail task mine` when the
   seat has unfinished tasks (`GET /tasks/mine?seat=` with the node
   token; the only task call node tokens may make).
+- Tasks, M8.1 (migration `0025_tasks_results.sql`):
+  - Every event of a task is kept (the compaction at 1,000 events and
+    `events_compacted` of `TaskDetail` are gone; the storage quota bounds
+    the events). A change of the description records the whole old and
+    new text. `amail task history --all` reads every page.
+  - Revisions: `rev` in every task, `Rev:` in `task show`. The writes to
+    one task take `if_rev` (`--if-rev N`) and are refused with 409 `stale`
+    and `{rev, task, since}` when the task changed; the command prints the
+    changes since then and the task.
+  - `POST /tasks` takes `client_key`: the same key within 24 hours answers
+    the existing task (200, `existing`). `amail task new` and the MCP
+    `task_new` send a key derived from the reporter, title, body,
+    assignee and parent; `task new --new` sends none.
+  - Child tasks: `progress` (`{done, total}`) on parents, shown as `· 3/5`
+    and `Children: 3/5 done`. Closing a parent with unfinished children
+    is refused with 409 `children_open` unless forced (`--force`). The
+    parent's assignee gets the reminder `children_done` when the last
+    child closes. Parents nest up to 8 levels.
+  - Results of done tasks: `result` (`ok`, `rejected`), `result_ref`,
+    `result_note`, `result_by`, `result_at`; `task done --result`,
+    `task result`, `task result withdraw` (event `result_withdrawn`);
+    reopening clears the result; `task list --result`.
+  - Dependencies that need an ok result (`task dep --needs-ok`,
+    `--any-close`): only a `done` blocker with `ok` satisfies them, for
+    `ready`, `unblocked`, `waiting` and `owed`. Reminder `blocker_rejected`
+    when such a blocker is rejected or its ok result is withdrawn.
+  - `amail task import <file> [--dry-run] [--map]` (`POST /tasks/import`,
+    user token): tasks from a JSON Lines file, matched by their `id` on
+    later imports; history entries become `imported` events; nothing is
+    mailed. `task show <id>` finds an imported task.
+  - `amail task report` (`GET /tasks/report`): the lead's report in
+    sections with counts.
+  - MCP: `task_result`, `task_report`, `if_rev`, the result fields and
+    `force` on `task_set`, `needs_ok` on `task_dep`, `client_key` on
+    `task_new`. The agent instructions mention results, child tasks and
+    `--if-rev`.
 - Work stealing: a seat asks to take over a task assigned to another seat
   that is not started (`/v1/tasks/{num}/steal`); the assignee is told by
   system mail and answers with `yield` (the requester gets the task) or
@@ -270,6 +306,12 @@ The first public version.
   for from it; a thread lists its tasks under the subject; "needs you"
   lists tasks waiting for the user and the user's overdue tasks. All of it
   follows `task` events live.
+- Tasks, M8.1: cards and table rows show the progress of child tasks and
+  a `rejected` badge; the table filters by result; the task page has a
+  result block that sets or withdraws the result, marks dependencies that
+  need an ok result, closes a parent with open children only when asked
+  to, and sends the revision with title and description edits. The Tasks
+  page has a Report view.
 
 #### Public servers and getting started
 

@@ -55,29 +55,80 @@ exit code.
 Every task command takes a task number as `t12` or `12`, prints the
 server's JSON with `--json`, and otherwise one line per task: number,
 shown state, priority, assignee (`-` for none), title, and what it waits
-on (`· waits on t9, t11`, or `· waits for w3: reason` for a `blocked`
-task). See [concepts](concepts.md#tasks) for states, `ready` and
-reminders.
+on (`· waits on t9, t11 (ok needed)`, or `· waits for w3: reason` for a
+`blocked` task), the progress of its children (`· 3/5`) and its result
+(`· ok`, `· rejected`). See [concepts](concepts.md#tasks) for states,
+`ready`, results, child tasks, revisions and reminders.
+
+The commands that change one task (`set`, `assign`, `take`, `block`,
+`unblock`, `start`, `review`, `done`, `cancel`, `reopen`, `result`, `dep`,
+`undep`, `link`, `unlink`) take `--if-rev N`: when the task's revision is
+not `N` (`Rev:` in `task show`), nothing is changed, the command prints
+the changes since revision `N` and the task as it is now (with `--json`,
+the whole 409 answer), and fails with `stale`.
 
 | command | |
 |---|---|
-| `amail task new <title> [-m body] [--priority urgent\|high\|normal\|low] [--assignee seat] [--team t] [--parent tN] [--label l]... [--due time] [--from <message id>]` | create a task; with `--from` the message's subject is the default title and its thread is linked. `--due` takes RFC 3339, `2026-10-30T12:00` or `2026-10-30` (UTC) |
-| `amail task show tN` | the fields one per line, the description behind `  > `, blockers, blocked tasks, children, linked threads and the last 20 events |
-| `amail task history tN [--all]` | the last 50 events (`--all`: every event kept), one per line: time, actor, change |
-| `amail task list [--state s,s\|all] [--assignee seat\|none] [--reporter seat] [--team t] [--priority p] [--label l] [--parent tN] [--due-before time] [--stale] [--text text] [--limit n] [--before n]` | tasks of the org, newest first; unfinished ones unless `--state`. Continue with `--before` (printed under the list) |
+| `amail task new <title> [-m body] [--priority urgent\|high\|normal\|low] [--assignee seat] [--team t] [--parent tN] [--label l]... [--due time] [--from <message id>] [--new]` | create a task; with `--from` the message's subject is the default title and its thread is linked. `--due` takes RFC 3339, `2026-10-30T12:00` or `2026-10-30` (UTC). The command sends a `client_key` derived from you, the title, the description, the assignee and the parent: the same command again within 24 hours prints the task it created and creates nothing. `--new` sends no key and creates another task |
+| `amail task show <tN \| import id>` | the fields one per line (with `Rev:`, `Result: ok, ref abc123, by w2 at …`, `Children: 3/5 done`, `Imported as: ISSUE-42`), the description behind `  > `, blockers (those that need an ok result marked `(ok needed)`), blocked tasks, children, linked threads and the last 20 events. An argument that is not a task number is the id of an imported task |
+| `amail task history tN [--all]` | the last 50 events (`--all`: every event, read page by page), one per line: time, actor, change |
+| `amail task list [--state s,s\|all] [--assignee seat\|none] [--reporter seat] [--team t] [--priority p] [--label l] [--parent tN] [--due-before time] [--stale] [--text text] [--result ok\|rejected\|none] [--limit n] [--before n]` | tasks of the org, newest first; unfinished ones unless `--state`. Continue with `--before` (printed under the list) |
 | `amail task mine` | your unfinished tasks, `ready` first |
 | `amail task next [--pool]` | your `ready` tasks; `--pool` adds the unassigned `ready` tasks of your team |
 | `amail task waiting` | whom you wait for: your `blocked` tasks with the seat they wait for, and each open blocker of your tasks with its assignee (`t12 … — waits for w3 (t9 doing)`) |
 | `amail task owed` | who waits for you: tasks `blocked` on you, and your tasks that are the last open blocker of another seat's task (`t9 … — w1 waits for it (t12 open)`) |
 | `amail task board [--team t]` | counts per state, the unfinished tasks of each column, the load per seat, stale and overdue tasks, and the tasks that wait on others (`t12 waits on t9, t11`) |
-| `amail task set tN [--title t] [--body b] [--state s] [--priority p] [--rank n] [--assignee seat\|none] [--team t\|none] [--parent tN\|none] [--label l... \| --no-labels] [--due time\|none]` | change fields; `--label` replaces the labels |
+| `amail task report [--team t]` | the lead's report, one section with its count each: assigned but not started (`open` with an assignee, by seat), in progress (`doing`, by seat), delivered and waiting for review (`review`, by the reporter, who reviews), rejected (`done` with `rejected`), approved but not taken further (`done` with `ok` while tasks that depend on it are still open, `— still open: t12`), parents partly done (unfinished tasks with unfinished children, with their progress), blocked (`blocked`, or `open` with unsatisfied dependencies, `— waits for w3`) |
+| `amail task set tN [--title t] [--body b] [--state s] [--priority p] [--rank n] [--assignee seat\|none] [--team t\|none] [--parent tN\|none] [--label l... \| --no-labels] [--due time\|none] [--force] [--if-rev N]` | change fields; `--label` replaces the labels; `--force` closes a parent whose children are not all closed |
 | `amail task assign tN <seat\|none>` / `take tN` | assign (or unassign); `take` assigns an unassigned task to you and fails with `taken` when someone has it |
 | `amail task steal tN` / `yield tN` / `keep tN` | ask the assignee of a task that is not started to hand it over to you; the assignee answers with `yield` (you get the task) or `keep`. A pending request shows as `· w2 asks to take over` in task lines and as `Takeover: asked for by w2 at <time>` in `show` |
 | `amail task block tN [--on seat] [-m reason]` / `unblock tN` | set `blocked`, waiting for a seat (it gets a reminder) or for a reason; `unblock` sets `open` again |
-| `amail task start` / `review` / `done` / `cancel` / `reopen tN` | set `doing`, `review`, `done`, `cancelled`, or `open` again |
-| `amail task dep tN --on tM` / `undep tN --on tM` | tN depends on tM (or no longer) |
+| `amail task start` / `review` / `done` / `cancel` / `reopen tN` | set `doing`, `review`, `done`, `cancelled`, or `open` again (reopening clears the result). `done` and `cancel` take `--force` (close a parent whose children are not all closed; without it the command fails with `children_open`, naming them) |
+| `amail task done tN --result ok\|rejected [--ref r] [-m note]` | close the task with a result: the version it is about (a commit, tag or URL, at most 200 characters) and a note (at most 2,000 characters) |
+| `amail task result tN ok\|rejected [--ref r] [-m note]` | set or replace the result of a task that is `done` (fails with `not_done` otherwise) |
+| `amail task result withdraw tN -m reason` | clear the result; the task stays `done` |
+| `amail task dep tN --on tM [--needs-ok \| --any-close]` / `undep tN --on tM` | tN depends on tM (or no longer). With `--needs-ok` only a `done` tM with result `ok` satisfies the dependency; repeating the command with `--needs-ok` or `--any-close` changes an existing dependency |
 | `amail task link tN <thread or message id>` / `unlink tN <thread id>` | link a thread to the task, or remove the link |
 | `amail task comment tN [-m text]` | mail in the task's discussion thread (`[tN] <title>`) to its assignee and reporter, `Cc` earlier commenters; the body comes from stdin without `-m`. Replies in that thread are comments too |
+| `amail task import <file> [--dry-run] [--map <out>]` | user token: create or update tasks from a JSON Lines file (format below). Prints one line per record, `ISSUE-42 -> t57 (created\|updated\|same)`, then the warnings (`warning: ISSUE-43: no seat "w9"; the task is left unassigned`). `--dry-run` checks the file and prints what would happen (`(new)` for tasks it would create) without changing anything; `--map` writes `id<TAB>tN` per record to a file |
+
+#### Import file
+
+One JSON object per line (blank lines and lines starting with `#` are
+skipped), one per task:
+
+```
+{"id": "ISSUE-42", "title": "…", "body": "…", "state": "doing",
+ "priority": "high", "assignee": "w3", "reporter": "lead",
+ "labels": ["a"], "due": "2026-11-01T00:00:00Z", "parent": "ISSUE-40",
+ "depends_on": [{"id": "ISSUE-41", "needs_ok": true}],
+ "result": {"value": "ok", "ref": "abc123", "note": "…", "by": "w2",
+            "at": "2026-10-20T10:00:00Z"},
+ "created_at": "…", "updated_at": "…",
+ "history": [{"at": "…", "by": "w3", "text": "…"}]}
+```
+
+- `id` (at most 200 characters, unique in the file) and `title` are
+  required; every other field is optional. A field the format does not
+  have is ignored with a warning.
+- `state` is a task state; `ready` is read as `open`. Times are RFC 3339.
+- `assignee` and `reporter` are seat names of the org. An unknown assignee
+  leaves the task unassigned, an unknown reporter makes the importing user
+  the reporter; both are warnings.
+- `parent` and `depends_on` name other records by `id`, in the file or
+  imported before. An unknown one, a cycle or a nesting too deep is a
+  warning and is left out.
+- `result` is kept only when the task is `done` (a warning otherwise); its
+  `by` is a name, which need not be a seat.
+- `history` entries become `imported` events with the given time, the
+  name in `by` as the actor (it need not be a seat) and the text as the
+  note. `created_at` becomes the task's creation time.
+- A record whose `id` was imported before updates its task: the fields the
+  record gives that differ are changed (with events, the importing user as
+  the actor), history entries the task does not have yet are added, and
+  missing parents and dependencies are set. Nothing is removed. Importing
+  the same file twice gives `same` for every record.
+- Nothing is mailed: no reminders and no discussion threads.
 
 ### Administration of an org (user token)
 
@@ -167,7 +218,8 @@ Each tool makes the same API calls as the matching command and answers
 the server's JSON (the same JSON as the command with `--json`) as
 structured content, with the command's text rendering as text content. An
 API error is a tool result with `isError: true` whose structured content
-is the server's `{"error": {"code", "message", "status"}}`; a missing or
+is the server's `{"error": {"code", "message", "status"}}` (for 409
+`stale`, the whole answer with `rev`, `task` and `since`); a missing or
 malformed argument gives the code `invalid_arguments`. A line that is not
 JSON is skipped without an answer; a request for an unknown method gets a
 JSON-RPC error.
@@ -184,19 +236,21 @@ JSON-RPC error.
 | `who` | `org?`, `text?` | `amail who [--search] [--org]` |
 | `status` | `id?` | without `id`: `GET /whoami`, the seat's record (state as the node reports it, focus) and the unread count (counted up to 100); with `id`: `amail status <id>` |
 | `focus` | `state` (`on`, `off`), `minutes?` | `amail focus on [--for]` / `off` |
-| `task_new` | `title`, `body?`, `priority?`, `assignee?`, `team?`, `parent?`, `labels[]?`, `due?`, `from_message?` | `POST /tasks` |
+| `task_new` | `title`, `body?`, `priority?`, `assignee?`, `team?`, `parent?`, `labels[]?`, `due?`, `from_message?`, `client_key?` (default: derived from the caller, title, body, assignee and parent, as `amail task new`) | `POST /tasks` |
 | `task_show` | `num` | `GET /tasks/{num}` |
-| `task_list` | `state?`, `assignee?`, `reporter?`, `team?`, `priority?`, `label?`, `parent?`, `due_before?`, `stale?`, `text?`, `before?`, `limit?` | `GET /tasks` |
+| `task_list` | `state?`, `assignee?`, `reporter?`, `team?`, `priority?`, `label?`, `parent?`, `due_before?`, `stale?`, `text?`, `result?`, `before?`, `limit?` | `GET /tasks` |
 | `task_mine` | `state?`, `limit?` | `GET /tasks/mine` |
 | `task_next` | `pool?` | `GET /tasks/next` |
 | `task_waiting`, `task_owed` | | `GET /tasks/waiting`, `/owed` |
 | `task_board` | `team?` | `GET /tasks/board` |
-| `task_set` | `num`, `title?`, `body?`, `state?`, `priority?`, `rank?`, `assignee?`, `team?`, `parent?`, `labels[]?`, `due?`, `waiting_on?`, `blocked_reason?` (`null` clears) | `PATCH /tasks/{num}` |
-| `task_take` | `num` | `POST /tasks/{num}/take` |
+| `task_report` | `team?` | `GET /tasks/report` |
+| `task_set` | `num`, `title?`, `body?`, `state?`, `priority?`, `rank?`, `assignee?`, `team?`, `parent?`, `labels[]?`, `due?`, `waiting_on?`, `blocked_reason?` (`null` clears), `result?` (`ok`, `rejected`, `null` withdraws), `result_ref?`, `result_note?`, `note?`, `force?`, `if_rev?` | `PATCH /tasks/{num}` |
+| `task_result` | `num`, `result` (`ok`, `rejected`, `withdraw`), `ref?`, `note?` (for `withdraw`, the reason), `if_rev?` | `PATCH /tasks/{num}` with the result fields |
+| `task_take` | `num`, `if_rev?` | `POST /tasks/{num}/take` |
 | `task_steal`, `task_yield`, `task_keep` | `num` | `POST /tasks/{num}/steal`, `/yield`, `/keep` (ask to take over a task assigned to another seat and not started; answer a pending request on your own task) |
-| `task_dep`, `task_undep` | `num`, `blocked_by` | `POST /tasks/{num}/deps`, `DELETE …/deps/{other}` |
-| `task_link` | `num`, `thread_id` or `message_id` | `POST /tasks/{num}/links` |
-| `task_unlink` | `num`, `thread_id` | `DELETE /tasks/{num}/links/{thread}` |
+| `task_dep`, `task_undep` | `num`, `blocked_by`, `needs_ok?` (`task_dep`), `if_rev?` | `POST /tasks/{num}/deps`, `DELETE …/deps/{other}` |
+| `task_link` | `num`, `thread_id` or `message_id`, `if_rev?` | `POST /tasks/{num}/links` |
+| `task_unlink` | `num`, `thread_id`, `if_rev?` | `DELETE /tasks/{num}/links/{thread}` |
 | `task_comment` | `num`, `body` | `POST /tasks/{num}/comments` |
 | `task_history` | `num`, `after_seq?`, `limit?` | `GET /tasks/{num}/events` |
 
@@ -311,37 +365,51 @@ caller's org only; a task number names a task of that org
 (`12` and `t12` are both accepted in paths). The actor recorded for a
 change is the token's seat (the user seat for a user token). Answers about
 one task are a `TaskDetail`: `{task, blockers, blocked, children, links,
-events, event_count, events_compacted}`, where `task` is
+events, event_count, existing?}`, where `task` is
 `{num, title, body, state, stored_state, priority, rank, reporter,
 assignee?, team?, parent?, labels, due?, waiting_on?, blocked_reason?,
-thread?, waits_on, steal_requested_by?, steal_requested_at?, created_at, updated_at, closed_at?}`, `blockers`,
-`blocked` and `children` are `{num, title, state, assignee?}`, `links` are
-`{thread_id, linked_by?, linked_at}` and `events` are the newest 20, oldest
-first. `state` is the shown state (`ready` for an `open` task whose
-blockers are all `done` or `cancelled`); `stored_state` is the stored one;
-`waits_on` lists the blockers that are not closed. Listings leave `body`
-out.
+thread?, waits_on, waits_on_ok, rev, progress?, result?, result_ref?,
+result_note?, result_by?, result_at?, import_key?, steal_requested_by?,
+steal_requested_at?, created_at, updated_at, closed_at?}`, `blockers`,
+`blocked` and `children` are `{num, title, state, assignee?, result?,
+needs_ok?}` (`needs_ok` in `blockers`: the dependency needs an ok result),
+`links` are `{thread_id, linked_by?, linked_at}` and `events` are the
+newest 20, oldest first. `state` is the shown state (`ready` for an `open`
+task whose dependencies are all satisfied); `stored_state` is the stored
+one; `waits_on` lists the blockers whose dependency is not satisfied, and
+`waits_on_ok` those of them whose dependency needs an ok result. `rev` is
+the sequence number of the newest event. `progress` is `{done, total}` for
+a task with children (`total` leaves out `cancelled` children). Listings
+leave `body` out.
+
+Every write to one task (`PATCH`, `take`, `deps`, `links`) takes
+`if_rev`, in the body (`PATCH`, `POST`) or the query (`DELETE …?if_rev=N`).
+When the task's `rev` differs, nothing changes and the answer is 409
+`{error: {code: "stale", message}, rev, task: TaskDetail, since: [events
+after if_rev]}`.
 
 | | |
 |---|---|
-| `POST /tasks` | create `{title, body?, priority?, assignee?, team?, parent?, labels?, due?, from_message?}` (201, `TaskDetail`). `from_message` (a message the caller can read) gives the default title (its subject) and links its thread. `team` defaults to the assignee's team, else the reporter's. The assignee gets a reminder |
+| `POST /tasks` | create `{title, body?, priority?, assignee?, team?, parent?, labels?, due?, from_message?, client_key?}` (201, `TaskDetail`). `from_message` (a message the caller can read) gives the default title (its subject) and links its thread. `team` defaults to the assignee's team, else the reporter's. The assignee gets a reminder. `client_key` (1 to 64 characters, 422 `invalid_client_key` otherwise): when a task of the org was created with the same key in the last 24 hours, nothing is created and the answer is 200 with that task and `"existing": true`. A `parent` chain longer than 8 is refused with 422 `parent_too_deep` |
 | `GET /tasks/{num}` | `TaskDetail` |
-| `PATCH /tasks/{num}` | change `{title?, body?, state?, priority?, rank?, assignee?, team?, parent?, labels?, due?, waiting_on?, blocked_reason?}`; `null` clears `assignee`, `team`, `parent`, `due`, `waiting_on`, `blocked_reason`; `labels` replaces the labels. Each changed field is one event (`changed`; `assigned` for the assignee). `state` is a stored state: `ready` is refused (400). `waiting_on` and `blocked_reason` only with `blocked` (422 `not_blocked`) and are cleared when the task leaves it. A `done` or `cancelled` task can only be reopened to `open` or `doing` (422 `invalid_transition`). Answers `TaskDetail` |
-| `POST /tasks/{num}/take` | assign the task to the caller if it has no assignee, atomically; 409 `taken` when someone has it, 422 `closed` for a closed task; nothing changes when the caller has it |
-| `POST /tasks/{num}/deps` | `{blocked_by: <num>}`: the task depends on that task. 422 `dependency_cycle` (including a task on itself), `dependency_too_deep` (the cycle check follows at most 32 tasks), `too_many_blockers` (50 per task), `too_many_blocked` (200 per task) |
+| `PATCH /tasks/{num}` | change `{title?, body?, state?, priority?, rank?, assignee?, team?, parent?, labels?, due?, waiting_on?, blocked_reason?, result?, result_ref?, result_note?, note?, force?, if_rev?}`; `null` clears `assignee`, `team`, `parent`, `due`, `waiting_on`, `blocked_reason`; `labels` replaces the labels. Each changed field is one event (`changed`; `assigned` for the assignee); a change of `body` records the whole old and new text. `state` is a stored state: `ready` is refused (400). `waiting_on` and `blocked_reason` only with `blocked` (422 `not_blocked`) and are cleared when the task leaves it. A `done` or `cancelled` task can only be reopened to `open` or `doing` (422 `invalid_transition`); reopening clears the result. Closing a task with children that are `open`, `doing`, `blocked` or `review` is refused with 409 `children_open` naming them, unless `force: true` (the state event's note names them). `result` (`ok` or `rejected`) only when the task is `done` after the change (422 `not_done`), with `result_ref` (at most 200 characters, one line: 422 `ref_too_long`, `invalid_ref`) and `result_note` (at most 2,000 characters: 422 `note_too_long`); it replaces the previous result and records `result_by` and `result_at`. `result_ref` or `result_note` without `result` is 400. `result: null` withdraws the result (event `result_withdrawn`, `from` the old result and ref, `note` the reason given in `note`). Answers `TaskDetail` |
+| `POST /tasks/{num}/take` | optional body `{if_rev}`: assign the task to the caller if it has no assignee, atomically; 409 `taken` when someone has it, 422 `closed` for a closed task; nothing changes when the caller has it |
+| `POST /tasks/{num}/deps` | `{blocked_by: <num>, needs_ok?, if_rev?}`: the task depends on that task; with `needs_ok: true` only a `done` blocker with result `ok` satisfies it. For an existing dependency, `needs_ok` changes it (event `changed`, field `needs_ok`; an `unblocked` event and reminder when this satisfies the last dependency); without it nothing changes. 422 `dependency_cycle` (including a task on itself), `dependency_too_deep` (the cycle check follows at most 32 tasks), `too_many_blockers` (50 per task), `too_many_blocked` (200 per task) |
 | `POST /tasks/{num}/steal` | ask to take over a task assigned to another seat that is not started (stored `open`): the task gets `steal_requested_by` and `steal_requested_at`, and the assignee system mail in `To` (`w2 asks to take over t12: <title>`) naming `amail task yield t12` and `amail task keep t12`. One pending request per task: 409 `steal_pending` for another seat (asking again changes nothing); 422 `not_assigned` (use `take`), `own_task`, `started` (any other state, closed included). A request not answered within 24 hours expires (`steal_expired`; the requester is told) |
 | `POST /tasks/{num}/yield` | the assignee or the org's user (403 `not_assignee` for anyone else; 404 without a pending request): the task is assigned to the requester (`assigned` event noted `yielded to <seat> on request`), who gets the `assigned` reminder |
 | `POST /tasks/{num}/keep` | the same callers: the request is cleared (`steal_declined`) and the requester is told. Changing the assignee or the state of a task (also by `PATCH`) ends a pending request the same way, with a note |
-| `DELETE /tasks/{num}/deps/{other}` | remove the dependency (404 when there is none); when it was the last open blocker, the task gets an `unblocked` event and its assignee (else its reporter) a reminder |
-| `POST /tasks/{num}/links` | `{thread_id}` or `{message_id}`: link a thread (user tokens: any thread of the org's mail; seat tokens: threads the seat is in; 404 otherwise). Linking a linked thread again changes nothing. 422 `too_many_links` (50) |
-| `DELETE /tasks/{num}/links/{thread}` | unlink (404 when not linked) |
+| `DELETE /tasks/{num}/deps/{other}` | `if_rev` in the query: remove the dependency (404 when there is none); when it was the last unsatisfied one, the task gets an `unblocked` event and its assignee (else its reporter) a reminder |
+| `POST /tasks/{num}/links` | `{thread_id}` or `{message_id}`, and `if_rev?`: link a thread (user tokens: any thread of the org's mail; seat tokens: threads the seat is in; 404 otherwise). Linking a linked thread again changes nothing. 422 `too_many_links` (50) |
+| `DELETE /tasks/{num}/links/{thread}` | `if_rev` in the query: unlink (404 when not linked) |
 | `POST /tasks/{num}/comments` | `{body}`: send a comment as the caller's seat in the task's discussion thread (the first comment starts it), subject `[t12] <title>`, `To` the assignee and the reporter, `Cc` the seats that commented before (the sender left out; with nobody else, to the sender). Any seat of the org may comment. Mail limits and budgets apply as for `POST /messages`. Answers `{id, thread_id, task}` |
-| `GET /tasks/{num}/events` | `after_seq`, `limit` (≤ 1,000, default 200): events oldest first `{events, next_after_seq?, events_compacted}`. Event: `{seq, at, actor?, written_by?, kind, field?, from?, to?, note?, message_id?}`; kinds `created`, `changed`, `assigned`, `linked`, `unlinked`, `dependency_added`, `dependency_removed`, `commented`, `reminder_sent`, `unblocked`, `steal_requested`, `steal_declined`, `steal_expired` |
-| `GET /tasks` | filters `state` (comma-separated shown states, or `all`; default every state but `done` and `cancelled`), `assignee` (a seat, or `none`), `reporter`, `team` (tasks with that team, or whose assignee or reporter is in it), `priority`, `label`, `parent`, `due_before`, `stale=1` (`doing` or `review` and not changed for the org's stale period), `text` (substring of title or body; at most 200 characters), `before`, `limit` (≤ 500, default 50). Newest first: `{tasks, next_before?}`; continue with `before=next_before`. With `text`, a request looks at the 5,000 newest tasks below `before` and takes one of the org's query slots (other pool), so a page can be short and still have `next_before` |
+| `GET /tasks/{num}/events` | `after_seq`, `limit` (≤ 1,000, default 200): events oldest first `{events, next_after_seq?, events_compacted}`; every event is kept, so reading pages with `after_seq=next_after_seq` until it is absent gives the whole history (`events_compacted` counts events that earlier builds deleted; 0 otherwise). Event: `{seq, at, actor?, written_by?, kind, field?, from?, to?, note?, message_id?}`; kinds `created`, `changed`, `assigned`, `linked`, `unlinked`, `dependency_added`, `dependency_removed`, `commented`, `reminder_sent`, `unblocked`, `steal_requested`, `steal_declined`, `steal_expired`, `result_withdrawn`, `imported` (`actor` is the name the import file gives). Reminder kinds (`field` of `reminder_sent`) include `children_done` and `blocker_rejected` |
+| `GET /tasks` | filters `state` (comma-separated shown states, or `all`; default every state but `done` and `cancelled`), `assignee` (a seat, or `none`), `reporter`, `team` (tasks with that team, or whose assignee or reporter is in it), `priority`, `label`, `parent`, `due_before`, `stale=1` (`doing` or `review` and not changed for the org's stale period), `text` (substring of title or body; at most 200 characters), `result` (`ok`, `rejected` or `none`), `import_key` (the task imported from the record with that id, in any state), `before`, `limit` (≤ 500, default 50). Newest first: `{tasks, next_before?}`; continue with `before=next_before`. With `text`, a request looks at the 5,000 newest tasks below `before` and takes one of the org's query slots (other pool), so a page can be short and still have `next_before` |
 | `GET /tasks/mine` | the caller's unfinished tasks: `ready` first, then `doing`, `review`, `blocked`, `open`; within each by priority, rank and number. `state`, `limit` (≤ 500) as for the list. `{tasks, truncated}`. Node tokens pass `seat=` (an agent seat of the org) |
 | `GET /tasks/next` | the caller's `ready` tasks by priority, rank and number; `pool=1` adds the unassigned `ready` tasks of the caller's team |
 | `GET /tasks/waiting` | `{items: [{task, seat?, blocker?}], truncated}`: the caller's tasks `blocked` with `waiting_on` (seat: that seat), and each unfinished blocker of the caller's unfinished tasks (seat: the blocker's assignee, else its reporter) |
 | `GET /tasks/owed` | `{items: [{task, seat?, blocks?}], truncated}`: tasks `blocked` with `waiting_on` the caller (seat: their assignee, else reporter), and the caller's unfinished tasks (assigned, or unassigned and reported by the caller) that are the last open blocker of another seat's task (`blocks`) |
+| `GET /tasks/report` | `team=` optional: `{team?, sections: [{name, count, items: [{task, seat?, waiting_for?, dependents?}]}]}`, the sections `not_started`, `in_progress`, `review`, `rejected`, `approved`, `parents`, `blocked` described under `amail task report` (the first 500 tasks of each; `count` is complete). `seat` is the assignee (in `review`, the reporter), `waiting_for` the seats a blocked task waits for, `dependents` the open tasks that depend on an approved one. Takes one of the org's query slots (other pool) |
+| `POST /tasks/import` | user tokens (403 otherwise): `{records: [<record>...], dry_run?}`, at most 5,000 records and 64 MiB (the [import file](#import-file) format, one object per record). One transaction, two passes (tasks, then parents and dependencies). Answers `{results: [{id, num?, action}], warnings, dry_run?}`, `action` `created`, `updated` or `same`; with `dry_run` nothing is kept and `num` is absent for tasks that would be created. 422 `invalid_import` (`record 3: …`) for a record without `id` or `title`, an `id` used twice, or a field over its limit; 422 `too_many_records`; the task bounds and the storage quota apply |
 | `GET /tasks/board` | `team=` optional: `{team?, columns: [{state, count, tasks}], load: [{seat, doing, ready, blocked, waiting, review}], stale, overdue, chains: [{num, waits_on}]}`: one column per shown state (the first 100 tasks each), the load per assignee, stale and overdue tasks, and unfinished tasks waiting on unfinished blockers (200). Takes one of the org's query slots (other pool) |
 
 Changes publish `task` events on `GET /events` (see below). Task calls
