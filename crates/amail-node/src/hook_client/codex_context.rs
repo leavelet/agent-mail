@@ -716,6 +716,33 @@ mod tests {
                     },
                 )
                 .expect("the test image stayed busy");
+            // Right after the spawn returns, the kernel may not yet show
+            // the new image in `/proc/<pid>/exe` (seen on a CI runner under
+            // a parallel test run); wait until it does, so the tests below
+            // look at the settled process.
+            let want = File::open(&retained).unwrap();
+            let mut last = None;
+            for _ in 0..100 {
+                let p = process(child.id()).unwrap();
+                if same_executable(&p.executable_image, &want).unwrap() {
+                    last = None;
+                    break;
+                }
+                let m = p.executable_image.metadata().unwrap();
+                last = Some(format!(
+                    "exe {} (dev {} ino {}), image {} (dev {} ino {})",
+                    p.executable.display(),
+                    m.dev(),
+                    m.ino(),
+                    retained.display(),
+                    want.metadata().unwrap().dev(),
+                    want.metadata().unwrap().ino()
+                ));
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            if let Some(l) = last {
+                panic!("the test image never showed as the child's executable: {l}");
+            }
             Self {
                 child,
                 _dir: dir,
