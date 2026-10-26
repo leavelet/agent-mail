@@ -2335,6 +2335,8 @@ harness = "codex"
     assert!(l[0].contains(&format!("--resume {cid}")), "{l:?}");
     let ran_in = std::fs::read_to_string(h.fake.join("c.cwd")).unwrap();
     assert!(Path::new(ran_in.trim()).ends_with("started/c"), "{ran_in}");
+    // (x may still be about to start: `idle` is also the state before.)
+    wait_for("x started", || h.fake.join("x.cwd").exists()).await;
     let ran_in = std::fs::read_to_string(h.fake.join("x.cwd")).unwrap();
     assert!(Path::new(ran_in.trim()).ends_with("work/x"), "{ran_in}");
     assert!(!l[0].contains("--session-id"), "{l:?}");
