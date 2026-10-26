@@ -89,7 +89,6 @@ fn exchange(
         .filter_map(|k| std::env::var(k).ok().map(|v| (k.to_string(), v)))
         .collect();
     let socket = crate::paths::socket();
-    let parent = std::os::unix::process::parent_id();
     // Read stdin on a helper thread so a harness that never closes it cannot
     // hold us past the deadline. Context validation and private-file I/O share
     // that same deadline; no process environment is mutated.
@@ -103,8 +102,7 @@ fn exchange(
                 .read_to_end(&mut buf)
                 .map_err(|e| format!("reading stdin: {e}"))?;
             let socket = if let Some(context) = context {
-                codex_context::restore(&context, &mut env, parent)?;
-                context.socket
+                codex_context::restore(&context, &mut env)?
             } else {
                 socket
             };

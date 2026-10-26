@@ -74,18 +74,22 @@ fn codex(name: &str) -> Value {
     fixture("codex", name)
 }
 
-/// The real CLI must not ignore the locator or fall back to inherited
-/// credentials when its caller is not the original Codex backend.
+/// The real CLI with the node context: a pass in the environment is used as
+/// it is; without one, the pass comes from the node's state file, but only
+/// for a hook that runs in that node's Codex home.
 #[test]
-fn hook_context_rejects_nonbackend_before_contacting_node() {
+fn hook_context_supplies_the_pass_only_in_the_nodes_codex_home() {
+    use std::io::{BufRead, BufReader};
     use std::os::unix::fs::PermissionsExt;
     use std::process::{Command, Stdio};
 
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
     let home = state.join("codex-home");
+    let other_home = dir.path().join("other-home");
     let run = dir.path().join("run");
     std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&other_home).unwrap();
     std::fs::create_dir(&run).unwrap();
     std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
     let saved = state.join("node-state.json");
@@ -94,26 +98,53 @@ fn hook_context_rejects_nonbackend_before_contacting_node() {
     let socket = run.join("node.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
-
-    let out = Command::new(BIN)
-        .args(["hook", "codex", "--node-state-dir"])
-        .arg(&state)
-        .arg("--node-socket")
-        .arg(&socket)
-        .env("CODEX_HOME", &home)
-        .env("AMAIL_NODE_SOCK", &socket)
-        .env("AMAIL_CODEX_PASS", "inherited-fixture-pass")
-        .env("AMAIL_HOOK_DEBUG", "1")
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
-    assert!(out.status.success());
-    assert!(out.stdout.is_empty());
-    assert!(!String::from_utf8_lossy(&out.stderr).contains("fixture-pass"));
-    assert_eq!(
-        listener.accept().unwrap_err().kind(),
-        std::io::ErrorKind::WouldBlock
-    );
+    // The request the hook sent to the node, if any (the hook gives up on
+    // the answer after its timeout and exits quietly).
+    let request = |home: &std::path::Path, pass: Option<&str>| {
+        let mut c = Command::new(BIN);
+        c.args(["hook", "codex", "--node-state-dir"])
+            .arg(&state)
+            .arg("--node-socket")
+            .arg(&socket)
+            .env("CODEX_HOME", home)
+            .env("AMAIL_HOOK_TIMEOUT_MS", "400")
+            .env_remove("AMAIL_CODEX_PASS")
+            .env_remove("AMAIL_NODE_SOCK")
+            .stdin(Stdio::null());
+        if let Some(p) = pass {
+            c.env("AMAIL_CODEX_PASS", p);
+        }
+        let out = c.output().unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert!(out.stdout.is_empty(), "{out:?}");
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("fixture-pass"));
+        // Without the pass the hook first connects once to read the socket's
+        // peer (no data), then sends its request.
+        let mut sent = None;
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let mut line = String::new();
+                    BufReader::new(stream).read_line(&mut line).unwrap();
+                    if !line.is_empty() {
+                        sent = Some(line);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break sent,
+                Err(e) => panic!("{e}"),
+            }
+        }
+    };
+    // A pass in the environment is forwarded as it is.
+    let r = request(&home, Some("inherited-fixture-pass")).expect("the node was asked");
+    assert!(r.contains("inherited-fixture-pass"), "{r}");
+    assert!(!r.contains("private-fixture-pass"), "{r}");
+    // Without one, a hook of another Codex home gets nothing and the node
+    // is not contacted.
+    assert!(request(&other_home, None).is_none());
+    // A hook of this node's Codex home gets the pass from the state file.
+    let r = request(&home, None).expect("the node was asked");
+    assert!(r.contains("private-fixture-pass"), "{r}");
 }
 
 /// Every row of the Claude Code state table, plus presence reporting.

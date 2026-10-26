@@ -121,9 +121,13 @@ act as that seat. Codex sets per-thread environment
 variables only when a thread is started, and the TUI starts the thread, so
 the pass is the same for all Codex seats of a node: Codex seats of one node
 are not separated from each other (any process of the user can also use the
-daemon's control socket to act in any thread). Codex seats started before
-an upgrade that added the pass get no mail until the daemon restarts
-(`amail down`, then `amail up`). Only launch flags that
+daemon's control socket to act in any thread). A daemon that was started
+without the node's environment (before the node, or by a person's own
+session in the same home) still serves the hooks: the hook command names the
+node's state directory and socket (`--node-state-dir`, `--node-socket`), and
+a hook without the pass in its environment reads it from the node's state
+file, after checking that it runs in that node's Codex home and that the
+file and the socket's peer belong to this user. Only launch flags that
 keep the session on the shared daemon are allowed (`-m`, `-a`, `-s`, `-C`,
 ...; not `-c`, `-p`, `--remote`).
 

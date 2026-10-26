@@ -231,8 +231,10 @@ The first public version.
   (`amail hook codex --node-state-dir … --node-socket …`). A hook started by
   a Codex daemon that does not have the node's environment (one started
   before the node, or by a person's own session in the same `CODEX_HOME`)
-  finds the node through them, after checking that its parent is that
-  home's app-server and that the socket's peer is this node binary. A
+  finds the node through them: it takes the pass from the node's state
+  file and the socket from the command, after checking that it runs in that
+  node's Codex home and that the state file and the socket's peer belong to
+  this user. A daemon whose environment has the pass uses it as before. A
   failed check of the managed hooks' trust is now a launch error with its
   reason, instead of a warning.
 - Codex seats whose turn history cannot be read (the app-server's thread
