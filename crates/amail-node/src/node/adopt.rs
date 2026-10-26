@@ -302,20 +302,37 @@ impl Node {
 
     /// `CheckSessions`: claims of seats whose session is new to the node.
     pub(super) async fn sup_check_sessions(&self, claims: Vec<SessionClaim>) -> Value {
+        // A seat that adopted the session already is not checked again; it
+        // answers with the directory it runs in, so that `amail up` keeps
+        // a seat without `cwd` there.
+        let mut known = Vec::new();
         let claims: Vec<SessionClaim> = {
             let st = self.lock();
             claims
                 .into_iter()
                 .filter(|c| {
-                    st.saved
+                    let m = st
+                        .saved
                         .managed
                         .get(&c.seat)
-                        .is_none_or(|m| m.adopted.as_deref() != Some(c.session.as_str()))
+                        .filter(|m| m.adopted.as_deref() == Some(c.session.as_str()));
+                    if let Some(m) = m {
+                        known.push(json!({
+                            "seat": c.seat,
+                            "session": c.session,
+                            "cwd": m.cwd,
+                            "warning": Value::Null,
+                        }));
+                    }
+                    m.is_none()
                 })
                 .collect()
         };
         match self.check_claims(&claims).await {
-            Ok(found) => json!({"sessions": found_json(&found)}),
+            Ok(found) => {
+                known.extend(found_json(&found));
+                json!({"sessions": known})
+            }
             Err(errors) => json!({"error": errors.join("\n")}),
         }
     }

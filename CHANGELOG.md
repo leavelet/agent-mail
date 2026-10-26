@@ -176,7 +176,8 @@ The first public version.
   dsh session. The node checks that the session exists on this host (the
   Claude Code transcript, the Codex rollout file in the node's Codex home,
   the dsh session directory) and that no other seat has it; `amail up`
-  checks before it changes anything. The adopted session gets the seat
+  checks before it changes anything. A seat without `cwd` runs in the
+  directory the session was started in. The adopted session gets the seat
   intro on its first start (Claude Code: in the system prompt; Codex and
   dsh: in a first prompt). A failed resume falls back to a new session and
   shows `adopt-failed` in `amail ps`.

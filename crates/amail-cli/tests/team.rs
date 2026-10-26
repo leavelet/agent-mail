@@ -2235,7 +2235,11 @@ async fn adopt_existing_sessions(b: Backend) {
         "3f1c2b4a-0d5e-4f6a-9b7c-8d9e0f1a2b3c",
         "019a0b1c-2d3e-7f40-8a5b-6c7d8e9f0a1b",
     );
-    claude_session(&h, cid, &work.join("c"));
+    // c's session was started outside the workroot: c runs there (no
+    // `cwd` in the file); x's was started in its default directory.
+    let started = h.dir.path().join("started").join("c");
+    std::fs::create_dir_all(&started).unwrap();
+    claude_session(&h, cid, &started);
     codex_session(&h, xid, &work.join("x"));
     let file = |c: &str, x: &str| {
         format!(
@@ -2316,12 +2320,23 @@ harness = "codex"
         "{out}"
     );
     assert!(!out.contains("warning"), "{out}");
+    assert!(
+        out.contains(&format!(
+            "seat c: runs in {}, where session {cid} was started",
+            started.display()
+        )),
+        "{out}"
+    );
     wait_state(&h, "c", "idle").await;
     wait_state(&h, "x", "idle").await;
     wait_state(&h, "y", "idle").await;
     let l = launches(&h, "c");
     assert_eq!(l.len(), 1, "{l:?}");
     assert!(l[0].contains(&format!("--resume {cid}")), "{l:?}");
+    let ran_in = std::fs::read_to_string(h.fake.join("c.cwd")).unwrap();
+    assert!(Path::new(ran_in.trim()).ends_with("started/c"), "{ran_in}");
+    let ran_in = std::fs::read_to_string(h.fake.join("x.cwd")).unwrap();
+    assert!(Path::new(ran_in.trim()).ends_with("work/x"), "{ran_in}");
     assert!(!l[0].contains("--session-id"), "{l:?}");
     assert!(l[0].contains("--append-system-prompt"), "{l:?}");
     assert!(l[0].contains("You are seat `c` in org"), "{l:?}");
@@ -2340,9 +2355,14 @@ harness = "codex"
     // The adopted thread's hooks are the seat's (it has no marker).
     let r = row(&h, "x").await;
     assert_eq!(r.attention, None, "{r:?}");
-    // Again: nothing to adopt, nothing restarted.
+    // Again: nothing to adopt, nothing restarted; c stays where it runs.
     let out = up(&h, &[]).await;
     assert!(!out.contains("adopts session"), "{out}");
+    assert!(
+        out.contains(&format!("seat c: runs in {}", started.display())),
+        "{out}"
+    );
+    assert_eq!(launches(&h, "c").len(), 1);
     // The intro is given once: the next start of x just resumes. (Only
     // after the adopted session's first turn sent its hooks: a session
     // stopped before any hook would be told again at its next start.)

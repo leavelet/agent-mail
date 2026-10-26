@@ -232,18 +232,26 @@ after it (`projects/<project directory>/<id>.jsonl` in its config
 directory); Codex names the rollout file after it
 (`sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl` in its home).
 
+A seat with `session` and no `cwd` runs in the directory the session was
+started in (Claude Code and Codex record it in the transcript or rollout
+file), when that directory still exists; `amail up` says so. With `cwd`
+set, or when the directory is gone, the seat runs where the file says, and
+for a Claude Code session in another directory `amail up` warns (see
+below). `amail run <seat> --session <id>` runs in the current directory.
+Worktree templates fix every seat's directory.
+
 Before it accepts an id, the node checks:
 
 - The session belongs to the seat's harness and exists on this host:
   - Claude Code: a transcript `<id>.jsonl` under `projects/` of the
     node's Claude config directory (`$CLAUDE_CONFIG_DIR` of the node, else
     `~/.claude`), in any project directory. The node reports the directory
-    the session was started in and warns when it is not the seat's working
-    directory: Claude Code keeps sessions per project directory and
-    resumes a session from the directory it was started in, so `claude
-    --resume` from another directory can fail (not tried with a real
-    Claude Code; if it fails, the seat falls back as described below). Set
-    the seat's `cwd` to that directory to avoid this.
+    the session was started in and warns when the seat runs elsewhere:
+    Claude Code keeps sessions per project directory and resumes a session
+    from the directory it was started in, so `claude --resume` from another
+    directory can fail (not tried with a real Claude Code; if it fails,
+    the seat falls back as described below). Leave the seat's `cwd` out,
+    or set it to that directory.
   - Codex: a rollout file under `sessions/` of the node's Codex home
     (`<node state dir>/codex-home`) whose first line is the `session_meta`
     of that id, or, when the node's Codex app-server runs, an answer to

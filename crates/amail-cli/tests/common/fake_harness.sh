@@ -5,6 +5,7 @@
 #
 # Files in $D (the directory of this script):
 #   <seat>.launches  one line per start: "<unix ms> <pid> <args...>"
+#   <seat>.cwd       the directory of the last start
 #   <seat>.mode      optional behaviour: trust | exit3 | launchererror | badresume | slow | noturn |
 #                    deaf (ignores native wake-ups; its screen shows an empty
 #                    input box) | deafdialog (the same, with a dialog open)
@@ -54,6 +55,7 @@ fi
 AMAIL=${FAKE_AMAIL:?}
 seat=${AMAIL_SEAT:?}
 printf '%s %s %s\n' "$(now)" "$$" "$(printf '%s' "$*" | tr '\n' ' ')" >> "$D/$seat.launches"
+pwd > "$D/$seat.cwd"
 mode=$(cat "$D/$seat.mode" 2>/dev/null)
 
 # Arguments: the session to resume or the id to use, and the last word.

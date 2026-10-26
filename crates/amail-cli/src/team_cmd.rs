@@ -363,7 +363,7 @@ fn team_put(cur: Option<&p::Team>, want: &team::TeamPlan) -> (Value, Vec<&'stati
 
 pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
     // 1. Everything that can fail without changing anything.
-    let t = team::load(&o.file).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut t = team::load(&o.file).map_err(|e| anyhow::anyhow!("{e}"))?;
     let selected = t.select(&o.only).map_err(|e| anyhow::anyhow!("{e}"))?;
     let (rows, session) = ps_answer()?;
     let me: p::WhoAmI = c.get("/whoami").await?;
@@ -401,9 +401,45 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
             })
         })
         .collect();
+    let mut session_dirs: Vec<String> = Vec::new();
     if !claims.is_empty() {
-        node(&Request::CheckSessions { claims }, Duration::from_secs(30))
+        let found = node(&Request::CheckSessions { claims }, Duration::from_secs(30))
             .context("a session in the team file cannot be adopted; nothing was changed")?;
+        // A seat without `cwd` runs where its session was started (the
+        // harness records that directory), as long as it still exists.
+        // Worktree templates fix every seat's directory already.
+        if !t.uses_worktrees() {
+            for f in found["sessions"].as_array().into_iter().flatten() {
+                let (Some(seat), Some(id), Some(dir)) =
+                    (f["seat"].as_str(), f["session"].as_str(), f["cwd"].as_str())
+                else {
+                    continue;
+                };
+                let explicit = t.seat(seat).is_none_or(|s| s.cwd.is_some());
+                let dir = PathBuf::from(dir);
+                let default = t.workdir(seat);
+                if explicit || dir == default {
+                    continue;
+                }
+                if dir.is_dir() {
+                    session_dirs.push(format!(
+                        "seat {seat}: runs in {}, where session {id} was started (no cwd in \
+                         the team file)",
+                        dir.display()
+                    ));
+                    if let Some(s) = t.seats.iter_mut().find(|s| s.name == seat) {
+                        s.cwd = Some(dir);
+                    }
+                } else {
+                    session_dirs.push(format!(
+                        "seat {seat}: session {id} was started in {}, which does not exist; \
+                         the seat runs in {}",
+                        dir.display(),
+                        default.display()
+                    ));
+                }
+            }
+        }
     }
     let main = match (&t.repo, t.uses_worktrees()) {
         (Some(repo), true) => {
@@ -444,7 +480,7 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
             bail!("the generated list {name:?} would clash with an existing seat of that name");
         }
     }
-    let mut report: Vec<String> = Vec::new();
+    let mut report: Vec<String> = session_dirs;
     // Whether anything changed on the server.
     let mut changed_any = false;
     let info: p::OrgInfo = c.get("/org").await?;
