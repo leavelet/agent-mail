@@ -76,7 +76,7 @@
       case 'unblocked':
         return t('task.ev.unblocked');
       case 'steal_requested':
-        return t('task.ev.stealRequested', { seat: value(e.to), from: value(e.from) });
+        return t('task.ev.stealRequested', { from: value(e.from) });
       case 'steal_declined':
         return t('task.ev.stealDeclined', { seat: value(e.to), from: value(e.from) });
       case 'steal_expired':

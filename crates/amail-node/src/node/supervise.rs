@@ -153,6 +153,20 @@ pub(super) fn classify_screen(screen: &str, seat: &str, cwd: &str) -> Option<(St
             ),
         ));
     }
+    if has("incompatible feature settings")
+        || (has("background server") && has("restart with these settings"))
+    {
+        return Some((
+            "codex-daemon".into(),
+            format!(
+                "Codex refuses to attach the session to its background app-server (another \
+                 version or other feature settings): choose Cancel in the pane (amail attach \
+                 {seat}), then run amail down and amail up; the node then starts the daemon of \
+                 the codex command's version again. Do not choose \"Restart with these \
+                 settings\": it restarts the shared daemon from this session"
+            ),
+        ));
+    }
     if has("/login")
         || has("not logged in")
         || has("invalid api key")
@@ -1618,6 +1632,13 @@ mod tests {
         assert_eq!(
             classify_screen(login, "a", "/w").map(|x| x.0),
             Some("login".into())
+        );
+        let daemon = "  Background server has incompatible feature settings\n  This session \
+                      requires api_key_model_discovery to be disabled\n  1. Run without daemon \
+                      this time\n  2. Restart with these settings\n› 3. Cancel";
+        assert_eq!(
+            classify_screen(daemon, "a", "/w").map(|x| x.0),
+            Some("codex-daemon".into())
         );
         assert_eq!(classify_screen("> ready", "a", "/w"), None);
         let id = uuid_v4();

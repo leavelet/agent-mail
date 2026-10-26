@@ -160,6 +160,16 @@ The first public version.
   `[mcp_servers.amail]` in the node's Codex home, the seat found from the
   thread id of each call). The command line stays the documented
   interface.
+- The node keeps Codex's app-server daemon at the `codex` command's
+  version: it turns the daemon package's self-update off
+  (`app-server-daemon/settings.json`) and removes a package of another
+  version before it starts the daemon. A session that Codex refuses to
+  attach to its daemon ("Background server has incompatible feature
+  settings") is reported by `amail ps` as `codex-daemon`.
+- A Codex session's environment carries no seat token. Tool commands and
+  the MCP server get the seat's credentials from the node by thread id; a
+  daemon that a session starts or restarts no longer hands its seat's token
+  to every thread.
 - Seats can continue existing conversations: `session = "<id>"` on a seat
   in the team file, `amail run <seat> --session <id>` and `amail seat adopt
   <seat> <id> [--restart]` make the seat resume that Claude Code, Codex or
@@ -327,7 +337,8 @@ Changes made after a security review, before the first public server.
   at most 20 browser sessions. Revoked tokens are deleted.
 - The node gives a seat's credentials and mail only to that seat's own
   session, identified by the calling process and its parents (Claude Code)
-  or by a value only the node's Codex sessions receive (Codex). Requests
+  or by a value only the node's Codex sessions receive (Codex; checked
+  under both local policies, so a thread id alone gets nothing). Requests
   meant for the person (`amail run`, `up`, `down`, `ps`, `attach`, `sleep`,
   `wake`, `node status`) are refused to agent sessions. The remaining
   limits, when agents run as the same operating-system user as the person,

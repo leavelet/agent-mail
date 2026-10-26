@@ -94,13 +94,30 @@ node starts. Its `auth.json` is a link to `~/.codex/auth.json` (or
 hooks are defined and pre-trusted in that home's `config.toml`, which also
 holds the mail instructions.
 
+Codex runs the daemon from a package it installs under that home
+(`packages/app-server-daemon`), and by default updates the package on its
+own. A session does not attach to a daemon of another version than its
+`codex` command: the TUI stops at "Background server has incompatible
+feature settings" and offers to restart the daemon from the session (the
+restarted daemon then has that session's environment). The node therefore
+turns the self-update off in the daemon's `settings.json`
+(`updater.autoUpdateEnabled = false`) and, before it starts the daemon,
+removes a package whose version is not the command's, so that the start
+installs the command's version again. When a seat still shows that prompt
+(the daemon was updated while it ran, or the `codex` command was upgraded),
+`amail ps` reports `codex-daemon`: choose Cancel in the pane, then run
+`amail down` and `amail up`.
+
 **Seat identity.** Hooks run inside the shared daemon, not in the session's
 terminal, so they do not see the session's environment. A session is tied to
 its seat by a one-time marker in its first prompt
 (`[amail:seat=<seat> launch=<nonce>]`), and tool commands find their seat's
 credentials through the node by `CODEX_THREAD_ID`. The node answers both
 only when they carry the node's Codex pass (`AMAIL_CODEX_PASS`), which it
-puts in the shared daemon's environment. Codex sets per-thread environment
+puts in the shared daemon's environment. The session's own environment
+holds no seat token (`AMAIL_TOKEN`), because a daemon the session starts
+or restarts inherits that environment, and every thread on it would then
+act as that seat. Codex sets per-thread environment
 variables only when a thread is started, and the TUI starts the thread, so
 the pass is the same for all Codex seats of a node: Codex seats of one node
 are not separated from each other (any process of the user can also use the
@@ -117,10 +134,11 @@ starts the server for each thread and passes it only the variables Codex
 passes to every MCP server, the configured `env` and the `env_vars` it
 names from the daemon's environment; the pass is therefore not written in
 the file. No variable names the thread. Codex instead sends the thread id
-in the `_meta` of every tool call (`threadId`; in the Codex source, not yet
-observed with codex-cli 0.160), and the server asks the node for the
-credentials of that thread's seat, as `amail` commands do with
-`CODEX_THREAD_ID`. A call without a thread id the node knows answers
+in the `_meta` of every tool call (`threadId`, seen with codex-cli 0.160
+and its 0.164 daemon; `env_vars` is passed on as described, seen with
+0.160), and the server asks the node for the credentials of that thread's
+seat, as `amail` commands do with `CODEX_THREAD_ID`, with the pass. A call
+without a thread id the node knows answers
 `no_identity`; the server never falls back to a saved login. The entry does
 not change the hook commands, so the hooks' trust hashes stay the same;
 other `mcp_servers` entries in the file are kept.

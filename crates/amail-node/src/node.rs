@@ -1251,10 +1251,19 @@ impl Node {
                 Ok(plan) => serde_json::to_value(plan).unwrap_or_default(),
                 Err(e) => json!({"error": format!("{e:#}")}),
             },
-            Request::Credentials { codex_thread, .. } => match self.credentials(&codex_thread) {
-                Some(c) => serde_json::to_value(c).unwrap_or_default(),
-                None => json!({"error": "no seat is registered for this thread"}),
-            },
+            Request::Credentials { codex_thread, pass } => {
+                // Under both local policies: a thread id alone (Codex shows
+                // them in file names and session lists) gets nothing.
+                if !self.codex_pass_ok(pass.as_deref()) {
+                    json!({"error": "credentials are given only to the seat's own Codex session \
+                                     (the node's Codex pass is missing or wrong)"})
+                } else {
+                    match self.credentials(&codex_thread) {
+                        Some(c) => serde_json::to_value(c).unwrap_or_default(),
+                        None => json!({"error": "no seat is registered for this thread"}),
+                    }
+                }
+            }
             Request::Status => self.status(),
             Request::Up {
                 seats,
@@ -1352,7 +1361,8 @@ impl Node {
         match req {
             Request::Credentials { codex_thread, pass } => {
                 // Codex sessions use this for their own seat; a Claude Code
-                // session has no reason to.
+                // session has no reason to. (The pass is checked when the
+                // request is served, under both policies.)
                 if caller.is_claude() {
                     let seat = self
                         .lock()

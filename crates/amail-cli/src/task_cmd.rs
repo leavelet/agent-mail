@@ -340,7 +340,7 @@ pub fn event_line(e: &p::TaskEvent) -> String {
         K::Commented => "commented".into(),
         K::ReminderSent => format!("reminder {field} sent to {}", v(&e.to)),
         K::Unblocked => format!("unblocked: {} closed", v(&e.to)),
-        K::StealRequested => format!("{} asked to take over from {}", v(&e.to), v(&e.from)),
+        K::StealRequested => format!("asked to take over from {}", v(&e.from)),
         K::StealDeclined => format!("request of {} to take over declined", v(&e.to)),
         K::StealExpired => format!("request of {} to take over expired", v(&e.to)),
     };

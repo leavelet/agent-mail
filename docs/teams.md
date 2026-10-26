@@ -249,8 +249,9 @@ Before it accepts an id, the node checks:
     of that id, or, when the node's Codex app-server runs, an answer to
     `thread/read` for it. Codex seats do not use `~/.codex`: a conversation
     from your own Codex home is not found until its rollout file is copied
-    to the same place under the node's Codex home. Whether Codex then
-    resumes a copied rollout file was not tried with a real Codex.
+    to the same place under the node's Codex home. Codex then resumes the
+    copied file with its history (seen with codex-cli 0.160); the thread
+    does not have to be in Codex's thread store.
   - dsh: the session's directory under `sessions/` of the seat's dsh home
     (`<node state dir>/dsh-home/<seat>`).
 - A session is the session of one seat only: an id that another seat of

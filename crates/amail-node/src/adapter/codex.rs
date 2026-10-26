@@ -7,6 +7,10 @@
 //!   first prompt, `[amail:seat=<seat> launch=<nonce>]`, where the nonce was
 //!   reserved by `amail run`; after that the hook's `session_id` identifies
 //!   the seat.
+//! - The daemon runs as a package Codex installs under the home; the node
+//!   turns its self-update off and keeps it at the `codex` command's version
+//!   (see `pin_daemon_package`), because a TUI does not attach to a daemon
+//!   of another version.
 //! - Hooks are defined in the home's `config.toml` and pre-trusted there
 //!   (trust hashes cover the binary and the explicit node-context paths).
 //! - Wake-up: `codex queue --thread <session id> --message ...`, which starts
@@ -601,6 +605,9 @@ const UNSET: &[&str] = &[
     "CODEX_SANDBOX",
     "CODEX_SANDBOX_NETWORK_DISABLED",
     "AMAIL_PROFILE",
+    // A seat token in the TUI's environment would reach a daemon the TUI
+    // starts, and so every thread on it (see `launch`).
+    "AMAIL_TOKEN",
 ];
 
 pub struct Codex {
@@ -909,6 +916,81 @@ impl Codex {
         Ok(out)
     }
 
+    /// Keep the daemon at the `codex` command's version. Codex installs the
+    /// daemon as a package under the home (`packages/app-server-daemon`)
+    /// and, by default, updates it on its own; a TUI refuses to attach to a
+    /// daemon of another version ("Background server has incompatible
+    /// feature settings") and offers to restart it from the session. So:
+    /// the daemon's `settings.json` turns the self-update off, and a
+    /// package whose version differs from the command's is removed before
+    /// the start, which installs the command's own version again. Best
+    /// effort: a failure here is logged and the start goes ahead.
+    async fn pin_daemon_package(&self) {
+        let dir = self.home().join("app-server-daemon");
+        let settings = dir.join("settings.json");
+        let mut v: serde_json::Value = std::fs::read_to_string(&settings)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .filter(|v: &serde_json::Value| v.is_object())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let updater = v
+            .as_object_mut()
+            .unwrap()
+            .entry("updater")
+            .or_insert_with(|| serde_json::json!({}));
+        if !updater.is_object() {
+            *updater = serde_json::json!({});
+        }
+        if updater.get("autoUpdateEnabled") != Some(&serde_json::Value::Bool(false)) {
+            updater["autoUpdateEnabled"] = serde_json::Value::Bool(false);
+            let text = serde_json::to_string_pretty(&v).unwrap_or_default();
+            if let Err(e) = std::fs::create_dir_all(&dir)
+                .map_err(anyhow::Error::from)
+                .and_then(|()| crate::persist::write_atomic(&settings, text.as_bytes(), 0o600))
+            {
+                tracing::warn!("codex daemon settings {}: {e:#}", settings.display());
+            }
+        }
+        let version = tokio::process::Command::new(&self.env.codex_bin)
+            .args(["app-server", "daemon", "version"])
+            .env("CODEX_HOME", self.home())
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output();
+        let Ok(Ok(out)) = tokio::time::timeout(Duration::from_secs(20), version).await else {
+            return;
+        };
+        // The last line of the output is JSON with `cliVersion` and, once a
+        // package is installed, `managedCodexVersion`.
+        let text = String::from_utf8_lossy(&out.stdout);
+        let Some(v) = text
+            .lines()
+            .rev()
+            .find_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        else {
+            return;
+        };
+        let (Some(cli), Some(managed)) = (
+            v.get("cliVersion").and_then(|x| x.as_str()),
+            v.get("managedCodexVersion").and_then(|x| x.as_str()),
+        ) else {
+            return;
+        };
+        if cli == managed {
+            return;
+        }
+        let packages = self.home().join("packages").join("app-server-daemon");
+        match std::fs::remove_dir_all(&packages) {
+            Ok(()) => tracing::warn!(
+                "codex daemon package {managed} differs from the codex command ({cli}): removed {} \
+                 so the start installs {cli} again",
+                packages.display()
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!("removing {}: {e}", packages.display()),
+        }
+    }
+
     /// Whether the daemon answers on its control socket (`Err`: why not).
     async fn daemon_up(&self) -> std::io::Result<()> {
         crate::paths::connect_unix(&self.control_socket())
@@ -925,6 +1007,7 @@ impl Codex {
         if self.daemon_up().await.is_ok() {
             return Ok(());
         }
+        self.pin_daemon_package().await;
         let out = tokio::process::Command::new(&self.env.codex_bin)
             .args(["app-server", "daemon", "start"])
             .env("CODEX_HOME", self.home())
@@ -1428,7 +1511,11 @@ impl Adapter for Codex {
             ),
             ("AMAIL_SEAT".to_string(), info.seat.clone()),
             ("AMAIL_URL".to_string(), self.env.server_url.clone()),
-            ("AMAIL_TOKEN".to_string(), info.token.clone()),
+            // No `AMAIL_TOKEN`: tool commands and the MCP server find the
+            // seat through the node by thread id. The TUI starts (or, when
+            // Codex asks it to, restarts) the shared daemon with this
+            // environment, and with a token here every thread on that
+            // daemon would act as this seat.
             (
                 crate::paths::SOCK_ENV.to_string(),
                 self.env.node_socket.to_string_lossy().into_owned(),

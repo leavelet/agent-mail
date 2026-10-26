@@ -173,14 +173,18 @@
 <style>
   .board {
     display: flex;
-    gap: 10px;
+    gap: 8px;
     overflow-x: auto;
+    scrollbar-width: thin;
     padding-bottom: 8px;
     align-items: flex-start;
     max-width: 100%;
   }
   .col {
-    flex: 0 0 248px;
+    /* Seven columns fit a 1,232 px wide board; below that the board scrolls. */
+    flex: 1 1 168px;
+    min-width: 168px;
+    max-width: 320px;
     background: var(--surface-2);
     border: 1px solid var(--border);
     border-radius: var(--radius);

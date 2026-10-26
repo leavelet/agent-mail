@@ -496,6 +496,15 @@ async fn codex_registration_and_rows(b: Backend) {
     assert!(prompt.starts_with("[amail:seat=cx launch="), "{prompt}");
     assert!(prompt.contains("You are cx."), "{prompt}");
     assert_eq!(plan["env"]["AMAIL_SEAT"], "cx");
+    // No seat token: a daemon the TUI starts would hand it to every thread.
+    assert!(plan["env"].get("AMAIL_TOKEN").is_none(), "{plan}");
+    assert!(
+        plan["unset_env"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("AMAIL_TOKEN")),
+        "{plan}"
+    );
     assert!(
         plan["env"]["CODEX_HOME"]
             .as_str()

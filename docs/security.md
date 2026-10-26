@@ -138,7 +138,8 @@ its socket the node takes the connecting process's id from the kernel
   one shared app-server, not below the session's process. The node starts
   that app-server with a random value of its own in its environment
   (`AMAIL_CODEX_PASS`) and answers Codex hooks and credential requests only
-  when they carry it, and never from a Claude Code session. A Codex thread
+  when they carry it (under both local policies), and never from a Claude
+  Code session. A Codex thread
   id alone, which Codex shows in file names and session lists, gets
   nothing. All Codex sessions of a node hold the same pass, so a Codex
   session that knows another Codex seat's thread id can get that seat's

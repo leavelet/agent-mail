@@ -501,10 +501,7 @@ async fn run(backend: Backend) {
     );
     let show = w1.run(&["task", "show", "t3"]);
     assert!(show.contains("Takeover: asked for by w2 at "), "{show}");
-    assert!(
-        show.contains("  w2  w2 asked to take over from w1"),
-        "{show}"
-    );
+    assert!(show.contains("  w2  asked to take over from w1"), "{show}");
     let line = w1.run(&["task", "yield", "t3"]);
     assert_eq!(line.trim(), "t3   ready   normal w2       Emit code");
     assert_eq!(w2.nums(&["task", "next"]), vec![3, 6]);
