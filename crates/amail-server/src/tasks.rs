@@ -1273,6 +1273,7 @@ pub async fn board(
             .map(|t| p::BoardChain {
                 num: t.num,
                 waits_on: t.waits_on.clone(),
+                waits_on_ok: t.waits_on_ok.clone(),
             })
             .collect(),
     }))
@@ -1747,7 +1748,7 @@ fn change_reminders(ch: &TaskChanged) -> Vec<Reminder> {
         let (id, name) = d.responsible();
         let line = if t.result == Some(p::TaskResult::Rejected) {
             format!(
-                "t{} was closed as rejected; t{} waits for an ok result",
+                "t{} is done with result rejected; t{} waits for an ok result",
                 t.num, d.num
             )
         } else {
@@ -1847,7 +1848,17 @@ fn reminder_body(org: &Org, rs: &[&Reminder]) -> String {
             t.assignee.as_deref().unwrap_or("(none)")
         ));
         if !t.waits_on.is_empty() {
-            let w: Vec<String> = t.waits_on.iter().map(|n| format!("t{n}")).collect();
+            let w: Vec<String> = t
+                .waits_on
+                .iter()
+                .map(|n| {
+                    if t.waits_on_ok.contains(n) {
+                        format!("t{n} (ok needed)")
+                    } else {
+                        format!("t{n}")
+                    }
+                })
+                .collect();
             body.push_str(&format!("  Waits on: {}", w.join(", ")));
         }
         if let Some(d) = t.due {

@@ -98,8 +98,19 @@ impl Client {
             }
             None => match env_token {
                 Some(t) => (env_url.unwrap_or_else(|| DEFAULT_URL.to_string()), t),
-                None => match node_credentials() {
-                    Some(c) => (c.url, c.token),
+                None => match codex_thread() {
+                    // Inside a Codex session the seat's credentials come from
+                    // the node, never from a saved login: that would be the
+                    // person's token.
+                    Some(thread) => {
+                        let c = node_credentials(&thread).with_context(|| {
+                            format!(
+                                "inside Codex session {thread}, amail uses the seat's credentials \
+                                 from the node and no saved login"
+                            )
+                        })?;
+                        (c.url, c.token)
+                    }
                     None => {
                         let cfg = crate::profiles::Config::load()?;
                         let (_, pr) = cfg.get(None).context(
@@ -182,20 +193,33 @@ fn is_saved_name(p: &Path) -> bool {
 /// do not see the session's environment; the node knows which seat owns the
 /// thread (`CODEX_THREAD_ID`) and holds its token. It answers only requests
 /// that carry the node's Codex pass, which the daemon's environment holds.
-fn node_credentials() -> Option<amail_node::wire::Credentials> {
-    let thread = std::env::var("CODEX_THREAD_ID")
-        .ok()
-        .filter(|t| !t.is_empty())?;
+fn node_credentials(thread: &str) -> Result<amail_node::wire::Credentials> {
+    let socket = amail_node::paths::socket();
     let v = amail_node::request(
-        &amail_node::paths::socket(),
+        &socket,
         &amail_node::wire::Request::Credentials {
-            codex_thread: thread,
+            codex_thread: thread.to_string(),
             pass: std::env::var(amail_node::wire::CODEX_PASS_ENV).ok(),
         },
         std::time::Duration::from_secs(5),
     )
-    .ok()?;
-    serde_json::from_value(v).ok()
+    .with_context(|| {
+        format!(
+            "asking the node at {} for the seat's credentials",
+            socket.display()
+        )
+    })?;
+    if let Some(e) = v.get("error").and_then(|e| e.as_str()) {
+        bail!("the node refused the seat's credentials: {e}");
+    }
+    serde_json::from_value(v).context("the node's answer to the credentials request")
+}
+
+/// The Codex thread this command runs in, if any.
+fn codex_thread() -> Option<String> {
+    std::env::var("CODEX_THREAD_ID")
+        .ok()
+        .filter(|t| !t.is_empty())
 }
 
 /// Percent-encode a path segment or query value.

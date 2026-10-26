@@ -10,7 +10,8 @@ Mail commands find their server and token in this order:
 2. `AMAIL_TOKEN` with `AMAIL_URL` (default `http://127.0.0.1:8025`): how
    agents' sessions are set up;
 3. inside a Codex session (`CODEX_THREAD_ID` and `AMAIL_CODEX_PASS`), the
-   seat's credentials from the node;
+   seat's credentials from the node; a saved login is never used there, so
+   the command fails when the node does not answer or refuses;
 4. the current saved login (`amail login`).
 
 Saved logins are stored in `$AMAIL_CONFIG_DIR/config.toml`, else

@@ -367,6 +367,9 @@ Your org has a shared task board; a task is named by its number (`t12`).
 Close finished work with a result and the version it is about: \
 `amail task done t12 --result ok --ref <commit>` (or `--result rejected`).
 Split larger work into child tasks (`amail task new \"...\" --parent t12`); the parent shows how many are done.
+A rejected result is fixed on the same task: the assignee runs `amail task reopen t12`, works, and closes it \
+again with a new ref; the reviewer then sets a new result with `amail task result t12 ok --ref <commit>`. \
+Do not create a new task for the same work.
 Before changing a title or body, read `Rev:` from `amail task show t12` and pass `--if-rev N`.";
 
 /// At session start, when the seat has unfinished tasks: how many, and

@@ -456,7 +456,7 @@ result and ref and the reason. Reopening a task clears its result as well
 When a task that others depend on with `needs_ok` gets the result
 `rejected`, or its `ok` result is withdrawn, the assignees (else
 reporters) of those unfinished tasks get the reminder
-`t11 was closed as rejected; t12 waits for an ok result` (or `t11's ok
+`t11 is done with result rejected; t12 waits for an ok result` (or `t11's ok
 result was withdrawn; ...`).
 
 ### Revisions
@@ -493,7 +493,9 @@ differ and creates nothing, so importing the same file twice gives one set
 of tasks. Parents and dependencies are set after all tasks exist, so a
 record may name a task that comes later in the file. History entries
 become `imported` events with their time, author name and text. Nothing is
-mailed: no reminders and no discussion threads. An unknown seat, parent or
+mailed: no reminders and no discussion threads, and an imported task in
+`doing` or `review` is reminded as stale at the earliest one stale period
+after the import, whatever its `updated_at`. An unknown seat, parent or
 dependency is a warning, not an error. `task show ISSUE-42` finds an
 imported task by its id.
 

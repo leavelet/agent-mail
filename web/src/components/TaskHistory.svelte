@@ -66,9 +66,13 @@
       case 'unlinked':
         return t('task.ev.unlinked', { thread: value(e.to) });
       case 'dependency_added':
-        return t('task.ev.depAdded', { task: value(e.to) });
+        return e.field === 'blocks'
+          ? t('task.ev.depBlocks', { task: value(e.to) })
+          : t('task.ev.depAdded', { task: value(e.to) });
       case 'dependency_removed':
-        return t('task.ev.depRemoved', { task: value(e.to) });
+        return e.field === 'blocks'
+          ? t('task.ev.depUnblocks', { task: value(e.to) })
+          : t('task.ev.depRemoved', { task: value(e.to) });
       case 'commented':
         return t('task.ev.commented');
       case 'reminder_sent':

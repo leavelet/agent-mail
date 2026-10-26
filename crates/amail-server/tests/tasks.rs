@@ -1321,7 +1321,8 @@ async fn children_results_and_reminders(srv: Server) {
         .await;
     assert_eq!(d["task"]["result"], "rejected");
     assert_eq!(d["task"]["result_by"], "w2");
-    let rejected = format!("t{review} was closed as rejected; t{integ} waits for an ok result");
+    let rejected =
+        format!("t{review} is done with result rejected; t{integ} waits for an ok result");
     let count = |v: &[String], s: &str| v.iter().filter(|r| r.as_str() == s).count();
     assert_eq!(count(&w3.reminders().await, &rejected), 1);
     assert_eq!(

@@ -306,6 +306,15 @@ The first public version.
   for from it; a thread lists its tasks under the subject; "needs you"
   lists tasks waiting for the user and the user's overdue tasks. All of it
   follows `task` events live.
+- Inside a Codex session, `amail` commands never fall back to a saved
+  login (the person's token) when the node does not answer the thread's
+  credentials request: the command fails and says why. An imported task is
+  not reminded as stale before one stale period after the import. The
+  `blocker_rejected` reminder reads "is done with result rejected". Board
+  chains and reminder mail mark dependencies that need an ok result; the
+  `unblocked` history line shows the event's note; the web history shows
+  the direction of a dependency; the agent instructions say to reopen and
+  re-result a rejected task instead of creating a new one.
 - Tasks, M8.1: cards and table rows show the progress of child tasks and
   a `rejected` badge; the table filters by result; the task page has a
   result block that sets or withdraws the result, marks dependencies that

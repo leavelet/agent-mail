@@ -361,14 +361,6 @@ fn or_null(s: &str) -> Value {
     }
 }
 
-/// `t9, t11`.
-fn nums(v: &[i64]) -> String {
-    v.iter()
-        .map(|n| format!("t{n}"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 /// `t9 (ok needed), t11`: blockers, marking those whose dependency needs
 /// an ok result.
 fn waits(v: &[i64], ok: &[i64]) -> String {
@@ -521,7 +513,10 @@ pub fn event_line(e: &p::TaskEvent) -> String {
         K::DependencyRemoved => format!("no longer depends on {}", v(&e.to)),
         K::Commented => "commented".into(),
         K::ReminderSent => format!("reminder {field} sent to {}", v(&e.to)),
-        K::Unblocked => format!("unblocked: {} closed", v(&e.to)),
+        K::Unblocked => match &e.note {
+            Some(n) => format!("unblocked: {}", l(n)),
+            None => format!("unblocked: {} closed", v(&e.to)),
+        },
         K::StealRequested => format!("asked to take over from {}", v(&e.from)),
         K::StealDeclined => format!("request of {} to take over declined", v(&e.to)),
         K::StealExpired => format!("request of {} to take over expired", v(&e.to)),
@@ -791,7 +786,11 @@ fn board_text(b: &p::TaskBoard) -> String {
         out.push(String::new());
         out.push("chains:".into());
         for c in &b.chains {
-            out.push(format!("t{} waits on {}", c.num, nums(&c.waits_on)));
+            out.push(format!(
+                "t{} waits on {}",
+                c.num,
+                waits(&c.waits_on, &c.waits_on_ok)
+            ));
         }
     }
     out.join("\n")

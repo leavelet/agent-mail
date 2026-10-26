@@ -2047,11 +2047,14 @@ macro_rules! impl_task_queries {
                             (t.num, "created")
                         }
                     };
+                    // The record's time, and no stale reminder before one stale
+                    // period after the import (nothing is mailed for an import).
                     if let Some(u) = r.updated_at.filter(|_| action != "same") {
-                        sqlx::query("UPDATE tasks SET updated_at = $3 WHERE org_id = $1 AND num = $2")
+                        sqlx::query("UPDATE tasks SET updated_at = $3, stale_reminded_at = $4 WHERE org_id = $1 AND num = $2")
                             .bind(imp.org_id)
                             .bind(num)
                             .bind(u)
+                            .bind(now_ms())
                             .execute(&mut *c)
                             .await?;
                     }

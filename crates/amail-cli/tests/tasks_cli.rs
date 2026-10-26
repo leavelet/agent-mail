@@ -351,10 +351,7 @@ async fn run(backend: Backend) {
     assert_eq!(w1.state("t5"), "ready");
     assert_eq!(w1.nums(&["task", "next"]), vec![3, 5]);
     let history = w1.run(&["task", "history", "t5"]);
-    assert!(
-        history.contains("  lead  unblocked: t8 closed"),
-        "{history}"
-    );
+    assert!(history.contains("  lead  unblocked: t8 done"), "{history}");
     // Reopening the blocker makes t5 wait again; removing the dependency
     // frees it.
     lead.run(&["task", "reopen", "t8"]);
@@ -665,7 +662,7 @@ async fn m81(backend: Backend) {
     let reminders = w2.run(&["inbox"]);
     assert!(
         reminders.contains(&format!(
-            "t{c2} was closed as rejected; t{c1} waits for an ok result"
+            "t{c2} is done with result rejected; t{c1} waits for an ok result"
         )),
         "{reminders}"
     );

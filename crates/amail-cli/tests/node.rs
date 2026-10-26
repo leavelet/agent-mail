@@ -2018,6 +2018,7 @@ AMAIL_SEAT=w2 "$B" hook claude < up.json > w2.out; echo "w2-hook-bytes=$(wc -c <
 "$B" hook claude < up.json > w1.out; echo "w1-hook-bytes=$(wc -c < w1.out)"
 "$B" hook claude < upt.json > /dev/null
 env -u AMAIL_TOKEN CODEX_THREAD_ID={tid} AMAIL_CODEX_PASS={pass} timeout 10 "$B" inbox; echo "codex-cred-exit=$?"
+env -u AMAIL_TOKEN -u AMAIL_CODEX_PASS CODEX_THREAD_ID={tid} timeout 10 "$B" inbox 2> nopass.err; echo "codex-nopass-exit=$?"
 "#,
         dir = h.dir.path().display(),
     );
@@ -2034,10 +2035,19 @@ env -u AMAIL_TOKEN CODEX_THREAD_ID={tid} AMAIL_CODEX_PASS={pass} timeout 10 "$B"
         "ps-exit=1",
         "w2-hook-bytes=0",
         "codex-cred-exit=1",
+        "codex-nopass-exit=1",
         "this request is for the person, not for agent sessions",
     ] {
         assert!(ran.contains(want), "missing {want:?} in:\n{ran}");
     }
+    // Inside a Codex session a refused credentials request is an error,
+    // never a fall-back to a saved login.
+    let nopass = std::fs::read_to_string(h.dir.path().join("nopass.err")).unwrap();
+    assert!(
+        nopass.contains("no saved login")
+            && nopass.contains("credentials are given only to the seat's own Codex session"),
+        "{nopass}"
+    );
     // No token was printed (tokens start with `amail_`).
     assert!(!ran.contains("amail_"), "{ran}");
     // w2's mail was not touched; w1's session got its own.

@@ -545,6 +545,9 @@ pub struct SeatLoad {
 pub struct BoardChain {
     pub num: i64,
     pub waits_on: Vec<i64>,
+    /// The blockers in `waits_on` whose dependency needs an ok result.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waits_on_ok: Vec<i64>,
 }
 
 /// Answer of `GET /v1/tasks/board`.
