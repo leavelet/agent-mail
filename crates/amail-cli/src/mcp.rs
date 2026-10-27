@@ -1510,9 +1510,18 @@ async fn thread(c: &Client, id: i64) -> Result<(Value, String)> {
     let mut text = t
         .messages
         .iter()
-        .map(|m| output::message(m).trim_end().to_string())
+        .map(|m| {
+            let s = output::message(m).trim_end().to_string();
+            match crate::doc_cmd::thread_comment_mark(&t, m.header.id) {
+                Some(mark) => format!("{mark}\n{s}"),
+                None => s,
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n---\n");
+    if let Some(docs) = crate::doc_cmd::thread_docs_text(&t.docs) {
+        text.push_str(&format!("\n---\n{docs}"));
+    }
     if let Some(tasks) = v.get("tasks").and_then(Value::as_array)
         && !tasks.is_empty()
     {

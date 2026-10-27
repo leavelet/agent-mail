@@ -2096,16 +2096,36 @@ pub async fn comment(
 // --- mail and tasks into documents ---------------------------------------------------
 
 /// Documents of the viewer's org that a thread cites (or whose discussion
-/// thread it is), for thread answers.
-pub async fn thread_refs(st: &AppState, org_id: i64, thread_id: i64) -> Vec<p::DocRef> {
+/// thread it is), and the comments of the thread on those documents whose
+/// discussion thread it is, for thread answers.
+pub async fn thread_refs(
+    st: &AppState,
+    org_id: i64,
+    thread_id: i64,
+) -> (Vec<p::DocRef>, Vec<p::ThreadDocComment>) {
     let now = amail_store::now_ms();
-    match st.store.thread_docs(org_id, thread_id).await {
-        Ok(v) => v.iter().map(|d| doc_ref(d, now)).collect(),
+    let docs = match st.store.thread_docs(org_id, thread_id).await {
+        Ok(v) => v,
         Err(e) => {
             tracing::warn!("documents of thread {thread_id}: {e}");
-            Vec::new()
+            return (Vec::new(), Vec::new());
+        }
+    };
+    let mut comments = Vec::new();
+    for d in docs.iter().filter(|d| d.thread_id == Some(thread_id)) {
+        match st.store.doc_detail(org_id, d.num, 0).await {
+            Ok(Some(r)) => comments.extend(r.comments.iter().map(|c| p::ThreadDocComment {
+                message_id: c.message_id,
+                doc: d.num,
+                anchor: c.anchor.clone(),
+                path: c.path.clone(),
+                removed: c.removed,
+            })),
+            Ok(None) => {}
+            Err(e) => tracing::warn!("comments of d{} for thread {thread_id}: {e}", d.num),
         }
     }
+    (docs.iter().map(|d| doc_ref(d, now)).collect(), comments)
 }
 
 /// Document numbers named as `[d12]` in a subject (at most 10).

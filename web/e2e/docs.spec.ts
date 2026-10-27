@@ -260,6 +260,23 @@ test('at phone width the reader does not cover the drafts and their Activate but
   await expect.poll(async () => (await getDoc(num)).status).toBe('active');
 });
 
+test('the thread page lists the documents it cites and marks a comment on a removed section', async ({ page }) => {
+  const s = state();
+  const lead = s.seatTokens['be-lead'];
+  const num = await newDoc(lead, {
+    title: 'Archive import notes',
+    body: '# Import\n\nRun the importer.\n\n# Old format\n\nThe 2019 files.\n',
+    team: 'backend',
+  });
+  const c = await api<{ id: number; thread_id: number }>(s.userToken, 'POST', `/docs/${num}/comment`, { anchor: 'old-format', body: 'Do we still get these?' });
+  await api(lead, 'PUT', `/docs/${num}/body`, { body: '# Import\n\nRun the importer.\n' });
+  await login(page, s.userToken, { lang: 'en' });
+  await page.goto(`${s.base}/#/thread/${c.thread_id}`);
+  await expect(page.getByTestId('thread-docs')).toContainText(`d${num}`);
+  await expect(page.getByTestId('thread-docs')).toContainText('Archive import notes');
+  await expect(page.getByTestId('comment-anchor').first()).toContainText('on a removed section (was: Old format)');
+});
+
 test('a comment on a section shows its anchor in the discussion', async ({ page }) => {
   const s = state();
   await login(page, s.userToken, { lang: 'en' });

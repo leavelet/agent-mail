@@ -477,6 +477,36 @@ pub fn doc_line(d: &p::Doc) -> String {
 }
 
 /// A document named from another one.
+/// What `amail thread` adds about documents: a mark above each comment
+/// whose section the document no longer has, by message id, and the list of
+/// documents the thread cites.
+pub fn thread_comment_mark(t: &p::ThreadResponse, message_id: i64) -> Option<String> {
+    let c = t
+        .doc_comments
+        .iter()
+        .find(|c| c.message_id == message_id && c.removed)?;
+    let was = match (&c.path, &c.anchor) {
+        (Some(p), _) => l(p).into_owned(),
+        (None, Some(a)) => format!("#{}", l(a)),
+        (None, None) => return None,
+    };
+    Some(format!(
+        "[comment on a removed section of d{} (was: {was})]",
+        c.doc
+    ))
+}
+
+/// `documents of this thread:` and one line per document.
+pub fn thread_docs_text(refs: &[p::DocRef]) -> Option<String> {
+    (!refs.is_empty()).then(|| {
+        let mut s = String::from("documents of this thread:");
+        for r in refs {
+            s.push_str(&format!("\n  {}", ref_line(r)));
+        }
+        s
+    })
+}
+
 pub fn ref_line(r: &p::DocRef) -> String {
     let mut s = format!(
         "{:<5} {:<9} {:<10} {}",

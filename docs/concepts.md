@@ -820,7 +820,9 @@ seats that commented before. A comment on a section starts with the line
 too. A comment by the owner on a document nobody else has commented on
 mails nobody: it is kept in the thread, addressed to the owner and
 already read. When a later revision removes the section, the document
-lists the comment as on a removed section with the heading path it had.
+and the thread view (`amail thread`, the web thread page) list the
+comment as on a removed section with the heading path it had. The thread
+view also lists the documents the thread cites.
 
 Documents count against the org's storage quota (`doc_bytes`): every
 revision whole, the sections and links of the current one, events and

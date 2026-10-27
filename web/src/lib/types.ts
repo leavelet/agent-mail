@@ -181,6 +181,22 @@ export interface ThreadResponse {
   truncated?: boolean;
   /** Tasks of the org linked to this thread, or whose discussion thread it is. */
   tasks?: TaskRef[];
+  /** Documents of the org this thread cites (`[d12]`), or whose discussion thread it is. */
+  docs?: DocRef[];
+  /** Comments of this thread on a document whose discussion thread it is. */
+  doc_comments?: ThreadDocComment[];
+}
+
+/** A comment on a document, as a thread lists it. */
+export interface ThreadDocComment {
+  message_id: number;
+  /** The document's number. */
+  doc: number;
+  anchor?: string;
+  /** The section's heading path when the comment was written. */
+  path?: string;
+  /** The current revision no longer has the section. */
+  removed?: boolean;
 }
 
 /** Response of `DELETE /v1/threads/{id}`. */
