@@ -656,6 +656,9 @@ struct Plan {
     listed: HashSet<i64>,
     /// Mail claimed earlier whose injection was lost.
     stash: Vec<InboxEntry>,
+    /// The prompt is a wake-up nudge and the node is connected: when the
+    /// hook then shows nothing, it says so, and the turn ends at once.
+    wake_prompt: bool,
 }
 
 impl Plan {
@@ -1687,7 +1690,7 @@ impl Node {
                     // Ask the server again (see `recheck_pending`).
                     recheck = true;
                 }
-                Event::UserPromptSubmit { .. } => {
+                Event::UserPromptSubmit { prompt } => {
                     st.seat(seat).restore_pending = false;
                     st.set_state(seat, SeatState::Busy);
                     self.turn_started(&mut st, seat);
@@ -1696,6 +1699,7 @@ impl Node {
                     s.wake_out = None;
                     s.clear_wake_failure();
                     plan.stash = std::mem::take(&mut s.stash);
+                    plan.wake_prompt = connected && crate::inject::is_wake_text(prompt);
                     if s.focused(now) {
                         plan.claim_urgent_all = connected && s.pending.urgent > 0;
                     } else {
@@ -1778,7 +1782,12 @@ impl Node {
         self.presence_kick.notify_one();
         self.wake_kick.notify_one();
         if plan.none() {
-            return (Output::None, Vec::new());
+            let out = if plan.wake_prompt {
+                Output::Context(crate::inject::NOTHING_PENDING.to_string())
+            } else {
+                Output::None
+            };
+            return (out, Vec::new());
         }
 
         // 2. Server calls, without the lock, all within `deadline`.
@@ -1979,7 +1988,13 @@ impl Node {
             text.push_str(&t);
         }
         let out = if text.is_empty() {
-            Output::None
+            // A wake-up whose mail is gone (shown by an earlier turn, or
+            // read since); not when a claim failed or was cut short.
+            if plan.wake_prompt && !failed && !more {
+                Output::Context(crate::inject::NOTHING_PENDING.to_string())
+            } else {
+                Output::None
+            }
         } else if hook.event == Event::Stop {
             Output::Block(text)
         } else {

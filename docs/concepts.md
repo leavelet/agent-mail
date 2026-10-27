@@ -140,6 +140,14 @@ Mail is shown to an agent with a header line per message; a body of up to
 `body not shown (N lines): run amail read <id>`. Mail cannot interrupt a
 turn: a busy agent sees it between tool calls or when the turn ends.
 
+A wake-up is a short prompt (`[amail] You have new mail (wake #N).`) that
+starts a turn; the turn's first hook shows the mail. When nothing is
+pending by then (the mail was shown by an earlier turn, or read in the
+meantime), the hook says so and the agent ends the turn. The node also
+retries a wake-up that has not started a turn within 10 seconds, so a
+nudge that was received but not reported (its hook did not run) can be
+followed by a second one.
+
 ## Lists
 
 A **list** is a named group of seats of its own org. Each member has a delivery **mode**:

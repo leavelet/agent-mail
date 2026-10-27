@@ -759,6 +759,28 @@ async fn codex_registration_and_rows(b: Backend) {
     // The queued message starts a turn: UserPromptSubmit claims the mail.
     let v = h.hook("codex", env.clone(), up.clone()).await;
     assert!(hook_text(&v).unwrap().contains("\"wake me\""));
+    // A wake-up whose mail is gone by the time its turn starts (shown by
+    // an earlier turn, as when Codex queued the nudge behind a running
+    // turn) is answered with a line that says so; an ordinary prompt with
+    // nothing pending gets nothing.
+    let late = with(
+        up.clone(),
+        &[("prompt", json!("[amail] You have new mail (wake #99)."))],
+    );
+    let v = h.hook("codex", env.clone(), late).await;
+    assert!(
+        hook_text(&v)
+            .unwrap()
+            .contains("Nothing is waiting for you"),
+        "{v}"
+    );
+    let v = h.hook("codex", env.clone(), up.clone()).await;
+    assert!(
+        !hook_text(&v)
+            .unwrap_or_default()
+            .contains("Nothing is waiting"),
+        "{v}"
+    );
     // A lazy SessionStart (first turn) means busy.
     h.hook("codex", env.clone(), start).await;
     assert_eq!(h.state("cx").await, "busy");

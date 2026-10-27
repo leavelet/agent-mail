@@ -17,6 +17,18 @@ pub fn wake_text(n: u64) -> String {
     format!("[amail] You have new mail (wake #{n}).")
 }
 
+/// Whether `prompt` is a wake-up nudge, as the harness hands it to the
+/// `UserPromptSubmit` hook (or keeps it in a thread's queue).
+pub fn is_wake_text(prompt: &str) -> bool {
+    prompt.trim_start().starts_with("[amail] You have new mail")
+}
+
+/// Shown when a wake-up starts a turn and nothing is pending any more: its
+/// mail was shown by an earlier turn or read in the meantime (a nudge
+/// queued behind a running turn arrives after that turn).
+pub const NOTHING_PENDING: &str = "[amail] Nothing is waiting for you: the mail behind this \
+wake-up was already shown to you or read. End the turn.";
+
 /// How the mail reached the seat: named in `To` ("to you"), through a list
 /// in `To` ("via list <name>"), or `Cc`. Lists are not marked in headers, so
 /// a `to` delivery whose `To` does not name the seat came through one of the

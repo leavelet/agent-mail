@@ -279,6 +279,12 @@ The first public version.
   the root.
 - `amail ps`, `attach`, `sleep`, `wake`, `down`; a guarded terminal-paste
   wake-up as a last resort (off by default).
+- A wake-up whose turn finds nothing pending any more (its mail was shown
+  by an earlier turn, or read in the meantime) is answered with one line
+  that says so, and the agent ends the turn. Before `codex queue`, the
+  node asks the Codex daemon about the thread and adds no nudge while a
+  turn runs or a nudge is already queued (a nudge queued behind a running
+  turn would start a turn of its own after it).
 - Failed turns: mail shown in a harness turn that failed (Claude Code
   `StopFailure`, a dsh turn that ended with an error, a Codex turn the
   app-server reports as failed, or a session process that ended during the

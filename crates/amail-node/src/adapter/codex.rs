@@ -1148,6 +1148,52 @@ impl Codex {
         Ok(())
     }
 
+    /// Why a wake-up must not be queued now, from the daemon: the thread
+    /// already holds one in its queue (it is busy, or has no terminal and
+    /// runs its queue when resumed), or a turn is running (the `Stop` hook
+    /// checks for mail at its end). `codex queue` on a busy thread adds a
+    /// turn that runs after the current one, when the mail has been shown
+    /// already; a second nudge would be another such turn.
+    async fn wake_held(&self, target: &str) -> Result<Option<&'static str>> {
+        let r = crate::codex_rpc::socket_calls(
+            &self.control_socket(),
+            &[
+                (
+                    "thread/read",
+                    json!({"threadId": target, "includeTurns": false}),
+                ),
+                ("thread/queue/list", json!({"threadId": target})),
+            ],
+        )
+        .await?;
+        let queued = r
+            .get(1)
+            .and_then(|q| q["data"].as_array())
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    item["input"].as_array().is_some_and(|input| {
+                        input.iter().any(|part| {
+                            part["text"]
+                                .as_str()
+                                .is_some_and(crate::inject::is_wake_text)
+                        })
+                    })
+                })
+            });
+        if queued {
+            return Ok(Some("a wake-up is already queued on the thread"));
+        }
+        let status = r
+            .first()
+            .and_then(|t| t["thread"]["status"]["type"].as_str());
+        if status == Some("active") {
+            return Ok(Some(
+                "the thread runs a turn; the Stop hook checks for mail at its end",
+            ));
+        }
+        Ok(None)
+    }
+
     /// The node persists the intended effort with a seat's resume ID.
     /// Read it at wake time too: a controller restart does not relaunch
     /// live seats, and must not discard this per-thread setting.
@@ -1386,6 +1432,17 @@ impl Adapter for Codex {
             )
             .await
             .context("restoring Codex effort before queueing wake-up")?;
+        }
+        match self.wake_held(target).await {
+            Ok(Some(why)) => {
+                tracing::info!("codex thread {target}: not queueing a wake-up: {why}");
+                return Ok(());
+            }
+            Ok(None) => {}
+            // Without an answer the nudge is queued as before.
+            Err(e) => {
+                tracing::debug!("codex thread {target}: asking the daemon before queueing: {e:#}")
+            }
         }
         let out = tokio::process::Command::new(&self.env.codex_bin)
             .args(["queue", "--thread", target, "--message", text])

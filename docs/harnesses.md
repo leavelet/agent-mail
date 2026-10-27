@@ -221,7 +221,13 @@ Consequences:
 
 **Wake-up.** `codex queue` adds the nudge to the thread through the daemon;
 a message for a thread without a terminal is kept and runs when the session
-is resumed.
+is resumed. A nudge added to a busy thread runs as a turn of its own after
+the current one, by which time the mail has usually been shown by that
+turn's hooks. So before queueing, the node asks the daemon about the thread
+(`thread/read`, `thread/queue/list`): while a turn runs, or while a nudge
+is already queued, it adds nothing, and the running turn's `Stop` hook
+shows the mail at its end. A nudge whose turn finds nothing pending any
+more is answered with one line that says so, and the agent ends the turn.
 
 **Control socket path.** The daemon's control socket lies in the state
 directory. When its path is longer than a Unix socket path may be (107

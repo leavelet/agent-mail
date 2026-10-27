@@ -40,6 +40,7 @@ turn_tests!(
     codex_failed_turns_from_the_app_server,
     codex_metadata_error_recovers_only_proven_completion,
     codex_restart_holds_failed_surviving_session,
+    codex_wake_asks_the_daemon_first,
 );
 
 fn claude(name: &str) -> Value {
@@ -832,4 +833,105 @@ async fn system_mail(h: &Harness) -> Vec<(String, String)> {
         ));
     }
     out
+}
+
+/// Before `codex queue`, the node asks the daemon about the thread: while a
+/// turn runs, or while a wake-up is already queued, no nudge is added (a
+/// nudge queued behind a running turn starts a turn of its own after it,
+/// when the mail has been shown already). The nudge goes once the thread
+/// is idle with an empty queue.
+async fn codex_wake_asks_the_daemon_first(b: Backend) {
+    let mut o = opts(150, false);
+    o.wake_confirm = Duration::from_millis(600);
+    o.wake_backoff = Duration::from_millis(400);
+    let Some(h) = Harness::start(b, "codex_wake_asks_the_daemon_first", o).await else {
+        return;
+    };
+    h.seat("cx", "codex").await;
+    let home = h.dir.path().join("state/codex-home");
+    let app = FakeAppServer::start(&home.join("app-server-control/app-server-control.sock"));
+    let sid = "00000000-0000-7000-8000-00000000c0df";
+    *app.thread.lock().unwrap() = json!({"thread":{"id":sid,"status":{"type":"active"}}});
+    let cwd = h.dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let plan = h
+        .node
+        .as_ref()
+        .unwrap()
+        .node
+        .handle(amail_node::wire::Request::Launch {
+            seat: "cx".into(),
+            cwd: cwd.to_string_lossy().into(),
+            pid: std::process::id(),
+            harness: None,
+            extra: vec![],
+            pane: None,
+            mux_session: None,
+            permission_mode: Some(amail_proto::PermissionMode::Unattended),
+            git_access: None,
+            dsh_jail: None,
+            session: None,
+        })
+        .await;
+    assert!(plan.get("error").is_none(), "{plan}");
+    let args: Vec<String> = serde_json::from_value(plan["args"].clone()).unwrap();
+    let env = vec![
+        (
+            "CODEX_HOME".to_string(),
+            home.to_string_lossy().into_owned(),
+        ),
+        (
+            "AMAIL_CODEX_PASS".to_string(),
+            plan["env"]["AMAIL_CODEX_PASS"].as_str().unwrap().into(),
+        ),
+    ];
+    let hook = |name: &str, extra: &[(&str, Value)]| {
+        let mut fields = vec![("session_id", json!(sid))];
+        fields.extend(extra.iter().cloned());
+        with(fixture("codex", name), &fields)
+    };
+    h.hook(
+        "codex",
+        env.clone(),
+        hook(
+            "UserPromptSubmit",
+            &[("prompt", json!(args.last().unwrap()))],
+        ),
+    )
+    .await;
+    assert_eq!(h.state("cx").await, "busy");
+    h.hook("codex", env.clone(), hook("Stop", &[])).await;
+    assert_eq!(h.state("cx").await, "idle");
+    let queued = || {
+        h.codex_calls()
+            .into_iter()
+            .filter(|c| c.starts_with("queue"))
+            .collect::<Vec<_>>()
+    };
+
+    // Mail for the idle seat while the daemon says a turn runs: nothing is
+    // queued, through the first attempt, the retry and the backoff.
+    h.api.send(&["cx"], &[], "while running", false).await;
+    h.wait_pending("cx", 1, 0, 0).await;
+    tokio::time::sleep(Duration::from_millis(1800)).await;
+    assert_eq!(queued(), Vec::<String>::new());
+
+    // Idle, but a wake-up is already in the thread's queue.
+    app.thread.lock().unwrap()["thread"]["status"]["type"] = json!("idle");
+    *app.queue.lock().unwrap() = json!({"data":[{"id":"q1","clientUserMessageId":"m1",
+        "input":[{"type":"text","text":"[amail] You have new mail (wake #7)."}]}],"nextCursor":null});
+    tokio::time::sleep(Duration::from_millis(1800)).await;
+    assert_eq!(queued(), Vec::<String>::new());
+
+    // Idle with an empty queue: the nudge goes.
+    *app.queue.lock().unwrap() = json!({"data":[],"nextCursor":null});
+    h.wait("codex queue", || async { !queued().is_empty() })
+        .await;
+    let call = queued().remove(0);
+    assert!(
+        call.starts_with(&format!(
+            "queue --thread {sid} --message [amail] You have new mail (wake #"
+        )),
+        "{call}"
+    );
 }
