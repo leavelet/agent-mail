@@ -15,6 +15,7 @@ pub mod claude;
 pub mod codex;
 pub mod dsh;
 pub mod tail;
+pub mod usage;
 
 use crate::adapter::Harness;
 use amail_proto::{TranscriptEvent, TranscriptKind, TranscriptRole};

@@ -15,6 +15,8 @@ events = [
     "Stop",
     "Interrupt",
     "SessionEnd",
+    "PreCompact",
+    "PostCompact",
 ]
 for line in sys.stdin:
     try:

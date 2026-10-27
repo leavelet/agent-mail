@@ -10,6 +10,8 @@
 //! repo = "/path/to/repo"
 //! workroot = "/path/to/worktrees"
 //! idle_sleep = "30m"            # or "off" (default)
+//! handover_idle = "30m"         # ask an idle seat with work for its note (default 30m; "off")
+//! docs.activate_by = "human"    # or "owner" (default: each kind decides)
 //! max_live = 40
 //! restart = "on-failure"        # or "never"
 //! local_policy = "restricted"   # can only make the node's policy stricter
@@ -22,6 +24,7 @@
 //! [[seat]]
 //! name = "root"
 //! role = "Overall technical lead."
+//! handover = "private"          # its notes: the seat, its lead, the user
 //!
 //! [[group]]
 //! name = "backend"
@@ -75,9 +78,52 @@ struct TeamRaw {
     repo: Option<PathBuf>,
     workroot: Option<PathBuf>,
     idle_sleep: Option<String>,
+    handover_idle: Option<String>,
     max_live: Option<u32>,
     restart: Option<String>,
     local_policy: Option<String>,
+    docs: Option<DocsRaw>,
+}
+
+/// `docs.activate_by` of `[team]` or a `[[group]]`.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DocsRaw {
+    activate_by: Option<String>,
+}
+
+/// Who activates the documents of a team's seats (`docs.activate_by`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DocActivation {
+    /// The document's kind decides (the server's `doc_activate_by: null`).
+    #[default]
+    Kind,
+    /// Every document waits for the user (`doc_activate_by: "human"`).
+    Human,
+}
+
+fn doc_activation(what: &str, d: Option<&DocsRaw>) -> Result<Option<DocActivation>, TeamError> {
+    match d.and_then(|d| d.activate_by.as_deref()).map(str::trim) {
+        None => Ok(None),
+        Some("human") => Ok(Some(DocActivation::Human)),
+        Some("owner") | Some("kind") => Ok(Some(DocActivation::Kind)),
+        Some(other) => err(format!(
+            "{what} docs.activate_by {other:?}: expected \"human\" or \"owner\""
+        )),
+    }
+}
+
+/// `handover` of a seat: `private` limits its notes to the seat, its lead
+/// and the user; `org` (the default) lets every seat of the org read them.
+fn handover_private(what: &str, v: Option<&String>) -> Result<Option<bool>, TeamError> {
+    match v.map(|s| s.trim()) {
+        None => Ok(None),
+        Some("private") => Ok(Some(true)),
+        Some("org") => Ok(Some(false)),
+        Some(other) => err(format!(
+            "{what}: handover {other:?}: expected \"private\" or \"org\""
+        )),
+    }
 }
 
 /// Settings a seat inherits from `[defaults]` (or a group's `workers`).
@@ -91,6 +137,8 @@ struct SeatOpts {
     dsh_jail: Option<bool>,
     /// Allow the guarded terminal-paste wake-up (see the node).
     paste_fallback: Option<bool>,
+    /// `private` or `org`: who reads the seat's handover notes.
+    handover: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize)]
@@ -117,6 +165,8 @@ struct SeatRaw {
     group: Option<String>,
     /// An existing harness session the seat adopts (resumes).
     session: Option<String>,
+    /// `private` or `org`: who reads the seat's handover notes.
+    handover: Option<String>,
 }
 
 /// A session id is used in file names: letters, digits and `-_.:` only,
@@ -149,6 +199,7 @@ struct GroupRaw {
     lead: SeatRaw,
     /// `{ count, prefix, ... }`, or an array of seat tables.
     workers: Option<toml::Value>,
+    docs: Option<DocsRaw>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -164,6 +215,7 @@ struct WorkersRaw {
     role: Option<String>,
     role_file: Option<PathBuf>,
     description: Option<String>,
+    handover: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -179,6 +231,10 @@ pub struct Settings {
     /// Put a seat to sleep after it has been idle this long.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_sleep_ms: Option<u64>,
+    /// Ask a seat idle this long with work in progress for its handover
+    /// note (default: 30 minutes; 0: never).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handover_idle_ms: Option<u64>,
     /// Most seats with a running process on this host.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_live: Option<u32>,
@@ -194,6 +250,7 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             idle_sleep_ms: None,
+            handover_idle_ms: None,
             max_live: None,
             restart: Restart::OnFailure,
             local_policy: None,
@@ -260,6 +317,9 @@ pub struct SeatPlan {
     /// An existing session of the seat's harness that the seat adopts: the
     /// node resumes it (see `docs/teams.md`).
     pub session: Option<String>,
+    /// `handover = "private"`: the seat's handover notes are read only by
+    /// the seat, its lead and the user.
+    pub handover_private: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -286,6 +346,9 @@ pub struct TeamPlan {
     pub contacts: Option<Vec<String>>,
     /// Audiences the file opens the team to: `linked` or org names.
     pub open: Vec<String>,
+    /// `docs.activate_by` (the group's, else `[team]`'s; default: the
+    /// kind decides).
+    pub doc_activation: DocActivation,
 }
 
 /// An expanded team file.
@@ -464,6 +527,17 @@ pub fn parse(text: &str, base: &Path) -> Result<Team, TeamError> {
         Some(s) => parse_duration(s).map_err(|e| TeamError(format!("[team] idle_sleep: {e}")))?,
         None => None,
     };
+    let handover_idle = match &t.handover_idle {
+        Some(s) => {
+            match parse_duration(s).map_err(|e| TeamError(format!("[team] handover_idle: {e}")))? {
+                Some(d) => Some(d),
+                // `off`: idle seats are not asked.
+                None => Some(Duration::ZERO),
+            }
+        }
+        None => None,
+    };
+    doc_activation("[team]", t.docs.as_ref())?;
     let restart = match t.restart.as_deref().map(str::trim) {
         None | Some("on-failure") => Restart::OnFailure,
         Some("never") => Restart::Never,
@@ -486,6 +560,7 @@ pub fn parse(text: &str, base: &Path) -> Result<Team, TeamError> {
     };
     let settings = Settings {
         idle_sleep_ms: idle_sleep.map(|d| d.as_millis() as u64),
+        handover_idle_ms: handover_idle.map(|d| d.as_millis() as u64),
         max_live: t.max_live,
         restart,
         local_policy,
@@ -582,6 +657,12 @@ pub fn parse(text: &str, base: &Path) -> Result<Team, TeamError> {
         if let Some(id) = &s.session {
             check_session_id(id).map_err(|e| TeamError(format!("{what}: {e}")))?;
         }
+        let private = match handover_private(&what, s.handover.as_ref())? {
+            Some(p) => p,
+            None => handover_private(&what, inherit.handover.as_ref())?
+                .or(handover_private("[defaults]", defaults.handover.as_ref())?)
+                .unwrap_or(false),
+        };
         seats.push(SeatPlan {
             name: s.name.clone(),
             parent,
@@ -606,6 +687,7 @@ pub fn parse(text: &str, base: &Path) -> Result<Team, TeamError> {
                 .or(defaults.paste_fallback)
                 .unwrap_or(false),
             session: s.session.clone(),
+            handover_private: private,
         });
         Ok(())
     };
@@ -684,6 +766,7 @@ pub fn parse(text: &str, base: &Path) -> Result<Team, TeamError> {
                     git_access: w.git_access.clone(),
                     dsh_jail: w.dsh_jail,
                     paste_fallback: None,
+                    handover: w.handover.clone(),
                 };
                 for n in 1..=w.count {
                     let s = SeatRaw {
@@ -954,6 +1037,7 @@ fn teams_of(
                 members,
                 contacts,
                 open,
+                doc_activation: doc_activation("[team]", t.docs.as_ref())?.unwrap_or_default(),
             });
         }
     }
@@ -981,6 +1065,10 @@ fn teams_of(
             &open,
             Some(&plan.lead),
         )?;
+        let doc_activation = match doc_activation(&what, g.docs.as_ref())? {
+            Some(a) => a,
+            None => doc_activation("[team]", t.docs.as_ref())?.unwrap_or_default(),
+        };
         teams.push(TeamPlan {
             name: g.name.clone(),
             description: description(&what, g.description.as_ref())?,
@@ -989,6 +1077,7 @@ fn teams_of(
             members,
             contacts,
             open,
+            doc_activation,
         });
     }
     // Team parents follow seat parents across groups, which can loop even
@@ -1380,6 +1469,69 @@ cwd = "docs"
         );
         let e = team(&format!("{base}local_policy = \"loose\"\n{seat}")).unwrap_err();
         assert!(e.to_string().contains("local_policy"), "{e}");
+    }
+
+    #[test]
+    fn document_and_handover_settings() {
+        let t = team(
+            r#"
+[team]
+name = "plat"
+workroot = "/w"
+handover_idle = "10m"
+docs.activate_by = "human"
+[defaults]
+harness = "claude"
+handover = "private"
+[[seat]]
+name = "root"
+[[seat]]
+name = "open"
+parent = "root"
+handover = "org"
+[[group]]
+name = "api"
+parent = "root"
+lead = { name = "api-lead" }
+docs.activate_by = "owner"
+workers = { count = 1, prefix = "w", handover = "org" }
+[[group]]
+name = "ops"
+parent = "root"
+lead = { name = "ops-lead" }
+"#,
+        )
+        .unwrap();
+        assert_eq!(t.settings.handover_idle_ms, Some(600_000));
+        let private = |n: &str| t.seat(n).unwrap().handover_private;
+        assert!(private("root") && private("api-lead"));
+        assert!(!private("open") && !private("w-1"));
+        let act = |n: &str| t.teams.iter().find(|x| x.name == n).unwrap().doc_activation;
+        assert_eq!(act("plat"), DocActivation::Human);
+        assert_eq!(act("api"), DocActivation::Kind);
+        assert_eq!(act("ops"), DocActivation::Human);
+        let base = "[team]\nworkroot = \"/w\"\n";
+        let seat = "[defaults]\nharness = \"claude\"\n[[seat]]\nname = \"a\"\n";
+        let t = team(&format!("{base}{seat}")).unwrap();
+        assert_eq!(t.settings.handover_idle_ms, None);
+        assert!(!t.seat("a").unwrap().handover_private);
+        let t = team(&format!("{base}handover_idle = \"off\"\n{seat}")).unwrap();
+        assert_eq!(t.settings.handover_idle_ms, Some(0));
+        for (text, want) in [
+            (
+                format!("{base}docs.activate_by = \"bot\"\n{seat}"),
+                "docs.activate_by",
+            ),
+            (format!("{base}docs.other = 1\n{seat}"), "other"),
+            (format!("{base}{seat}handover = \"secret\"\n"), "handover"),
+            (
+                format!("{base}handover_idle = \"10x\"\n{seat}"),
+                "handover_idle",
+            ),
+        ] {
+            let e = team(&text).unwrap_err();
+            assert!(e.to_string().contains(want), "{want}: {e}");
+        }
     }
 
     #[test]

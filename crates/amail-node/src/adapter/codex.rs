@@ -41,6 +41,8 @@ const EVENTS: &[(&str, &str)] = &[
     ("Stop", "stop"),
     ("Interrupt", "interrupt"),
     ("SessionEnd", "session_end"),
+    ("PreCompact", "pre_compact"),
+    ("PostCompact", "post_compact"),
 ];
 
 const HOOK_TIMEOUT: i64 = 5;
@@ -1345,7 +1347,7 @@ impl Adapter for Codex {
             "Interrupt" => Event::Interrupt,
             "PermissionRequest" => Event::Awaiting,
             "SessionEnd" => Event::SessionEnd,
-            _ => return None,
+            other => compact_event(other, input)?,
         };
         Some(Hook {
             name,
@@ -1354,6 +1356,7 @@ impl Adapter for Codex {
             transcript_path: str_field(input, "transcript_path")
                 .filter(|p| !p.is_empty())
                 .map(str::to_string),
+            facts: HookFacts::from_input(input),
         })
     }
 

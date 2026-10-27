@@ -323,6 +323,140 @@ impl ServerClient {
         .await
     }
 
+    /// The document index `seat` is shown (`GET /docs/index`), cut by the
+    /// server to `max_lines` lines and `max_chars` characters.
+    pub async fn docs_index(
+        &self,
+        seat: &str,
+        max_lines: u32,
+        max_chars: usize,
+        timeout: Duration,
+    ) -> Result<amail_proto::DocIndex> {
+        self.json(
+            self.req(
+                reqwest::Method::GET,
+                &format!(
+                    "/docs/index?seat={}&max_lines={max_lines}&max_chars={max_chars}",
+                    enc(seat)
+                ),
+            )
+            .timeout(timeout),
+        )
+        .await
+    }
+
+    /// The seat's handover note and its state (`GET /seats/{name}/handover`).
+    pub async fn handover(
+        &self,
+        seat: &str,
+        timeout: Duration,
+    ) -> Result<amail_proto::HandoverResponse> {
+        self.json(
+            self.req(
+                reqwest::Method::GET,
+                &format!("/seats/{}/handover", enc(seat)),
+            )
+            .timeout(timeout),
+        )
+        .await
+    }
+
+    /// File a harness's compaction summary as a draft note revision.
+    pub async fn handover_compaction(
+        &self,
+        seat: &str,
+        summary: &str,
+        session: Option<&str>,
+    ) -> Result<amail_proto::HandoverResponse> {
+        let body = amail_proto::HandoverWrite {
+            text: Some(summary.to_string()),
+            session: session.map(str::to_string),
+            source: Some(amail_proto::HandoverSource::Compaction),
+            ..Default::default()
+        };
+        self.json(
+            self.req(
+                reqwest::Method::PUT,
+                &format!("/seats/{}/handover", enc(seat)),
+            )
+            .timeout(Duration::from_secs(10))
+            .json(&body),
+        )
+        .await
+    }
+
+    /// Record that `session` was shown revision `rev` of the seat's note.
+    pub async fn handover_read(
+        &self,
+        seat: &str,
+        session: &str,
+        rev: i64,
+    ) -> Result<amail_proto::HandoverReadResponse> {
+        let body = amail_proto::HandoverRead {
+            session: session.to_string(),
+            rev: Some(rev),
+        };
+        self.json(
+            self.req(
+                reqwest::Method::POST,
+                &format!("/seats/{}/handover/read", enc(seat)),
+            )
+            .timeout(Duration::from_secs(10))
+            .json(&body),
+        )
+        .await
+    }
+
+    /// Ask the seat for its note (system mail to the seat).
+    pub async fn handover_request(&self, seat: &str) -> Result<amail_proto::HandoverRequested> {
+        self.json(
+            self.req(
+                reqwest::Method::POST,
+                &format!("/seats/{}/handover/request", enc(seat)),
+            )
+            .timeout(Duration::from_secs(10)),
+        )
+        .await
+    }
+
+    /// The seat's worklog entries of `kind` since `since` (RFC 3339),
+    /// newest first.
+    pub async fn worklog(
+        &self,
+        seat: &str,
+        kind: &str,
+        since: &str,
+        limit: u32,
+        timeout: Duration,
+    ) -> Result<amail_proto::WorklogPage> {
+        self.json(
+            self.req(
+                reqwest::Method::GET,
+                &format!(
+                    "/seats/{}/worklog?kind={}&since={}&limit={limit}",
+                    enc(seat),
+                    enc(kind),
+                    enc(since)
+                ),
+            )
+            .timeout(timeout),
+        )
+        .await
+    }
+
+    /// Append worklog entries (`POST /worklog`).
+    pub async fn post_worklog(
+        &self,
+        post: &amail_proto::WorklogPost,
+    ) -> Result<amail_proto::WorklogPosted> {
+        self.json(
+            self.req(reqwest::Method::POST, "/worklog")
+                .timeout(Duration::from_secs(15))
+                .json(post),
+        )
+        .await
+    }
+
     pub async fn presence(&self, report: &PresenceReport) -> Result<()> {
         let resp = self
             .req(reqwest::Method::POST, "/presence")

@@ -348,6 +348,19 @@ fn team_put(cur: Option<&p::Team>, want: &team::TeamPlan) -> (Value, Vec<&'stati
     field("root", cur_v(|t| json!(t.root)), json!(want.root));
     field("parent", cur_v(|t| json!(t.parent)), json!(want.parent));
     field("managed", cur_v(|t| json!(t.managed)), json!(true));
+    // `docs.activate_by`: `human`, or null (each kind decides).
+    let want_activation = match want.doc_activation {
+        team::DocActivation::Human => json!("human"),
+        team::DocActivation::Kind => Value::Null,
+    };
+    field(
+        "doc_activate_by",
+        cur_v(|t| match t.doc_activate_by {
+            Some(p::ActivateBy::Human) => json!("human"),
+            _ => Value::Null,
+        }),
+        want_activation,
+    );
     if let Some(cs) = &want.contacts {
         let have: BTreeSet<String> = cur
             .map(|t| t.contacts.iter().cloned().collect())
@@ -565,6 +578,29 @@ pub async fn up(c: &Client, out: &Out, o: &UpOpts) -> Result<()> {
     }
     if !created.is_empty() {
         report.push(format!("created seats: {}", created.join(", ")));
+    }
+    // `handover = "private"`: who reads each seat's handover notes.
+    for s in &t.seats {
+        let v = c
+            .raw(
+                Method::PUT,
+                &format!("/seats/{}/handover/private", enc(&s.name)),
+                Some(&json!({"private": s.handover_private})),
+            )
+            .await
+            .with_context(|| format!("setting who reads the handover notes of {}", s.name))?;
+        if v["changed"].as_bool() == Some(true) {
+            changed_any = true;
+            report.push(format!(
+                "seat {}: handover notes {}",
+                s.name,
+                if s.handover_private {
+                    "private (the seat, its lead and the user read them)"
+                } else {
+                    "readable by every seat of the org"
+                }
+            ));
+        }
     }
     // Seats that left the file.
     // Supervised seats that were deleted on the server (e.g. with `amail
@@ -1042,6 +1078,7 @@ pub fn ps(out: &Out) -> Result<()> {
             "PANE".into(),
             "PENDING".into(),
             "ACTIVE".into(),
+            "NOTE".into(),
             "ATTENTION".into(),
         ]];
         for r in &rows {
@@ -1057,10 +1094,11 @@ pub fn ps(out: &Out) -> Result<()> {
                     .as_deref()
                     .map(ago)
                     .unwrap_or_else(|| "-".into()),
+                r.note.clone().unwrap_or_else(|| "-".into()),
                 r.attention.clone().unwrap_or_else(|| "-".into()),
             ]);
         }
-        let widths: Vec<usize> = (0..6)
+        let widths: Vec<usize> = (0..7)
             .map(|i| {
                 table
                     .iter()

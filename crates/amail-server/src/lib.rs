@@ -355,6 +355,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/seats/{name}/handover/request", post(handover::request))
         .route("/seats/{name}/handover/read", post(handover::read))
+        .route(
+            "/seats/{name}/handover/private",
+            get(handover::get_private).put(handover::put_private),
+        )
         .route("/seats/{name}/worklog", get(handover::worklog))
         .route(
             "/worklog",

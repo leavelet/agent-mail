@@ -341,6 +341,35 @@ async fn private_notes(srv: Server) {
     )
     .await;
     assert_eq!(b.get("/seats/a/handover").await["note"]["rev"], 4);
+    // The seat's setting (the team file's `handover = "private"`): the
+    // user only; it makes the notes private whatever their flags.
+    for c in [&a, &node] {
+        let (s, _) = c
+            .refused(
+                Method::PUT,
+                "/seats/a/handover/private",
+                Some(json!({ "private": true })),
+            )
+            .await;
+        assert_eq!(s, StatusCode::FORBIDDEN);
+    }
+    let v = org
+        .put("/seats/a/handover/private", json!({ "private": true }))
+        .await;
+    assert_eq!(
+        (v["private"].clone(), v["changed"].clone()),
+        (json!(true), json!(true))
+    );
+    let v = org
+        .put("/seats/a/handover/private", json!({ "private": true }))
+        .await;
+    assert_eq!(v["changed"], false);
+    assert_eq!(org.get("/seats/a/handover/private").await["private"], true);
+    let (s, _) = b.refused(Method::GET, "/seats/a/handover", None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    org.put("/seats/a/handover/private", json!({ "private": false }))
+        .await;
+    assert_eq!(b.get("/seats/a/handover").await["private"], false);
 }
 
 async fn requests_mail_the_seat(srv: Server) {
@@ -378,6 +407,21 @@ async fn requests_mail_the_seat(srv: Server) {
     a.put("/seats/a/handover", json!({ "text": NOTE })).await;
     let v = a.get("/seats/a/handover").await;
     assert!(v.get("requested_at").is_none(), "{v}");
+    // A node asks in the name of the system seat.
+    let node = org.node().await;
+    let v = node.post("/seats/a/handover/request", json!({})).await;
+    assert!(v["message_id"].as_i64().is_some(), "{v}");
+    let v = a.get("/seats/a/handover").await;
+    assert_eq!(v["requested_by"], "amail");
+    let inbox = a.get("/inbox").await;
+    assert!(
+        inbox["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["message"]["subject"] == "Handover note requested by the node"),
+        "{inbox}"
+    );
     // The user may ask too; a seat without a team has no lead.
     org.post("/seats/b/handover/request", json!({})).await;
     let (s, _) = lead
@@ -601,8 +645,8 @@ async fn node_entries_and_queries(srv: Server) {
     }
     let (s, _) = c.refused(Method::GET, "/seats/a/worklog", None).await;
     assert_eq!(s, StatusCode::FORBIDDEN);
-    let (s, _) = node.refused(Method::GET, "/seats/a/worklog", None).await;
-    assert_eq!(s, StatusCode::FORBIDDEN);
+    // Node tokens read it (the node looks at the tasks a seat closed).
+    assert_eq!(node.worklog("a", "").await.len(), 4);
     // Only node tokens post.
     let (s, _) = a
         .refused(

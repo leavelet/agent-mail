@@ -506,6 +506,72 @@ later (checked with codex-cli 0.160: wake 0.1 s after sleep, the next turn
 used the corrected model). A Codex seat's new role text does not reach its
 resumed session: tell the agent by mail, which `amail up` says.
 
+## What the node does with hooks
+
+**Hooks registered.**
+
+| harness | events |
+|---|---|
+| Claude Code | `SessionStart`, `UserPromptSubmit`, `PostToolUse`, `Stop`, `StopFailure`, `Notification`, `PermissionRequest`, `SessionEnd`, `PreCompact`, `PostCompact` |
+| Codex | `SessionStart`, `UserPromptSubmit`, `PostToolUse`, `PermissionRequest`, `Stop`, `Interrupt`, `SessionEnd`, `PreCompact`, `PostCompact` (codex-cli 0.160 lists all nine in `hooks/list`) |
+| dsh | `SessionStart`, `UserPromptSubmit`, `PostToolUse`, `Stop`, through the Codex hook bridge (no compaction events) |
+
+The node reads from each input only what it needs and treats a missing or
+unknown field as unknown: the session id, the transcript path, `cwd`,
+`model`, `source` (`SessionStart`), `prompt`, `tool_name` and `tool_input`
+(`PostToolUse`), `reason` (`SessionEnd`), `trigger` (`PreCompact`) and
+`compact_summary` (`PostCompact`; `summary` is also read).
+
+**What is injected, and when.** One answer holds, in this order: the
+seat's handover note, then mail (new mail in full, a digest, the unread
+summary), then the task line, then the document index under
+`Documents:`. Mail is fitted first; the note may then take up to two
+thirds of the harness's injection budget and the index up to a third
+(Claude Code and dsh: 9,000 characters, so about 6,000 and 3,000; Codex:
+6,000, so about 4,000 and 2,000), each cut to what is left. The index is
+cut first.
+
+| hook | shows |
+|---|---|
+| `SessionStart` | the note (sources `startup`, `resume`, `clear`, `compact`), the unread summary, the task line, the index |
+| `UserPromptSubmit` | mail; the index when it changed since the seat last saw it (looked at most every 30 s per seat) |
+| `PostToolUse` | `to` and urgent mail |
+| `Stop` | blocks to show mail; or, once per turn, to ask for the handover note; the index only in an answer that blocks anyway |
+| `PostCompact` | nothing; the next answer shows the whole index again |
+
+**Handover note.** At the end of a turn the node may block the `Stop`
+once with `Write your handover note now with amail handover write; then
+stop.` (see [concepts](concepts.md#seat-handover) for the rules). For the
+context's size it reads the end of the session's transcript: Claude Code
+records `message.usage` on assistant records, and the node adds
+`input_tokens`, `cache_creation_input_tokens` and
+`cache_read_input_tokens` (with prompt caching `input_tokens` alone counts
+only the uncached part); Codex records `token_count` events with
+`info.last_token_usage.input_tokens` (cached input included) and
+`info.model_context_window`. The context window comes from, in this order:
+`--context-window N`, `--context-window MODEL=N` for a model whose name
+contains MODEL, the window the harness recorded (Codex), the node's table
+(`[1m]` models 1,000,000 tokens; Claude models 200,000; `gpt-5`, `gpt-6`
+and `codex` models 272,000; `gpt-4.1` 1,000,000; `deepseek` 128,000), and
+200,000. The node logs the figure and where it came from at debug level.
+dsh records no usage the node reads, so on dsh seats this rule never
+applies. `PreCompact` writes a worklog entry; `PostCompact` writes the
+harness's summary to the worklog and files it as a draft note unless the
+note was written in the current turn.
+
+**Worklog.** The node sends the seat's worklog entries in batches, every
+3 seconds while it is connected (kept in memory, at most 10,000, while it
+is not): `session_start` (`source: startup`), `session_end` (`reason:
+...`), `precompact` (`trigger: auto`), `compact` (the summary, cut to
+1,000 characters), `turn_start`, `turn_end` (`turn ended`, `turn ended by
+the person ...` or `turn failed: <reason>`), `tool` (the tool's name and
+the first 200 characters of its input: a shell command as it is, other
+input as JSON; never the output) and `commit` (hash and subject: at
+`Stop` the node runs `git log -1` in the session's working directory and
+records the commit when it changed since the last look). Each entry
+carries the session id and, when the seat is doing exactly one task, that
+task.
+
 ## Limitations common to all harnesses
 
 - **Mail cannot interrupt.** A busy agent sees mail only between tool calls
