@@ -995,31 +995,27 @@ async fn storage_quota_and_request_limit(srv: Server) {
     assert!(limited);
 }
 
+/// Reminders have no hourly cap: every change reaches its seat, and the
+/// user is not told that any were dropped.
 async fn reminder_cap(srv: Server) {
     let org = srv.org("alpha").await;
     let w1 = org.seat("w1").await;
     org.seat("w2").await;
     org.task(json!({ "title": "ping-pong" })).await;
-    for i in 0..205 {
+    for i in 0..230 {
         let who = if i % 2 == 0 { "w1" } else { "w2" };
         org.patch(1, json!({ "assignee": who })).await;
     }
-    eventually("the notice to the user", || async {
-        org.reminders()
+    eventually("every assignment to w1", || async {
+        w1.reminders().await.len() == 115
+    })
+    .await;
+    assert!(
+        !org.reminders()
             .await
             .iter()
             .any(|s| s == "Task reminders dropped")
-    })
-    .await;
-    let n = org
-        .reminders()
-        .await
-        .iter()
-        .filter(|s| *s == "Task reminders dropped")
-        .count();
-    assert_eq!(n, 1, "one notice");
-    let w1_count = w1.reminders().await.len();
-    assert!(w1_count <= 103, "{w1_count}");
+    );
 }
 
 async fn work_stealing(srv: Server) {

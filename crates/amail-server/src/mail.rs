@@ -351,6 +351,7 @@ pub async fn thread(
         messages,
         participants,
         tasks,
+        docs: crate::docs::thread_refs(&st, auth.org.id, id).await,
     }))
 }
 
@@ -618,6 +619,20 @@ pub async fn events(
     } else {
         stream::empty().boxed()
     };
+    // And `doc` events (a document of the org changed).
+    let doc_events = if matches!(auth.scope, TokenScope::User | TokenScope::Seat) {
+        BroadcastStream::new(st.docs.subscribe(auth.org.id))
+            .filter_map(|r| {
+                std::future::ready(r.ok().map(|t| {
+                    Event::default()
+                        .event("doc")
+                        .data(serde_json::to_string(&t).unwrap_or_default())
+                }))
+            })
+            .boxed()
+    } else {
+        stream::empty().boxed()
+    };
     // Node tokens also get `command` events (sleep, wake, transcript leases);
     // while the stream is open the node counts as connected.
     let commands = if auth.scope == TokenScope::Node {
@@ -643,7 +658,7 @@ pub async fn events(
         .chain(stream::once(std::future::ready(None)));
     let others = stream::select(
         stream::select(presence, commands),
-        stream::select(user_events, task_events),
+        stream::select(user_events, stream::select(task_events, doc_events)),
     )
     .map(Some);
     let stream = stream::select(mailbox, others)

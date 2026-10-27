@@ -12,9 +12,10 @@
 //!   name of a seat record the user as `written_by`, as mail does.
 //! - Reminders are system mail addressed in `To` (so an idle agent is
 //!   woken): never to the seat that made the change, one mail per
-//!   recipient per change, at most
-//!   [`amail_proto::limits::TASK_REMINDERS_PER_HOUR`] per org (the rest
-//!   are dropped and the user is told once an hour).
+//!   recipient per change, and one mail per recipient per background pass
+//!   that lists everything due for it (tasks and documents together, see
+//!   [`run`]). There is no count limit: the storage quota and the per-org
+//!   send limits bound them as they bound all mail.
 //! - Changes publish `task` events (see [`TaskHub`]) for the web
 //!   interface; nodes do not get them.
 //! - A subject with `[t12]` links the message's thread to task 12 of the
@@ -522,6 +523,7 @@ pub async fn create(
         return Ok((StatusCode::OK, Json(d)));
     }
     publish(&st, org.id, t.num, "created", &[]);
+    crate::docs::link_task_title(&st, org.id, Some(me.id), &t).await;
     if let Some(a) = t.assignee_id
         && a != me.id
     {
@@ -1591,10 +1593,17 @@ pub async fn thread_refs(st: &AppState, org_id: i64, thread_id: i64) -> Vec<p::T
 
 /// Task numbers named as `[t12]` in a subject (at most 10).
 pub fn subject_tags(subject: &str) -> Vec<i64> {
+    subject_tags_with(subject, 't')
+}
+
+/// Numbers named as `[<prefix>12]` in a subject (at most 10): tasks `t`,
+/// documents `d`.
+pub fn subject_tags_with(subject: &str, prefix: char) -> Vec<i64> {
+    let open = format!("[{prefix}");
     let mut out = Vec::new();
     let mut rest = subject;
-    while let Some(i) = rest.find("[t") {
-        rest = &rest[i + 2..];
+    while let Some(i) = rest.find(&open) {
+        rest = &rest[i + open.len()..];
         let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
         if !digits.is_empty()
             && rest[digits.len()..].starts_with(']')
@@ -1663,21 +1672,39 @@ pub async fn after_send(
 
 // --- reminders -----------------------------------------------------------------------
 
-/// One reminder for one seat about one task.
+/// What a reminder is about.
+#[derive(Debug, Clone)]
+pub enum About {
+    Task(TaskRec),
+    Doc(amail_store::DocRec),
+}
+
+impl About {
+    /// `t` or `d` and the record's id.
+    fn key(&self) -> (char, i64) {
+        match self {
+            About::Task(t) => ('t', t.id),
+            About::Doc(d) => ('d', d.id),
+        }
+    }
+}
+
+/// One reminder for one seat about one task or document.
 #[derive(Debug, Clone)]
 pub struct Reminder {
-    seat_id: i64,
-    seat: String,
-    /// `assigned`, `unblocked`, `waiting`, `closed`, `urgent`, `stale`, `due`,
-    /// `steal`, `steal_declined`, `steal_expired`, `children_done`,
-    /// `blocker_rejected`.
-    kind: &'static str,
-    task: TaskRec,
-    line: String,
+    pub(crate) seat_id: i64,
+    pub(crate) seat: String,
+    /// Tasks: `assigned`, `unblocked`, `waiting`, `closed`, `urgent`,
+    /// `stale`, `due`, `steal`, `steal_declined`, `steal_expired`,
+    /// `children_done`, `blocker_rejected`. Documents: `revised`,
+    /// `supplemented`, `superseded`, `expired`, `dangling`.
+    pub(crate) kind: &'static str,
+    pub(crate) about: About,
+    pub(crate) line: String,
     /// A copy (the team's lead, for stale tasks).
-    cc: Option<(i64, String)>,
+    pub(crate) cc: Option<(i64, String)>,
     /// More text for the body, after the lines.
-    extra: Option<String>,
+    pub(crate) extra: Option<String>,
 }
 
 impl Reminder {
@@ -1686,7 +1713,26 @@ impl Reminder {
             seat_id,
             seat,
             kind,
-            task: task.clone(),
+            about: About::Task(task.clone()),
+            line,
+            cc: None,
+            extra: None,
+        }
+    }
+
+    /// A reminder about a document.
+    pub fn doc(
+        seat_id: i64,
+        seat: String,
+        kind: &'static str,
+        doc: &amail_store::DocRec,
+        line: String,
+    ) -> Self {
+        Reminder {
+            seat_id,
+            seat,
+            kind,
+            about: About::Doc(doc.clone()),
             line,
             cc: None,
             extra: None,
@@ -1814,13 +1860,17 @@ async fn after_change(
         return;
     }
     publish(st, org.id, ch.task.num, change, &ch.fields);
+    if ch.fields.iter().any(|f| f == "title") {
+        crate::docs::link_task_title(st, org.id, actor, &ch.task).await;
+    }
     for d in &ch.unblocked {
         publish(st, org.id, d.num, "changed", &["state".to_string()]);
     }
     remind(st, org, actor, change_reminders(ch)).await;
 }
 
-/// The body of a reminder mail: its lines, then each task it is about.
+/// The body of a reminder mail: its lines, then each task and document it
+/// is about.
 fn reminder_body(org: &Org, rs: &[&Reminder]) -> String {
     let mut body = String::new();
     for r in rs {
@@ -1834,11 +1884,17 @@ fn reminder_body(org: &Org, rs: &[&Reminder]) -> String {
     }
     let mut seen = Vec::new();
     for r in rs {
-        let t = &r.task;
-        if seen.contains(&t.id) {
+        if seen.contains(&r.about.key()) {
             continue;
         }
-        seen.push(t.id);
+        seen.push(r.about.key());
+        let t = match &r.about {
+            About::Task(t) => t,
+            About::Doc(d) => {
+                body.push_str(&crate::docs::reminder_block(d));
+                continue;
+            }
+        };
         body.push_str(&format!(
             "\nt{}: {}\nState: {}  Priority: {}  Assignee: {}",
             t.num,
@@ -1870,14 +1926,14 @@ fn reminder_body(org: &Org, rs: &[&Reminder]) -> String {
         body.push_str(&format!("\nShow it: amail task show t{}\n", t.num));
     }
     body.push_str(&format!(
-        "\nThis is a reminder of the task board of org {}; the mail system sent it.\n",
+        "\nThis is a reminder about the tasks and documents of org {}; the mail system sent it.\n",
         org.name
     ));
     body
 }
 
-/// Send reminders: never to `actor`, one mail per recipient, within the
-/// org's hourly reminder budget. Best effort: errors are logged.
+/// Send reminders: never to `actor`, one mail per recipient listing all
+/// of its reminders. Best effort: errors are logged.
 pub async fn remind(st: &AppState, org: &Org, actor: Option<i64>, list: Vec<Reminder>) {
     let mut by_seat: Vec<(i64, Vec<Reminder>)> = Vec::new();
     for r in list {
@@ -1886,7 +1942,10 @@ pub async fn remind(st: &AppState, org: &Org, actor: Option<i64>, list: Vec<Remi
         }
         match by_seat.iter_mut().find(|(s, _)| *s == r.seat_id) {
             Some((_, v)) => {
-                if !v.iter().any(|x| x.kind == r.kind && x.task.id == r.task.id) {
+                if !v
+                    .iter()
+                    .any(|x| x.kind == r.kind && x.about.key() == r.about.key())
+                {
                     v.push(r)
                 }
             }
@@ -1924,27 +1983,6 @@ pub async fn remind(st: &AppState, org: &Org, actor: Option<i64>, list: Vec<Remi
     };
     for (seat_id, rs) in by_seat {
         if !alive(seat_id) {
-            continue;
-        }
-        if st.limiters.task_reminders.take(&org.id).is_err() {
-            tracing::warn!(
-                "org {}: task reminder for seat {seat_id} dropped, over the hourly budget",
-                org.id
-            );
-            if st.limiters.task_reminder_notices.take(&org.id).is_ok() {
-                crate::notices::tell_user(
-                    st,
-                    org.id,
-                    "Task reminders dropped",
-                    &format!(
-                        "Your org's tasks produced more than {} reminder mails in the last hour. \
-                         Further reminders are dropped until the hourly budget allows more; the \
-                         tasks themselves and their history are unchanged (amail task board).\n",
-                        TASK_REMINDERS_PER_HOUR as i64
-                    ),
-                )
-                .await;
-            }
             continue;
         }
         let refs: Vec<&Reminder> = rs.iter().collect();
@@ -1993,7 +2031,8 @@ pub async fn remind(st: &AppState, org: &Org, actor: Option<i64>, list: Vec<Remi
                 ack_due: None,
                 written_by: None,
                 // Reminders from the mail system are never refused (as the
-                // acknowledgement reminders); the hourly budget bounds them.
+                // acknowledgement reminders): one per recipient per change or
+                // per pass.
                 storage_quota: None,
                 notice: false,
                 guards: Vec::new(),
@@ -2016,27 +2055,44 @@ pub async fn remind(st: &AppState, org: &Org, actor: Option<i64>, list: Vec<Remi
             })
             .collect();
         st.bus.publish(org.id, &events);
-        let mut done: Vec<(i64, &str)> = Vec::new();
+        let mut done: Vec<((char, i64), &str)> = Vec::new();
         for r in &rs {
-            if done.contains(&(r.task.id, r.kind)) {
+            if done.contains(&(r.about.key(), r.kind)) {
                 continue;
             }
-            done.push((r.task.id, r.kind));
-            if let Err(e) = st
-                .store
-                .record_task_reminder(org.id, r.task.id, r.kind, &seat, sent.message_id)
-                .await
-            {
-                tracing::warn!("recording a reminder of t{}: {e}", r.task.num);
+            done.push((r.about.key(), r.kind));
+            match &r.about {
+                About::Task(t) => {
+                    if let Err(e) = st
+                        .store
+                        .record_task_reminder(org.id, t.id, r.kind, &seat, sent.message_id)
+                        .await
+                    {
+                        tracing::warn!("recording a reminder of t{}: {e}", t.num);
+                    }
+                    publish(st, org.id, t.num, "reminder", &[]);
+                }
+                About::Doc(d) => {
+                    if let Err(e) = st
+                        .store
+                        .record_doc_reminder(org.id, d.id, r.kind, &seat, sent.message_id)
+                        .await
+                    {
+                        tracing::warn!("recording a reminder of d{}: {e}", d.num);
+                    }
+                    crate::docs::publish(st, org.id, d.num, "reminder", &[]);
+                }
             }
-            publish(st, org.id, r.task.num, "reminder", &[]);
         }
     }
 }
 
-/// The background pass: due times that passed (each task once), and the
-/// stale pass (at most once an hour per org; each task once per stale
-/// period, with a copy to its team's lead, the team's root seat).
+/// The background pass: due times that passed (each task once), the stale
+/// pass (at most once an hour per org; each task once per stale period,
+/// with a copy to its team's lead, the team's root seat), expired steal
+/// requests, and the document reminders (expiry once, dangling links once
+/// a day per document). Each seat gets one mail per pass listing
+/// everything due for it.
 pub async fn run(st: AppState) {
     loop {
         tokio::time::sleep(st.attention.task_scan_every).await;
@@ -2110,6 +2166,9 @@ pub async fn scan(st: &AppState) -> amail_store::Result<()> {
             .and_then(|tm| leads.get(&t.org_id).and_then(|m| m.get(&tm)).cloned())
             .filter(|(lead, _)| *lead != id);
         by_org.entry(t.org_id).or_default().push(r);
+    }
+    for (org_id, r) in crate::docs::due_reminders(st, now).await? {
+        by_org.entry(org_id).or_default().push(r);
     }
     for (org_id, rs) in by_org {
         let Some(org) = st.store.org_by_id(org_id).await? else {

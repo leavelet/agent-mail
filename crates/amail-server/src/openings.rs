@@ -186,6 +186,7 @@ async fn teams_out(st: &AppState, org: &Org) -> ApiResult<Vec<p::Team>> {
                     .collect(),
                 open_to: open.remove(&t.id).unwrap_or_default(),
                 managed: t.managed,
+                doc_activate_by: t.doc_activate_by.as_deref().and_then(|s| s.parse().ok()),
                 primaries: primaries
                     .iter()
                     .filter(|(_, team, _)| *team == Some(t.id))
@@ -260,6 +261,11 @@ pub async fn put_team(
         parent: put.parent,
         contacts: put.contacts,
         managed: put.managed,
+        // `owner` is the default: the kind decides.
+        doc_activate_by: put.doc_activate_by.map(|v| {
+            v.filter(|a| *a == p::ActivateBy::Human)
+                .map(|a| a.as_str().to_string())
+        }),
     };
     let (_, changes) = boundary::changing(&st, &auth.org, async {
         Ok(st.store.put_team(auth.org.id, &name, &change).await?)

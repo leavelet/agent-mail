@@ -442,6 +442,7 @@ async fn send_inner(
     // comment is recorded by its caller).
     if !comment {
         crate::tasks::after_send(st, org, sender, msg.written_by.as_deref(), &msg, &sent).await;
+        crate::docs::after_send(st, org, sender, msg.written_by.as_deref(), &msg, &sent).await;
     }
     r.tell_new_participants(&msg.deliveries, sent.thread_id, &msg.subject)
         .await;

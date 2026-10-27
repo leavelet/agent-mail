@@ -11,6 +11,7 @@ pub mod config;
 mod deletion;
 mod directory;
 pub mod dirwatch;
+pub mod docs;
 pub mod error;
 pub mod events;
 pub mod limits;
@@ -68,6 +69,8 @@ pub struct AppState {
     pub directory: Arc<dirwatch::DirectoryHub>,
     /// Task changes, for `task` events.
     pub tasks: Arc<tasks::TaskHub>,
+    /// Document changes, for `doc` events.
+    pub docs: Arc<docs::DocHub>,
 }
 
 impl AppState {
@@ -90,6 +93,7 @@ impl AppState {
             activity: Arc::new(activity::Activity::default()),
             directory: Arc::new(dirwatch::DirectoryHub::default()),
             tasks: Arc::new(tasks::TaskHub::default()),
+            docs: Arc::new(docs::DocHub::default()),
         }
     }
 
@@ -267,6 +271,23 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/tasks/{num}/comments", post(tasks::comment))
         .route("/tasks/{num}/events", get(tasks::events))
+        .route("/docs", get(docs::list).post(docs::create))
+        .route("/docs/search", get(docs::search))
+        .route("/docs/find", get(docs::find))
+        .route("/docs/index", get(docs::index))
+        .route("/docs/check", get(docs::check))
+        .route("/docs/kinds", get(docs::kinds).post(docs::put_kind))
+        .route("/docs/{num}", get(docs::get).patch(docs::patch))
+        .route("/docs/{num}/body", put(docs::put_body))
+        .route("/docs/{num}/supersede", post(docs::supersede))
+        .route("/docs/{num}/verify", post(docs::verify))
+        .route("/docs/{num}/split", post(docs::split))
+        .route("/docs/{num}/extract", post(docs::extract))
+        .route("/docs/{num}/merge", post(docs::merge))
+        .route("/docs/{num}/history", get(docs::history))
+        .route("/docs/{num}/diff", get(docs::diff))
+        .route("/docs/{num}/links", get(docs::links))
+        .route("/docs/{num}/comment", post(docs::comment))
         .route("/inbox", get(mail::inbox))
         .route("/claim", post(mail::claim))
         .route("/claim/release", post(mail::release))

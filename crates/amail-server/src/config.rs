@@ -69,6 +69,58 @@ pub struct Limits {
     /// worth. A client over it gets 429 for requests with a credential the
     /// server has not seen valid lately, without a database lookup.
     pub auth_failures_per_min: Option<f64>,
+    /// The resource rules of documents (`limits.docs.*`).
+    pub docs: DocLimits,
+}
+
+/// The resource rules of documents: one org's share of a shared server.
+/// They apply in public mode only; a self-hosted server leaves them all
+/// unset, so that the org's storage quota is the only bound. Format rules
+/// and the rules that protect the model are constants
+/// (`amail_proto::limits`, documents).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DocLimits {
+    /// Documents per org (numbers given out).
+    pub docs_per_org: Option<i64>,
+    /// Sections of one revision that are stored and searched.
+    pub sections_per_doc: Option<usize>,
+    /// Links of one revision that are recorded.
+    pub links_per_rev: Option<usize>,
+    /// Hits of one `GET /docs/search`.
+    pub search_hits: Option<i64>,
+    /// Documents the per-turn index is built from.
+    pub index_scan: Option<i64>,
+    /// Documents of a kind a new document is compared with.
+    pub candidates_scan: Option<i64>,
+    /// Document kinds per org.
+    pub kinds_per_org: Option<i64>,
+}
+
+impl DocLimits {
+    /// The defaults of public mode.
+    pub fn public() -> Self {
+        DocLimits {
+            docs_per_org: Some(50_000),
+            sections_per_doc: Some(2_000),
+            links_per_rev: Some(2_000),
+            search_hits: Some(1_000),
+            index_scan: Some(5_000),
+            candidates_scan: Some(5_000),
+            kinds_per_org: Some(200),
+        }
+    }
+
+    /// The bounds the store applies.
+    pub fn bounds(&self) -> amail_store::DocBounds {
+        amail_store::DocBounds {
+            docs_per_org: self.docs_per_org,
+            sections_per_doc: self.sections_per_doc,
+            links_per_rev: self.links_per_rev,
+            kinds_per_org: self.kinds_per_org,
+            index_scan: self.index_scan,
+            candidates_scan: self.candidates_scan,
+        }
+    }
 }
 
 impl Limits {
@@ -91,6 +143,7 @@ impl Limits {
             org_queries: Some(1),
             queries: Some(8),
             auth_failures_per_min: Some(10.0),
+            docs: DocLimits::public(),
         }
     }
 }

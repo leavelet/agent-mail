@@ -177,11 +177,6 @@ pub struct Limiters {
     pub queries: QuerySlots,
     /// Node notice reports per org (always on).
     pub node_notices: Buckets<i64>,
-    /// Task reminder mails per org (always on; see
-    /// [`amail_proto::limits::TASK_REMINDERS_PER_HOUR`]).
-    pub task_reminders: Buckets<i64>,
-    /// Notices to the user that task reminders were dropped: one an hour.
-    pub task_reminder_notices: Buckets<i64>,
     /// Held while one node notice report checks and uses its org's daily
     /// notice budget, so that two reports do not both pass one count.
     pub notice_budget: tokio::sync::Mutex<()>,
@@ -232,11 +227,6 @@ impl Limiters {
                 amail_proto::limits::NODE_NOTICES_PER_HOUR,
                 amail_proto::limits::NODE_NOTICE_BURST,
             ),
-            task_reminders: Buckets::per_hour(
-                amail_proto::limits::TASK_REMINDERS_PER_HOUR,
-                amail_proto::limits::TASK_REMINDERS_PER_HOUR,
-            ),
-            task_reminder_notices: Buckets::per_hour(1.0, 1.0),
             notice_budget: tokio::sync::Mutex::new(()),
             auth_failures: l.auth_failures_per_min.map(|n| {
                 Buckets::new(
@@ -276,8 +266,6 @@ impl Limiters {
             b.prune();
         }
         self.node_notices.prune();
-        self.task_reminders.prune();
-        self.task_reminder_notices.prune();
         if let Some(b) = &self.auth_failures {
             b.prune();
         }
