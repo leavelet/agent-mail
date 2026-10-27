@@ -699,6 +699,25 @@ struct NodeArgs {
     /// dir>/node.toml, else `open` (see docs/security.md).
     #[arg(long, env = "AMAIL_LOCAL_POLICY", value_name = "POLICY")]
     local_policy: Option<amail_proto::LocalPolicy>,
+    /// Ask a seat for its handover note at the end of a turn whose input
+    /// passed this percentage of the model's context window.
+    #[arg(long, value_name = "PERCENT", default_value_t = 70.0,
+          value_parser = parse_percent)]
+    handover_threshold: f64,
+    /// The context window of the seats' models, in tokens: `N` for every
+    /// model, or `MODEL=N` for models whose name contains MODEL (may be
+    /// repeated; `k` and `m` suffixes). Default: the harness's figure, else
+    /// the node's table, else 200,000.
+    #[arg(long, value_name = "N|MODEL=N")]
+    context_window: Vec<String>,
+}
+
+/// A percentage from 1 to 100 (`70` or `70%`).
+fn parse_percent(s: &str) -> Result<f64, String> {
+    match s.trim().trim_end_matches('%').trim().parse::<f64>() {
+        Ok(v) if v > 0.0 && v <= 100.0 => Ok(v),
+        _ => Err(format!("{s:?}: give a percentage from 1 to 100")),
+    }
 }
 
 #[derive(Subcommand)]
@@ -2441,6 +2460,8 @@ fn node_args(a: &NodeArgs) -> (Vec<String>, Option<String>) {
         web_terminal_port,
         web_terminal_url,
         local_policy,
+        handover_threshold,
+        context_window,
     } = a;
     let mut v = Vec::new();
     let mut opt = |k: &str, val: Option<String>| {
@@ -2475,6 +2496,10 @@ fn node_args(a: &NodeArgs) -> (Vec<String>, Option<String>) {
         "--local-policy",
         local_policy.map(|p| p.as_str().to_string()),
     );
+    opt("--handover-threshold", Some(handover_threshold.to_string()));
+    for w in context_window {
+        opt("--context-window", Some(w.clone()));
+    }
     (v, token.clone())
 }
 
@@ -2541,6 +2566,12 @@ async fn node_daemon(a: NodeArgs) -> Result<()> {
     }
     cfg.wake_window = std::time::Duration::from_millis(a.wake_window_ms);
     cfg.wake_confirm = std::time::Duration::from_millis(a.wake_confirm_ms);
+    cfg.handover_threshold = a.handover_threshold;
+    for w in &a.context_window {
+        cfg.context_windows
+            .add(w)
+            .map_err(|e| anyhow::anyhow!("--context-window {e}"))?;
+    }
     if let Some(port) = a.web_terminal_port {
         cfg.web_terminal = Some(amail_node::node::WebTerminal {
             port,
