@@ -69,6 +69,10 @@ pub struct Limits {
     /// worth. A client over it gets 429 for requests with a credential the
     /// server has not seen valid lately, without a database lookup.
     pub auth_failures_per_min: Option<f64>,
+    /// Days a worklog entry is kept (`limits.handover.worklog_days`).
+    pub worklog_days: Option<u32>,
+    /// Entries per `POST /v1/worklog` request.
+    pub worklog_batch_entries: Option<usize>,
 }
 
 impl Limits {
@@ -91,6 +95,8 @@ impl Limits {
             org_queries: Some(1),
             queries: Some(8),
             auth_failures_per_min: Some(10.0),
+            worklog_days: Some(90),
+            worklog_batch_entries: Some(5_000),
         }
     }
 }

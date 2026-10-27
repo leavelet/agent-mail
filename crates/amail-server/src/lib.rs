@@ -13,6 +13,7 @@ mod directory;
 pub mod dirwatch;
 pub mod error;
 pub mod events;
+pub mod handover;
 pub mod limits;
 mod mail;
 pub mod netguard;
@@ -176,6 +177,7 @@ pub fn start_background(state: &AppState) -> Vec<tokio::task::JoinHandle<()>> {
         state.store.clone(),
     )));
     tasks.push(tokio::spawn(public::sweep(state.clone())));
+    tasks.push(tokio::spawn(handover::retention(state.clone())));
     if state.config.retention_days.is_some() {
         tasks.push(tokio::spawn(public::retention(state.clone())));
     }
@@ -325,6 +327,19 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/links/{org}",
             axum::routing::delete(d::revoke_link).patch(d::patch_link),
+        )
+        .route(
+            "/seats/{name}/handover",
+            get(handover::get).put(handover::put),
+        )
+        .route("/seats/{name}/handover/request", post(handover::request))
+        .route("/seats/{name}/handover/read", post(handover::read))
+        .route("/seats/{name}/worklog", get(handover::worklog))
+        .route(
+            "/worklog",
+            post(handover::post).layer(axum::extract::DefaultBodyLimit::max(
+                amail_proto::MAX_WORKLOG_POST_BYTES,
+            )),
         );
     let v1 = v1
         .fallback(|| async { error::ApiError::not_found("no such endpoint") })

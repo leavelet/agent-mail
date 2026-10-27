@@ -270,6 +270,7 @@ pub async fn put_focus(
     let bump = st.store.set_focus(seat.id, Some(until)).await?;
     st.bus
         .publish(bump.org_id, &[(seat.name.clone(), bump.seq)]);
+    crate::handover::focus(&st, &seat, Some(until)).await;
     Ok(Json(FocusResponse {
         seat: seat.name,
         focus_until: Some(crate::render::ts(until)),
@@ -290,6 +291,7 @@ pub async fn delete_focus(
     let bump = st.store.set_focus(seat.id, None).await?;
     st.bus
         .publish(bump.org_id, &[(seat.name.clone(), bump.seq)]);
+    crate::handover::focus(&st, &seat, None).await;
     Ok(Json(FocusResponse {
         seat: seat.name,
         focus_until: None,

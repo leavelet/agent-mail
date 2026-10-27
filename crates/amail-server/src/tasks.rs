@@ -522,6 +522,7 @@ pub async fn create(
         return Ok((StatusCode::OK, Json(d)));
     }
     publish(&st, org.id, t.num, "created", &[]);
+    crate::handover::task_created(&st, org, &me, &t).await;
     if let Some(a) = t.assignee_id
         && a != me.id
     {
@@ -1814,6 +1815,7 @@ async fn after_change(
         return;
     }
     publish(st, org.id, ch.task.num, change, &ch.fields);
+    crate::handover::task_changed(st, org, actor, ch).await;
     for d in &ch.unblocked {
         publish(st, org.id, d.num, "changed", &["state".to_string()]);
     }
