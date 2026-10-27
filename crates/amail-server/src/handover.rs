@@ -9,8 +9,9 @@
 //! |---|---|
 //! | `GET /seats/{name}/handover` | every seat of the org, the user, node tokens; a private note only the seat, its lead, the user and node tokens |
 //! | `PUT /seats/{name}/handover` | the seat itself, the user; node tokens with `source: compaction` only |
-//! | `POST /seats/{name}/handover/request` | the seat's lead, the user |
+//! | `POST /seats/{name}/handover/request` | the seat's lead, the user; node tokens (the node asks a seat idle with work in progress) |
 //! | `POST /seats/{name}/handover/read` | node tokens, the seat itself |
+//! | `GET`, `PUT /seats/{name}/handover/private` | the user (the team file's `handover = "private"`) |
 //! | `GET /seats/{name}/worklog` | the seat itself, seats of its team, its lead, the user |
 //! | `POST /worklog` | node tokens, for the org's agent seats |
 //!
@@ -352,11 +353,16 @@ pub async fn request(
     Path(name): Path<String>,
 ) -> ApiResult<Json<p::HandoverRequested>> {
     let seat = target(&st, &auth.org, &name).await?;
+    // A node asks in the name of the org's system seat (`amail`).
+    let by_node = auth.scope == TokenScope::Node;
     let me = match auth.scope {
         TokenScope::User | TokenScope::Seat => auth.mail_seat()?.clone(),
-        _ => return Err(ApiError::forbidden("requires a user or seat token")),
+        TokenScope::Node => st.store.system_seat(auth.org.id).await?,
+        _ => {
+            return Err(ApiError::forbidden("requires a user, seat or node token"));
+        }
     };
-    if !auth.is_user() && lead_of(&st, &seat).await? != Some(me.id) {
+    if !auth.is_user() && !by_node && lead_of(&st, &seat).await? != Some(me.id) {
         return Err(ApiError::forbidden(format!(
             "only the lead of {} (its team's root seat) and the user ask for its note",
             seat.name
@@ -372,15 +378,31 @@ pub async fn request(
     st.store
         .request_handover(auth.org.id, seat.id, me.id, now)
         .await?;
-    let body = format!(
-        "{by} asks you to write your handover note now.\n\nRun:\n    amail handover write\n\
-         with the fields State, Summary, Next, Waiting on, Traps, Verify and Pointers \
-         (amail handover template prints them). Pointers may stay empty: the server fills it in \
-         from your worklog.\n\nThis mail was sent by the mail system of org {org} for {by}.\n",
-        by = me.name,
-        org = auth.org.name
-    );
-    let subject = format!("Handover note requested by {}", me.name);
+    let how = "Run:\n    amail handover write\nwith the fields State, Summary, Next, Waiting \
+               on, Traps, Verify and Pointers (amail handover template prints them). Pointers \
+               may stay empty: the server fills it in from your worklog.";
+    let (subject, body) = if by_node {
+        (
+            "Handover note requested by the node".to_string(),
+            format!(
+                "You have been idle with work in progress, and your handover note is older \
+                 than your last turn. Write your handover note now, then stop.\n\n{how}\n\n\
+                 This mail was sent by the mail system of org {org} for the node that runs \
+                 you.\n",
+                org = auth.org.name
+            ),
+        )
+    } else {
+        (
+            format!("Handover note requested by {}", me.name),
+            format!(
+                "{by} asks you to write your handover note now.\n\n{how}\n\n\
+                 This mail was sent by the mail system of org {org} for {by}.\n",
+                by = me.name,
+                org = auth.org.name
+            ),
+        )
+    };
     let message_id = system_mail(&st, &auth.org, &seat, subject, body).await;
     Ok(Json(p::HandoverRequested {
         seat: seat.name,
@@ -482,6 +504,62 @@ pub async fn read(
         read_by_session: session,
         read_at: ts(n.read_at.unwrap_or_default()),
     }))
+}
+
+/// Body and answer of `PUT /v1/seats/{name}/handover/private`.
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+pub struct PrivateSetting {
+    pub private: bool,
+}
+
+/// `GET /v1/seats/{name}/handover/private` (user tokens): the seat's
+/// setting (the team file's `handover = "private"`), not the flags of its
+/// notes. Answers `{seat, private}`.
+pub async fn get_private(
+    State(st): State<AppState>,
+    auth: Auth,
+    Path(name): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if !auth.is_user() {
+        return Err(ApiError::forbidden("requires a user token"));
+    }
+    let seat = target(&st, &auth.org, &name).await?;
+    let state = st.store.handover_seat(auth.org.id, seat.id).await?;
+    Ok(Json(
+        serde_json::json!({"seat": seat.name, "private": state.private}),
+    ))
+}
+
+/// `PUT /v1/seats/{name}/handover/private` (user tokens) `{private}`: set
+/// the seat's setting; `amail up` applies the team file's
+/// `handover = "private"` with it. Answers `{seat, private, changed}`.
+pub async fn put_private(
+    State(st): State<AppState>,
+    auth: Auth,
+    Path(name): Path<String>,
+    Json(req): Json<PrivateSetting>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if !auth.is_user() {
+        return Err(ApiError::forbidden("requires a user token"));
+    }
+    let seat = target(&st, &auth.org, &name).await?;
+    if seat.kind != SeatKind::Agent {
+        return Err(ApiError::unprocessable(
+            "not_an_agent",
+            "only agent seats have handover notes",
+        ));
+    }
+    let before = st.store.handover_seat(auth.org.id, seat.id).await?.private;
+    if before != req.private {
+        st.store
+            .set_handover_private(auth.org.id, seat.id, req.private)
+            .await?;
+    }
+    Ok(Json(serde_json::json!({
+        "seat": seat.name,
+        "private": req.private,
+        "changed": before != req.private,
+    })))
 }
 
 // --- the worklog -------------------------------------------------------------------------
