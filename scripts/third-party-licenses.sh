@@ -13,7 +13,7 @@ cargo about generate --manifest-path crates/amail-cli/Cargo.toml about.hbs > "$o
 
 # npm packages bundled into web/dist (the rest of web/package.json is build
 # tooling). Check with `npx vite build --sourcemap` when dependencies change.
-bundled="svelte"
+bundled="svelte marked dompurify"
 {
     printf '## npm packages in the web interface\n\n'
     for p in $bundled; do
