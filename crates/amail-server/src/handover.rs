@@ -450,7 +450,9 @@ async fn tell_requester(
     };
     let subject = format!("Handover note of {} written (rev {})", seat.name, n.rev);
     let body = format!(
-        "{name} wrote its handover note (rev {rev}, {at_w}), which you asked for at {at_r}.\n\n         Read it:\n    amail handover show {name}\n\n         This mail was sent by the mail system of org {org}.\n",
+        "{name} wrote its handover note (rev {rev}, {at_w}), which you asked for at {at_r}.\n\n\
+         Read it:\n    amail handover show {name}\n\n\
+         This mail was sent by the mail system of org {org}.\n",
         name = seat.name,
         rev = n.rev,
         at_w = ts(n.written_at),

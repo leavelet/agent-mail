@@ -432,7 +432,7 @@ async fn requests_mail_the_seat(srv: Server) {
         m["message"]["body"]
             .as_str()
             .unwrap()
-            .contains("amail handover show a"),
+            .contains(".\n\nRead it:\n    amail handover show a\n"),
         "{m}"
     );
     // A later note answers nothing: no second mail.

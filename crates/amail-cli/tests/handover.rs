@@ -832,12 +832,11 @@ async fn codex_index_and_compaction(b: Backend) {
             with(codex("UserPromptSubmit"), &[("prompt", json!(prompt))]),
         )
         .await;
-    // Nothing cached yet: no index in this answer. The seat's note is
-    // shown: the Codex session's own `SessionStart` came before its
-    // registration, so this prompt starts the session, and the worklog
-    // records the start.
+    // The seat's note is shown: the Codex session's own `SessionStart`
+    // came before its registration, so this prompt starts the session
+    // (and waits a little for the note, so the index fetched alongside
+    // may come too), and the worklog records the start.
     let t = hook_text(&v).unwrap_or_default();
-    assert!(!t.contains("Documents:"), "{t}");
     assert!(t.contains("Handover note of this seat"), "{t}");
     h.wait("session start entry", || async {
         node_entries(&h, "cx", "session_start").await.len() == 1
