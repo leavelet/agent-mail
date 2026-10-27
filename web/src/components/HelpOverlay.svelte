@@ -11,7 +11,7 @@
     [['a'], 'keys.ack'],
     [['c'], 'keys.compose'],
     [['/'], 'keys.search'],
-    [['g n', 'g o', 'g t', 'g i', 'g a'], 'keys.goto'],
+    [['g n', 'g o', 'g t', 'g d', 'g i', 'g a'], 'keys.goto'],
     [['Alt ↑', 'Alt ↓'], 'keys.moveTask'],
     [['?'], 'keys.help'],
   ];

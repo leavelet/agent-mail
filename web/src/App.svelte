@@ -28,7 +28,12 @@
   import TasksPage from './pages/TasksPage.svelte';
   import TaskPage from './pages/TaskPage.svelte';
   import TaskNewPage from './pages/TaskNewPage.svelte';
+  import DocsPage from './pages/DocsPage.svelte';
+  import DocPage from './pages/DocPage.svelte';
+  import DocNewPage from './pages/DocNewPage.svelte';
+  import DocKindsPage from './pages/DocKindsPage.svelte';
   import { parseTaskNum } from './lib/tasks';
+  import { parseDocTarget } from './lib/docs';
 
   const registering = currentPage() === 'register';
 
@@ -54,7 +59,7 @@
     if (ui.helpOpen) return;
     if (gPending) {
       gPending = false;
-      const target = { n: 'needs', o: 'org', t: 'tasks', i: 'inbox', a: 'archive' }[e.key];
+      const target = { n: 'needs', o: 'org', t: 'tasks', d: 'docs', i: 'inbox', a: 'archive' }[e.key];
       if (target) {
         go([target]);
         e.preventDefault();
@@ -122,6 +127,15 @@
         <TaskPage num={parseTaskNum(parts[1]) ?? 0} />
       {:else if section === 'tasks'}
         <TasksPage />
+      {:else if section === 'docs' && parts[1] === 'new'}
+        <DocNewPage {query} />
+      {:else if section === 'docs' && parts[1] === 'kinds'}
+        <DocKindsPage />
+      {:else if section === 'docs' && parts[1]}
+        {@const target = parseDocTarget(parts[1])}
+        {#key target.ref}<DocPage target={target.ref} anchor={target.anchor} />{/key}
+      {:else if section === 'docs'}
+        <DocsPage {query} />
       {:else if section === 'needs'}
         <NeedsPage />
       {:else if section === 'inbox'}

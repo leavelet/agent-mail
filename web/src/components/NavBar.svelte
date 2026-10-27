@@ -27,6 +27,7 @@
   </a>
   <a href={href(['org'])} class:active={section === 'org' || section === 'seat'}><span>{t('nav.org')}</span></a>
   <a href={href(['tasks'])} class:active={section === 'tasks'}><span>{t('nav.tasks')}</span></a>
+  <a href={href(['docs'])} class:active={section === 'docs'}><span>{t('nav.docs')}</span></a>
   <a href={href(['teams'])} class:active={section === 'teams'}><span>{t('nav.teams')}</span></a>
   <a href={href(['orgs'])} class:active={section === 'orgs' || (section === 'admin' && sub === 'links')}>
     <span>{t('nav.others')}</span>
