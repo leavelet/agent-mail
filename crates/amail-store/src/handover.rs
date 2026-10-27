@@ -514,14 +514,33 @@ macro_rules! impl_handover_queries {
                     summary.push_str(nt.trim());
                 }
                 summary.push_str(" The seat holds no other unfinished task.");
+                // The agent's own summary, verification path and pointers
+                // stay readable in the idle note: they are what the
+                // successor needs when the seat is given work again.
+                let agent = prev.as_ref().filter(|p| p.source == HandoverSource::Agent);
+                let mut verify = format!("amail task show t{num}");
+                let mut pointers = String::new();
+                if let Some(p) = agent {
+                    if !p.fields.summary.trim().is_empty() {
+                        summary.push_str(&format!(
+                            "\nEarlier summary (rev {}, before t{num} closed): {}",
+                            p.rev,
+                            p.fields.summary.trim()
+                        ));
+                    }
+                    if !p.fields.verify.trim().is_empty() {
+                        verify.push_str(&format!("\nFrom rev {}: {}", p.rev, p.fields.verify.trim()));
+                    }
+                    pointers = p.fields.pointers.trim().to_string();
+                }
                 let fields = HandoverFields {
                     state: format!("idle: t{num} closed, no other work"),
                     summary,
                     next: "Nothing assigned: read new mail, then `amail task next` for work that is ready.".into(),
                     waiting_on: "nothing".into(),
                     traps,
-                    verify: format!("amail task show t{num}"),
-                    pointers: String::new(),
+                    verify,
+                    pointers,
                 };
                 let n = NewNoteRec {
                     org_id,

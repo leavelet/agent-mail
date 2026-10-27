@@ -914,7 +914,8 @@ than the task's closing, and never over a note the agent (or the user in
 its name) wrote in the turn that closed the task or later: the turn is
 the seat's last `turn_start` its node reported, and when no turn is known
 the agent's note is kept. When the idle note replaces a note the agent
-wrote in an earlier turn, the agent's `Traps` are kept in it.
+wrote in an earlier turn, the agent's `Traps`, `Verify` and `Pointers`
+are kept in it, and its `Summary` is quoted after the server's line.
 
 The lead of a seat (its team's root seat) and the user can ask a seat for
 its note; the seat then gets system mail naming `amail handover write`.

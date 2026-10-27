@@ -533,6 +533,19 @@ async fn idle_note_keeps_the_agents_note(s: S) {
         "{}",
         n.fields.traps
     );
+    // Its summary and verification path too.
+    assert!(
+        n.fields.summary.contains("Earlier summary (rev 1")
+            && n.fields.summary.contains("Writing the parser."),
+        "{}",
+        n.fields.summary
+    );
+    assert!(
+        n.fields.verify.starts_with("amail task show t")
+            && n.fields.verify.contains("cargo test prints ok"),
+        "{}",
+        n.fields.verify
+    );
     // A server note is replaced at the next close without asking.
     let t4 = s.create_task(&mk("printer")).await.unwrap();
     pause().await;
