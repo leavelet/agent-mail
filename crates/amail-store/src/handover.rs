@@ -252,12 +252,17 @@ macro_rules! impl_handover_queries {
             /// The seat is a seat of the org (deleted seats too: their
             /// history stays readable).
             async fn check_seat(c: &mut Conn, org_id: i64, seat_id: i64) -> Result<()> {
-                let n: Option<i64> = sqlx::query_scalar("SELECT id FROM seats WHERE id = $1 AND org_id = $2")
+                seat_kind(c, org_id, seat_id).await.map(|_| ())
+            }
+
+            /// The kind of a seat of the org.
+            async fn seat_kind(c: &mut Conn, org_id: i64, seat_id: i64) -> Result<String> {
+                let k: Option<String> = sqlx::query_scalar("SELECT kind FROM seats WHERE id = $1 AND org_id = $2")
                     .bind(seat_id)
                     .bind(org_id)
                     .fetch_optional(&mut *c)
                     .await?;
-                n.map(|_| ()).ok_or_else(|| StoreError::NotFound("seat".into()))
+                k.ok_or_else(|| StoreError::NotFound("seat".into()))
             }
 
             async fn ensure_seat_row(c: &mut Conn, org_id: i64, seat_id: i64) -> Result<()> {
@@ -441,6 +446,9 @@ macro_rules! impl_handover_queries {
             /// and the seat holds no other unfinished task; `None` when it
             /// holds one.
             pub async fn write_idle_note(c: &mut Conn, org_id: i64, seat_id: i64, num: i64, quota: Option<i64>) -> Result<Option<NoteRec>> {
+                if seat_kind(c, org_id, seat_id).await? != "agent" {
+                    return Ok(None);
+                }
                 let open: i64 = sqlx::query_scalar(
                     "SELECT COUNT(*) FROM tasks WHERE org_id = $1 AND assignee_id = $2 AND state NOT IN ('done', 'cancelled')",
                 )
@@ -566,7 +574,8 @@ macro_rules! impl_handover_queries {
                 Ok(true)
             }
 
-            /// Append entries (of seats of the org); the number written.
+            /// Append entries (of agent seats of the org; others are left out);
+            /// the number written.
             pub async fn append(c: &mut Conn, org_id: i64, entries: &[NewWorklogEntry], quota: Option<i64>) -> Result<usize> {
                 if entries.is_empty() {
                     return Ok(0);
@@ -595,7 +604,9 @@ macro_rules! impl_handover_queries {
                     ids.dedup();
                     let mut ok = std::collections::HashSet::new();
                     for id in ids {
-                        if check_seat(c, org_id, id).await.is_ok() {
+                        // Agent seats only: the user and the system seat
+                        // have no sessions to hand over.
+                        if seat_kind(c, org_id, id).await.ok().as_deref() == Some("agent") {
                             ok.insert(id);
                         }
                     }

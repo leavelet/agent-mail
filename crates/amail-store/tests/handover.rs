@@ -446,6 +446,8 @@ async fn worklog_queries(s: S) {
     es.push(entry(&o.a, "s1", "tool", &"y".repeat(5000), None));
     let other = setup(&s, "beta").await;
     es.push(entry(&other.a, "s1", "tool", "foreign", None));
+    // The user seat has no worklog.
+    es.push(entry(&o.user, "s1", "tool", "user", None));
     assert_eq!(s.append_worklog(o.org.id, &es, None).await.unwrap(), 31);
     let all = s.worklog(&q(&o, &o.a)).await.unwrap();
     assert_eq!(all.len(), 31);

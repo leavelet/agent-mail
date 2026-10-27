@@ -763,7 +763,8 @@ pub trait Store: Send + Sync + 'static {
         at: i64,
     ) -> Result<HandoverSeatRec>;
     /// The server's note after the seat's task `num` closed: written
-    /// (`State: idle`) only when the seat holds no other unfinished task.
+    /// (`State: idle`) only for an agent seat that holds no other unfinished
+    /// task.
     async fn write_idle_note(
         &self,
         org_id: i64,
@@ -771,7 +772,7 @@ pub trait Store: Send + Sync + 'static {
         num: i64,
         quota: Option<i64>,
     ) -> Result<Option<NoteRec>>;
-    /// Append worklog entries of seats of the org (others are left out);
+    /// Append worklog entries of agent seats of the org (others are left out);
     /// the number written. Over the quota, the org's oldest entries are
     /// deleted to make room.
     async fn append_worklog(
