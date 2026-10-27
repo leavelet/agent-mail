@@ -180,6 +180,37 @@ The first public version.
   `keep`. One pending request per task; it ends with the answer, with a
   change of the task's assignee or state, or after 24 hours, and the
   requester is told. Migration `0024_task_steal.sql`.
+- Documents, M9 (server and API; the command line, MCP tools, node
+  injection and web pages follow): an org's knowledge base under
+  `/v1/docs…` (migration `0026_docs.sql`). A document has a number per org
+  (`d12`), an optional slug, a kind, a title, a one-line description, a
+  Markdown body kept whole per revision, a status (`draft`, `active`,
+  `superseded`, `archived`), an owner, a team, labels, editors and a
+  verification date with an expiry. Five built-in kinds per org
+  (`decision`, `finding`, `runbook`, `index`, `reference`) with required
+  sections; the user adds kinds. Bodies are parsed on write into sections
+  with anchors (`d12#rollback`), read and written one section at a time,
+  and into links (documents, tasks, messages, threads, seats, repository
+  paths) with backlinks and dangling-link checks. A body is at most
+  512 KiB, with advice to split above an estimated 40,000 tokens; `split`,
+  `extract` and `merge` run in one transaction and rewrite the links to
+  moved sections in other documents and in task bodies. Writes take
+  `if_rev` and answer 409 `stale` with the changes since and a diff; equal
+  writes create no revision; `client_key` as for tasks. An active
+  `decision` is frozen. Search by section (trigram, with Chinese text),
+  `find` by title, the per-turn index cut to the caller's budget, and
+  similar existing documents listed on create without refusing it.
+  Comments are mail in the document's thread (`[d12] <title>`); `[d12]` in
+  a subject and `d12` in a task title link the thread or task. The owner
+  is mailed about revisions by others, new documents that supplement or
+  supersede theirs, expiry (once) and dangling links (once a day).
+  `doc` events on `/v1/events`. A team can require the user to activate
+  every document (`doc_activate_by` on `PUT /v1/teams/{name}`). Documents
+  count against the storage quota (`doc_bytes`).
+- Reminders: the cap of 200 reminder mails per org and hour, and the
+  notice to the user when it dropped some, are removed. The background
+  pass sends each seat one mail listing everything due for it (tasks and
+  documents together); changes still send one mail per recipient.
 
 #### Running agents
 
@@ -438,6 +469,11 @@ Changes made after a security review, before the first public server.
 - A per-org storage quota (`--max-org-storage-mb`, 1 GiB by default in
   public mode) counts the mail each org sent; a send over it is refused
   with 507 `storage_quota`.
+- Documents have two classes of limits: format and model-protection rules
+  (body 512 KiB, field lengths, the index budget) everywhere, and resource
+  rules (documents, indexed sections and links, search hits, kinds per
+  org, how many documents the index and the candidates look at) in public
+  mode only; on a self-hosted server the storage quota is the only bound.
 - Conversation mirrors are bounded per post (1 MiB), per watcher (8 MiB),
   per seat (16 MiB) and per server instance (`--max-mirror-mb`, 256 MiB by
   default in public mode); a watcher that falls behind is disconnected and

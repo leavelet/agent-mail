@@ -556,9 +556,14 @@ addressed in `To`, so an idle agent is woken:
 
 No reminder goes to the seat that made the change. One change sends at
 most one mail to each seat; that mail lists everything the change means
-for it. An org receives at most 200 reminder mails an hour; further ones
-are dropped, and the user is told once an hour. Each reminder is recorded
-in the task's history (`reminder_sent`).
+for it. The reminders that come from the server's background pass (stale
+and due tasks, expired requests to take a task over, and the reminders of
+documents: expiry and dangling links) are gathered per seat: each pass
+sends a seat one mail that lists everything due for it, tasks and
+documents together. There is no limit on the number of reminders; the
+org's storage quota and the send limits that apply to all mail are the
+bounds. Each reminder is recorded in the task's (or document's) history
+(`reminder_sent`).
 
 ### Mail and tasks
 
@@ -602,6 +607,202 @@ after. A change of the description records the whole old and new text.
 Events are never changed or deleted; the org's storage quota, which counts
 them, bounds them. There is no deleting a task: `cancelled` is the end
 state (deleting the org deletes its tasks).
+
+## Documents
+
+An org keeps what its team has learned as documents: decisions and why
+they were taken, findings with their evidence, procedures. A document is
+one record that every seat of the org sees and that nothing outside the
+org sees. Documents are numbered per org (`d1`, `d2`, ...); a number is
+never given out twice. A document may also have a slug, a dot-separated
+alias such as `runbook.deploy.rollback` (at most 128 characters of `a-z`,
+`0-9`, `.`, `_` and `-`), which is accepted wherever `d12` is; renaming the
+slug keeps the number.
+
+A document has a kind, a title (one line, at most 512 characters), a
+description (one line for the index, at most 200 characters), a Markdown
+body, a status, an owner seat, a team (by default the owner's), labels (at
+most ten of at most 32 characters), editors (at most 20 seats), whether it
+is pinned, its verification (`verified_at`, `verified_by`, `expires_at`),
+its relations to other documents and its current revision (`rev`).
+
+### Kinds
+
+Kinds are per org. Each has required sections (heading titles the body
+must contain), who activates its documents (`owner` or `human`), whether
+its active documents are in the per-turn index, a body cap and a default
+verification interval. Every org has five built-in kinds:
+
+| Kind | Required sections | Activated by | In the index | Verified for |
+|---|---|---|---|---|
+| `decision` | Context, Decision, Alternatives, Consequences | the user | yes | no expiry |
+| `finding` | Observed, Evidence, Applies to | the owner | yes | 30 days |
+| `runbook` | When, Steps, Verify | the owner | yes | 60 days |
+| `index` | none | the owner | yes | 30 days |
+| `reference` | none | the owner | no | no expiry |
+
+The user adds kinds (`POST /docs/kinds`) and may change or disable them; a
+disabled kind takes no new documents. A new document without a kind is a
+`reference`.
+
+### Status
+
+A new document is `draft`. The owner, or the user, sets it `active`; for
+a kind activated by the human (`decision`), or for any document of a team
+whose `doc_activate_by` is `human`, only the user does. A draft is visible
+and searchable but is not in the per-turn index and is not found by a
+search unless the search asks for it. `superseded` is set by naming the
+replacing document (`POST /docs/{num}/supersede`); the old document keeps
+its text and shows `superseded_by`, and the new one shows `replaces`.
+`archived` is for a document that is no longer true and has no
+replacement. The allowed changes are `draft` to `active` or `archived`,
+`active` to `archived`, `archived` to `draft`, and `superseded` to
+`archived`. An `active` decision is frozen: its body cannot change (409
+`frozen`); a correction is a new decision that supersedes it.
+
+### Body, sections and size
+
+The body is Markdown. The server parses it on every write: every heading
+is a section with an anchor, written `d12#rollback`. A heading with an
+explicit `{#id}` keeps that id; otherwise the anchor is derived from the
+heading's text (lower case, spaces to `-`, letters of any script and
+digits kept, other characters dropped; a repeated anchor gets `-1`, `-2`).
+The text before the first heading is a section with an empty anchor. A
+section reaches up to the next heading of the same or a higher level, so a
+section includes its subsections. A body that lacks a required section of
+its kind is refused with 422 `sections_missing`, naming the missing ones.
+
+A body is at most 512 KiB (422 `body_too_large` with its size); a kind may
+set less. The server estimates a body's tokens (one per 4 characters of
+text that is not CJK, one per CJK character, rounded up). Above an
+estimated 40,000 tokens a write still succeeds, and the document carries
+the advice `the body is ~52,000 tokens; split it with amail doc split
+d12` until the body is below that. An `index` document longer than 1,000
+characters carries advice to shorten it.
+
+A section can be read and written on its own (`GET /docs/12?section=
+rollback`, `PUT /docs/12/body` with `section`). A large document is split
+in one call: `split` turns each heading of a level (default 1) into a
+child document of the same kind, owner and labels, titled with the
+heading, and leaves the parent its other text followed by a list of the
+children; `extract` moves one section into a new document that
+supplements the source and leaves the heading and `See d31.` in its
+place; `merge` appends a document to another as a section (only the owner
+of both, or the user) and marks the merged one superseded. Each of the
+three runs in one transaction, writes a revision of every document it
+changes, and rewrites the references to the moved sections (`d12#rollback`
+becomes `d31`, `d12#rollback-steps` becomes `d31#rollback-steps`) in the
+bodies of other documents and of tasks.
+
+### Revisions
+
+Every write that changes the body, the title or the description is a new
+revision: the whole text, the author, an optional message (at most 500
+characters), the SHA-256 of the body and the time. A write whose text
+equals the current revision's writes nothing and answers `unchanged`.
+Other changes (status, owner, labels, pinning, verification, relations)
+are events without a revision. Every revision stays readable
+(`GET /docs/12?rev=3`), and a diff between two revisions is computed on
+request.
+
+Writes take `if_rev`. When the document's `rev` differs, nothing changes
+and the answer is 409 `stale` with the document as it is now, the
+revisions and events since that revision with their authors and
+messages, and the diff from it to the current revision, so a writer can
+merge without another call. `POST /docs` takes a `client_key` as
+`POST /tasks` does. A write with `silent` records its events but sends no
+mail.
+
+### Links and relations
+
+Relations are typed: `parent` (a tree; at most eight ancestors, no
+cycles), `supersedes`, `supplements` and `related`. Each is shown on both
+documents.
+
+Links in bodies are extracted on every write: `d12` and `d12#anchor`
+(also `[[d12]]` and `[text](doc:d12)`), `t12`, a message (`#45`) or thread
+(`thread 7`), a seat (`@w1`, when the seat exists) and a repository path
+(`src/main.rs`, optionally `:line`). Text in fenced code blocks is not
+read. Each link keeps the target's title when it was written, so a link
+whose target was renamed since shows both. A link to a document that does
+not exist, or to an anchor its target no longer has, is dangling: the
+write succeeds and its answer lists the dangling links. A repository path
+that the node reported missing is stale. `GET /docs/{num}/links` shows the
+links of a document and the links into it; `GET /docs/check` lists the
+dangling and stale links of the org's draft and active documents.
+
+A mail subject with `[d12]` links its thread to document 12; a task
+title that names `d12` links the task. A document shows its linked
+threads and tasks, and a thread answer lists the documents it cites.
+
+### Search and the index
+
+Documents are searched by section (`GET /docs/search`), as mail is: on
+SQLite a trigram full-text index, on Postgres a trigram index used by
+`ILIKE`, so substrings and Chinese and Japanese text are found. Terms of
+fewer than 3 characters narrow a search; when every term is that short,
+titles and descriptions are searched instead of sections. A search finds
+`active` documents unless it asks for other statuses (`status=all` finds
+every status, each marked), shows the caller's team's documents first and
+documents past their expiry last, and answers one line per hit:
+`d12#rollback  runbook  active  Deploy > Rollback — <matching sentence>
+(verified 2026-10-20)`. `GET /docs/find` searches titles, slugs and
+descriptions only.
+
+The per-turn index (`GET /docs/index`) is what a seat is shown without
+asking: one line per active document of a kind in the index,
+`d12  runbook  <title> — <description>`, pinned documents first, then the
+team's own, then those of no team; within each, fresh before stale and
+newest verified first. The caller passes the budget it has (`max_lines`,
+default 60, and `max_chars`, default 3,000); the server cuts the list to it
+and ends with `… and 41 more: amail doc list --team backend`.
+
+### Candidates on create
+
+A new document is compared with the documents of its kind: those whose
+title, description or slug is close to the new one (trigram similarity of
+at least 0.3, at most five) come back as `candidates`, with the line
+`similar documents exist: d12 <title>; supersede or supplement one of them
+if this is the same subject`. The create is never refused for this.
+
+### Who may do what
+
+| Action | Who |
+|---|---|
+| create a document, comment | any seat or the user |
+| revise body, title, description, labels, slug, team, relations | the owner, the user, and the seats in `editors` |
+| change status, owner, editors, pinning, expiry; verify | the owner and the user |
+| activate a document of a kind activated by the human | the user |
+| add or change kinds | the user |
+
+Other writes are refused with 403 `not_owner`.
+
+### Verification and reminders
+
+`POST /docs/{num}/verify` records that the content is current: now, by
+whom, and until when (`for`: `30d`, `12h`, `2w` or `none`; by default the
+kind's interval). A document past its `expires_at` is stale: marked in
+lists, search and the index and sorted after fresh documents; nothing is
+hidden or deleted.
+
+Documents send mail to their owner only: a revision by another seat (not
+with `silent`), a new document that supplements or supersedes theirs, and
+two reminders of the background pass: once when `expires_at` passes,
+naming `amail doc verify d12` and `amail doc show d12`; and once a day
+while the document has dangling links, listing them.
+
+### Comments
+
+A comment (`POST /docs/{num}/comment`) is a message in the document's
+discussion thread, subject `[d12] <title>`, to the owner, copied to the
+seats that commented before. A comment on a section starts with the line
+`On d12#rollback (Deploy > Rollback):`. Replies in the thread are comments
+too. When a later revision removes the section, the document lists the
+comment as on a removed section with the heading path it had.
+
+Documents count against the org's storage quota (`doc_bytes`): every
+revision whole, the sections and links of the current one, events and
+relations. Deleting the org deletes its documents.
 
 ## The user's queue ("needs you")
 

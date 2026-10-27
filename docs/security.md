@@ -623,6 +623,15 @@ time has a fixed bound. Limits marked *public* apply only with
 variable shown in [operations.md](operations.md)); the others always apply.
 Rate and stream limits are counted per server instance.
 
+Document limits come in two classes. The format rules and the rules that
+protect a model's context (the body cap, field lengths, the index budget)
+apply everywhere. The resource rules (documents, sections, links, hits,
+kinds per org, how many documents the index and the candidates look at)
+are marked *public*: they protect a shared server from one org and are off
+on a self-hosted server, where the org's storage quota is the only bound.
+They are set by public mode (`limits.docs.*` in the server's
+configuration) and have no flags of their own yet.
+
 | What | Limit |
 |---|---|
 | Request body (any endpoint) | 2 MiB; a transcript post (`POST /seats/{name}/transcript`) 1 MiB (HTTP 413 beyond; nodes split their posts to fit); a task import (`POST /tasks/import`, user tokens) 64 MiB, read only after the token is checked. A body whose declared length is above its limit is answered with 413 before authentication; up to 16 MiB of it is read and dropped first (for at most 5 s), so that the client receives the answer instead of a reset connection |
@@ -679,7 +688,15 @@ Rate and stream limits are counted per server instance.
 | Task history | every event is kept; the storage quota bounds them (a change of the description records the whole old and new text, so its event counts both) |
 | Task storage | each task counts its title, body, labels, reason, result ref, note and author, and import id plus 512 bytes, each event its texts plus 128 bytes, each dependency and link 128 bytes, against the org's storage quota together with its mail (`task_bytes`); a change over it is refused with 507 `storage_quota` |
 | Task import | user tokens only; at most 5,000 records and a 64 MiB body per request (other requests: 2 MiB), in one transaction; the task bounds and the storage quota apply |
-| Task reminders | at most 200 reminder mails per org per hour (per server instance); further ones are dropped and the user is told once an hour. The stale pass runs at most once an hour per org; a due time is reminded once |
+| Reminders (tasks and documents) | no count limit: one mail per recipient seat per change, and one mail per recipient seat per background pass listing everything due for it; the storage quota and the send limits of all mail bound them. The stale pass runs at most once an hour per org; a due time and a document's expiry are reminded once; dangling links once a day per document |
+| One document (format and model protection; always) | body 512 KiB (a kind may set less; 422 `body_too_large`), advice to split above an estimated 40,000 tokens; title 512 characters, description 200, slug 128, revision message 500, one line each; 10 labels of at most 32 characters; 20 editors; at most eight ancestors (`parent` chain); kind names 32 characters, required section titles 200 |
+| Document index and search answers | the index is cut to the budget the caller passes (default 60 lines and 3,000 characters) and says how many lines were left out; a search answers 20 hits by default and cuts each snippet to 200 characters; at most 10 terms |
+| Documents per org | 50,000 (*public*); 422 `too_many_docs` beyond |
+| Sections stored and searched per revision, links recorded per revision | 2,000 and 2,000 (*public*); the rest of a larger body is stored but not indexed |
+| Search hits per request | 1,000 (*public*); a search takes a query slot of the search pool, `GET /docs`, `/docs/find` and `/docs/check` of the other pool, the index of the light pool |
+| Documents the index is built from, documents of a kind a new one is compared with | 5,000 and 5,000 (*public*) |
+| Document kinds per org | 200 (*public*); 422 `too_many_kinds` beyond |
+| Document storage | every revision counts its whole text, each section and link of the current revision its text plus 128 bytes, each event and relation 128 bytes plus its texts, each document 512 bytes plus its fields, against the org's storage quota together with its mail and tasks (`doc_bytes`); a write over it is refused with 507 `storage_quota`. On a server without the *public* limits this is the only bound on documents |
 | Task queries | `GET /tasks` and the personal lists at most 500 tasks per page; `GET /tasks?text=` looks at the 5,000 newest tasks below its cursor; `GET /tasks/board` shows at most 100 tasks per column and 200 waiting tasks; `GET /tasks/report` at most 500 tasks per section; these take a query slot of the other pool |
 | Event replay buffer (`Last-Event-ID`) | 4,096 events per org; a subscriber more than 1,024 events behind is disconnected and resynchronizes |
 | Presence report | 5,000 seats per request; an entry is valid for 90 s |

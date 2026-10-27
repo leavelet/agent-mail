@@ -347,11 +347,11 @@ URL (`AMAIL_URL=https://example.com/amail`). See
 | `GET /messages/{id}/status` | per-recipient state (`queued`, `notified`, `read`, `acked`, `withdrawn`; the sender and the sender org's user only); seats reached through another org's list, including seats of a third org that the list contains, are counted under the list's address (`members`) |
 | `DELETE /threads/{id}` | user tokens: delete, for the org, the messages of the thread it may delete: mail of orgs that no longer exist (the org's deliveries of it; the message goes once no org keeps a delivery of it), and mail the org sent that no other org has a delivery of (its internal mail, including mail from the mail system). Mail exchanged with orgs that still exist stays, for both sides, until retention clears its bodies. Answers `{deleted, kept, more}`: `kept` counts the messages that stay; at most 1,000 messages are deleted per call (among the newest 50,000 of the thread), and `more` says to call again. Replies to a deleted message lose their `in_reply_to`. Each seat that loses deliveries gets a `mailbox` event. Mail that a seat was shown in a turn that has not ended goes too: reading it then answers 404, and releasing it after a failed turn (`POST /claim/release`) releases nothing. 404 for a thread the org cannot see, as for a missing one. Takes one of the org's query slots |
 | `POST /archive/purge-deleted-orgs` | `before_id` (user tokens): delete up to 1,000 messages of deleted orgs that the org keeps, looking at the org's mail below `before_id` in steps of 5,000 messages and starting no step after 100 ms; answers `{deleted, more, next_before_id}`, call again with `before_id` set to `next_before_id` while `more` is true. Takes one of the org's query slots |
-| `GET /threads/{id}` | messages of a thread the caller may see, oldest first, and `tasks`: the caller's org's tasks linked to it or whose discussion thread it is (`{num, title, state, assignee?}`) (404 for a thread the caller cannot see, as for a missing one): at most the newest 500 and 2 MiB of headers, with `"truncated": true` when older ones were left out. Bodies are included newest first up to 1 MiB in total; a message whose body was left out has `"body_omitted": true` and an empty `body`; read it with `GET /messages/{id}?peek=1` |
+| `GET /threads/{id}` | messages of a thread the caller may see, oldest first, `tasks`: the caller's org's tasks linked to it or whose discussion thread it is (`{num, title, state, assignee?}`), and `docs`: the caller's org's documents it cites (`[d12]` subjects) or whose discussion thread it is (`{num, slug?, kind, title, description, status, stale}`) (404 for a thread the caller cannot see, as for a missing one): at most the newest 500 and 2 MiB of headers, with `"truncated": true` when older ones were left out. Bodies are included newest first up to 1 MiB in total; a message whose body was left out has `"body_omitted": true` and an empty `body`; read it with `GET /messages/{id}?peek=1` |
 | `POST /claim` | `{classes, min_priority?, via, limit?, inline_body_max?, include_digest?, digest_only?, mark_inlined_read?, key?, preview_chars?}`: atomically mark pending deliveries notified and return them; concurrent claims never return the same delivery. `key` (chosen by the caller) makes the claim idempotent: a claim with a key the seat used in the last six hours takes nothing new and returns what the first one took. `inline_body_max` and `preview_chars` are capped at 16,384 characters |
 | `POST /claim/release` | node tokens, `seat=`: `{key, messages}`: the turn that showed these messages of the claim with `key` failed; their deliveries go back to not notified, not read (unless acknowledged). Answers `{seat, released}` |
 | `GET /changes` | `since` (a sequence number): deliveries created or changed since (`limit` ≤ 5000, at most 2 MiB); continue from `next` while `more` is true. Takes one of the org's query slots |
-| `GET /events` | server-sent events: `mailbox` `{"seat","seq"}` per mailbox change (supports `Last-Event-ID`), `presence` (with `node_connected` as in `GET /seats`), for user tokens `directory` (`{kind: "seat"\|"list", name, change: "created"\|"updated"\|"deleted"}`) and `nodes` (`{connected}`: open node streams, sent at once and on change), for user and seat tokens `task` (`{num, change: "created"\|"changed"\|"assigned"\|"dependency"\|"link"\|"commented"\|"reminder"\|"steal", fields?}`: a task of the org changed; read it with `GET /tasks/{num}`), and for node tokens `command` (`{op: "transcript"\|"sleep"\|"wake", seat, lease_ms?, backfill?, node?}`) |
+| `GET /events` | server-sent events: `mailbox` `{"seat","seq"}` per mailbox change (supports `Last-Event-ID`), `presence` (with `node_connected` as in `GET /seats`), for user tokens `directory` (`{kind: "seat"\|"list", name, change: "created"\|"updated"\|"deleted"}`) and `nodes` (`{connected}`: open node streams, sent at once and on change), for user and seat tokens `task` (`{num, change: "created"\|"changed"\|"assigned"\|"dependency"\|"link"\|"commented"\|"reminder"\|"steal", fields?}`: a task of the org changed; read it with `GET /tasks/{num}`) and `doc` (`{num, change: "created"\|"revised"\|"changed"\|"relation"\|"verified"\|"split"\|"extracted"\|"merged"\|"link"\|"commented"\|"reminder", fields?}`: a document of the org changed; read it with `GET /docs/{num}`), and for node tokens `command` (`{op: "transcript"\|"sleep"\|"wake", seat, lease_ms?, backfill?, node?}`) |
 | `PUT /focus`, `DELETE /focus` | `seat=` (user tokens; seat tokens: their own): focus `{for_s?, until?}`, or end it |
 | `GET /sent` | `seat`, `before_id`, `limit` (≤ 500), `delivery`: messages a seat sent, newest first; paged like the archive. With `delivery=true` (`limit` ≤ 100) the answer also has `delivery: [{message_id, queued, notified, read, acked}]`, how many deliveries of each listed message are in each state (and `withdrawn`) (each delivery counted in its most advanced state, across orgs, as in `/messages/{id}/status`) |
 | `GET /archive/messages` | `since`, `until`, `from`, `to`, `thread`, `before_id`, `limit` (≤ 500) (user tokens): below |
@@ -418,6 +418,81 @@ count against the org's request limit; tasks count against the org's
 storage quota (`task_bytes` in `GET /org`): a change that would take the
 org over it is refused with 507 `storage_quota`.
 
+### Documents
+
+Every call needs a user or seat token (node tokens get 403, except for
+`GET /docs/index?seat=<agent seat>`) and works on the documents of the
+caller's org only. In paths, `{num}` is `12`, `d12`, or a slug; `d12#anchor`
+(with `#` written `%23`) also names a section where one is read, written or
+commented. The actor of a change is the token's seat (the user seat for a
+user token). See [concepts](concepts.md#documents) for who may write what.
+
+Answers about one document are a `DocDetail`: `{doc, read?, sections,
+parent?, children, superseded_by?, replaces, supplements?,
+supplemented_by, related, links, linked_from, threads, tasks, comments,
+events, event_count, existing?, unchanged?, candidates?, candidates_line?,
+dangling?, moved?}`, where `doc` is `{num, slug?, kind, title,
+description, status, owner, team?, labels, editors, pinned, rev, bytes,
+tokens, sha256, verified_at?, verified_by?, expires_at?, stale, superseded_by?,
+replaces, supplements?, parent?, thread?, body, advice?, created_at,
+updated_at}`; documents named from it are `{num, slug?, kind, title,
+description, status, stale}`; `sections` are `{anchor, level, heading,
+path, start, end, tokens}` (`start`, `end`: the byte range with the
+subsections); links are `{src, src_anchor, kind, target, num?, anchor?,
+title_at_write?, title?, renamed, dangling, stale}` with `kind` `doc`,
+`task`, `message`, `thread`, `seat` or `path` and `target` as written
+(`d12#rollback`, `t3`, `#45`, `thread 7`, `@w1`, `src/main.rs:10`);
+`comments` are `{message_id, by?, at, anchor?, path?, removed}`; `events`
+are the newest 20, oldest first. Listings leave `body` out. `advice` is
+the line `the body is ~52,000 tokens; split it with amail doc split d12`
+while the estimate is above 40,000 tokens.
+
+Writes to one document (`PUT …/body`, `PATCH`, `split`, `extract`,
+`merge`) take `if_rev` in the body. When the document's `rev` differs,
+nothing changes and the answer is 409 `{error: {code: "stale", message},
+rev, doc: DocDetail, since: [events after the revision if_rev], diff}`;
+`since` holds the `revised` events (with `rev`, `actor` and the message in
+`note`) and the other events since, and `diff` is the unified diff from
+`if_rev` to the current revision. `silent: true` (create, body, `PATCH`,
+`supersede`) records the events but sends no mail.
+
+Error codes: 409 `stale`, `frozen` (the body of an active decision),
+`slug_taken`; 403 `not_owner` (a write the caller may not make, including
+activating a document the user activates); 422 `sections_missing`,
+`body_too_large`, `nothing_to_split`, `no_section`, `invalid_transition`,
+`invalid_relation`, `parent_cycle`, `parent_too_deep`, `unknown_kind`,
+`kind_disabled`, `invalid_title`, `invalid_description`, `invalid_slug`,
+`invalid_label`, `too_many_labels`, `too_many_editors`, `invalid_message`,
+`invalid_kind`, `invalid_section`, `invalid_cap`, `invalid_interval`,
+`invalid_client_key`, and on a public server `too_many_docs`,
+`too_many_kinds`; 507 `storage_quota`.
+
+| | |
+|---|---|
+| `POST /docs` | create `{title, kind?, body?, description?, slug?, team?, labels?, parent?, supplements?, owner?, editors?, message?, client_key?, silent?, paths?}` (201, `DocDetail`, status `draft`). `kind` defaults to `reference`, `team` to the owner's team, `owner` to the caller. `paths` is `[{path, exists}]`, what the node found for repository paths in the body. The answer lists the `dangling` links and the `candidates` (`[{doc, similarity}]`, at most 5 documents of the same kind with a close title, description or slug) with `candidates_line`; the create is never refused for them. `client_key` as for `POST /tasks` (200 with `existing: true`). `supplements` mails the owner of that document |
+| `GET /docs` | `kind`, `status` (comma-separated, or `all`; default `draft,active`), `team`, `owner`, `label`, `stale=1`, `pinned=1`, `before`, `limit` (≤ 500, default 100): newest first, `{docs, next_before?}` |
+| `GET /docs/{num}` | `DocDetail` with the whole body. `?section=anchor` (or `d12%23anchor`) and `?rev=N` answer what was asked in `read` (`{rev, title, anchor?, path?, text, tokens}`) and leave `doc.body` out; 422 `no_section` |
+| `PUT /docs/{num}/body` | `{body, section?, message?, if_rev?, silent?, paths?}`: a new revision of the body, or of one section (the section's heading stays unless `body` starts with a heading). A body equal to the current one writes nothing (`unchanged: true`). A revision by a seat other than the owner mails the owner (`d12 was revised by w2: <title>`) unless `silent` |
+| `PATCH /docs/{num}` | `{title?, description?, slug?, labels?, team?, parent?, supplements?, related?, owner?, editors?, status?, pinned?, expires_at?, message?, if_rev?, silent?}`; `null` clears `slug`, `team`, `parent`, `supplements`, `expires_at`; `labels`, `editors` and `related` replace the lists. A new title or description is a revision; the other fields are events. `status` is `draft`, `active` or `archived` |
+| `POST /docs/{num}/supersede` | `{by, silent?}`: `by` replaces the document, which becomes `superseded`; the owner and the user only. The owner is mailed when someone else does it |
+| `POST /docs/{num}/verify` | optional `{for}` (`30d`, `12h`, `2w`, a number of days, or `none`; default the kind's interval): sets `verified_at`, `verified_by`, `expires_at`; the owner and the user only |
+| `POST /docs/{num}/split` | optional `{level, if_rev}` (default 1): each heading of that level becomes a child document; `moved` lists `{from: "#anchor", to: "d31"}`; 422 `nothing_to_split` |
+| `POST /docs/{num}/extract` | `{anchor, into, kind?, if_rev?}`: the section moves to a new document titled `into` that supplements this one |
+| `POST /docs/{num}/merge` | `{into, if_rev?}`: the document is appended to `into` as a section and becomes superseded by it; the owner of both or the user. `moved` lists `{from: "d31", to: "d12#anchor"}` and each moved subsection |
+| `GET /docs/{num}/history` | every revision `{rev, title, author?, written_by?, message?, sha256, bytes, at}` and a page of events (`after_seq`, `limit` ≤ 500, default 200; `next_after_seq`). Event: `{seq, at, actor?, written_by?, kind, field?, from?, to?, note?, message_id?, rev?}`, kinds `created`, `revised`, `changed`, `relation`, `verified`, `split`, `extracted`, `merged`, `links_rewritten`, `linked`, `commented`, `reminder_sent` |
+| `GET /docs/{num}/diff` | `from`, `to` (default: the revision before the current one, and the current one): `{num, from, to, diff}`, a unified diff, with `title:` and `description:` lines first when those changed |
+| `GET /docs/{num}/links` | `{links, linked_from}` |
+| `POST /docs/{num}/comment` | `{body, anchor?}`: a message in the discussion thread, subject `[d12] <title>`, to the owner, `Cc` the seats that commented before; with an anchor the body starts with `On d12#rollback (Deploy > Rollback):`. Answers `{id, thread_id, doc}` |
+| `GET /docs/search` | `q` (terms, at most 10), `kind`, `status` (default `active`; `all`), `team`, `label`, `owner`, `limit` (default 20): `{hits: [{num, slug?, anchor, path, kind, status, title, stale, verified_at?, snippet, line}], titles_only?}`, the caller's team first, stale documents last. `line` is `d12#rollback  runbook  active  Deploy > Rollback — <snippet>  (verified 2026-10-20)` (`stale` after the status when it is). When every term is shorter than 3 characters, titles and descriptions are searched (`titles_only`). Takes a query slot of the search pool |
+| `GET /docs/find` | `q`, `kind`, `status` (default all), `limit`: documents whose title, slug or description contains every term, `{docs}` |
+| `GET /docs/index` | `team` (default the caller's team), `max_lines` (default 60), `max_chars` (default 3,000), `seat` (node tokens): `{team?, lines, more, more_line?, text}`. Each line is `d12  runbook  <title> — <description>`, with `  (stale)` past the expiry; pinned first, then the team's, then documents of no team. `more_line` is `… and 41 more: amail doc list --team backend`; `max_chars` counts the newlines and the more line, `max_lines` only the document lines |
+| `GET /docs/check` | `team`, `limit` (≤ 500): `{problems: [links]}`, the dangling and stale links of draft and active documents |
+| `GET /docs/kinds` | `{kinds: [{name, description, required_sections, activate_by, in_index, body_cap_bytes, verify_days?, builtin, disabled, docs}]}` |
+| `POST /docs/kinds` | user tokens: `{name, description?, required_sections?, activate_by?, in_index?, body_cap_bytes?, verify_days?, disabled?}` adds a kind or changes one (`verify_days` 0: no expiry). A kind is never deleted; `disabled` stops new documents of it |
+
+Changes publish `doc` events on `GET /events`. Documents count against the
+org's storage quota (`doc_bytes` in `GET /org`).
+
 ### Directory and settings
 
 | | |
@@ -425,11 +500,11 @@ org over it is refused with 507 `storage_quota`.
 | `GET, POST /seats`; `GET, PATCH, DELETE /seats/{name}`; `POST /seats/{name}/tokens` | seats; `GET /seats` cuts each role to its first 1,000 characters and sets `role_truncated`, `GET /seats/{name}` has all of it |
 | `GET, POST /lists`; `GET, DELETE /lists/{name}`; `PUT, DELETE /lists/{name}/members/{address}` | lists (at most 1,000 members each, seats of the org only: 422 `local_only`) |
 | `GET, POST /links`; `POST /links/{org}/accept`; `PATCH, DELETE /links/{org}` | links; `POST` takes `{org, note?}`; `PATCH` (user) `{primary: seat \| null, team?}` sets a primary contact (422 `not_a_contact` for a seat not open to that org); active links show `primary` |
-| `GET /teams`; `GET, PUT, DELETE /teams/{name}` | teams; `PUT` (user) `{description?, root?, parent?, contacts?, managed?}` creates or changes one (422 `no_contacts` when an open team would have none) |
+| `GET /teams`; `GET, PUT, DELETE /teams/{name}` | teams; `PUT` (user) `{description?, root?, parent?, contacts?, managed?, doc_activate_by?}` creates or changes one (`doc_activate_by: "human"`: every document of the team waits for the user to activate it; `null` or `owner`: the kind decides) (422 `no_contacts` when an open team would have none) |
 | `GET, POST /grants`; `DELETE /grants/{id}`; `POST /grants/preview` | openings; `POST` (user) `{target, audience?: "linked" \| org, managed?}`; changes and the preview `{add: [...], remove: [ids]}` answer `{grant?, changes: [{org, gains, loses}]}` |
 | `GET /orgs/{name}` | another org: `{card, link?, open_to_you, you_open, primary?}`; 404 for a name no org has and for a hidden org without an active link (600 lookups per hour per org) |
 | `DELETE /org/notice` | user: the one-time notice in `GET /org` was shown |
-| `GET, PATCH /org` | org settings (including `webhook_url`; `null` clears it; `display_name`, `description`, `visibility`, `outbound`, `new_threads_per_hour`, `task_stale_hours`: 0 to 8,760, 0 turns stale reminders off, default 24), `stored_bytes` (the mail the org sent with its deliveries, as counted for the storage quota) with `storage_quota_bytes` when the server has a quota, `task_bytes` (the org's tasks, counted against the quota with `stored_bytes`), and `kept_bytes` (the mail of deleted orgs the org keeps, counted the same way but not against the quota) |
+| `GET, PATCH /org` | org settings (including `webhook_url`; `null` clears it; `display_name`, `description`, `visibility`, `outbound`, `new_threads_per_hour`, `task_stale_hours`: 0 to 8,760, 0 turns stale reminders off, default 24), `stored_bytes` (the mail the org sent with its deliveries, as counted for the storage quota) with `storage_quota_bytes` when the server has a quota, `task_bytes` (the org's tasks, counted against the quota with `stored_bytes`), `doc_bytes` (the org's documents, counted the same way), and `kept_bytes` (the mail of deleted orgs the org keeps, counted the same way but not against the quota) |
 | `DELETE /org` | user tokens, `{"confirm": "<org name>"}`: delete the org and all its data; mail other orgs received from it stays with them, from `name@org (deleted org)` |
 | `GET, POST /tokens`; `DELETE /tokens/{id}` | tokens |
 | `POST /tokens/rotate` | user tokens, `{label?}`: a new user token (answered once); the calling token is revoked, its browser sessions end and its open streams close; a browser that rotated gets a new session |
