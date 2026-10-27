@@ -1853,6 +1853,18 @@ impl Node {
                     recheck = true;
                 }
                 Event::UserPromptSubmit { prompt } => {
+                    if registered {
+                        // The session's own `SessionStart` came before its
+                        // registration and could not be tied to the seat
+                        // (Codex): this prompt starts the session.
+                        st.log(seat, "session_start", "source: startup");
+                        let ho = &mut st.seat(seat).ho;
+                        ho.note_pending = true;
+                        ho.note_fetched = None;
+                        ho.note_fetching = false;
+                        ho.note_gen += 1;
+                        plan.note_wait = connected;
+                    }
                     st.seat(seat).restore_pending = false;
                     st.set_state(seat, SeatState::Busy);
                     self.turn_started(&mut st, seat);

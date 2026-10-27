@@ -577,7 +577,9 @@ note was written in the current turn.
 
 **Worklog.** The node sends the seat's worklog entries in batches, every
 3 seconds while it is connected (kept in memory, at most 10,000, while it
-is not): `session_start` (`source: startup`), `session_end` (`reason:
+is not): `session_start` (`source: startup`; for a new Codex session, whose
+`SessionStart` comes before the first prompt registers it, at that
+prompt, which also shows the seat's handover note), `session_end` (`reason:
 ...`), `precompact` (`trigger: auto`), `compact` (the summary, cut to
 1,000 characters), `turn_start`, `turn_end` (`turn ended`, `turn ended by
 the person ...` or `turn failed: <reason>`), `tool` (the tool's name and

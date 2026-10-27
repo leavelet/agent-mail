@@ -775,6 +775,8 @@ async fn codex_index_and_compaction(b: Backend) {
         return;
     };
     h.seat("cx", "codex").await;
+    // A note from an earlier session of the seat (written by the user).
+    write_note(&h.api, "cx", "none").await;
     let long: Vec<String> = (0..40)
         .map(|i| format!("topic {i:02} {}", "y".repeat(30)))
         .collect();
@@ -830,8 +832,20 @@ async fn codex_index_and_compaction(b: Backend) {
             with(codex("UserPromptSubmit"), &[("prompt", json!(prompt))]),
         )
         .await;
-    // Nothing cached yet: no index in this answer.
-    assert!(!hook_text(&v).unwrap_or_default().contains("Documents:"));
+    // Nothing cached yet: no index in this answer. The seat's note is
+    // shown: the Codex session's own `SessionStart` came before its
+    // registration, so this prompt starts the session, and the worklog
+    // records the start.
+    let t = hook_text(&v).unwrap_or_default();
+    assert!(!t.contains("Documents:"), "{t}");
+    assert!(t.contains("Handover note of this seat"), "{t}");
+    h.wait("session start entry", || async {
+        node_entries(&h, "cx", "session_start").await.len() == 1
+    })
+    .await;
+    let start = &node_entries(&h, "cx", "session_start").await[0];
+    assert_eq!(start["text"], "source: startup");
+    assert_eq!(start["session"], sid);
     h.wait("cx's index", || async {
         h.seat_status("cx").await["index_lines"]
             .as_u64()
@@ -840,8 +854,10 @@ async fn codex_index_and_compaction(b: Backend) {
     })
     .await;
     let v = h.hook("codex", env.clone(), codex("SessionStart")).await;
-    let t = hook_text(&v).unwrap();
-    assert!(t.starts_with("Documents:\n"), "{t}");
+    let all = hook_text(&v).unwrap();
+    // The note first (shown again: a session start), then the index.
+    let (_, t) = all.split_once("\n\nDocuments:\n").unwrap();
+    let t = format!("Documents:\n{t}");
     assert!(t.chars().count() <= 2_000, "{}", t.chars().count());
     assert!(t.contains("more: amail doc"), "{t}");
     assert_eq!(
