@@ -1658,6 +1658,10 @@ impl Node {
         let transcript = adapter
             .transcript(hook, seat)
             .and_then(|p| self.accept_transcript(adapter.harness(), seat, &p));
+        // The context's size, from the transcript (read before the lock).
+        let over = hook.event == Event::Stop
+            && self.lock().connected
+            && self.context_over(adapter.harness(), seat);
         // 1. State transition and plan, under the lock.
         let plan = {
             let mut st = self.lock();
@@ -1795,6 +1799,7 @@ impl Node {
                     plan.wake_prompt = connected && wake;
                     s.ho.turn_start = Some(now);
                     s.ho.asked = false;
+                    s.ho.task_tool = false;
                     // A turn whose end is still being checked stays open.
                     s.ho.turns_open = s.ho.turns_open.min(u32::from(s.turn_check.is_some())) + 1;
                     // A wake-up whose mail is gone should end at once.
@@ -1820,9 +1825,14 @@ impl Node {
                     st.seat(seat).restore_pending = false;
                     st.set_state(seat, SeatState::Busy);
                     if let Some(tool) = &hook.facts.tool {
-                        let text = match &hook.facts.tool_input {
-                            Some(i) if !i.is_empty() => format!("{tool}: {i}"),
-                            _ => tool.clone(),
+                        let input = hook.facts.tool_input.as_deref().unwrap_or_default();
+                        if handover::touches_tasks(tool, input) {
+                            st.seat(seat).ho.task_tool = true;
+                        }
+                        let text = if input.is_empty() {
+                            tool.clone()
+                        } else {
+                            format!("{tool}: {input}")
                         };
                         st.log(seat, "tool", text);
                     }
@@ -1861,8 +1871,11 @@ impl Node {
                             plan.digest = pending && s.pending.digest > 0;
                         }
                         plan.index = (connected && index_due).then_some(false);
-                    } else if connected && !s.ho.asked {
-                        // The turn ends after the handover check (step 3).
+                    } else if connected && !s.ho.asked && (over || s.ho.task_tool || s.ho.requested)
+                    {
+                        // Only then is the server asked: a turn's end with
+                        // nothing to show is otherwise answered from
+                        // memory. The turn ends after the check (step 3).
                         plan.handover = true;
                         plan.index = index_due.then_some(false);
                         recheck = true;
@@ -2116,11 +2129,11 @@ impl Node {
                 return handover::StopCheck::default();
             }
             let turn_start = self.lock().seats.get(seat).and_then(|s| s.ho.turn_start);
-            let over = self.context_over(adapter.harness(), seat);
             self.stop_check(seat, turn_start, over, deadline).await
         };
-        let ((summary, late1), (tasks, doing, late2), index, note, check) =
-            tokio::join!(summary_call, tasks_call, index_call, note_call, check_call);
+        // Mail first; the index and the note reuse its connections.
+        let ((summary, late1), (tasks, doing, late2)) = tokio::join!(summary_call, tasks_call);
+        let (index, note, check) = tokio::join!(index_call, note_call, check_call);
         timed_out |= late1 || late2;
 
         // 3. Apply the outcome.
@@ -2163,9 +2176,15 @@ impl Node {
                 }
                 if let Some(n) = &note {
                     ho.note_at = Some(n.note.as_ref().and_then(|n| parse_ts(&n.written_at)));
+                    ho.requested = n.requested_at.is_some();
                 }
                 if let Some(n) = check.note_at {
                     ho.note_at = Some(n);
+                    ho.requested = check.requested;
+                }
+                // A request for the note arrives as system mail.
+                if claimed.iter().any(handover::is_request) {
+                    ho.requested = true;
                 }
             }
             if hook.event == Event::Stop {

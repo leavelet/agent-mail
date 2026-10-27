@@ -19,7 +19,11 @@
 //!   with [`crate::inject::HANDOVER_ASK`] when the note is older than the
 //!   turn and the context passed [`Config::handover_threshold`] of the
 //!   model's window, or the seat closed a task and still holds work, or a
-//!   request for the note is open. A seat idle with work in progress (for
+//!   request for the note is open. The server is asked only when one of
+//!   these may hold: the transcript shows the context over the threshold,
+//!   the turn ran an `amail task` command or task tool, or a request was
+//!   seen (at session start, at the last check, or as mail); any other
+//!   turn's end is answered from memory. A seat idle with work in progress (for
 //!   the team's `handover_idle`, or half its `idle_sleep`, whichever is
 //!   shorter) is asked by a request mail through the server, since no turn
 //!   runs to block. `PostCompact` files the harness's summary as a draft
@@ -67,6 +71,12 @@ pub(super) struct SeatHo {
     pub(super) turn_start: Option<i64>,
     /// The current turn's `Stop` was blocked to ask for the note.
     pub(super) asked: bool,
+    /// The current turn ran an `amail task` command or an amail task tool
+    /// (it may have closed a task).
+    pub(super) task_tool: bool,
+    /// A request for the note may be open (seen at session start, at the
+    /// last turn's end, or as mail since).
+    pub(super) requested: bool,
     /// Turns started whose end was not logged yet (a Codex turn's end is
     /// settled after the next one may have started).
     pub(super) turns_open: u32,
@@ -141,6 +151,19 @@ pub(super) fn text_hash(t: &str) -> u64 {
     h.finish()
 }
 
+/// Whether a tool call may change a task: an `amail task` command line,
+/// or an amail MCP tool about tasks.
+pub(super) fn touches_tasks(tool: &str, input: &str) -> bool {
+    let t = tool.to_ascii_lowercase();
+    (t.contains("amail") && t.contains("task")) || input.contains("amail task")
+}
+
+/// Whether a claimed message is the server's request for the note.
+pub(super) fn is_request(e: &amail_proto::InboxEntry) -> bool {
+    e.message.source == amail_proto::Source::System
+        && e.message.subject.starts_with("Handover note requested by")
+}
+
 /// Whether a worklog entry of kind `task` records a close.
 fn closes_task(text: &str) -> bool {
     text.contains("→ done") || text.contains("→ cancelled")
@@ -191,6 +214,8 @@ pub(super) struct StopCheck {
     pub(super) ask: Option<&'static str>,
     /// The note's time, when the server answered.
     pub(super) note_at: Option<Option<i64>>,
+    /// A request for the note is open.
+    pub(super) requested: bool,
 }
 
 impl Node {
@@ -272,6 +297,7 @@ impl Node {
         let mut out = StopCheck {
             ask: None,
             note_at: Some(note_at),
+            requested: h.requested_at.is_some(),
         };
         let older = match (note_at, turn_start) {
             (None, _) => true,
@@ -551,6 +577,14 @@ async fn last_commit(cwd: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_tools() {
+        assert!(touches_tasks("Bash", "amail task done t3 --result ok"));
+        assert!(touches_tasks("mcp__amail__task_set", "{}"));
+        assert!(!touches_tasks("Bash", "cargo test"));
+        assert!(!touches_tasks("mcp__amail__send", "{}"));
+    }
 
     #[test]
     fn closes() {

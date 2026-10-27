@@ -300,6 +300,8 @@ async fn worklog_of_a_session(b: Backend) {
             Some(json!({"state": "doing"})),
         )
         .await;
+    // The assignment's mail is shown by the first turn.
+    h.wait_pending("w1", 1, 0, 0).await;
     let at = |name: &str| with(claude(name), &[("cwd", cwd.clone())]);
     h.hook("claude", env.clone(), at("SessionStart")).await;
     h.hook("claude", env.clone(), at("UserPromptSubmit")).await;
@@ -424,9 +426,12 @@ async fn stop_asks_for_the_note_after_a_closed_task(b: Backend) {
                 .unwrap()
         }
     };
-    let (t1, _t2) = (task("first").await, task("second").await);
+    let (t1, t2) = (task("first").await, task("second").await);
+    h.wait_pending("w1", 2, 0, 0).await;
+    // The seat closes a task with `amail task done`, which its
+    // PostToolUse hook reports.
     let close = |n: i64| {
-        let w1 = w1.clone();
+        let (h, w1, env) = (&h, w1.clone(), env.clone());
         async move {
             w1.call(
                 reqwest::Method::PATCH,
@@ -434,11 +439,36 @@ async fn stop_asks_for_the_note_after_a_closed_task(b: Backend) {
                 Some(json!({"state": "done"})),
             )
             .await;
+            let tool = with(
+                claude("PostToolUse"),
+                &[(
+                    "tool_input",
+                    json!({"command": format!("amail task done t{n} --result ok")}),
+                )],
+            );
+            h.hook("claude", env, tool).await;
         }
     };
     h.hook("claude", env.clone(), claude("SessionStart")).await;
     // A turn that closes nothing ends at once.
     h.hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    assert_eq!(
+        h.hook("claude", env.clone(), claude("Stop")).await,
+        Value::Null
+    );
+    // A task closed without a tool call the node sees (here by the
+    // user) is not the seat's: no request.
+    let t3 = task("third").await;
+    h.wait_pending("w1", 1, 0, 0).await;
+    h.hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    h.api
+        .call(
+            reqwest::Method::PATCH,
+            &format!("/tasks/{t3}"),
+            Some(json!({"state": "done"})),
+        )
         .await;
     assert_eq!(
         h.hook("claude", env.clone(), claude("Stop")).await,
@@ -458,7 +488,7 @@ async fn stop_asks_for_the_note_after_a_closed_task(b: Backend) {
     // the seat is not asked.
     h.hook("claude", env.clone(), claude("UserPromptSubmit"))
         .await;
-    close(_t2).await;
+    close(t2).await;
     assert_eq!(
         h.hook("claude", env.clone(), claude("Stop")).await,
         Value::Null
@@ -649,6 +679,8 @@ async fn idle_seat_with_work_is_asked(b: Backend) {
     h.api
         .post("/tasks", json!({"title": "work", "assignee": "w1"}))
         .await;
+    // The assignment's mail is shown by the turn.
+    h.wait_pending("w1", 1, 0, 0).await;
     h.hook("claude", env.clone(), claude("SessionStart")).await;
     h.hook("claude", env.clone(), claude("UserPromptSubmit"))
         .await;
