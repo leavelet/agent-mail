@@ -29,6 +29,7 @@ import type {
   SeatCounts,
   ServerInfo,
   TaskBusEvent,
+  DocBusEvent,
   WhoAmI,
 } from './types';
 
@@ -66,6 +67,12 @@ class Store {
   /** The tasks changed in the last round; null when anything may have
    * changed (the stream was opened again). */
   taskChanged = $state.raw<Set<number> | null>(null);
+  /** Counts the rounds of `doc` events (and stream openings): views that
+   * show documents reload when it changes. */
+  docSeq = $state(0);
+  /** The documents changed in the last round; null when anything may have
+   * changed. */
+  docChanged = $state.raw<Set<number> | null>(null);
 
   seatMap = $derived(new Map(this.seats.map((s) => [s.name, s])));
 
@@ -187,6 +194,7 @@ class Store {
       this.coalescer.add('d:seats');
       // Task events are not replayed either: views that show tasks reload.
       this.coalescer.add('t:*');
+      this.coalescer.add('x:*');
     };
     es.addEventListener('mailbox', (e) => {
       try {
@@ -224,6 +232,15 @@ class Store {
       try {
         const ev = JSON.parse((e as MessageEvent).data) as TaskBusEvent;
         if (typeof ev.num === 'number') this.coalescer.add(`t:${ev.num}`);
+      } catch {
+        // Ignore malformed events.
+      }
+    });
+    // A document of the org changed: views that show it reload.
+    es.addEventListener('doc', (e) => {
+      try {
+        const ev = JSON.parse((e as MessageEvent).data) as DocBusEvent;
+        if (typeof ev.num === 'number') this.coalescer.add(`x:${ev.num}`);
       } catch {
         // Ignore malformed events.
       }
@@ -274,6 +291,8 @@ class Store {
     const jobs: Promise<unknown>[] = [];
     let tasks: Set<number> | null = new Set();
     let anyTask = false;
+    let docs: Set<number> | null = new Set();
+    let anyDoc = false;
     for (const k of keys) {
       if (k.startsWith('m:')) mail.add(k.slice(2));
       else if (k.startsWith('p:')) presenceChanged = true;
@@ -282,7 +301,16 @@ class Store {
         const n = Number(k.slice(2));
         if (k === 't:*' || !Number.isFinite(n)) tasks = null;
         else tasks?.add(n);
+      } else if (k.startsWith('x:')) {
+        anyDoc = true;
+        const n = Number(k.slice(2));
+        if (k === 'x:*' || !Number.isFinite(n)) docs = null;
+        else docs?.add(n);
       }
+    }
+    if (anyDoc) {
+      this.docChanged = docs;
+      this.docSeq++;
     }
     if (anyTask) {
       this.taskChanged = tasks;

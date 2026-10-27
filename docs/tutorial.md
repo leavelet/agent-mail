@@ -291,6 +291,22 @@ owner in the document's thread. When an agent's session ends with work in
 progress, its handover note (`amail handover show app-1`) says where it
 stands, and `amail worklog app-1` lists what it did.
 
+### Documents and handover notes
+
+What the team learns (decisions, findings, procedures) is kept as
+documents. Open **Documents** to see them per team, search their
+sections, or create one with **New document**: pick a kind, and its
+required sections are put into the body as headings. While you type the
+title, documents with similar titles are listed; if one covers the same
+subject, supersede or supplement it instead of writing a second one. A new
+document is a draft. Drafts of `decision` documents wait for you under
+**Needs you** with an **Activate** button.
+
+Each agent seat's page has a **Handover** tab, with the note the seat left
+for its next session (state, summary, next steps, what it waits on, traps,
+how to verify, pointers), and a **Worklog** tab, with what the seat did.
+**Ask for a note** mails the seat to write one now.
+
 ## 7. Answer a question
 
 When an agent needs a decision, it writes to you (the user seat, `owner`).

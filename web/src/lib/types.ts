@@ -379,6 +379,8 @@ export interface Team {
   open_to?: string[];
   managed?: boolean;
   primaries?: TeamPrimary[];
+  /** `human`: every document of the team waits for the user to activate it. */
+  doc_activate_by?: string;
   created_at: string;
 }
 
@@ -706,4 +708,319 @@ export interface TaskCommentResponse {
   id: number;
   thread_id: number;
   task: number;
+}
+
+// --- Documents (`/v1/docs`) ---------------------------------------------------
+
+export type DocStatus = 'draft' | 'active' | 'superseded' | 'archived';
+
+export interface Doc {
+  num: number;
+  slug?: string;
+  kind: string;
+  title: string;
+  description?: string;
+  status: DocStatus;
+  owner: string;
+  team?: string;
+  labels?: string[];
+  editors?: string[];
+  pinned?: boolean;
+  rev: number;
+  bytes: number;
+  tokens: number;
+  sha256: string;
+  verified_at?: string;
+  verified_by?: string;
+  expires_at?: string;
+  stale?: boolean;
+  superseded_by?: number;
+  replaces?: number[];
+  supplements?: number;
+  parent?: number;
+  thread?: number;
+  /** Left out in listings. */
+  body?: string;
+  /** The split advice while the token estimate is above the threshold. */
+  advice?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface DocRef {
+  num: number;
+  slug?: string;
+  kind: string;
+  title: string;
+  description?: string;
+  status: DocStatus;
+  stale?: boolean;
+}
+
+export interface DocSection {
+  anchor: string;
+  level: number;
+  heading: string;
+  path: string;
+  start: number;
+  end: number;
+  tokens: number;
+}
+
+export interface DocLink {
+  src: number;
+  src_anchor?: string;
+  /** `doc`, `task`, `message`, `thread`, `seat` or `path`. */
+  kind: string;
+  /** As written: `d12#rollback`, `t3`, `#45`, `thread 7`, `@w1`, `src/main.rs:10`. */
+  target: string;
+  num?: number;
+  anchor?: string;
+  title_at_write?: string;
+  /** The target's current title. */
+  title?: string;
+  renamed?: boolean;
+  dangling?: boolean;
+  stale?: boolean;
+}
+
+export interface DocEvent {
+  seq: number;
+  at: string;
+  actor?: string;
+  written_by?: string;
+  kind: string;
+  field?: string;
+  from?: string;
+  to?: string;
+  note?: string;
+  message_id?: number;
+  rev?: number;
+}
+
+export interface DocRevision {
+  rev: number;
+  title: string;
+  author?: string;
+  written_by?: string;
+  message?: string;
+  sha256: string;
+  bytes: number;
+  at: string;
+}
+
+export interface DocComment {
+  message_id: number;
+  by?: string;
+  at: string;
+  anchor?: string;
+  path?: string;
+  /** The section was removed by a later revision. */
+  removed?: boolean;
+}
+
+export interface DocThreadLink {
+  thread_id: number;
+  linked_by?: string;
+  linked_at: string;
+}
+
+export interface DocCandidate {
+  doc: DocRef;
+  similarity: number;
+}
+
+export interface DocMove {
+  from: string;
+  to: string;
+}
+
+export interface DocText {
+  rev: number;
+  title: string;
+  anchor?: string;
+  path?: string;
+  text: string;
+  tokens: number;
+}
+
+export interface DocDetail {
+  doc: Doc;
+  read?: DocText;
+  sections: DocSection[];
+  parent?: DocRef;
+  children?: DocRef[];
+  superseded_by?: DocRef;
+  replaces?: DocRef[];
+  supplements?: DocRef;
+  supplemented_by?: DocRef[];
+  related?: DocRef[];
+  links: DocLink[];
+  linked_from: DocLink[];
+  threads?: DocThreadLink[];
+  tasks?: TaskRef[];
+  comments?: DocComment[];
+  events: DocEvent[];
+  event_count: number;
+  existing?: boolean;
+  unchanged?: boolean;
+  candidates?: DocCandidate[];
+  candidates_line?: string;
+  dangling?: DocLink[];
+  moved?: DocMove[];
+}
+
+/** The body of a 409 `stale` answer to a write. */
+export interface DocStaleBody {
+  rev: number;
+  doc: DocDetail;
+  since: DocEvent[];
+  diff: string;
+}
+
+export interface DocList {
+  docs: Doc[];
+  next_before?: number;
+}
+
+export interface DocSearchHit {
+  num: number;
+  slug?: string;
+  anchor?: string;
+  path?: string;
+  kind: string;
+  status: DocStatus;
+  title: string;
+  stale?: boolean;
+  verified_at?: string;
+  snippet: string;
+  line: string;
+}
+
+export interface DocSearchResult {
+  hits: DocSearchHit[];
+  titles_only?: boolean;
+}
+
+export interface DocHistory {
+  revisions: DocRevision[];
+  events: DocEvent[];
+  next_after_seq?: number;
+}
+
+export interface DocDiff {
+  num: number;
+  from: number;
+  to: number;
+  diff: string;
+}
+
+export interface DocKind {
+  name: string;
+  description?: string;
+  required_sections: string[];
+  activate_by: 'owner' | 'human';
+  in_index: boolean;
+  body_cap_bytes: number;
+  verify_days?: number;
+  builtin?: boolean;
+  disabled?: boolean;
+  docs: number;
+}
+
+export interface DocCommentResponse {
+  id: number;
+  thread_id: number;
+  doc: number;
+}
+
+export interface DocBusEvent {
+  num: number;
+  change: string;
+  fields?: string[];
+}
+
+// --- Seat handover (`/v1/seats/{name}/handover`, `/worklog`) ------------------
+
+export interface HandoverFields {
+  state: string;
+  summary: string;
+  next: string;
+  waiting_on: string;
+  traps: string;
+  verify: string;
+  pointers: string;
+}
+
+export type HandoverSource = 'agent' | 'compaction' | 'server';
+
+export interface HandoverNote {
+  seat: string;
+  rev: number;
+  fields: HandoverFields;
+  text: string;
+  chars: number;
+  pointers_filled?: boolean;
+  private?: boolean;
+  source: HandoverSource;
+  draft?: boolean;
+  session?: string;
+  written_by?: string;
+  written_at: string;
+  read_by_session?: string;
+  read_at?: string;
+}
+
+export interface HandoverRevision {
+  rev: number;
+  written_at: string;
+  source: HandoverSource;
+  private?: boolean;
+  chars: number;
+  session?: string;
+  written_by?: string;
+  read_by_session?: string;
+  read_at?: string;
+}
+
+export interface HandoverResponse {
+  seat: string;
+  note?: HandoverNote;
+  current_rev: number;
+  revisions: HandoverRevision[];
+  private?: boolean;
+  requested_at?: string;
+  requested_by?: string;
+}
+
+export interface HandoverRequested {
+  seat: string;
+  requested_at: string;
+  message_id?: number;
+}
+
+export interface WorklogEntry {
+  id: number;
+  seat: string;
+  session?: string;
+  at: string;
+  kind: string;
+  text: string;
+  task?: number;
+  doc?: number;
+  source: 'server' | 'node';
+}
+
+export interface WorklogPage {
+  seat: string;
+  entries: WorklogEntry[];
+  next_before?: number;
+}
+
+export interface WorklogSummary {
+  seat: string;
+  total: number;
+  kinds: { kind: string; count: number }[];
+  tasks: { task: number; count: number; last_at: string }[];
+  last: WorklogEntry[];
 }
