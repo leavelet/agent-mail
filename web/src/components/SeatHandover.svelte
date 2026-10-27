@@ -154,11 +154,11 @@
       {#if n.private || data?.private}<span class="chip ack">{t('handover.privateChip')}</span>{/if}
       {#if n.pointers_filled}<span class="faint">{t('handover.pointersFilled')}</span>{/if}
       <span class="faint">{t('handover.chars', { n: n.chars, max: 16384 })}</span>
-      {#if n.session}<span class="faint mono" title={n.session}>{t('handover.session', { id: n.session.slice(0, 12) })}</span>{/if}
+      {#if n.session}<span class="faint mono" title={n.session}>{t('handover.session', { id: n.session })}</span>{/if}
     </div>
     <p class="read" data-testid="handover-read">
       {#if n.read_at}
-        {t('handover.readBy', { session: (n.read_by_session ?? '—').slice(0, 12), time: shortTime(n.read_at, ui.now, ui.lang) })}
+        {t('handover.readBy', { session: n.read_by_session ?? '—', time: shortTime(n.read_at, ui.now, ui.lang) })}
       {:else}
         <span class="warn">{t('handover.notRead')}</span>
       {/if}

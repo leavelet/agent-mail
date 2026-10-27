@@ -3,13 +3,16 @@
   // with the server's section anchors on its headings. `anchor` scrolls to
   // its section when it changes.
   import { tick } from 'svelte';
-  import { renderDoc } from '../lib/markdown';
   import { t } from '../lib/ui.svelte';
   import type { DocSection } from '../lib/types';
 
   let { body, sections, num, anchor = '' }: { body: string; sections: DocSection[]; num: number | null; anchor?: string } = $props();
 
-  const rendered = $derived(renderDoc(body, sections, num));
+  // The renderer (marked, DOMPurify) is loaded when a body is first shown.
+  type Markdown = typeof import('../lib/markdown');
+  let md = $state.raw<Markdown | null>(null);
+  import('../lib/markdown').then((m) => (md = m));
+  const rendered = $derived(md ? md.renderDoc(body, sections, num) : null);
   let el: HTMLDivElement | undefined = $state();
   let missing = $state(false);
 
@@ -21,11 +24,18 @@
     };
   }
 
+  // Scroll when the anchor changes (or the body first shows), not on
+  // every live update of the body.
+  let scrolledTo = '';
   $effect(() => {
     const a = anchor;
-    void rendered;
+    if (!a) {
+      scrolledTo = '';
+      missing = false;
+    }
+    if (!a || !rendered || a === scrolledTo) return;
+    scrolledTo = a;
     missing = false;
-    if (!a) return;
     void tick().then(() => {
       const target = el?.querySelector(`[data-anchor="${CSS.escape(a)}"]`);
       if (target) {
@@ -38,13 +48,14 @@
 </script>
 
 {#if missing}<p class="faint missing" role="status">{t('doc.noSection', { anchor })}</p>{/if}
-{#if rendered.front !== null}
+{#if !rendered}<p class="faint">{t('app.loading')}</p>{/if}
+{#if rendered && rendered.front !== null}
   <details class="front">
     <summary>{t('doc.frontMatter')}</summary>
     <pre>{rendered.front}</pre>
   </details>
 {/if}
-<div class="md" bind:this={el} data-testid="doc-body" {@attach content(rendered.fragment)}></div>
+{#if rendered}<div class="md" bind:this={el} data-testid="doc-body" {@attach content(rendered.fragment)}></div>{/if}
 
 <style>
   .md {

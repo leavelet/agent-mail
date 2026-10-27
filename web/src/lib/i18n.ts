@@ -814,7 +814,7 @@ const en = {
   'docs.kinds': 'Kinds',
   'docs.new': 'New document',
   'docs.overview': 'Overview',
-  'docs.drafts': '{n} drafts',
+  'docs.drafts': '{n} draft(s)',
   'docs.staleCount': '{n} stale',
   'docs.total': '{n} documents (draft and active)',
   'docs.pinned': 'Pinned',
