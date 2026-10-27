@@ -1549,9 +1549,24 @@ pub async fn find(
     }))
 }
 
+/// A heading line's text without its attribute block (`Rounding
+/// {#rounding}` is `Rounding`).
+fn heading_text(line: &str) -> &str {
+    let t = line.trim_start_matches('#').trim();
+    match t.rfind('{') {
+        Some(i) if t.ends_with('}') && matches!(t[i + 1..].chars().next(), Some('#' | '.')) => {
+            t[..i].trim_end()
+        }
+        _ => t,
+    }
+}
+
 /// The sentence of a section's text that holds the most terms (the heading
 /// line only when nothing else matches), cut to [`DOC_SNIPPET_CHARS`]
-/// characters.
+/// characters. A sentence ends at `.`, `!` or `?` followed by a space or
+/// the end of the line (not inside a code span), and at a line's end. A
+/// heading shows without its `{#id}` attribute, and a cut never ends inside
+/// a code span.
 pub fn snippet(text: &str, terms: &[String]) -> String {
     let t = text.trim_start();
     let content = if t.starts_with('#') {
@@ -1559,20 +1574,37 @@ pub fn snippet(text: &str, terms: &[String]) -> String {
     } else {
         text
     };
-    let stop = |c: char| matches!(c, '.' | '!' | '?' | '。' | '！' | '？' | '\n');
     let sentences = |t: &str| -> Vec<String> {
         let mut out = Vec::new();
         let mut cur = String::new();
-        for c in t.chars() {
+        let mut code = false;
+        let mut chars = t.chars().peekable();
+        while let Some(c) = chars.next() {
             cur.push(c);
-            if stop(c) {
-                out.push(std::mem::take(&mut cur));
+            match c {
+                '`' => code = !code,
+                '\n' => {
+                    code = false;
+                    out.push(std::mem::take(&mut cur));
+                }
+                '。' | '！' | '？' if !code => out.push(std::mem::take(&mut cur)),
+                '.' | '!' | '?' if !code && chars.peek().is_none_or(|n| n.is_whitespace()) => {
+                    out.push(std::mem::take(&mut cur))
+                }
+                _ => {}
             }
         }
         out.push(cur);
         out.into_iter()
+            .map(|s| {
+                let s = s.trim();
+                if s.starts_with('#') {
+                    heading_text(s).to_string()
+                } else {
+                    s.to_string()
+                }
+            })
             .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
-            .map(|s| s.trim_start_matches('#').trim().to_string())
             .filter(|s| !s.is_empty())
             .collect()
     };
@@ -1595,7 +1627,15 @@ pub fn snippet(text: &str, terms: &[String]) -> String {
     if s.chars().count() <= DOC_SNIPPET_CHARS {
         return s;
     }
-    let cut: String = s.chars().take(DOC_SNIPPET_CHARS - 1).collect();
+    let mut cut: String = s.chars().take(DOC_SNIPPET_CHARS - 1).collect();
+    // Not inside a code span: end before the span's opening backtick.
+    if cut.matches('`').count() % 2 == 1
+        && let Some(i) = cut.rfind('`')
+    {
+        cut.truncate(i);
+        let kept = cut.trim_end().len();
+        cut.truncate(kept);
+    }
     format!("{cut}…")
 }
 
@@ -2224,6 +2264,27 @@ mod tests {
             snippet(t, &["ROLLBACK script".into(), "script".into()]),
             "Run the rollback script now."
         );
+        // A heading's attribute is not shown; a period inside a code span
+        // or a word does not end the sentence.
+        assert_eq!(
+            snippet(
+                "## Rounding {#rounding}\n\nOther text.",
+                &["rounding".into()]
+            ),
+            "Rounding"
+        );
+        assert_eq!(
+            snippet(
+                "Tests may assert `format_cents(-1250) == \"-12.50\"` in tests/. Then more.",
+                &["tests".into()]
+            ),
+            "Tests may assert `format_cents(-1250) == \"-12.50\"` in tests/."
+        );
+        // A cut inside a code span ends before the span.
+        let code = format!("{} `{}`", "a ".repeat(90), "x".repeat(100));
+        let s = snippet(&code, &["a".into()]);
+        assert!(!s.contains('`'), "{s}");
+        assert!(s.ends_with("a…"), "{s}");
         let long = format!("{} needle {}", "a".repeat(300), "b".repeat(300));
         assert_eq!(
             snippet(&long, &["needle".into()]).chars().count(),
