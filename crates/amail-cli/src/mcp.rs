@@ -1,5 +1,6 @@
-//! `amail mcp`: an MCP server on stdin and stdout that exposes mail and
-//! task operations as typed tools.
+//! `amail mcp`: an MCP server on stdin and stdout that exposes mail, task
+//! and document operations, the handover note and the worklog as typed
+//! tools.
 //!
 //! Each tool makes the same API calls as the matching command and answers
 //! the server's JSON as structured content, with the command's text
@@ -247,13 +248,32 @@ fn error_value(e: &anyhow::Error) -> (Value, String) {
         if let Some(o) = v.get_mut("error").and_then(Value::as_object_mut) {
             o.insert("status".into(), json!(api.status));
         }
-        let text = match serde_json::from_value::<p::TaskStale>(api.raw.clone()) {
-            Ok(s) if api.body.error.code == "stale" => format!(
+        let code = api.body.error.code.as_str();
+        let text = if code == "stale"
+            && let Ok(s) = serde_json::from_value::<p::TaskStale>(api.raw.clone())
+        {
+            format!(
                 "{api}\n{}\nNothing was changed. Check the changes, then call again with if_rev {}.",
                 stale_text(&s),
                 s.rev
-            ),
-            _ => api.to_string(),
+            )
+        } else if code == "stale"
+            && let Ok(s) = serde_json::from_value::<p::DocStale>(api.raw.clone())
+        {
+            format!(
+                "{api}\n{}",
+                crate::doc_cmd::stale_text(&s, "call again with if_rev")
+            )
+        } else if code == "note_fields_missing"
+            && let Some(m) = crate::handover_cmd::missing_text(&api.raw)
+        {
+            format!(
+                "{api}\n{}\n\n{}",
+                m.replace("amail handover template", "below"),
+                p::HANDOVER_TEMPLATE.trim_end()
+            )
+        } else {
+            api.to_string()
         };
         return (v, text);
     }
@@ -286,13 +306,16 @@ fn arg_err(msg: String) -> anyhow::Error {
 }
 
 const INSTRUCTIONS: &str = "amail: mail between the agent seats of a team, and the team's \
-shared tasks. These tools do what the `amail` command line does and answer the same JSON. \
-New mail is also shown to you by the session's hooks; use `inbox` and `read` to look at it, \
+shared tasks and documents. These tools do what the `amail` command line does and answer the \
+same JSON. New mail is also shown to you by the session's hooks; use `inbox` and `read` to look at it, \
 `reply` to answer and `ack` when a message asks for an acknowledgement. Tasks are numbered \
 per org (t12); `task_mine` and `task_next` show your work. Close a task with a result \
 (`task_set` state done with `result` ok or rejected and `result_ref`, the commit or version \
 it is about); split work into child tasks (`parent`) so that the parent shows progress; \
-pass the task's `rev` as `if_rev` when you change a title or body.";
+pass the task's `rev` as `if_rev` when you change a title or body. The team keeps decisions, \
+findings and procedures as documents (d12): search them with `doc_search` before you decide how \
+something is done here, read one section at a time with `doc_read`, and record a new finding or \
+decision as a document with `doc_new`, not as mail.";
 
 /// One tool: its name, description, input schema and whether it only reads.
 struct ToolDef {
@@ -330,6 +353,20 @@ const IF_REV: &str = "Refuse the change with `stale` if the task changed since t
 
 fn if_rev_schema() -> Value {
     json!({"type": "integer", "description": IF_REV})
+}
+
+const DOC: &str = "The document: 12, \"d12\" or a slug; \"d12#anchor\" names a section \
+where one is read, written or commented.";
+
+fn doc_schema() -> Value {
+    json!({"type": ["integer", "string"], "description": DOC})
+}
+
+const DOC_IF_REV: &str = "Refuse the change with `stale` if the document changed since this \
+revision (its `rev`); the answer then shows the changes and the diff.";
+
+fn doc_if_rev_schema() -> Value {
+    json!({"type": "integer", "description": DOC_IF_REV})
 }
 
 /// `{num, if_rev}`.
@@ -792,6 +829,346 @@ const TOOLS: &[ToolDef] = &[
             )
         },
     },
+    ToolDef {
+        name: "doc_new",
+        description: "Create a document (status draft) in the team's knowledge base: a \
+            decision, a finding (a verified fact with its evidence), a runbook (a procedure), an \
+            index or reference material. Use it to record what you learned or decided instead \
+            of writing it in mail; search first (`doc_search`). Kinds have required sections, \
+            given as Markdown headings: decision needs Context, Decision, Alternatives, \
+            Consequences; finding needs Observed, Evidence, Applies to; runbook needs When, \
+            Steps, Verify. The answer lists similar existing documents (`candidates`); if one \
+            covers the same subject, supersede or supplement it instead of keeping two. The \
+            same call again within 24 hours answers the document it created.",
+        read_only: false,
+        schema: || {
+            obj(
+                json!({
+                    "title": {"type": "string", "description": "One line."},
+                    "kind": {"type": "string", "description": "decision, finding, runbook, index, reference (default) or a kind the org added."},
+                    "body": {"type": "string", "description": "Markdown; headings become sections (d12#anchor)."},
+                    "description": {"type": "string", "description": "One line for the index: what the document is and when to read it (at most 200 characters)."},
+                    "slug": {"type": "string", "description": "An alias accepted wherever d12 is, e.g. runbook.deploy.rollback."},
+                    "team": {"type": "string"},
+                    "labels": {"type": "array", "items": {"type": "string"}},
+                    "parent": {"type": ["integer", "string"], "description": "The parent document (d12 or a slug)."},
+                    "supplements": {"type": ["integer", "string"], "description": "A document this one adds to (d12 or a slug)."},
+                    "message": {"type": "string", "description": "The revision message."},
+                    "silent": {"type": "boolean", "description": "Send no notification mail."},
+                    "client_key": {"type": "string", "description": "Default: derived from you, the kind, the title and the description."},
+                }),
+                &["title"],
+            )
+        },
+    },
+    ToolDef {
+        name: "doc_show",
+        description: "Show a document's record: kind, status, owner, revision (`rev`, for \
+            `if_rev`), verification and expiry, relations, its sections, links out and in \
+            (dangling and stale marked), linked tasks and threads, comments, the last 20 \
+            events, and the first 2,000 characters of the body. Use `doc_read` for the text.",
+        read_only: true,
+        schema: || obj(json!({"doc": doc_schema()}), &["doc"]),
+    },
+    ToolDef {
+        name: "doc_read",
+        description: "Read a document's text: one section (`doc` \"d12#anchor\" or \
+            `section`), an old revision (`rev`), or with `sections` the list of sections with \
+            anchors and token estimates. Prefer reading one section to reading a whole \
+            document. A whole document above 20,000 characters is answered with its section \
+            list unless `whole` is true.",
+        read_only: true,
+        schema: || {
+            obj(
+                json!({
+                    "doc": doc_schema(),
+                    "section": {"type": "string", "description": "The section's anchor (as in d12#anchor)."},
+                    "rev": {"type": "integer", "description": "An earlier revision."},
+                    "sections": {"type": "boolean", "description": "List the sections instead of the text."},
+                    "whole": {"type": "boolean", "description": "Answer the whole text even when it is long."},
+                }),
+                &["doc"],
+            )
+        },
+    },
+    ToolDef {
+        name: "doc_write",
+        description: "Replace a document's body, or one section (`section`, or `doc` \
+            \"d12#anchor\"; the section's heading stays unless the text starts with a \
+            heading). Pass the `rev` you read as `if_rev`: when someone changed the document \
+            since, nothing is written and the answer shows the changes and the diff, so you \
+            can merge and call again. An active decision cannot be changed; supersede it with \
+            a new one.",
+        read_only: false,
+        schema: || {
+            obj(
+                json!({
+                    "doc": doc_schema(),
+                    "body": {"type": "string", "description": "The new body, or the section's new text."},
+                    "section": {"type": "string"},
+                    "message": {"type": "string", "description": "The revision message (at most 500 characters)."},
+                    "if_rev": doc_if_rev_schema(),
+                    "silent": {"type": "boolean", "description": "Send no notification mail."},
+                }),
+                &["doc", "body"],
+            )
+        },
+    },
+    ToolDef {
+        name: "doc_set",
+        description: "Change fields of a document: title, description, slug, labels, team, \
+            parent, supplements, related, owner, editors, status (draft, active, archived), \
+            pinned. A null value clears slug, team, parent or supplements; lists replace the \
+            old ones. Status, owner and pinned are changed by the owner and the user only; an \
+            active decision is set by the user. When a newer document replaces this one, give \
+            only `superseded_by`.",
+        read_only: false,
+        schema: || {
+            let opt_str = json!({"type": ["string", "null"]});
+            let list = json!({"type": "array", "items": {"type": "string"}});
+            obj(
+                json!({
+                    "doc": doc_schema(),
+                    "title": {"type": "string"},
+                    "description": {"type": "string"},
+                    "slug": opt_str,
+                    "labels": list,
+                    "team": opt_str,
+                    "parent": {"type": ["integer", "string", "null"]},
+                    "supplements": {"type": ["integer", "string", "null"]},
+                    "related": list,
+                    "owner": {"type": "string"},
+                    "editors": list,
+                    "status": {"type": "string", "enum": ["draft", "active", "archived"]},
+                    "pinned": {"type": "boolean"},
+                    "superseded_by": {"type": ["integer", "string"], "description": "The document that replaces this one: sets status superseded and both relations (give no other field with it)."},
+                    "message": {"type": "string"},
+                    "if_rev": doc_if_rev_schema(),
+                    "silent": {"type": "boolean"},
+                }),
+                &["doc"],
+            )
+        },
+    },
+    ToolDef {
+        name: "doc_search",
+        description: "Search the team's documents by section; one line per hit \
+            (`d12#rollback  runbook  active  Deploy > Rollback — <snippet>`). Use it before \
+            you decide how something is done here or rely on how a tool behaves, and before \
+            you create a document. Active documents only unless `status` (`all` adds drafts, \
+            superseded and archived ones); your team first, stale documents last.",
+        read_only: true,
+        schema: || {
+            obj(
+                json!({
+                    "terms": {"type": "string", "description": "Words to search for (at most 10)."},
+                    "kind": {"type": "string"},
+                    "status": {"type": "string", "description": "A status, or all."},
+                    "team": {"type": "string"},
+                    "label": {"type": "string"},
+                    "owner": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+                }),
+                &["terms"],
+            )
+        },
+    },
+    ToolDef {
+        name: "doc_find",
+        description: "Find documents whose title, slug or description contains every word, \
+            in any status. Use it when you remember a document's name; use `doc_search` to \
+            search the text.",
+        read_only: true,
+        schema: || {
+            obj(
+                json!({
+                    "words": {"type": "string"},
+                    "kind": {"type": "string"},
+                    "status": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                }),
+                &["words"],
+            )
+        },
+    },
+    ToolDef {
+        name: "doc_list",
+        description: "List documents newest first, one line each, filtered by kind, \
+            status (default draft and active; `all`), team, owner, label, stale (past their \
+            expiry) or pinned. Continue with `before` set to `next_before`.",
+        read_only: true,
+        schema: || {
+            obj(
+                json!({
+                    "kind": {"type": "string"},
+                    "status": {"type": "string"},
+                    "team": {"type": "string"},
+                    "owner": {"type": "string"},
+                    "label": {"type": "string"},
+                    "stale": {"type": "boolean"},
+                    "pinned": {"type": "boolean"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                    "before": {"type": "integer"},
+                }),
+                &[],
+            )
+        },
+    },
+    ToolDef {
+        name: "doc_index",
+        description: "The document index of a team (default: yours) as a seat is shown it \
+            each turn: active documents of the indexed kinds, pinned first, one line each. \
+            Use it to see what the team has written down before searching.",
+        read_only: true,
+        schema: || obj(json!({"team": {"type": "string"}}), &[]),
+    },
+    ToolDef {
+        name: "doc_history",
+        description: "A document's revisions (author, message, size) and events, oldest \
+            first. Use it to see who changed a document and why. Continue the events with \
+            `after_seq` set to `next_after_seq`.",
+        read_only: true,
+        schema: || {
+            obj(
+                json!({
+                    "doc": doc_schema(),
+                    "after_seq": {"type": "integer"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                }),
+                &["doc"],
+            )
+        },
+    },
+    ToolDef {
+        name: "doc_split",
+        description: "Split a large document: each heading of `level` (1 or 2, default 1) \
+            becomes a child document; the parent keeps its text before the first such heading \
+            and a list of the children. Links to the moved sections are rewritten. Answers \
+            where each section went (`#rollback -> d31`). Use it when a document is too long \
+            to read in one piece or carries advice to split.",
+        read_only: false,
+        schema: || {
+            obj(
+                json!({"doc": doc_schema(), "level": {"type": "integer", "enum": [1, 2]},
+                       "if_rev": doc_if_rev_schema()}),
+                &["doc"],
+            )
+        },
+    },
+    ToolDef {
+        name: "doc_extract",
+        description: "Move one section of a document (`doc` \"d12#anchor\", or `anchor`) \
+            into a new document titled `into` that supplements it; the source keeps the \
+            heading and a line pointing to the new document, and links follow. Use it to \
+            turn a finding inside a long document into its own document.",
+        read_only: false,
+        schema: || {
+            obj(
+                json!({
+                    "doc": doc_schema(),
+                    "anchor": {"type": "string"},
+                    "into": {"type": "string", "description": "The new document's title."},
+                    "kind": {"type": "string", "description": "Default: the source's kind."},
+                    "if_rev": doc_if_rev_schema(),
+                }),
+                &["doc", "into"],
+            )
+        },
+    },
+    ToolDef {
+        name: "doc_verify",
+        description: "Confirm that a document is still correct: sets the verification time \
+            and the next expiry (`for`: 30d, 12h, 2w or none; default the kind's interval). \
+            Use it after checking a stale document against the system it describes. The owner \
+            and the user only.",
+        read_only: false,
+        schema: || {
+            obj(
+                json!({"doc": doc_schema(), "for": {"type": "string"}}),
+                &["doc"],
+            )
+        },
+    },
+    ToolDef {
+        name: "doc_comment",
+        description: "Comment on a document or one section (`doc` \"d12#anchor\", or \
+            `anchor`): a message in the document's discussion thread to its owner, with \
+            earlier commenters in Cc. Use it when a document you do not own is wrong or \
+            incomplete.",
+        read_only: false,
+        schema: || {
+            obj(
+                json!({"doc": doc_schema(), "anchor": {"type": "string"}, "body": {"type": "string"}}),
+                &["doc", "body"],
+            )
+        },
+    },
+    ToolDef {
+        name: "handover_show",
+        description: "A seat's handover note (default: yours): State, Summary, Next, Waiting \
+            on, Traps, Verify, Pointers, written by the seat's previous session for the next \
+            one, with its revisions and whether a session read it. Use it at the start of work \
+            in a seat, or to see where a teammate stands.",
+        read_only: true,
+        schema: || {
+            obj(
+                json!({"seat": {"type": "string"}, "rev": {"type": "integer"}}),
+                &[],
+            )
+        },
+    },
+    ToolDef {
+        name: "handover_write",
+        description: "Write your handover note for the next session of your seat, when you \
+            are asked to or before you stop with work in progress. Give `text` with the \
+            fields as `Field:` lines or Markdown headings, or `fields`. State, Summary, Next, \
+            Waiting on, Traps and Verify are required (Next: the first item an exact command \
+            or file; Verify: a command and its expected output); an empty Pointers is filled \
+            in from your worklog. At most 16,384 characters; keep State, Summary and Next short.",
+        read_only: false,
+        schema: || {
+            let s = json!({"type": "string"});
+            obj(
+                json!({
+                    "text": {"type": "string", "description": "The note as text: `State: ...`, `Summary:` and so on."},
+                    "fields": {
+                        "type": "object",
+                        "properties": {
+                            "state": s, "summary": s, "next": s, "waiting_on": s,
+                            "traps": s, "verify": s, "pointers": s,
+                        },
+                        "additionalProperties": false,
+                        "description": "The note as fields, instead of text.",
+                    },
+                    "private": {"type": "boolean", "description": "Only the seat, its lead and the user may read it."},
+                    "session": {"type": "string", "description": "Your session id."},
+                }),
+                &[],
+            )
+        },
+    },
+    ToolDef {
+        name: "worklog",
+        description: "A seat's worklog (default: yours), newest first: mail sent and read, \
+            task changes, document changes, sessions, tool calls and commits. Use it to find \
+            what was done before you (or by a teammate) without asking; `summary` gives counts \
+            per kind, the tasks touched and the last ten entries.",
+        read_only: true,
+        schema: || {
+            obj(
+                json!({
+                    "seat": {"type": "string"},
+                    "since": {"type": "string", "description": "30m, 2h, 7d, or an RFC 3339 time."},
+                    "task": {"type": ["integer", "string"], "description": "A task, 12 or t12."},
+                    "kind": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 1000},
+                    "before": {"type": "integer", "description": "An entry id (next_before)."},
+                    "summary": {"type": "boolean"},
+                }),
+                &[],
+            )
+        },
+    },
 ];
 
 /// The tool list as MCP describes it.
@@ -888,6 +1265,23 @@ impl Args<'_> {
 
     fn req_task(&self, k: &str) -> Result<i64> {
         self.task(k)?
+            .ok_or_else(|| arg_err(format!("`{k}` is required")))
+    }
+
+    /// A document: `12`, `"d12"`, a slug, optionally with `#anchor`.
+    fn doc(&self, k: &str) -> Result<Option<String>> {
+        match self.get(k) {
+            None => Ok(None),
+            Some(Value::Number(n)) => Ok(Some(n.to_string())),
+            Some(Value::String(s)) if !s.trim().is_empty() => Ok(Some(s.trim().to_string())),
+            Some(_) => Err(arg_err(format!(
+                "`{k}` must be a document such as 12, \"d12\" or a slug"
+            ))),
+        }
+    }
+
+    fn req_doc(&self, k: &str) -> Result<String> {
+        self.doc(k)?
             .ok_or_else(|| arg_err(format!("`{k}` is required")))
     }
 
@@ -1051,6 +1445,10 @@ async fn call(c: &Client, name: &str, args: &JsonObject) -> Result<(Value, Strin
             Ok((v, t))
         }
         n if n.starts_with("task_") => task(c, n, &a).await,
+        n if n.starts_with("doc_") || n.starts_with("handover_") || n == "worklog" => {
+            let (v, t) = docs(c, n, &a).await?;
+            Ok(cut_result(n, v, t))
+        }
         _ => bail!("no tool {name}"),
     }
 }
@@ -1711,6 +2109,303 @@ async fn task(c: &Client, name: &str, a: &Args<'_>) -> Result<(Value, String)> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Documents, the handover note and the worklog
+
+/// Text results of the document, handover and worklog tools are cut at
+/// this many characters, with a line that says what to narrow.
+const RESULT_MAX_CHARS: usize = 25_000;
+
+/// `doc_read` of a whole document above this many characters answers the
+/// section list unless `whole` is true.
+const READ_WHOLE_MAX_CHARS: usize = 20_000;
+
+/// What to narrow when a tool's text is cut.
+fn narrow_hint(name: &str) -> &'static str {
+    match name {
+        "doc_read" => "read one section (doc \"d12#anchor\"; the list: sections: true)",
+        "doc_show" => "read the text with doc_read, one section at a time",
+        "doc_search" | "doc_find" | "doc_list" => {
+            "use more specific terms or filters (kind, team, status), or a lower limit"
+        }
+        "doc_history" => "pass a lower limit and continue with after_seq",
+        "worklog" => "pass since, task, kind or a lower limit, or summary: true",
+        _ => "narrow the request",
+    }
+}
+
+/// Cut a text result at [`RESULT_MAX_CHARS`] (at a line end where there
+/// is one), ending with a line that says what to narrow. When the text is
+/// cut and the JSON is larger than the limit too, the structured content
+/// says so instead of carrying it.
+fn cut_result(name: &str, v: Value, t: String) -> (Value, String) {
+    let n = t.chars().count();
+    if n <= RESULT_MAX_CHARS {
+        return (v, t);
+    }
+    let hint = narrow_hint(name);
+    let tail = format!(
+        "\n… cut at {} of {} characters: {hint}",
+        crate::doc_cmd::thousands(RESULT_MAX_CHARS as i64),
+        crate::doc_cmd::thousands(n as i64)
+    );
+    let keep = RESULT_MAX_CHARS.saturating_sub(tail.chars().count());
+    let end = t
+        .char_indices()
+        .nth(keep)
+        .map(|(i, _)| i)
+        .unwrap_or(t.len());
+    let head = &t[..end];
+    let head = match head.rfind('\n') {
+        Some(i) if i > end / 2 => &head[..i],
+        _ => head,
+    };
+    let text = format!("{head}{tail}");
+    let big = serde_json::to_string(&v).map_or(0, |s| s.len()) > RESULT_MAX_CHARS;
+    let v = if big {
+        json!({"cut": true, "chars": n, "narrow": hint})
+    } else {
+        v
+    };
+    (v, text)
+}
+
+/// Put the arguments named in `keys` into `b` as given; an explicit null
+/// is kept (it clears the field).
+fn copy_args(a: &Args, b: &mut Map<String, Value>, keys: &[&str]) {
+    for k in keys {
+        if let Some(v) = a.get(k) {
+            b.insert((*k).into(), v.clone());
+        } else if a.has(k) {
+            b.insert((*k).into(), Value::Null);
+        }
+    }
+}
+
+async fn docs(c: &Client, name: &str, a: &Args<'_>) -> Result<(Value, String)> {
+    use crate::doc_cmd as d;
+    use crate::handover_cmd as h;
+    match name {
+        "doc_new" => {
+            let mut b = Map::new();
+            b.insert("title".into(), json!(a.req_str("title")?));
+            for k in [
+                "kind",
+                "body",
+                "description",
+                "slug",
+                "team",
+                "message",
+                "client_key",
+            ] {
+                if let Some(s) = a.str(k)? {
+                    b.insert(k.into(), json!(s));
+                }
+            }
+            for k in ["parent", "supplements"] {
+                if let Some(s) = a.doc(k)? {
+                    b.insert(k.into(), json!(s));
+                }
+            }
+            let labels = a.strings("labels")?;
+            if !labels.is_empty() {
+                b.insert("labels".into(), json!(labels));
+            }
+            if a.bool("silent")? {
+                b.insert("silent".into(), json!(true));
+            }
+            d::create(c, b, true).await
+        }
+        "doc_show" => {
+            let (mut v, t) = d::show(c, &a.req_doc("doc")?).await?;
+            // The body is read with doc_read; the record carries its size.
+            if let Some(o) = v.get_mut("doc").and_then(Value::as_object_mut)
+                && let Some(Value::String(body)) = o.remove("body")
+            {
+                o.insert("body_chars".into(), json!(body.chars().count()));
+            }
+            Ok((v, t))
+        }
+        "doc_read" => {
+            let whole = a.bool("whole")?;
+            d::read(
+                c,
+                &a.req_doc("doc")?,
+                a.str("section")?,
+                a.int("rev")?,
+                a.bool("sections")?,
+                (!whole).then_some(READ_WHOLE_MAX_CHARS),
+            )
+            .await
+        }
+        "doc_write" => {
+            let mut b = Map::new();
+            b.insert("body".into(), json!(a.req_str("body")?));
+            for k in ["section", "message"] {
+                if let Some(s) = a.str(k)? {
+                    b.insert(k.into(), json!(s));
+                }
+            }
+            if let Some(r) = a.int("if_rev")? {
+                b.insert("if_rev".into(), json!(r));
+            }
+            if a.bool("silent")? {
+                b.insert("silent".into(), json!(true));
+            }
+            d::write(c, &a.req_doc("doc")?, b).await
+        }
+        "doc_set" => {
+            let doc = a.req_doc("doc")?;
+            if let Some(by) = a.doc("superseded_by")? {
+                let others =
+                    a.0.keys()
+                        .any(|k| !matches!(k.as_str(), "doc" | "superseded_by" | "silent"));
+                if others {
+                    return Err(arg_err(
+                        "`superseded_by` is given alone (with `silent`); change other fields \
+                         in another call"
+                            .into(),
+                    ));
+                }
+                return d::supersede(c, &doc, &by, a.bool("silent")?).await;
+            }
+            let mut b = Map::new();
+            copy_args(
+                a,
+                &mut b,
+                &[
+                    "title",
+                    "description",
+                    "slug",
+                    "labels",
+                    "team",
+                    "related",
+                    "owner",
+                    "editors",
+                    "status",
+                    "pinned",
+                    "message",
+                    "silent",
+                ],
+            );
+            for k in ["parent", "supplements"] {
+                if let Some(s) = a.doc(k)? {
+                    b.insert(k.into(), json!(s));
+                } else if a.has(k) {
+                    b.insert(k.into(), Value::Null);
+                }
+            }
+            if let Some(r) = a.int("if_rev")? {
+                b.insert("if_rev".into(), json!(r));
+            }
+            d::set(c, &doc, b).await
+        }
+        "doc_search" => {
+            d::search(
+                c,
+                &[
+                    ("q", Some(a.req_str("terms")?)),
+                    ("kind", a.str("kind")?),
+                    ("status", a.str("status")?),
+                    ("team", a.str("team")?),
+                    ("label", a.str("label")?),
+                    ("owner", a.str("owner")?),
+                    ("limit", a.int("limit")?.map(|x| x.to_string())),
+                ],
+            )
+            .await
+        }
+        "doc_find" => {
+            d::find(
+                c,
+                &[
+                    ("q", Some(a.req_str("words")?)),
+                    ("kind", a.str("kind")?),
+                    ("status", a.str("status")?),
+                    ("limit", a.int("limit")?.map(|x| x.to_string())),
+                ],
+            )
+            .await
+        }
+        "doc_list" => {
+            d::list(
+                c,
+                &[
+                    ("kind", a.str("kind")?),
+                    ("status", a.str("status")?),
+                    ("team", a.str("team")?),
+                    ("owner", a.str("owner")?),
+                    ("label", a.str("label")?),
+                    ("stale", a.bool("stale")?.then(|| "1".to_string())),
+                    ("pinned", a.bool("pinned")?.then(|| "1".to_string())),
+                    ("limit", a.int("limit")?.map(|x| x.to_string())),
+                    ("before", a.int("before")?.map(|x| x.to_string())),
+                ],
+            )
+            .await
+        }
+        "doc_index" => d::index(c, a.str("team")?).await,
+        "doc_history" => {
+            d::history_page(c, &a.req_doc("doc")?, a.int("after_seq")?, a.int("limit")?).await
+        }
+        "doc_split" => d::split(c, &a.req_doc("doc")?, a.int("level")?, a.int("if_rev")?).await,
+        "doc_extract" => {
+            d::extract(
+                c,
+                &a.req_doc("doc")?,
+                a.str("anchor")?,
+                &a.req_str("into")?,
+                a.str("kind")?,
+                a.int("if_rev")?,
+            )
+            .await
+        }
+        "doc_verify" => d::verify(c, &a.req_doc("doc")?, a.str("for")?).await,
+        "doc_comment" => {
+            d::comment(c, &a.req_doc("doc")?, a.str("anchor")?, a.req_str("body")?).await
+        }
+        "handover_show" => h::show(c, a.str("seat")?, a.int("rev")?).await,
+        "handover_write" => {
+            let mut b = Map::new();
+            match (a.str("text")?, a.get("fields")) {
+                (Some(t), None) => {
+                    b.insert("text".into(), json!(t));
+                }
+                (None, Some(f @ Value::Object(_))) => {
+                    b.insert("fields".into(), f.clone());
+                }
+                (Some(_), Some(_)) => {
+                    return Err(arg_err("give `text` or `fields`, not both".into()));
+                }
+                _ => return Err(arg_err("give the note as `text` or `fields`".into())),
+            }
+            if a.get("private").is_some() {
+                b.insert("private".into(), json!(a.bool("private")?));
+            }
+            if let Some(s) = a.str("session")? {
+                b.insert("session".into(), json!(s));
+            }
+            h::write(c, None, b).await
+        }
+        "worklog" => {
+            h::worklog(
+                c,
+                a.str("seat")?,
+                &[
+                    ("since", a.str("since")?),
+                    ("task", a.task("task")?.map(|x| x.to_string())),
+                    ("kind", a.str("kind")?),
+                    ("limit", a.int("limit")?.map(|x| x.to_string())),
+                    ("before", a.int("before")?.map(|x| x.to_string())),
+                ],
+                a.bool("summary")?,
+            )
+            .await
+        }
+        _ => Err(anyhow!("no tool {name}")),
+    }
+}
+
 /// A `TaskDetail` answer, or a short note when the answer is something
 /// else (an empty body, for example).
 fn detail(v: Value, verb: &str) -> Result<(Value, String)> {
@@ -1950,6 +2645,22 @@ mod tests {
         assert_eq!(a.req_task("b").unwrap(), 7);
         assert!(a.req_task("c").is_err());
         assert!(a.req_task("d").is_err());
+    }
+
+    #[test]
+    fn long_results_are_cut() {
+        let short = cut_result("doc_list", json!({"a": 1}), "x".into());
+        assert_eq!(short, (json!({"a": 1}), "x".to_string()));
+        let line = "word ".repeat(19) + "word\n";
+        let t = line.repeat(400);
+        let (v, cut) = cut_result("doc_search", json!({"text": t}), t.clone());
+        assert!(cut.chars().count() <= RESULT_MAX_CHARS, "{}", cut.len());
+        assert!(cut.ends_with(
+            "characters: use more specific terms or filters (kind, team, status), or a lower limit"
+        ));
+        assert!(cut.contains("word\n… cut at 25,000 of 40,000 characters"));
+        assert_eq!(v["cut"], true);
+        assert_eq!(v["chars"], 40_000);
     }
 
     #[test]

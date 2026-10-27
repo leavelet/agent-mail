@@ -50,6 +50,23 @@ const TOOLS: &[&str] = &[
     "task_history",
     "task_result",
     "task_report",
+    "doc_new",
+    "doc_show",
+    "doc_read",
+    "doc_write",
+    "doc_set",
+    "doc_search",
+    "doc_find",
+    "doc_list",
+    "doc_index",
+    "doc_history",
+    "doc_split",
+    "doc_extract",
+    "doc_verify",
+    "doc_comment",
+    "handover_show",
+    "handover_write",
+    "worklog",
 ];
 
 /// `amail --json <args>` as the seat with `token`.
@@ -332,6 +349,8 @@ fn drive(url: &str, t1: &str, t2: &str) {
         "{list}"
     );
 
+    documents(url, t1, &mut m1, &mut m2);
+
     // Errors: an unknown task is the server's error as a tool error; bad
     // arguments too.
     let missing = m1.call("task_show", json!({"num": 99999}));
@@ -364,4 +383,193 @@ fn drive(url: &str, t1: &str, t2: &str) {
     none.initialize();
     assert_eq!(err_code(&none.call("inbox", json!({}))), "no_identity");
     assert!(none.request("ping", json!({}))["result"].is_object());
+}
+
+fn text(v: &Value) -> &str {
+    v["content"][0]["text"].as_str().unwrap()
+}
+
+/// The document, handover and worklog tools. `m1` is w1 (token `t1`), `m2`
+/// is w2.
+fn documents(url: &str, t1: &str, m1: &mut McpProc, m2: &mut McpProc) {
+    let body = "# Observed\nThe build cache is cleared on every merge.\n\n\
+                # Evidence\nRan the pipeline twice; the cache step took 12 minutes both times.\n\n\
+                # Applies to\nThe CI of this repository.\n";
+    let args = json!({
+        "title": "CI clears the build cache", "kind": "finding", "body": body,
+        "description": "Why CI is slow after merges",
+    });
+    let new = m1.call("doc_new", args.clone());
+    let num = ok(&new)["doc"]["num"].as_i64().unwrap();
+    assert_eq!(ok(&new)["doc"]["status"], "draft", "{new}");
+    assert!(text(&new).starts_with(&format!("d{num} ")), "{new}");
+    let rev = ok(&new)["doc"]["rev"].as_i64().unwrap();
+    // The same call again: the same document, nothing created.
+    let again = m1.call("doc_new", args);
+    assert_eq!(ok(&again)["doc"]["num"], json!(num), "{again}");
+    assert_eq!(ok(&again)["existing"], true, "{again}");
+    // Another seat on the same subject: created, with the candidates.
+    let other = m2.call(
+        "doc_new",
+        json!({"title": "CI clears the build cache", "kind": "finding", "body": body}),
+    );
+    let other_num = ok(&other)["doc"]["num"].as_i64().unwrap();
+    assert_eq!(
+        ok(&other)["candidates"][0]["doc"]["num"],
+        json!(num),
+        "{other}"
+    );
+    assert!(
+        text(&other).contains(&format!("warning: similar documents exist: d{num} ")),
+        "{other}"
+    );
+
+    // Read one section; the same JSON as the command.
+    let r = m2.call("doc_read", json!({"doc": format!("d{num}#evidence")}));
+    assert_eq!(ok(&r)["read"]["anchor"], "evidence", "{r}");
+    assert!(text(&r).contains("12 minutes"), "{r}");
+    assert!(!text(&r).contains("Observed"), "{r}");
+    assert_eq!(
+        ok(&r),
+        &cli_json(url, t1, &["doc", "read", &format!("d{num}#evidence")]),
+        "doc_read"
+    );
+    let r = m2.call("doc_read", json!({"doc": num, "sections": true}));
+    assert!(text(&r).contains("#applies-to  Applies to"), "{r}");
+    // A whole document above 20,000 characters: the section list.
+    let long = format!(
+        "# Part one\n{}\n\n# Part two\n{}\n",
+        "alpha ".repeat(2000),
+        "beta ".repeat(2000)
+    );
+    let ln = m1.call("doc_new", json!({"title": "Long reference", "body": long}));
+    let lnum = ok(&ln)["doc"]["num"].as_i64().unwrap();
+    let r = m1.call("doc_read", json!({"doc": lnum}));
+    assert!(text(&r).contains("#part-one  Part one"), "{r}");
+    assert!(text(&r).contains("or pass whole: true"), "{r}");
+    assert!(ok(&r)["whole_chars"].as_i64().unwrap() > 20_000, "{r}");
+    assert!(ok(&r)["doc"].get("body").is_none(), "{r}");
+    let r = m1.call("doc_read", json!({"doc": lnum, "whole": true}));
+    assert!(text(&r).contains("beta beta"), "{r}");
+    // doc_show: the record without the body (its size instead).
+    let s = m1.call("doc_show", json!({"doc": num}));
+    assert!(ok(&s)["doc"].get("body").is_none(), "{s}");
+    assert!(ok(&s)["doc"]["body_chars"].as_i64().unwrap() > 50, "{s}");
+    assert!(text(&s).contains("Kind: finding · Status: draft"), "{s}");
+
+    // doc_write with if_rev, then a stale write with the changes and diff.
+    let w = m1.call(
+        "doc_write",
+        json!({"doc": format!("d{num}#evidence"), "body": "Ran the pipeline three times.",
+               "if_rev": rev, "message": "third run"}),
+    );
+    assert_eq!(ok(&w)["doc"]["rev"], json!(rev + 1), "{w}");
+    let stale = m1.call("doc_write", json!({"doc": num, "body": "x", "if_rev": rev}));
+    assert_eq!(err_code(&stale), "stale", "{stale}");
+    let sc = &stale["structuredContent"];
+    assert_eq!(sc["rev"], json!(rev + 1), "{stale}");
+    assert!(
+        sc["diff"].as_str().unwrap().contains("three times"),
+        "{stale}"
+    );
+    assert_eq!(sc["since"][0]["note"], "third run", "{stale}");
+    assert!(
+        text(&stale).contains(&format!("call again with if_rev {}", rev + 1)),
+        "{stale}"
+    );
+
+    // Search: active documents; activate, then it is found and indexed.
+    let none = m2.call("doc_search", json!({"terms": "pipeline three"}));
+    assert_eq!(text(&none), "no hits", "{none}");
+    let set = m1.call("doc_set", json!({"doc": num, "status": "active"}));
+    assert_eq!(ok(&set)["doc"]["status"], "active", "{set}");
+    let hits = m2.call("doc_search", json!({"terms": "pipeline three"}));
+    assert_eq!(ok(&hits)["hits"][0]["num"], json!(num), "{hits}");
+    assert!(
+        text(&hits).starts_with(&format!("d{num}#evidence  finding  active  Evidence — ")),
+        "{hits}"
+    );
+    let idx = m2.call("doc_index", json!({}));
+    assert!(
+        text(&idx).contains(&format!("d{num}  finding  CI clears the build cache")),
+        "{idx}"
+    );
+    let found = m2.call("doc_find", json!({"words": "build cache"}));
+    assert_eq!(ok(&found)["docs"].as_array().unwrap().len(), 2, "{found}");
+    let list = m2.call("doc_list", json!({"kind": "finding", "status": "all"}));
+    assert_eq!(ok(&list)["docs"].as_array().unwrap().len(), 2, "{list}");
+    // w2 supersedes its own duplicate by w1's document.
+    let sup = m2.call(
+        "doc_set",
+        json!({"doc": other_num, "superseded_by": format!("d{num}")}),
+    );
+    assert_eq!(ok(&sup)["doc"]["status"], "superseded", "{sup}");
+    assert!(
+        text(&sup).contains(&format!("superseded by d{num}")),
+        "{sup}"
+    );
+    assert_eq!(
+        err_code(&m2.call(
+            "doc_set",
+            json!({"doc": other_num, "superseded_by": num, "title": "x"})
+        )),
+        "invalid_arguments"
+    );
+    let c = m2.call(
+        "doc_comment",
+        json!({"doc": format!("d{num}#evidence"), "body": "Which runner?"}),
+    );
+    assert!(ok(&c)["id"].is_i64(), "{c}");
+    let v = m1.call("doc_verify", json!({"doc": num, "for": "2w"}));
+    assert!(ok(&v)["doc"]["expires_at"].is_string(), "{v}");
+    let sp = m1.call("doc_split", json!({"doc": lnum}));
+    assert!(text(&sp).contains("#part-one -> d"), "{sp}");
+    assert_eq!(ok(&sp)["moved"].as_array().unwrap().len(), 2, "{sp}");
+    let h = m1.call("doc_history", json!({"doc": num}));
+    assert_eq!(ok(&h)["revisions"].as_array().unwrap().len(), 2, "{h}");
+    assert!(text(&h).contains("(third run)"), "{h}");
+
+    // The handover note: missing fields, then written as fields.
+    let missing = m1.call(
+        "handover_write",
+        json!({"text": "State: on track\nSummary: x\n"}),
+    );
+    assert_eq!(err_code(&missing), "note_fields_missing", "{missing}");
+    assert_eq!(
+        missing["structuredContent"]["missing"],
+        json!(["Next", "Waiting on", "Traps", "Verify"]),
+        "{missing}"
+    );
+    assert!(
+        text(&missing).contains("The note lacks: Next, Waiting on, Traps, Verify."),
+        "{missing}"
+    );
+    assert!(text(&missing).contains("\nPointers:\n"), "{missing}");
+    let w = m1.call(
+        "handover_write",
+        json!({"fields": {"state": "on track", "summary": "CI finding recorded.",
+                          "next": format!("1. amail doc show d{num}"), "waiting_on": "nothing",
+                          "traps": "none", "verify": "doc_search finds it"},
+               "session": "sess-1"}),
+    );
+    assert_eq!(ok(&w)["note"]["rev"], 1, "{w}");
+    assert_eq!(ok(&w)["note"]["pointers_filled"], true, "{w}");
+    let show = m2.call("handover_show", json!({"seat": "w1"}));
+    assert!(
+        text(&show).contains("Summary: CI finding recorded."),
+        "{show}"
+    );
+    assert_eq!(ok(&show)["note"]["session"], "sess-1", "{show}");
+
+    // The worklog: entries, and the summary as the command answers it.
+    let wl = m1.call("worklog", json!({"kind": "handover"}));
+    assert_eq!(ok(&wl)["entries"].as_array().unwrap().len(), 1, "{wl}");
+    assert!(text(&wl).contains("handover note rev 1 written"), "{wl}");
+    let sum = m1.call("worklog", json!({"summary": true}));
+    assert!(text(&sum).starts_with("worklog of w1: "), "{sum}");
+    assert_eq!(
+        ok(&sum),
+        &cli_json(url, t1, &["worklog", "--summary"]),
+        "worklog summary"
+    );
 }
