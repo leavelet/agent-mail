@@ -399,6 +399,10 @@ struct State {
     seats: HashMap<String, SeatRt>,
     saved: Saved,
     dirty_pending: HashSet<String>,
+    /// Seats whose pending counts the server refused to give this node (the
+    /// user seat: node tokens read agent seats' mailboxes only). Their
+    /// mailbox events are ignored until the node connects again.
+    pending_refused: HashSet<String>,
     dirty_presence: HashSet<String>,
     /// `saved` changed and must be written.
     save_dirty: bool,
@@ -442,6 +446,7 @@ impl Default for State {
             seats: HashMap::new(),
             saved: Saved::default(),
             dirty_pending: HashSet::new(),
+            pending_refused: HashSet::new(),
             dirty_presence: HashSet::new(),
             save_dirty: false,
             sup: HashMap::new(),
@@ -741,6 +746,32 @@ fn valid_model(m: &str) -> bool {
 }
 
 /// RFC 3339 to Unix ms.
+/// After a refresh of pending counts: the seats to ask again, and the
+/// seats the server refused for good (a permanent error of a per-seat
+/// request: asking again cannot help). A failed request for the whole org
+/// is asked again for every seat.
+fn after_refresh(
+    whole: bool,
+    dirty: &[String],
+    results: &[Result<amail_proto::PendingResponse>],
+) -> (Vec<String>, Vec<String>) {
+    let (mut retry, mut refused) = (Vec::new(), Vec::new());
+    if whole {
+        if results.iter().any(|r| r.is_err()) {
+            retry.extend(dirty.iter().cloned());
+        }
+        return (retry, refused);
+    }
+    for (seat, r) in dirty.iter().zip(results) {
+        match r {
+            Ok(_) => {}
+            Err(e) if crate::server::is_permanent(e) => refused.push(seat.clone()),
+            Err(_) => retry.push(seat.clone()),
+        }
+    }
+    (retry, refused)
+}
+
 fn parse_ts(s: &str) -> Option<i64> {
     s.parse::<jiff::Timestamp>()
         .ok()
@@ -2857,6 +2888,7 @@ impl Node {
                             let mut st = self.lock();
                             self.apply_pending(&mut st, p);
                             st.connected = true;
+                            st.pending_refused.clear();
                             // The server (or another instance) may know
                             // nothing about the seats: report them all.
                             let all: Vec<String> = st
@@ -2897,6 +2929,9 @@ impl Node {
                             continue;
                         };
                         let mut st = self.lock();
+                        if st.pending_refused.contains(&m.seat) {
+                            continue;
+                        }
                         if st
                             .server_seat(&m.seat)
                             .is_some_and(|s| m.seq > s.pending.seq)
@@ -2953,22 +2988,28 @@ impl Node {
                     futures::future::join_all(dirty.iter().map(|s| self.server.pending(Some(s))))
                         .await
                 };
-                let mut failed = false;
-                {
+                let failed = {
                     let mut st = self.lock();
+                    let (retry, refused) = after_refresh(whole, &dirty, &results);
                     for r in results {
                         match r {
                             Ok(p) => self.apply_pending(&mut st, p),
                             Err(e) => {
                                 tracing::debug!("refreshing pending counts: {e:#}");
-                                failed = true;
                             }
                         }
                     }
-                    if failed {
-                        st.dirty_pending.extend(dirty);
+                    for seat in refused {
+                        tracing::debug!(
+                            "seat {seat}: the server does not give this node its pending \
+                             counts; not asked again until the node reconnects"
+                        );
+                        st.pending_refused.insert(seat);
                     }
-                }
+                    let failed = !retry.is_empty();
+                    st.dirty_pending.extend(retry);
+                    failed
+                };
                 self.wake_kick.notify_one();
                 self.presence_kick.notify_one();
                 if failed {
