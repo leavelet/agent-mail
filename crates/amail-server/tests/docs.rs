@@ -55,6 +55,9 @@ doc_tests!(
     live_doc_events,
     other_orgs_see_no_docs,
     public_doc_limits,
+    doc_events_in_the_worklog,
+    owner_mail_silent_and_activation,
+    own_comment_mails_nobody,
 );
 
 struct Server {
@@ -997,4 +1000,149 @@ async fn public_doc_limits(srv: Server) {
         (s, c.as_str()),
         (StatusCode::UNPROCESSABLE_ENTITY, "too_many_kinds")
     );
+}
+
+/// The worklog of an agent seat records its document events (`doc`, with
+/// the document's number); the user's events have no worklog.
+async fn doc_events_in_the_worklog(srv: Server) {
+    let org = srv.org("alpha").await;
+    let w1 = org.seat("w1").await;
+    w1.doc(json!({ "title": "Ops", "kind": "runbook", "body": RUNBOOK }))
+        .await;
+    w1.ok(
+        Method::PUT,
+        "/docs/1/body",
+        Some(
+            json!({ "section": "steps", "body": "# Steps\n\nrun twice\n\n## Rollback\n\nundo\n",
+                    "message": "twice" }),
+        ),
+    )
+    .await;
+    w1.patch(1, json!({ "status": "active", "labels": ["ops"] }))
+        .await;
+    w1.post("/docs/1/verify", json!({ "for": "30d" })).await;
+    w1.post(
+        "/docs/1/comment",
+        json!({ "anchor": "verify", "body": "check it" }),
+    )
+    .await;
+    w1.post("/docs/1/split", json!({})).await;
+    w1.post(
+        "/docs/3/extract",
+        json!({ "anchor": "rollback", "into": "Rolling back" }),
+    )
+    .await;
+    w1.post("/docs/5/merge", json!({ "into": "d3" })).await;
+    w1.doc(json!({ "title": "Ops 2", "kind": "runbook", "body": RUNBOOK }))
+        .await;
+    w1.post("/docs/1/supersede", json!({ "by": "d6" })).await;
+    // The user's own changes are not in any worklog.
+    org.patch(6, json!({ "labels": ["x"] })).await;
+    let v = w1.get("/seats/w1/worklog?kind=doc&limit=100").await;
+    let mut entries: Vec<(i64, String)> = v["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["doc"].as_i64().unwrap(),
+                e["text"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    entries.reverse();
+    let texts: Vec<&str> = entries.iter().map(|(_, t)| t.as_str()).collect();
+    let want = [
+        (1, "d1 created (draft runbook): Ops"),
+        (1, "d1#steps revised (rev 2): twice"),
+        (1, "d1: draft → active; changed labels"),
+        (1, "d1 verified until "),
+        (1, "d1#verify commented (m"),
+        (1, "d1 split into d2, d3, d4"),
+        (3, "d3#rollback extracted into d5"),
+        (5, "d5 merged into d3"),
+        (6, "d6 created (draft runbook): Ops 2"),
+        (1, "d1 superseded by d6"),
+    ];
+    assert_eq!(entries.len(), want.len(), "{texts:#?}");
+    for ((doc, text), (wd, wt)) in entries.iter().zip(want) {
+        assert_eq!(*doc, wd, "{text}");
+        assert!(text.starts_with(wt), "{text} should start with {wt}");
+    }
+}
+
+/// `--silent` silences the mail to a new owner; a status change by someone
+/// else (the user activating a draft) is mailed to the owner unless
+/// silent.
+async fn owner_mail_silent_and_activation(srv: Server) {
+    let org = srv.org("alpha").await;
+    let w1 = org.seat("w1").await;
+    let w2 = org.seat("w2").await;
+    org.doc(json!({ "title": "Given", "body": "a" })).await;
+    org.patch(1, json!({ "owner": "w1", "silent": true })).await;
+    org.patch(1, json!({ "owner": "w2" })).await;
+    eventually("the owner mail", || async {
+        w2.reminders().await == ["d1 is now yours to keep: Given"]
+    })
+    .await;
+    // Activation of w1's draft by the user is mailed to w1.
+    w1.doc(json!({ "title": "Decided", "kind": "decision",
+                   "body": "# Context\n\nc\n\n# Decision\n\nd\n\n# Alternatives\n\na\n\n# Consequences\n\nq\n" }))
+        .await;
+    org.patch(2, json!({ "status": "active" })).await;
+    eventually("the activation mail", || async {
+        w1.reminders()
+            .await
+            .iter()
+            .any(|s| s == "d2 was activated by owner: Decided")
+    })
+    .await;
+    // The owner's own status change, and a silent one, send nothing.
+    w2.patch(1, json!({ "status": "active" })).await;
+    w1.doc(json!({ "title": "Quiet", "body": "q" })).await;
+    org.patch(3, json!({ "status": "active", "silent": true }))
+        .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(w1.reminders().await.len(), 1, "{:?}", w1.reminders().await);
+    assert_eq!(w2.reminders().await.len(), 1, "{:?}", w2.reminders().await);
+}
+
+/// The owner's comment on a document nobody else commented on is kept in
+/// the discussion thread without mailing anyone, the owner included.
+async fn own_comment_mails_nobody(srv: Server) {
+    let org = srv.org("alpha").await;
+    let w1 = org.seat("w1").await;
+    org.doc(json!({ "title": "Mine", "body": "# Part\n\nx\n" }))
+        .await;
+    let c = org
+        .post(
+            "/docs/1/comment",
+            json!({ "anchor": "part", "body": "note to self" }),
+        )
+        .await;
+    let id = c["id"].as_i64().unwrap();
+    let inbox = org.inbox().await;
+    let e = inbox
+        .iter()
+        .find(|e| e["message"]["id"] == id)
+        .expect("the comment is in the thread");
+    assert!(
+        e["delivery"]["read_at"].is_string(),
+        "the owner's own comment is not unread: {e}"
+    );
+    let needs = org.get("/attention").await;
+    assert!(
+        !needs.to_string().contains("note to self"),
+        "the own comment is not waiting for the owner: {needs}"
+    );
+    // A seat's comment reaches the owner as before.
+    let c = w1
+        .post("/docs/1/comment", json!({ "body": "a question" }))
+        .await;
+    let inbox = org.inbox().await;
+    let q = inbox
+        .iter()
+        .find(|e| e["message"]["id"] == c["id"])
+        .expect("the seat's comment reaches the owner");
+    assert!(q["delivery"]["read_at"].is_null(), "{q}");
 }

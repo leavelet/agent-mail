@@ -796,9 +796,12 @@ kind's interval). A document past its `expires_at` is stale: marked in
 lists, search and the index and sorted after fresh documents; nothing is
 hidden or deleted.
 
-Documents send mail to their owner only: a revision by another seat (not
-with `silent`), a new document that supplements or supersedes theirs, and
-two reminders of the background pass: once when `expires_at` passes,
+Documents send mail to their owner only: a revision by another seat, a
+change of the status by another seat or the user (`d12 was activated by
+owner: <title>`, also archived or set back to draft), a new owner
+(`d12 is now yours to keep`, to the new owner), a new document that
+supplements or supersedes theirs (none of these with `silent`), and two
+reminders of the background pass: once when `expires_at` passes,
 naming `amail doc verify d12` and `amail doc show d12`; and once a day
 while the document has dangling links, listing them.
 
@@ -808,8 +811,10 @@ A comment (`POST /docs/{num}/comment`) is a message in the document's
 discussion thread, subject `[d12] <title>`, to the owner, copied to the
 seats that commented before. A comment on a section starts with the line
 `On d12#rollback (Deploy > Rollback):`. Replies in the thread are comments
-too. When a later revision removes the section, the document lists the
-comment as on a removed section with the heading path it had.
+too. A comment by the owner on a document nobody else has commented on
+mails nobody: it is kept in the thread, addressed to the owner and
+already read. When a later revision removes the section, the document
+lists the comment as on a removed section with the heading path it had.
 
 Documents count against the org's storage quota (`doc_bytes`): every
 revision whole, the sections and links of the current one, events and
@@ -862,7 +867,9 @@ parts, kept apart on purpose.
 The **worklog** is an append-only record per agent seat of what the seat
 did. The server writes entries from its own events: mail the seat sent,
 read or acknowledged, task changes the seat made (`t12: open → doing`),
-focus on and off, note revisions, and document events. The node writes
+focus on and off, note revisions, and document events (created, revised,
+status and other fields changed, superseded, verified, split, extracted,
+merged, commented; each with the document's number). The node writes
 entries from the harness: session start, resume, compaction and end, turns
 and their failures, tool calls (the tool and a short cut of its input),
 and commits. Each entry has a time, a session id, a kind, a text of at
@@ -903,6 +910,8 @@ wrote in an earlier turn, the agent's `Traps` are kept in it.
 
 The lead of a seat (its team's root seat) and the user can ask a seat for
 its note; the seat then gets system mail naming `amail handover write`.
+When the seat writes the note (a compaction draft does not count), the
+one who asked gets system mail `Handover note of <seat> written (rev N)`.
 When the node shows the note to a new session, it records the read with
 the session id, which the note then shows (`read_by_session`, `read_at`).
 

@@ -319,6 +319,18 @@ pub async fn put(
         e.extra = Some(extra);
         return Err(e);
     }
+    // An open request (asked after the current note was written) is
+    // answered by this note, unless it is a compaction draft.
+    let open_request = if source == HandoverSource::Compaction {
+        None
+    } else {
+        let state = st.store.handover_seat(auth.org.id, seat.id).await?;
+        let current = st.store.handover_note(auth.org.id, seat.id, None).await?;
+        match (state.requested_at, state.requested_by) {
+            (Some(at), Some(by)) if current.is_none_or(|n| n.written_at < at) => Some((at, by)),
+            _ => None,
+        }
+    };
     let n = st
         .store
         .write_handover_note(&NewNoteRec {
@@ -342,6 +354,10 @@ pub async fn put(
         None,
     )
     .await;
+    if let Some((at, by)) = open_request {
+        let writer = auth.mail_seat().ok().map(|s| s.id);
+        tell_requester(&st, &auth.org, &seat, &n, at, &by, writer).await;
+    }
     Ok(Json(note_answer(&st, &auth, &seat, None).await?))
 }
 
@@ -409,6 +425,39 @@ pub async fn request(
         requested_at: ts(now),
         message_id,
     }))
+}
+
+/// Tell the seat (or the user) that asked for `seat`'s note at `at` that
+/// the note was written. A request the node made (in the name of the
+/// system seat), a seat's own request and a note written by the asker
+/// are not answered by mail.
+async fn tell_requester(
+    st: &AppState,
+    org: &Org,
+    seat: &Seat,
+    n: &NoteRec,
+    at: i64,
+    by: &str,
+    writer: Option<i64>,
+) {
+    let asker = match st.store.seat_by_name(org.id, by).await {
+        Ok(Some(s)) if s.kind != SeatKind::System && s.id != seat.id && Some(s.id) != writer => s,
+        Ok(_) => return,
+        Err(e) => {
+            tracing::warn!("org {}: handover requester {by} not found: {e}", org.id);
+            return;
+        }
+    };
+    let subject = format!("Handover note of {} written (rev {})", seat.name, n.rev);
+    let body = format!(
+        "{name} wrote its handover note (rev {rev}, {at_w}), which you asked for at {at_r}.\n\n         Read it:\n    amail handover show {name}\n\n         This mail was sent by the mail system of org {org}.\n",
+        name = seat.name,
+        rev = n.rev,
+        at_w = ts(n.written_at),
+        at_r = ts(at),
+        org = org.name
+    );
+    system_mail(st, org, &asker, subject, body).await;
 }
 
 /// System mail to `seat` in `To` (it wakes an idle agent). Best effort.
@@ -897,10 +946,14 @@ pub async fn focus(st: &AppState, seat: &Seat, until: Option<i64>) {
     log(st, seat.org_id, seat.id, "focus", text, None).await;
 }
 
-/// The hook for document events (the documents feature calls it): an
-/// entry of kind `doc` for the seat that changed or read document `doc`.
-pub async fn doc_event(st: &AppState, org_id: i64, seat_id: i64, doc: i64, text: String) {
-    log_doc(st, org_id, seat_id, "doc", text, None, Some(doc)).await
+/// A document event the seat caused (`doc`, with the document's number):
+/// a revision, a change of fields or status, a supersession, a
+/// verification, a split, extract or merge, or a comment.
+pub async fn doc_event(st: &AppState, actor: &Seat, doc: i64, text: String) {
+    if actor.kind != SeatKind::Agent {
+        return;
+    }
+    log_doc(st, actor.org_id, actor.id, "doc", text, None, Some(doc)).await
 }
 
 // --- retention ---------------------------------------------------------------------------

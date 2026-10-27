@@ -403,10 +403,41 @@ async fn requests_mail_the_seat(srv: Server) {
     let v = a.get("/seats/a/handover").await;
     assert_eq!(v["requested_by"], "lead");
     assert!(v["requested_at"].is_string());
-    // A newer note answers the request.
+    // A newer note answers the request, and the lead is told.
     a.put("/seats/a/handover", json!({ "text": NOTE })).await;
     let v = a.get("/seats/a/handover").await;
     assert!(v.get("requested_at").is_none(), "{v}");
+    let told = |c: &Client| {
+        let c = c.clone();
+        async move {
+            c.get("/inbox").await["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| {
+                    e["message"]["source"] == "system"
+                        && e["message"]["subject"]
+                            .as_str()
+                            .unwrap()
+                            .starts_with("Handover note of a written")
+                })
+                .count()
+        }
+    };
+    assert_eq!(told(&lead).await, 1);
+    let inbox = lead.get("/inbox").await;
+    let id = inbox["entries"][0]["message"]["id"].as_i64().unwrap();
+    let m = lead.get(&format!("/messages/{id}")).await;
+    assert!(
+        m["message"]["body"]
+            .as_str()
+            .unwrap()
+            .contains("amail handover show a"),
+        "{m}"
+    );
+    // A later note answers nothing: no second mail.
+    a.put("/seats/a/handover", json!({ "text": NOTE })).await;
+    assert_eq!(told(&lead).await, 1);
     // A node asks in the name of the system seat.
     let node = org.node().await;
     let v = node.post("/seats/a/handover/request", json!({})).await;
@@ -422,8 +453,19 @@ async fn requests_mail_the_seat(srv: Server) {
             .any(|e| e["message"]["subject"] == "Handover note requested by the node"),
         "{inbox}"
     );
-    // The user may ask too; a seat without a team has no lead.
+    // A request of the node is not answered by mail (nobody reads the
+    // system seat's inbox).
+    a.put("/seats/a/handover", json!({ "text": NOTE })).await;
+    // The user may ask too and is told; a seat without a team has no lead.
     org.post("/seats/b/handover/request", json!({})).await;
+    b.put("/seats/b/handover", json!({ "text": NOTE })).await;
+    assert!(
+        org.get("/inbox").await["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["message"]["subject"] == "Handover note of b written (rev 1)"),
+    );
     let (s, _) = lead
         .refused(Method::POST, "/seats/b/handover/request", None)
         .await;

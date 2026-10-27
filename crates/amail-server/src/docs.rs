@@ -715,6 +715,44 @@ async fn notify_related(st: &AppState, org: &Org, actor: i64, ch: &DocChanged, s
     crate::tasks::remind(st, org, Some(actor), rs).await;
 }
 
+/// The worklog entry of the caller's change of document `num` (agent
+/// seats only).
+async fn worklog(st: &AppState, auth: &Auth, num: i64, text: String) {
+    if let Ok(me) = actor(auth) {
+        crate::handover::doc_event(st, me, num, text).await;
+    }
+}
+
+/// `: message`, or nothing.
+fn with_message(m: Option<&str>) -> String {
+    m.map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(|m| format!(": {m}"))
+        .unwrap_or_default()
+}
+
+/// What a change of fields did, for the worklog: `draft → active`,
+/// `changed owner, labels`.
+fn change_text(ch: &DocChanged) -> Option<String> {
+    let mut parts = Vec::new();
+    if ch.before.status != ch.doc.status {
+        parts.push(format!("{} → {}", ch.before.status, ch.doc.status));
+    }
+    let rest: Vec<&str> = ch
+        .fields
+        .iter()
+        .map(String::as_str)
+        .filter(|f| *f != "status")
+        .collect();
+    if !rest.is_empty() {
+        parts.push(format!("changed {}", rest.join(", ")));
+    }
+    if ch.revised {
+        parts.push(format!("rev {}", ch.doc.rev));
+    }
+    (!parts.is_empty()).then(|| format!("d{}: {}", ch.doc.num, parts.join("; ")))
+}
+
 // --- handlers ------------------------------------------------------------------
 
 /// `POST /v1/docs`.
@@ -788,6 +826,16 @@ pub async fn create(
     }
     let num = ch.doc.num;
     publish(&st, org.id, num, "created", &[]);
+    worklog(
+        &st,
+        &auth,
+        num,
+        format!(
+            "d{num} created ({} {}): {}",
+            ch.doc.status, ch.doc.kind, ch.doc.title
+        ),
+    )
+    .await;
     let mut d = written(&st, &ch).await?;
     let now = amail_store::now_ms();
     let candidates = st
@@ -916,14 +964,15 @@ pub async fn put_body(
     let w = write_ctx(&st, &auth, num, req.if_rev)?;
     check_body(&req.body)?;
     let message = check_message(&req.message)?;
+    let section = req.section.or(anchor);
     let ch = match st
         .store
         .write_doc_body(
             &w,
             &DocBodyRec {
                 body: req.body,
-                section: req.section.or(anchor),
-                message,
+                section: section.clone(),
+                message: message.clone(),
                 paths: paths(&req.paths),
             },
         )
@@ -935,6 +984,18 @@ pub async fn put_body(
     if ch.revised {
         publish(&st, auth.org.id, num, "revised", &ch.fields);
         notify_revision(&st, &auth.org, actor(&auth)?, &ch, req.silent).await;
+        let at = section.map(|a| format!("#{a}")).unwrap_or_default();
+        worklog(
+            &st,
+            &auth,
+            num,
+            format!(
+                "d{num}{at} revised (rev {}){}",
+                ch.doc.rev,
+                with_message(message.as_deref())
+            ),
+        )
+        .await;
     }
     Ok(Json(written(&st, &ch).await?))
 }
@@ -1014,16 +1075,46 @@ pub async fn patch(
     let actor_id = w.actor_id.unwrap_or_default();
     notify_revision(&st, org, actor(&auth)?, &changed, req.silent).await;
     notify_related(&st, org, actor_id, &changed, req.silent).await;
-    if changed.fields.iter().any(|f| f == "owner") && changed.doc.owner_id != actor_id {
-        let d = &changed.doc;
-        let r = Reminder::doc(
+    let d = &changed.doc;
+    let mut owner_mail = Vec::new();
+    if changed.fields.iter().any(|f| f == "owner") && d.owner_id != actor_id && !req.silent {
+        owner_mail.push(Reminder::doc(
             d.owner_id,
             d.owner.clone(),
             "revised",
             d,
             format!("d{} is now yours to keep: {}", d.num, d.title),
-        );
-        crate::tasks::remind(&st, org, Some(actor_id), vec![r]).await;
+        ));
+    }
+    // The owner learns that someone else activated (or archived, or set
+    // back to draft) the document.
+    if changed.before.status != d.status && d.owner_id != actor_id && !req.silent {
+        let who = &actor(&auth)?.name;
+        let what = match d.status {
+            DocStatus::Active => "activated",
+            DocStatus::Archived => "archived",
+            DocStatus::Draft => "set back to draft",
+            DocStatus::Superseded => "marked superseded",
+        };
+        owner_mail.push(Reminder::doc(
+            d.owner_id,
+            d.owner.clone(),
+            "status",
+            d,
+            format!("d{} was {what} by {who}: {}", d.num, d.title),
+        ));
+    }
+    if !owner_mail.is_empty() {
+        crate::tasks::remind(&st, org, Some(actor_id), owner_mail).await;
+    }
+    if let Some(t) = change_text(&changed) {
+        worklog(
+            &st,
+            &auth,
+            num,
+            format!("{t}{}", with_message(req.message.as_deref())),
+        )
+        .await;
     }
     Ok(Json(written(&st, &changed).await?))
 }
@@ -1045,6 +1136,7 @@ pub async fn supersede(
         .map_err(|e| store_err(&st, e))?;
     publish(&st, auth.org.id, num, "relation", &ch.fields);
     publish(&st, auth.org.id, by, "relation", &["replaces".to_string()]);
+    worklog(&st, &auth, num, format!("d{num} superseded by d{by}")).await;
     notify_related(
         &st,
         &auth.org,
@@ -1104,6 +1196,11 @@ pub async fn verify(
         .await
         .map_err(|e| store_err(&st, e))?;
     publish(&st, auth.org.id, num, "verified", &ch.fields);
+    let until = match ch.doc.expires_at {
+        Some(t) => format!(" until {}", render::ts(t)),
+        None => String::new(),
+    };
+    worklog(&st, &auth, num, format!("d{num} verified{until}")).await;
     Ok(Json(written(&st, &ch).await?))
 }
 
@@ -1165,6 +1262,14 @@ pub async fn split(
         Ok(m) => m,
         Err(e) => return Err(write_failed(&st, &w, e).await),
     };
+    let into: Vec<String> = m.created.iter().map(|d| format!("d{}", d.num)).collect();
+    worklog(
+        &st,
+        &auth,
+        num,
+        format!("d{num} split into {}", into.join(", ")),
+    )
+    .await;
     Ok(Json(moved_out(&st, &auth.org, num, &m, "split").await?))
 }
 
@@ -1191,6 +1296,14 @@ pub async fn extract(
         Ok(m) => m,
         Err(e) => return Err(write_failed(&st, &w, e).await),
     };
+    let into: Vec<String> = m.created.iter().map(|d| format!("d{}", d.num)).collect();
+    worklog(
+        &st,
+        &auth,
+        num,
+        format!("d{num}#{anchor} extracted into {}", into.join(", ")),
+    )
+    .await;
     Ok(Json(moved_out(&st, &auth.org, num, &m, "extracted").await?))
 }
 
@@ -1208,6 +1321,7 @@ pub async fn merge(
         Ok(m) => m,
         Err(e) => return Err(write_failed(&st, &w, e).await),
     };
+    worklog(&st, &auth, num, format!("d{num} merged into d{into}")).await;
     Ok(Json(moved_out(&st, &auth.org, num, &m, "merged").await?))
 }
 
@@ -1875,7 +1989,11 @@ pub async fn comment(
         .collect();
     to.retain(|n| live.contains(n));
     cc.retain(|n| live.contains(n));
-    if to.is_empty() && cc.is_empty() {
+    // A message needs a recipient: with nobody else to tell (the owner
+    // comments and nobody else has), the comment goes to the caller and is
+    // marked read at once, so that nobody is mailed.
+    let alone = to.is_empty() && cc.is_empty();
+    if alone {
         to.push(me.name.clone());
     }
     let subject: String = format!("[d{num}] {}", d.title)
@@ -1913,6 +2031,21 @@ pub async fn comment(
         .await
         .map_err(|e| store_err(&st, e))?;
     publish(&st, auth.org.id, num, "commented", &[]);
+    if alone {
+        match st.store.mark_read(sent.id, me.id).await {
+            Ok(Some((_, Some(b)))) => st.bus.publish(b.org_id, &[(me.name.clone(), b.seq)]),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("org {}: own comment not marked read: {e}", auth.org.id),
+        }
+    }
+    let at = anchor.map(|a| format!("#{a}")).unwrap_or_default();
+    worklog(
+        &st,
+        &auth,
+        num,
+        format!("d{num}{at} commented (m{})", sent.id),
+    )
+    .await;
     Ok(Json(p::DocCommentResponse {
         id: sent.id,
         thread_id: d.thread_id.unwrap_or(sent.thread_id),
