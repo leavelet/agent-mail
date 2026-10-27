@@ -44,6 +44,7 @@ handover_tests!(
     post_compact_files_a_draft,
     note_shown_at_session_start,
     idle_seat_with_work_is_asked,
+    codex_index_and_compaction,
 );
 
 const ASK: &str = "Write your handover note now with `amail handover write`; then stop.";
@@ -728,4 +729,95 @@ async fn set_handover_idle(h: &Harness, secs: u64) {
     )
     .await;
     assert!(v.get("error").is_none(), "{v}");
+}
+
+/// A Codex seat: the index within Codex's share, and the compaction hooks.
+async fn codex_index_and_compaction(b: Backend) {
+    let Some(h) = setup(b, "codex_index_and_compaction").await else {
+        return;
+    };
+    h.seat("cx", "codex").await;
+    let long: Vec<String> = (0..40)
+        .map(|i| format!("topic {i:02} {}", "y".repeat(30)))
+        .collect();
+    for t in &long {
+        active_doc(&h, t, "a description of some length for the index line").await;
+    }
+    let sid = "00000000-0000-7000-8000-00000000c0de";
+    let cwd = h.dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let plan = h
+        .node
+        .as_ref()
+        .unwrap()
+        .node
+        .handle(amail_node::wire::Request::Launch {
+            seat: "cx".into(),
+            cwd: cwd.to_string_lossy().into(),
+            pid: std::process::id(),
+            harness: None,
+            extra: vec![],
+            pane: None,
+            mux_session: None,
+            permission_mode: Some(amail_proto::PermissionMode::Unattended),
+            git_access: None,
+            dsh_jail: None,
+            session: None,
+        })
+        .await;
+    assert!(plan.get("error").is_none(), "{plan}");
+    let args: Vec<String> = serde_json::from_value(plan["args"].clone()).unwrap();
+    let prompt = args.last().unwrap().clone();
+    let env: Vec<(String, String)> = vec![
+        (
+            "CODEX_HOME".into(),
+            h.dir
+                .path()
+                .join("state/codex-home")
+                .to_string_lossy()
+                .into(),
+        ),
+        (
+            "AMAIL_CODEX_PASS".into(),
+            plan["env"]["AMAIL_CODEX_PASS"].as_str().unwrap().into(),
+        ),
+    ];
+    let codex = |name: &str| with(fixture("codex", name), &[("session_id", json!(sid))]);
+    // The first prompt registers the session and shows the index, cut to
+    // Codex's share (2,000 of 6,000 characters).
+    let v = h
+        .hook(
+            "codex",
+            env.clone(),
+            with(codex("UserPromptSubmit"), &[("prompt", json!(prompt))]),
+        )
+        .await;
+    let t = hook_text(&v).unwrap();
+    let docs = &t[t.find("Documents:\n").expect(&t)..];
+    assert!(docs.chars().count() <= 2_000, "{}", docs.chars().count());
+    assert!(docs.contains("more: amail doc"), "{docs}");
+    let v = h.hook("codex", env.clone(), codex("SessionStart")).await;
+    assert!(hook_text(&v).unwrap().starts_with("Documents:\n"));
+    assert_eq!(
+        h.hook("codex", env.clone(), codex("PreCompact")).await,
+        Value::Null
+    );
+    assert_eq!(
+        h.hook("codex", env.clone(), codex("PostCompact")).await,
+        Value::Null
+    );
+    h.wait("compaction draft", || async {
+        note(&h, "cx").await["note"]["source"] == "compaction"
+    })
+    .await;
+    assert_eq!(
+        note(&h, "cx").await["note"]["fields"]["summary"],
+        "Summary of the conversation so far: working on t1."
+    );
+    h.wait("compaction entries", || async {
+        node_entries(&h, "cx", "precompact").await.len() == 1
+            && node_entries(&h, "cx", "compact").await.len() == 1
+    })
+    .await;
+    assert_eq!(node_entries(&h, "cx", "compact").await[0]["session"], sid);
 }
