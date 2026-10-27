@@ -1827,7 +1827,11 @@ impl Node {
                     if let Some(tool) = &hook.facts.tool {
                         let input = hook.facts.tool_input.as_deref().unwrap_or_default();
                         if handover::touches_tasks(tool, input) {
-                            st.seat(seat).ho.task_tool = true;
+                            let ho = &mut st.seat(seat).ho;
+                            ho.task_tool = true;
+                            // The task it holds may have changed: from now
+                            // on the server fills it in.
+                            ho.doing = None;
                         }
                         let text = if input.is_empty() {
                             tool.clone()
