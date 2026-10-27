@@ -1997,8 +1997,13 @@ async fn socket_checks_callers(b: Backend) {
         session.env_remove(k);
     }
     let mut session = session.spawn().unwrap();
-    h.wait("w1 started", || async { h.state("w1").await == "idle" })
-        .await;
+    // Idle after its first turn: between SessionStart and that turn's
+    // prompt the seat is idle too, and mail sent then would be shown by
+    // the session's own first turn instead of the hook below.
+    h.wait("w1 started", || async {
+        h.state("w1").await == "idle" && h.fake.join("w1.ready").exists()
+    })
+    .await;
 
     // A Codex seat with a registered thread. Its session process is a
     // stand-in that does nothing.
