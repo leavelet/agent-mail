@@ -2,6 +2,8 @@
 
 mod admin;
 mod client;
+mod doc_cmd;
+mod handover_cmd;
 mod mcp;
 mod onboard;
 mod openings_cmd;
@@ -216,6 +218,16 @@ enum Cmd {
     /// Tasks: the org's shared task board.
     #[command(subcommand)]
     Task(task_cmd::TaskCmd),
+    /// Documents: the org's decisions, findings, procedures and
+    /// reference material.
+    #[command(subcommand)]
+    Doc(doc_cmd::DocCmd),
+    /// A seat's handover note: what the next session of the seat reads
+    /// first.
+    #[command(subcommand)]
+    Handover(handover_cmd::HandoverCmd),
+    /// A seat's worklog: what it did, newest first.
+    Worklog(handover_cmd::WorklogArgs),
     /// Focus mode: only urgent mail reaches the seat until it ends.
     Focus {
         #[command(subcommand)]
@@ -1293,6 +1305,9 @@ async fn run(cli: Cli) -> Result<()> {
             linux_only("amail seat adopt")?;
             return team_cmd::adopt(&seat, &session, restart, &out);
         }
+        Cmd::Handover(handover_cmd::HandoverCmd::Template) => {
+            return handover_cmd::template(&out);
+        }
         Cmd::Node(NodeCli {
             cmd: Some(NodeCmd::Status),
             ..
@@ -1351,6 +1366,7 @@ async fn run(cli: Cli) -> Result<()> {
         | Cmd::Sleep { .. }
         | Cmd::Wake { .. }
         | Cmd::Seat(SeatCmd::Adopt { .. })
+        | Cmd::Handover(handover_cmd::HandoverCmd::Template)
         | Cmd::Node(NodeCli { cmd: None, .. })
         | Cmd::Node(NodeCli {
             cmd:
@@ -1643,6 +1659,9 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Openings => openings_cmd::openings(&c, &out).await,
         Cmd::Team(cmd) => openings_cmd::team(&c, &out, cmd).await,
         Cmd::Task(cmd) => task_cmd::run(&c, &out, cmd).await,
+        Cmd::Doc(cmd) => doc_cmd::run(&c, &out, cmd).await,
+        Cmd::Handover(cmd) => handover_cmd::run(&c, &out, cmd).await,
+        Cmd::Worklog(a) => handover_cmd::run_worklog(&c, &out, a).await,
         Cmd::Focus { cmd } => {
             let (method, seat, body) = match cmd {
                 FocusCmd::On { duration, seat } => {
