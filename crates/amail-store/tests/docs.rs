@@ -430,6 +430,46 @@ async fn sections_written_alone(s: S) {
         .await
         .unwrap_err();
     assert_eq!(code(e), "no_section");
+    // The spacing of the original stays: no blank line is added after a
+    // heading that had none, or between sections.
+    let d = new(
+        &s,
+        &o,
+        &o.a,
+        "reference",
+        "Compact",
+        "# When\nalways\n\n# Steps\nold\n# Verify\ncheck\n",
+    )
+    .await;
+    for (anchor, text) in [("steps", "new steps\n"), ("verify", "check twice")] {
+        s.write_doc_body(
+            &w(&o, d.num, &o.a),
+            &DocBodyRec {
+                body: text.into(),
+                section: Some(anchor.into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        body(&s, &o, d.num).await,
+        "# When\nalways\n\n# Steps\nnew steps\n# Verify\ncheck twice\n"
+    );
+    // A section without text gets its text after a blank line.
+    let d = new(&s, &o, &o.a, "reference", "Empty", "# A\n\n# B\nb\n").await;
+    s.write_doc_body(
+        &w(&o, d.num, &o.a),
+        &DocBodyRec {
+            body: "a".into(),
+            section: Some("a".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(body(&s, &o, d.num).await, "# A\n\na\n\n# B\nb\n");
 }
 
 async fn idempotent_create(s: S) {
