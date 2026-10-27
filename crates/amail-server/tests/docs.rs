@@ -818,24 +818,37 @@ async fn reminders_one_mail_per_pass(srv: Server) {
          DELETE FROM doc_sections WHERE anchor = 'later'; COMMIT;",
     )
     .await;
+    // Everything is due at once, so one pass sends one mail. A pass that
+    // started before the update committed may take part of it and the next
+    // pass the rest (the claims are separate statements), so a second mail
+    // is allowed; every item is reminded once.
+    let items = [
+        "t1 is past its due time",
+        "d1 is due to be confirmed: Fact",
+        "d3 has 1 dangling link: d2#later",
+    ];
+    let system_bodies = || async {
+        let inbox = w1.inbox().await;
+        let mut bodies = Vec::new();
+        for e in inbox.iter().filter(|e| e["message"]["source"] == "system") {
+            assert_eq!(e["delivery"]["class"], "to");
+            bodies.push(w1.body_of(&e["message"]["id"]).await);
+        }
+        bodies
+    };
     eventually("the pass's mail", || async {
-        w1.reminders().await.len() == 2
+        let all = system_bodies().await.join("\n");
+        items.iter().all(|l| all.contains(l))
     })
     .await;
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let inbox = w1.inbox().await;
-    let system: Vec<&Value> = inbox
-        .iter()
-        .filter(|e| e["message"]["source"] == "system")
-        .collect();
-    assert_eq!(system.len(), 2, "one mail per pass: {system:?}");
-    let last = system.last().unwrap();
-    assert_eq!(last["delivery"]["class"], "to");
-    let body = w1.body_of(&last["message"]["id"]).await;
-    assert!(body.contains("t1 is past its due time"), "{body}");
-    assert!(body.contains("d1 is due to be confirmed: Fact"), "{body}");
-    assert!(body.contains("amail doc verify d1"), "{body}");
-    assert!(body.contains("d3 has 1 dangling link: d2#later"), "{body}");
+    let bodies = system_bodies().await;
+    assert!(bodies.len() <= 3, "one mail per pass: {bodies:?}");
+    let all = bodies.join("\n");
+    for l in items {
+        assert_eq!(all.matches(l).count(), 1, "{l} once in {all}");
+    }
+    assert!(all.contains("amail doc verify d1"), "{all}");
     // Each once: the expiry until the next confirmation, the dangling link
     // once a day.
     let h = w1.get("/docs/1/history").await;
