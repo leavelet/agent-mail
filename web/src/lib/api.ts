@@ -10,11 +10,15 @@ export class ApiError extends Error {
   status: number;
   code: string;
   rejected: { address: string; reason: string }[];
-  constructor(status: number, code: string, message: string, rejected: ApiError['rejected'] = []) {
+  /** The whole answer of the failed request (e.g. a document's 409 `stale`
+   * carries the current revision and the diff). */
+  body: unknown;
+  constructor(status: number, code: string, message: string, rejected: ApiError['rejected'] = [], body?: unknown) {
     super(message);
     this.status = status;
     this.code = code;
     this.rejected = rejected;
+    this.body = body;
   }
 }
 
@@ -56,6 +60,7 @@ export async function request<T>(method: string, path: string, body?: unknown): 
       err?.code ?? 'http',
       err?.message ?? `HTTP ${resp.status}`,
       err?.rejected ?? [],
+      data,
     );
   }
   return data as T;
