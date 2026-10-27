@@ -456,8 +456,10 @@ async fn stop_asks_for_the_note_after_a_closed_task(b: Backend) {
     };
     let (t1, t2) = (task("first").await, task("second").await);
     h.wait_pending("w1", 2, 0, 0).await;
-    // The seat closes a task with `amail task done`, which its
-    // PostToolUse hook reports.
+    // The seat closes a task with `amail task done` at the end of a long
+    // shell command, which its PostToolUse hook reports: the node keeps
+    // 200 characters of it for the worklog but finds the task command in
+    // the whole input.
     let close = |n: i64| {
         let (h, w1, env) = (&h, w1.clone(), env.clone());
         async move {
@@ -471,7 +473,10 @@ async fn stop_asks_for_the_note_after_a_closed_task(b: Backend) {
                 claude("PostToolUse"),
                 &[(
                     "tool_input",
-                    json!({"command": format!("amail task done t{n} --result ok")}),
+                    json!({"command": format!(
+                        "cd /work/app && git commit -am '{}' && amail send lead -s merge -m ok; amail task done t{n} --result ok",
+                        "fix the login form ".repeat(15)
+                    )}),
                 )],
             );
             h.hook("claude", env, tool).await;

@@ -179,13 +179,6 @@ pub(super) fn text_hash(t: &str) -> u64 {
     h.finish()
 }
 
-/// Whether a tool call may change a task: an `amail task` command line,
-/// or an amail MCP tool about tasks.
-pub(super) fn touches_tasks(tool: &str, input: &str) -> bool {
-    let t = tool.to_ascii_lowercase();
-    (t.contains("amail") && t.contains("task")) || input.contains("amail task")
-}
-
 /// Whether a claimed message is the server's request for the note.
 pub(super) fn is_request(e: &amail_proto::InboxEntry) -> bool {
     e.message.source == amail_proto::Source::System
@@ -661,14 +654,6 @@ async fn last_commit(cwd: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn task_tools() {
-        assert!(touches_tasks("Bash", "amail task done t3 --result ok"));
-        assert!(touches_tasks("mcp__amail__task_set", "{}"));
-        assert!(!touches_tasks("Bash", "cargo test"));
-        assert!(!touches_tasks("mcp__amail__send", "{}"));
-    }
 
     #[test]
     fn closes() {

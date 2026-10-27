@@ -1847,7 +1847,7 @@ impl Node {
                     st.set_state(seat, SeatState::Busy);
                     if let Some(tool) = &hook.facts.tool {
                         let input = hook.facts.tool_input.as_deref().unwrap_or_default();
-                        if handover::touches_tasks(tool, input) {
+                        if hook.facts.task_tool {
                             let ho = &mut st.seat(seat).ho;
                             ho.task_tool = true;
                             // The task it holds may have changed: from now

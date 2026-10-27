@@ -106,6 +106,9 @@ pub struct HookFacts {
     /// `PostToolUse`: the tool's input, cut to [`TOOL_INPUT_CHARS`]
     /// characters: a shell command as it is, other input as compact JSON.
     pub tool_input: Option<String>,
+    /// `PostToolUse`: whether the call may change a task (see
+    /// [`touches_tasks`]), judged on the whole input before it is cut.
+    pub task_tool: bool,
     /// `SessionEnd`: why the session ended.
     pub reason: Option<String>,
 }
@@ -120,6 +123,8 @@ impl HookFacts {
                 .filter(|v| !v.is_empty())
                 .map(str::to_string)
         };
+        let tool = s("tool_name");
+        let mut task_tool = false;
         let tool_input = input.get("tool_input").and_then(|v| {
             let text = match v {
                 Value::Null => return None,
@@ -135,17 +140,52 @@ impl HookFacts {
                 },
                 other => other.to_string(),
             };
+            if let Some(tool) = &tool {
+                task_tool = touches_tasks(tool, &text);
+            }
             let line = amail_proto::text::line(text.trim()).into_owned();
             Some(cut_chars(&line, TOOL_INPUT_CHARS))
         });
+        if let (Some(tool), false) = (&tool, task_tool) {
+            task_tool = touches_tasks(tool, "");
+        }
         HookFacts {
             cwd: s("cwd"),
             model: s("model"),
-            tool: s("tool_name"),
+            tool,
             tool_input,
+            task_tool,
             reason: s("reason"),
         }
     }
+}
+
+/// Whether a tool call may change a task: an amail MCP tool about tasks,
+/// or a shell command that runs `amail task` anywhere in it (after `cd`,
+/// `&&`, `;`, `|` or on another line; global flags such as `--json`
+/// between `amail` and `task` are allowed).
+pub fn touches_tasks(tool: &str, input: &str) -> bool {
+    let t = tool.to_ascii_lowercase();
+    if t.contains("amail") && t.contains("task") {
+        return true;
+    }
+    if !input.contains("amail") {
+        return false;
+    }
+    let is_sep = |c: char| matches!(c, ';' | '&' | '|' | '\n' | '(' | ')' | '`' | '{' | '}');
+    input.split(is_sep).any(|segment| {
+        let words: Vec<&str> = segment
+            .split_whitespace()
+            .map(|w| w.trim_matches(|c| c == '"' || c == '\''))
+            .collect();
+        words.iter().enumerate().any(|(i, w)| {
+            (*w == "amail" || w.ends_with("/amail"))
+                && words[i + 1..]
+                    .iter()
+                    .find(|w| !w.starts_with('-'))
+                    .is_some_and(|w| *w == "task")
+        })
+    })
 }
 
 /// `s` cut to `max` characters.
@@ -517,5 +557,54 @@ pub fn shell_quote(s: &str) -> String {
         s.to_string()
     } else {
         format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_tools() {
+        assert!(touches_tasks("Bash", "amail task done t3 --result ok"));
+        assert!(touches_tasks("mcp__amail__task_set", "{}"));
+        assert!(touches_tasks(
+            "Bash",
+            "cd /w && git commit -m x; amail task done t3"
+        ));
+        assert!(touches_tasks("Bash", "make || amail --json task mine"));
+        assert!(touches_tasks(
+            "Bash",
+            "git push\n/usr/local/bin/amail task done t1"
+        ));
+        assert!(!touches_tasks("Bash", "cargo test"));
+        assert!(!touches_tasks("Bash", "amail send lead -m 'task list'"));
+        assert!(!touches_tasks("mcp__amail__send", "{}"));
+    }
+
+    /// The command that closes the task comes after the part kept for the
+    /// worklog.
+    #[test]
+    fn task_command_after_the_cut() {
+        let long = format!(
+            "cd /work/tally && git commit -am '{}' && amail send lead -s merge -m ok; amail task done t17 --result ok",
+            "x".repeat(400)
+        );
+        let f = HookFacts::from_input(&json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": long},
+        }));
+        assert!(f.task_tool);
+        assert_eq!(f.tool_input.unwrap().chars().count(), TOOL_INPUT_CHARS);
+        let f = HookFacts::from_input(&json!({
+            "tool_name": "mcp__amail__task_done",
+            "tool_input": {"num": 3},
+        }));
+        assert!(f.task_tool);
+        let f = HookFacts::from_input(&json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "cargo test"},
+        }));
+        assert!(!f.task_tool);
     }
 }

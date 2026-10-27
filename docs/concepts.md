@@ -917,7 +917,9 @@ holds:
 
 The node asks the server about the note only when one of these may hold:
 the transcript shows the context over the threshold, the turn ran an
-`amail task` command or an amail task tool, or the node saw a request (at
+`amail task` command (anywhere in a shell command, also after `cd`, `&&`
+or `;` and beyond the 200 characters kept for the worklog) or an amail
+task tool, or the node saw a request (at
 session start, at the last turn's end, or as mail). Any other turn's end
 is answered from memory, as before. If the agent still does not write,
 the next `Stop` ends the turn. A seat idle with work in progress, for the
