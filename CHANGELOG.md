@@ -180,6 +180,36 @@ The first public version.
   `keep`. One pending request per task; it ends with the answer, with a
   change of the task's assignee or state, or after 24 hours, and the
   requester is told. Migration `0024_task_steal.sql`.
+- Seat handover, M9 (server side; migration `0027_handover.sql`):
+  - The handover note: one live note per agent seat with every revision
+    kept (`GET /seats/{name}/handover[?rev=N]`, `PUT
+    /seats/{name}/handover`). Seven fields in order (`State`, `Summary`,
+    `Next`, `Waiting on`, `Traps`, `Verify`, `Pointers`), written as text
+    (Markdown headings or `Field:` lines) or JSON; a note lacking one of
+    the first six is refused with 422 `note_fields_missing` (with
+    `missing`), one over 16,384 characters with 422 `note_too_large` (with
+    `chars`). An empty `Pointers` is filled in from the worklog. Notes are
+    readable by every seat of the org; a `private` note only by the seat,
+    its lead (the team's root seat) and the user. The user may write a
+    seat's note; node tokens file compaction summaries as drafts
+    (`source: compaction`).
+  - `POST /seats/{name}/handover/request` (the lead or the user) records
+    a request and mails the seat; `POST /seats/{name}/handover/read`
+    (node tokens) records which session was shown the note.
+  - When a task closes and its assignee holds no other unfinished task,
+    the server writes the seat's note itself (`State: idle`).
+  - The worklog: `POST /worklog` (node tokens) appends entries for the
+    org's agent seats; the server adds entries for mail sent, read and
+    acknowledged, task changes, focus and note revisions.
+    `GET /seats/{name}/worklog` (the seat, its team, its lead, the user)
+    filters by `since`, `task`, `kind` and pages with `before`;
+    `summary=1` gives counts per kind, the tasks touched and the last ten
+    entries. Entries hold at most 1,000 characters of text.
+  - Notes and worklog entries count against the storage quota in
+    `task_bytes`; a worklog entry that does not fit deletes the org's
+    oldest entries. Worklog retention (`--worklog-days`) and the entries
+    per request (`--max-worklog-batch`) are limits of public servers
+    (defaults 90 days and 5,000).
 
 #### Running agents
 

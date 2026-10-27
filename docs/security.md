@@ -610,7 +610,12 @@ purge-deleted-orgs`), and retention deletes it once it is older than the
 retention period. The user can also delete the org's internal mail (mail
 no other org received); mail exchanged with orgs that still exist cannot be
 deleted by either side, so neither can remove what it sent to the other.
-An operator may set a retention period after which message bodies are
+Handover notes (every revision) and the worklog of each seat are stored
+until the org is deleted; on a server with `--worklog-days` (public
+default 90), worklog entries older than that are deleted. A deleted
+seat's notes and worklog stay stored (the API no longer shows them) until
+the org is deleted. An operator may set a
+retention period after which message bodies are
 cleared. Backups the
 operator made earlier are not affected by either. A public server limits
 the mail each org may store (see [resource limits](#resource-limits)).
@@ -623,9 +628,17 @@ time has a fixed bound. Limits marked *public* apply only with
 variable shown in [operations.md](operations.md)); the others always apply.
 Rate and stream limits are counted per server instance.
 
+The bounds of the seat handover come in two kinds. Format rules (the
+note's fields and its 16,384 characters, the 1,000 characters of a
+worklog entry) protect the model that reads the text and apply on every
+server. Resource rules (worklog retention, entries per request) protect a
+shared server from one org; they are marked *public* and are off on a
+self-hosted server, where the org's storage quota is the only bound on
+how many note revisions and worklog entries are kept.
+
 | What | Limit |
 |---|---|
-| Request body (any endpoint) | 2 MiB; a transcript post (`POST /seats/{name}/transcript`) 1 MiB (HTTP 413 beyond; nodes split their posts to fit); a task import (`POST /tasks/import`, user tokens) 64 MiB, read only after the token is checked. A body whose declared length is above its limit is answered with 413 before authentication; up to 16 MiB of it is read and dropped first (for at most 5 s), so that the client receives the answer instead of a reset connection |
+| Request body (any endpoint) | 2 MiB; a transcript post (`POST /seats/{name}/transcript`) 1 MiB (HTTP 413 beyond; nodes split their posts to fit); a task import (`POST /tasks/import`, user tokens) 64 MiB, read only after the token is checked; a worklog post (`POST /worklog`, node tokens) 8 MiB. A body whose declared length is above its limit is answered with 413 before authentication; up to 16 MiB of it is read and dropped first (for at most 5 s), so that the client receives the answer instead of a reset connection |
 | Message subject | 4,096 characters (Unicode scalar values: a character outside the Basic Multilingual Plane counts once), one line. Where a subject is shown on one line (injected header lines, the text output of the command line, system mail, list rows of the web interface) it is cut to 200 characters followed by `…` (120 in digests); `--json`, the API and the web interface's message view keep all of it |
 | Other stored text | token labels, seat display names and models, node labels 200 characters; seat roles 16,000; list descriptions 1,000; harness names and presence `attention` 64; presence hints 500; URLs (webhook, terminal) 2,000 (HTTP 400 beyond) |
 | Message body | 256 KB |
@@ -681,6 +694,11 @@ Rate and stream limits are counted per server instance.
 | Task import | user tokens only; at most 5,000 records and a 64 MiB body per request (other requests: 2 MiB), in one transaction; the task bounds and the storage quota apply |
 | Task reminders | at most 200 reminder mails per org per hour (per server instance); further ones are dropped and the user is told once an hour. The stale pass runs at most once an hour per org; a due time is reminded once |
 | Task queries | `GET /tasks` and the personal lists at most 500 tasks per page; `GET /tasks?text=` looks at the 5,000 newest tasks below its cursor; `GET /tasks/board` shows at most 100 tasks per column and 200 waiting tasks; `GET /tasks/report` at most 500 tasks per section; these take a query slot of the other pool |
+| Handover note (a format rule, on every server) | seven fields (`State`, `Summary`, `Next`, `Waiting on`, `Traps`, `Verify`, `Pointers`), the first six required (422 `note_fields_missing`); 16,384 characters stored (422 `note_too_large` with the count); a session id 200 characters; the newest 20 revisions are listed with a note |
+| Worklog entry (a format rule, on every server) | text 1,000 characters (longer text is cut: an entry points at evidence, it does not hold it); kind 40 characters of `a-z`, `0-9`, `_`, `-`, `.`; session id 200 characters; a page of `GET /seats/{name}/worklog` at most 1,000 entries; the summary lists at most 100 tasks and the newest 10 entries; these queries take a query slot of the other pool |
+| Note revisions and worklog entries (storage) | not counted per org on any server: the storage quota is their only bound. Each revision counts its text, session id and author plus 128 bytes, each worklog entry its text, kind and session id plus 64 bytes, in `task_bytes`. A note over the quota is refused with 507 `storage_quota`; a worklog entry over it deletes the org's oldest worklog entries to make room instead of being refused |
+| Worklog retention | 90 days (*public*, `--worklog-days`); on a self-hosted server entries are kept until the storage quota needs the room |
+| Worklog entries per `POST /worklog` | 5,000 (*public*, `--max-worklog-batch`; 422 `too_many_entries` beyond); the 8 MiB body limit applies on every server |
 | Event replay buffer (`Last-Event-ID`) | 4,096 events per org; a subscriber more than 1,024 events behind is disconnected and resynchronizes |
 | Presence report | 5,000 seats per request; an entry is valid for 90 s |
 | Conversation mirror, per watched seat | in memory only while someone watches: the last 1,000 events or 4 MiB kept for watchers that join later; at most 8 MiB waiting to be sent to one watcher (a watcher that falls further behind, for example one that stopped reading, is disconnected and its queue freed; it reconnects and starts again from the kept events); 16 MiB for the seat in all (beyond it, the watchers furthest behind are disconnected); 1,000 events per post; 16,000 characters per event; 2,000 characters per status field |
