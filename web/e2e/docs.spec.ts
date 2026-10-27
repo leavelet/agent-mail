@@ -64,7 +64,10 @@ const RUNBOOK = [
 test.beforeAll(async () => {
   const s = state();
   const lead = s.seatTokens['be-lead'];
-  nums.task = (await api<{ task: { num: number } }>(s.userToken, 'POST', '/tasks', { title: 'Deploy the search service', assignee: 'be-1' })).task.num;
+  // A task for the body to link to; cancelled, so that the task board
+  // that tasks.spec.ts checks keeps its counts.
+  nums.task = (await api<{ task: { num: number } }>(s.userToken, 'POST', '/tasks', { title: 'Deploy the search service' })).task.num;
+  await api(s.userToken, 'PATCH', `/tasks/${nums.task}`, { state: 'cancelled' });
   nums.decision = await newDoc(lead, {
     title: 'Use trigram search for archives',
     kind: 'decision',
