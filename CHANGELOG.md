@@ -390,6 +390,21 @@ The first public version.
   need an ok result, closes a parent with open children only when asked
   to, and sends the revision with title and description edits. The Tasks
   page has a Report view.
+- Documents and seat handover, M9: a **Documents** section with a page per
+  team (pinned documents, kinds with counts, stale and draft counts), lists
+  per kind with filters, section search, and a viewer that renders the
+  Markdown body (marked and DOMPurify; no script, event handler or
+  `javascript:` link survives, images are not shown) with the server's
+  section anchors, `d12`/`t3` references as links, the fields, relations,
+  links in and out with dangling and stale marks, linked tasks and
+  threads, the discussion with section anchors, revisions with a diff, and
+  the history. The user verifies, activates, archives, supersedes, pins,
+  edits fields and the body (with `if_rev`; a stale write shows the diff
+  and can be sent again), comments on a section, and splits, extracts and
+  merges. The create form shows similar titles while typing; a Kinds page
+  lists and adds kinds. Seat pages have **Handover** and **Worklog** tabs;
+  "needs you" lists `decision` drafts to activate and the user's stale
+  documents. All of it follows `doc` events live.
 
 #### Public servers and getting started
 

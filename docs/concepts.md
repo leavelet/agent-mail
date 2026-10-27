@@ -803,6 +803,44 @@ comment as on a removed section with the heading path it had.
 Documents count against the org's storage quota (`doc_bytes`): every
 revision whole, the sections and links of the current one, events and
 relations. Deleting the org deletes its documents.
+
+### In the web interface
+
+**Documents** in the sidebar (`g d`) opens a page per team: the pinned
+documents, the number of draft and active documents of each kind, and the
+number of drafts and of stale documents. A kind opens its list, which
+filters by status, team, owner, label, stale and pinned. The search box
+searches sections (`GET /docs/search`) and shows each hit with its heading
+path, status and stale mark; with "all statuses" it includes drafts,
+superseded and archived documents.
+
+A document's page (`#/docs/d12`, or the slug; `#/docs/d12#rollback`
+scrolls to that section) shows the body rendered from Markdown. The
+headings carry the anchors the server computed, `d12`, `d12#anchor` and
+`t3` in the body are links inside the app, and the HTML is sanitized: no
+script, event handler or `javascript:` link of a body reaches the page,
+and images are not shown. Beside the body are the fields, the token
+estimate with the split advice, the section list, and the user's actions:
+activate, archive, supersede by another document, verify (with an
+interval), pin, and split, extract and merge. Below it are the relations,
+links in and out (dangling and stale links marked, the current title of
+each target), linked tasks and threads, the discussion thread with the
+section each comment is on (or "on a removed section"), the revisions
+with a diff between any two of them, and the events.
+
+The body and the fields are edited in forms that send `if_rev`. When
+someone else wrote a revision in the meantime, nothing is saved; the page
+shows the revisions and events since, the diff, and a button that saves
+the text as the revision after the current one. The create form
+(**New document**) puts the kind's required sections into the body as
+headings and, while the title is typed, lists documents whose title,
+slug or description contains its words (`GET /docs/find`); it never
+prevents the create. **Kinds** lists the kinds and adds or changes one.
+The pages follow `doc` events, so changes made by agents appear without
+reloading. **Needs you** lists the `decision` drafts (and the drafts of
+teams whose documents the user activates) with an **Activate** button, and
+the stale documents the user owns with a **Verify** button.
+
 ## Seat handover
 
 A seat outlives its sessions: a session ends, is compacted or is replaced,
@@ -864,6 +902,20 @@ colleague stands. A note is private when written with `private` (later
 notes keep the flag until one sets it off) or when the team file says
 `handover = "private"` for the seat. Worklogs stay within the team because
 they are large and detailed. Nothing of either reaches another org.
+
+### In the web interface
+
+An agent seat's page has two tabs for this. **Handover** shows the current
+note field by field, who wrote it and how (the agent, a compaction draft,
+the server, or the user in the seat's name), whether a session has read it
+and when, an open request, and the earlier revisions (a selector shows
+any of them). **Ask for a note** sends the request; **Write the note**
+opens the current note as text, one heading per field, and saves it as
+the next revision in the seat's name, optionally private. **Worklog**
+lists the entries newest first with filters by kind, task and time
+(`since`), loads older entries in pages, and shows the counts per kind
+and the tasks the entries name; a count selects its filter.
+`#/org/<seat>?tab=handover` and `?tab=worklog` open a tab directly.
 
 ## The user's queue ("needs you")
 
