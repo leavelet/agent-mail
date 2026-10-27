@@ -492,6 +492,52 @@ activating a document the user activates); 422 `sections_missing`,
 
 Changes publish `doc` events on `GET /events`. Documents count against the
 org's storage quota (`doc_bytes` in `GET /org`).
+### Seat handover
+
+The handover note and the worklog of an agent seat ([concepts](concepts.md#seat-handover)).
+`{name}` is a seat of the caller's org (404 for any other name);
+writing a note or asking for one needs an agent seat (422
+`not_an_agent`). The
+lead of a seat is the root seat of the seat's team (`root` in the team
+records); a seat without a team has no lead.
+
+A note is `{seat, rev, fields, text, chars, pointers_filled, private,
+source, draft, session?, written_by?, written_at, read_by_session?,
+read_at?}`: `fields` is `{state, summary, next, waiting_on, traps, verify,
+pointers}`, `text` the fields as `Label: value` lines (a field of several
+lines as `Label:` followed by its lines), `chars` the length of `text`,
+`source` `agent`, `compaction` (a draft from a compaction summary,
+`draft: true`) or `server` (the idle note), `written_by` the user's name
+when the user wrote it for the seat. A revision in a list is
+`{rev, written_at, source, private, chars, session?, written_by?,
+read_by_session?, read_at?}`. A worklog entry is `{id, seat, session?, at,
+kind, text, task?, doc?, source}`, `source` `server` or `node`.
+
+| | |
+|---|---|
+| `GET /seats/{name}/handover` | `rev=` optional. `{seat, note?, current_rev, revisions, private, requested_at?, requested_by?}`: the current note (or revision `rev`; 404 when there is none), the newest 20 revisions newest first, whether the seat's notes are private (the current note's flag, the revision's flag or the team file's `handover = "private"`), and an unanswered request (a request newer than the current note). Every seat of the org, the user and node tokens read it; a private note only the seat itself, its lead, the user and node tokens (403 `private` otherwise) |
+| `PUT /seats/{name}/handover` | `{text? \| fields?, private?, session?, source?}`: write the next revision; answers as `GET`. The seat itself or the user (`written_by`); node tokens only with `source: "compaction"` (403 otherwise). `text` gives each field as a Markdown heading (`## State`) or a `State:` line, running to the next field (labels in any case; text before the first field is left out); `fields` gives them as JSON. Fields in order: `State`, `Summary`, `Next`, `Waiting on`, `Traps`, `Verify`, `Pointers`. A note lacking one of the first six is 422 `note_fields_missing` with `missing` (the labels, in order); a note over 16,384 characters (of `text`) is 422 `note_too_large` with `chars` and `max`. An empty `Pointers` is filled in by the server (`pointers_filled: true`): the tasks and documents named by the worklog entries of `session` (without one: by the entries since the previous note), and the seat's last `commit` entry. `private` not given keeps the previous note's flag. `session` is at most 200 characters (422 `invalid_session`). `source: "compaction"` takes `text` as the draft's `Summary` when it has no field labels, sets `State` to `draft: from compaction summary` when empty, and checks no fields. 507 `storage_quota` when the org is at its quota |
+| `POST /seats/{name}/handover/request` | the seat's lead or the user (403 otherwise): records the request and sends the seat system mail in `To` (`Handover note requested by <seat>`) naming `amail handover write`. Answers `{seat, requested_at, message_id?}` |
+| `POST /seats/{name}/handover/read` | node tokens and the seat itself: `{session, rev?}` records that `session` was shown revision `rev` (default: the current one). Answers `{seat, rev, read_by_session, read_at}`; 404 when the seat has no such note, 400 without `session` |
+| `GET /seats/{name}/worklog` | the seat itself, seats of its team, its lead and the user (403 otherwise; node tokens too). `since` (`30m`, `2h`, `7d` before now, or an RFC 3339 time), `task` (`t12` or `12`), `kind`, `before` (an entry id), `limit` (≤ 1,000, default 100): entries newest first, `{seat, entries, next_before?}`; continue with `before=next_before`. With `summary=1`: `{seat, total, kinds: [{kind, count}], tasks: [{task, count, last_at}], last}` over the same filters (`kinds` most first, `tasks` most recent first, at most 100, `last` the newest 10 entries). Takes one of the org's query slots (other pool) |
+| `POST /worklog` | node tokens: `{node?, entries: [{seat, session?, at?, kind, text, task?, doc?}]}` for agent seats of the org. `kind` is 1 to 40 characters of `a-z`, `0-9`, `_`, `-`, `.`; `at` is RFC 3339 (default and upper bound: now); `text` is cut to 1,000 characters, `session` to 200. Entries naming another seat, or with an unreadable kind or time, are left out. Answers `{accepted, skipped}`. At most 8 MiB per request (413 `too_large`); on a server with `--max-worklog-batch` (public default 5,000) more entries are 422 `too_many_entries` |
+
+The server writes worklog entries itself, for agent seats, with `source:
+server`, the seat's last session the node reported and, when the entry
+names no task, the seat's `doing` task changed last: `mail_sent`
+(`m12 "subject" to b, c`), `mail_read` and `mail_acked`
+(`m12 "subject" from a`; `GET /messages/{id}` without `peek`, `POST
+/messages/{id}/ack`; a `[t12]` subject names task 12), `task`
+(`t12: created (open): title`, `t12: open → doing`, `t12: changed title,
+priority`: changes the seat made), `focus` (`focus on until …`,
+`focus off`), `handover` (a note revision written) and `doc` (document
+events). When a change closes a task and its assignee (an agent seat)
+holds no other task that is not `done` or `cancelled`, the server writes
+the seat's note itself (`source: server`): `State: idle: t12 closed, no
+other work`, `Summary` from the task's title, state and result, `Pointers`
+from the worklog. Notes and worklog entries count against the org's
+storage quota in `task_bytes`; a worklog entry that does not fit deletes
+the org's oldest entries to make room.
 
 ### Directory and settings
 

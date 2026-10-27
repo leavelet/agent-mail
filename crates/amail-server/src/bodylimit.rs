@@ -30,6 +30,8 @@ pub async fn layer(req: Request, next: Next) -> Response {
     // `POST /v1/tasks/import` takes a whole file of tasks.
     let max = if req.uri().path().ends_with("/v1/tasks/import") {
         amail_proto::limits::MAX_TASK_IMPORT_BYTES
+    } else if req.uri().path().ends_with("/v1/worklog") {
+        amail_proto::MAX_WORKLOG_POST_BYTES
     } else {
         crate::MAX_REQUEST_BYTES
     };

@@ -524,6 +524,7 @@ pub async fn create(
     }
     publish(&st, org.id, t.num, "created", &[]);
     crate::docs::link_task_title(&st, org.id, Some(me.id), &t).await;
+    crate::handover::task_created(&st, org, &me, &t).await;
     if let Some(a) = t.assignee_id
         && a != me.id
     {
@@ -1863,6 +1864,7 @@ async fn after_change(
     if ch.fields.iter().any(|f| f == "title") {
         crate::docs::link_task_title(st, org.id, actor, &ch.task).await;
     }
+    crate::handover::task_changed(st, org, actor, ch).await;
     for d in &ch.unblocked {
         publish(st, org.id, d.num, "changed", &["state".to_string()]);
     }

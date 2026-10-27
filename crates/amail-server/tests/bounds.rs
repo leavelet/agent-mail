@@ -1009,7 +1009,12 @@ async fn storage_quota(b: Backend, t: &str) {
 /// refused.
 async fn storage_quota_counts_deliveries(b: Backend, t: &str) {
     let to_list = charge("x", 1, "", &["all@acme"], &[], 20);
-    let quota = 3 * to_list;
+    // Each send also writes a worklog entry of `a` (`m1 "x" to all`),
+    // charged to the org's task bytes: its text and kind and
+    // `STORED_BYTES_PER_WORKLOG_ENTRY`.
+    let worklog = (r#"m1 "x" to all"#.len() + "mail_sent".len()) as i64
+        + amail_proto::STORED_BYTES_PER_WORKLOG_ENTRY;
+    let quota = 3 * to_list + 3 * worklog;
     let mut cfg = public();
     cfg.limits.org_storage_bytes = Some(quota);
     let srv = start!(b, t, cfg);
@@ -1049,7 +1054,8 @@ async fn storage_quota_counts_deliveries(b: Backend, t: &str) {
     // The last one asks for acknowledgement within a second.
     a.send(json!({ "to": ["all"], "subject": "x", "body": "y", "ack_required": true, "ack_timeout_s": 1 }))
         .await;
-    assert_eq!(acme.get("/org").await.1["stored_bytes"], quota);
+    assert_eq!(acme.get("/org").await.1["stored_bytes"], 3 * to_list);
+    assert_eq!(acme.get("/org").await.1["task_bytes"], 3 * worklog);
     counts_consistent(&srv, "full").await;
     // At the quota, nothing more is accepted, however small.
     for (to, subject, body) in [("all", "", ""), ("owner", "", ""), ("a", "x", "y")] {

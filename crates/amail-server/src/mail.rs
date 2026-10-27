@@ -148,6 +148,7 @@ pub async fn read(
         match st.store.mark_read(id, seat.id).await? {
             Some((d, bump)) => {
                 publish(&st, &seat.name, bump);
+                crate::handover::mail_read(&st, seat, &m, "mail_read").await;
                 Some(d)
             }
             None => None,
@@ -164,12 +165,13 @@ pub async fn ack(
     auth: Auth,
     Path(id): Path<i64>,
 ) -> ApiResult<Json<p::AckResponse>> {
-    readable_message(&st, &auth, id).await?;
+    let m = readable_message(&st, &auth, id).await?;
     let seat = auth.mail_seat()?;
     let (d, bump) = st.store.ack(id, seat.id).await?.ok_or_else(|| {
         ApiError::not_found(format!("message {id} was not delivered to {}", seat.name))
     })?;
     publish(&st, &seat.name, bump);
+    crate::handover::mail_read(&st, seat, &m, "mail_acked").await;
     Ok(Json(p::AckResponse {
         delivery: render::delivery(&d, &auth.org),
     }))

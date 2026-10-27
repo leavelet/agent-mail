@@ -50,6 +50,8 @@ mod tasks;
 pub use tasks::*;
 mod docs;
 pub use docs::*;
+mod handover;
+pub use handover::*;
 
 string_enum!(
     /// Kind of seat. Every org has exactly one `user` seat, and one hidden

@@ -494,6 +494,14 @@ struct ServeOpts {
     /// limit).
     #[arg(long, env = "AMAIL_MAX_AUTH_FAILURES_PER_MIN")]
     max_auth_failures_per_min: Option<f64>,
+    /// Days a seat's worklog entries are kept (public default 90; 0: kept
+    /// until the org's storage quota needs the room).
+    #[arg(long, env = "AMAIL_WORKLOG_DAYS")]
+    worklog_days: Option<u32>,
+    /// Worklog entries per `POST /v1/worklog` request (public default
+    /// 5000; 0: no limit).
+    #[arg(long, env = "AMAIL_MAX_WORKLOG_BATCH")]
+    max_worklog_batch: Option<usize>,
     /// URL path prefix to serve under, e.g. /amail for
     /// https://example.com/amail/ (a leading slash, no trailing slash).
     /// Behind a proxy that removes the prefix, leave this at / and have the
@@ -574,6 +582,12 @@ impl ServeOpts {
         }
         if let Some(v) = self.max_auth_failures_per_min {
             l.auth_failures_per_min = pos_f(v);
+        }
+        if let Some(v) = self.worklog_days {
+            l.worklog_days = (v > 0).then_some(v);
+        }
+        if let Some(v) = self.max_worklog_batch {
+            l.worklog_batch_entries = (v > 0).then_some(v);
         }
         Ok(c)
     }

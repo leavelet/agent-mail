@@ -803,6 +803,67 @@ comment as on a removed section with the heading path it had.
 Documents count against the org's storage quota (`doc_bytes`): every
 revision whole, the sections and links of the current one, events and
 relations. Deleting the org deletes its documents.
+## Seat handover
+
+A seat outlives its sessions: a session ends, is compacted or is replaced,
+and the next session in the same seat starts without the previous one's
+context. The handover is what the next session reads first. It has two
+parts, kept apart on purpose.
+
+The **worklog** is an append-only record per agent seat of what the seat
+did. The server writes entries from its own events: mail the seat sent,
+read or acknowledged, task changes the seat made (`t12: open → doing`),
+focus on and off, note revisions, and document events. The node writes
+entries from the harness: session start, resume, compaction and end, turns
+and their failures, tool calls (the tool and a short cut of its input),
+and commits. Each entry has a time, a session id, a kind, a text of at
+most 1,000 characters, and when known the task the seat held at the time
+and a document. The worklog is never injected into an agent's context; it
+is queried (`GET /v1/seats/{name}/worklog`, with filters and a summary).
+
+The **handover note** is written text: one live note per seat, every
+earlier revision kept and readable by number. It has seven labelled
+fields in a fixed order:
+
+1. `State`: one line: `on track`, `blocked`, `environment broken` or
+   `idle`, with a few words;
+2. `Summary`: the current work in two or three sentences;
+3. `Next`: an ordered list, the first item an exact command or file;
+4. `Waiting on`: who, for what, since when (or `nothing`);
+5. `Traps`: rejected approaches with the reason, constraints, files not to
+   touch, flaky tests;
+6. `Verify`: how to confirm the state before continuing;
+7. `Pointers`: task ids, document ids, message ids, commit hashes.
+
+The server refuses a note that lacks one of the first six fields or is
+longer than 16,384 characters. When `Pointers` is empty, the server fills
+it in from the worklog: the tasks and documents of the writing session
+and the seat's last commit. Three other writers exist besides the agent:
+the user may write a seat's note (it shows `written_by`); the node files
+the harness's compaction summary as a draft revision (`source:
+compaction`), so that the next session has something even when the agent
+never wrote; and when a task closes and its assignee holds no other
+unfinished task, the server writes an idle note itself (`State: idle`,
+the summary from the task's title and result) without a model turn.
+
+The lead of a seat (its team's root seat) and the user can ask a seat for
+its note; the seat then gets system mail naming `amail handover write`.
+When the node shows the note to a new session, it records the read with
+the session id, which the note then shows (`read_by_session`, `read_at`).
+
+Who reads what:
+
+| | the seat | its team | its lead | other seats of the org | the user |
+|---|---|---|---|---|---|
+| handover note | yes | yes | yes | yes | yes |
+| private note | yes | no | yes | no | yes |
+| worklog | yes | yes | yes | no | yes |
+
+Notes are readable across the org so that a teammate can see where a
+colleague stands. A note is private when written with `private` (later
+notes keep the flag until one sets it off) or when the team file says
+`handover = "private"` for the seat. Worklogs stay within the team because
+they are large and detailed. Nothing of either reaches another org.
 
 ## The user's queue ("needs you")
 
