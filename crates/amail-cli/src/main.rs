@@ -2808,6 +2808,9 @@ mod tests {
         "--web-terminal-port=19512",
         "--web-terminal-url=https://term.example.com",
         "--local-policy=restricted",
+        "--handover-threshold=65",
+        "--context-window=sonnet=500k",
+        "--context-window=300000",
     ];
 
     fn parse_node(sub: &[&str], args: &[String]) -> NodeArgs {
