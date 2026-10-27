@@ -87,6 +87,8 @@ idle_sleep = "30m"               # put idle seats to sleep; "off" (default)
 max_live = 40                    # seats with a process on this host
 restart = "on-failure"           # or "never"
 # local_policy = "restricted"    # see "Agents that manage seats" below
+# handover_idle = "30m"          # ask an idle seat with work for its handover note (default 30m; "off")
+# docs.activate_by = "human"     # every document of the teams' seats waits for you; or "owner"
 
 [defaults]
 harness = "claude"               # or "codex", "dsh"
@@ -95,12 +97,14 @@ permission_mode = "unattended"   # or "default" (keep the harness's prompts)
 # git_access = "worktree"        # Codex and dsh seats: "worktree" (default), "full" or "off"
 # dsh_jail = true                # dsh seats: run unattended hosts in a bwrap jail (default)
 # paste_fallback = true          # see docs/harnesses.md; off by default
+# handover = "private"           # who reads the seats' handover notes; "org" (default)
 
 [[seat]]
 name = "root"
 role = "Overall technical lead."
 description = "Leads the project; answers questions about its plan."  # shown to other orgs when open
 open = "linked"                  # or ["org", ...]: open this seat to other orgs
+# handover = "private"           # its handover notes: the seat, its lead and you only
 
 [[group]]
 name = "backend"
@@ -110,6 +114,7 @@ workers = { count = 3, prefix = "be", role = "..." }   # be-1..be-3, under be-le
 description = "The backend: API and storage."          # the team's description
 # open = ["partner-org"]         # open the team; its contacts (default: the lead)
 # contacts = ["be-lead"]
+# docs.activate_by = "owner"     # this team only; default: [team]'s
 
 [[group]]
 name = "core"
@@ -172,6 +177,36 @@ operating-system user can, saved logins and keys included; `amail up`
 names such seats, and the node reports the change to you by system mail.
 `amail run --dsh-jail on|off` sets it for one start. See
 [harness support](harnesses.md#deepseek-harness-dsh).
+
+### Documents and handover notes
+
+`docs.activate_by` decides who moves a document from `draft` to `active`
+(see [documents](concepts.md#documents)). With `"human"`, every document
+whose owner is a seat of the team waits for you to activate it, whatever
+its kind says. With `"owner"`, or without the setting, each document kind
+decides (a `decision` always waits for you). Under `[team]` the setting
+applies to every team the file declares (the file's own team and its
+groups); a `[[group]]` can set its own. `amail up` applies it with `PUT
+/v1/teams/{name}` (`doc_activate_by`), and removing the line from the file
+sets the team back to `"owner"` at the next `amail up`.
+
+`handover` (in `[defaults]`, a `workers` table or a seat) decides who reads
+a seat's [handover notes](concepts.md#seat-handover). `"org"`, the
+default, lets every seat of the org read them; `"private"` limits them to
+the seat itself, its lead (the root seat of its team) and you. `amail up`
+applies it to each seat of the file (`PUT
+/v1/seats/{name}/handover/private`) and reports the seats it changed. The
+setting holds for all of the seat's notes, whatever flag a note was
+written with.
+
+`handover_idle` (under `[team]`, a duration, default `30m`) is how long a
+seat may sit idle with work in progress (an unfinished task assigned to
+it) before the node asks it for its handover note, by a request mail,
+when its note is older than its last turn. When the team also sets
+`idle_sleep`, the node asks at half of `idle_sleep` if that comes first,
+so the seat can write before it is put to sleep. `"off"` turns these
+requests off. The node asks at most once per idle period and not while
+an earlier request is unanswered.
 
 ### Agents that manage seats
 

@@ -224,15 +224,19 @@ The first public version.
     its lead (the team's root seat) and the user. The user may write a
     seat's note; node tokens file compaction summaries as drafts
     (`source: compaction`).
-  - `POST /seats/{name}/handover/request` (the lead or the user) records
-    a request and mails the seat; `POST /seats/{name}/handover/read`
-    (node tokens) records which session was shown the note.
+  - `POST /seats/{name}/handover/request` (the lead, the user, or a node
+    in the name of the system seat) records a request and mails the seat;
+    `POST /seats/{name}/handover/read` (node tokens) records which session
+    was shown the note. `GET`/`PUT /seats/{name}/handover/private` (the
+    user) is the seat's setting from the team file's `handover =
+    "private"`.
   - When a task closes and its assignee holds no other unfinished task,
     the server writes the seat's note itself (`State: idle`).
   - The worklog: `POST /worklog` (node tokens) appends entries for the
     org's agent seats; the server adds entries for mail sent, read and
     acknowledged, task changes, focus and note revisions.
-    `GET /seats/{name}/worklog` (the seat, its team, its lead, the user)
+    `GET /seats/{name}/worklog` (the seat, its team, its lead, the user,
+    node tokens)
     filters by `since`, `task`, `kind` and pages with `before`;
     `summary=1` gives counts per kind, the tasks touched and the last ten
     entries. Entries hold at most 1,000 characters of text.
@@ -352,6 +356,33 @@ The first public version.
   turn) goes back to "not read" and is delivered again, up to three failed
   turns in a row; the seat is flagged as `turn failed` in `amail ps`, the
   web interface and the user's queue, and the user gets one system mail.
+
+- Documents and seat handover on the node, M9:
+  - Claude Code and Codex seats register `PreCompact` and `PostCompact`
+    hooks.
+  - Session start shows the seat's handover note before the mail (up to
+    two thirds of the injection budget; `State`, `Summary`, `Next`,
+    `Waiting on` and `Verify` whole, then as much of `Traps` and
+    `Pointers` as fits; a warning line past 7 days) and records the read,
+    and the team's document index under `Documents:` after the task line
+    (up to a third of the budget). A turn's start shows the index again
+    when it changed. Mail always comes first.
+  - The end of a turn asks once for the handover note when the note is
+    older than the turn and the context passed `--handover-threshold`
+    (70%) of the model's window (read from the transcript; windows from
+    `--context-window`, the harness or a table), the seat closed a task
+    and still holds work, or a request is open. Seats idle with work in
+    progress for the team's `handover_idle` (30 minutes) are asked by a
+    request mail. `PostCompact` files the harness's summary as a draft
+    note.
+  - Worklog entries from hooks: session start and end, compaction, turn
+    start and end (with the failure), tool calls (name and 200 characters
+    of input), and commits in the seat's working directory.
+  - The mail instructions describe documents and the index; the seat
+    introduction says what to keep when the context is compacted.
+  - Team files: `docs.activate_by` (`[team]` and `[[group]]`),
+    `handover_idle`, and `handover = "private"` per seat; `amail up`
+    applies them. `amail ps` has a NOTE column.
 
 #### Web interface
 

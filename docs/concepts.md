@@ -757,6 +757,17 @@ newest verified first. The caller passes the budget it has (`max_lines`,
 default 60, and `max_chars`, default 3,000); the server cuts the list to it
 and ends with `… and 41 more: amail doc list --team backend`.
 
+The node shows the index to an agent seat under the heading `Documents:`,
+after the mail and the task line: at the start of every session, after a
+compaction, and at the start of a turn (or in a `Stop` answer that blocks
+anyway) when the index text changed since the seat last saw it. It asks
+for at most a third of the harness's injection budget (about 3,000
+characters on Claude Code and dsh, 2,000 on Codex) and cuts the index
+further when the mail in the same answer leaves less room: mail always
+comes first. The mail instructions every seat gets tell the agent what the
+index is and to search before writing a new document
+([harness support](harnesses.md#what-the-node-does-with-hooks)).
+
 ### Candidates on create
 
 A new document is compared with the documents of its kind: those whose
@@ -851,6 +862,53 @@ its note; the seat then gets system mail naming `amail handover write`.
 When the node shows the note to a new session, it records the read with
 the session id, which the note then shows (`read_by_session`, `read_at`).
 
+**When the node asks for the note.** The agent is not expected to know
+when its context will be compacted, and compaction is never blocked. At
+the end of a turn, the node blocks the `Stop` once with the instruction
+`Write your handover note now with amail handover write; then stop.` when
+the seat's note is older than the turn (or there is none) and one of these
+holds:
+
+- the turn's input, as the harness's transcript records it for the latest
+  model request, passed 70% of the model's context window (the node's
+  `--handover-threshold` and `--context-window`);
+- the seat closed a task in the turn (the server's worklog says so) and
+  still holds unfinished work; when it holds none, the server has written
+  the idle note itself and nothing is asked;
+- a request for the note is open.
+
+The node asks the server about the note only when one of these may hold:
+the transcript shows the context over the threshold, the turn ran an
+`amail task` command or an amail task tool, or the node saw a request (at
+session start, at the last turn's end, or as mail). Any other turn's end
+is answered from memory, as before. If the agent still does not write,
+the next `Stop` ends the turn. A seat idle with work in progress, for the
+team's `handover_idle` (default 30 minutes; half of `idle_sleep` when that
+is shorter), is asked by a request mail through the server instead, since
+no turn runs that a `Stop` could block; the request is made in the name of
+the org's system seat `amail`, at most once per idle period. The seat
+introduction tells the model what to keep in the summary when the harness
+compacts and to write the note first when asked.
+
+**Compaction.** `PreCompact` records a worklog entry and nothing else.
+`PostCompact` records the harness's summary in the worklog (`compact`) and,
+unless the note was written during the current turn, files the summary as
+a draft revision (`source: compaction`, `State: draft: from compaction
+summary`).
+
+**When the note is read.** At session start with source `startup`,
+`resume`, `clear` or `compact` (not `fork`), the node shows the note
+before the mail, as `Handover note of this seat, written by the previous
+session at <time>:` followed by the fields, with a warning line when the
+note is older than 7 days. The note may take two thirds of the injection
+budget (about 6,000 characters on Claude Code and dsh, 4,000 on Codex),
+less what the mail in the same answer needs. When it is longer, `State`,
+`Summary`, `Next`, `Waiting on` and `Verify` are shown whole, then as much
+of `Traps` and `Pointers` as fits, and the text ends with `… the rest:
+amail handover show`. The node then records the read. `amail ps` shows
+for each seat whether its note is `current` (no turn started after it was
+written), `stale` or `none`, as far as the node has seen.
+
 Who reads what:
 
 | | the seat | its team | its lead | other seats of the org | the user |
@@ -858,6 +916,8 @@ Who reads what:
 | handover note | yes | yes | yes | yes | yes |
 | private note | yes | no | yes | no | yes |
 | worklog | yes | yes | yes | no | yes |
+
+Nodes (node tokens) read every seat's note and worklog of the org.
 
 Notes are readable across the org so that a teammate can see where a
 colleague stands. A note is private when written with `private` (later
