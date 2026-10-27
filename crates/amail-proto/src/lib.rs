@@ -48,6 +48,8 @@ macro_rules! string_enum {
 
 mod tasks;
 pub use tasks::*;
+mod docs;
+pub use docs::*;
 
 string_enum!(
     /// Kind of seat. Every org has exactly one `user` seat, and one hidden
@@ -482,9 +484,6 @@ pub mod limits {
     /// Longest chain of dependencies the cycle check follows; an edge that
     /// would make a longer one is refused.
     pub const MAX_TASK_DEP_DEPTH: usize = 32;
-    /// Reminder mails (system mail about tasks) one org receives per hour;
-    /// further ones are dropped and the user is told once.
-    pub const TASK_REMINDERS_PER_HOUR: f64 = 200.0;
     /// Tasks one `GET /tasks?text=` request looks at (newest first) before
     /// it answers with what it found and a cursor (`next_before`).
     pub const TASK_TEXT_SCAN: i64 = 5_000;
@@ -507,6 +506,60 @@ pub mod limits {
     /// Bytes counted against the storage quota for each task event, on top
     /// of its texts, and for each dependency and link.
     pub const STORED_BYTES_PER_TASK_EVENT: i64 = 128;
+
+    // --- documents (see `docs/concepts.md`, Documents) ---
+    //
+    // Format and model-protection rules; they apply everywhere. The resource
+    // rules of documents are configuration of public servers
+    // (`amail_server::config::DocLimits`).
+
+    /// Bytes of a document's body (a kind may set less).
+    pub const MAX_DOC_BODY_BYTES: usize = 512 * 1024;
+    /// Estimated tokens of a body above which writes and `show` advise
+    /// splitting it.
+    pub const DOC_SPLIT_ADVICE_TOKENS: i64 = 40_000;
+    /// Characters of an `index` document's body above which its owner is
+    /// advised to shorten it.
+    pub const DOC_INDEX_BODY_CHARS: usize = 1_000;
+    /// Characters of a document's title (one line).
+    pub const MAX_DOC_TITLE_CHARS: usize = 512;
+    /// Characters of a document's description (one line).
+    pub const MAX_DOC_DESCRIPTION_CHARS: usize = 200;
+    /// Characters of a slug (`[a-z0-9][a-z0-9._-]*`).
+    pub const MAX_DOC_SLUG_CHARS: usize = 128;
+    /// Characters of a revision message.
+    pub const MAX_DOC_MESSAGE_CHARS: usize = 500;
+    /// Labels of one document, and characters of one label.
+    pub const MAX_DOC_LABELS: usize = 10;
+    pub const MAX_DOC_LABEL_CHARS: usize = 32;
+    /// Editors of one document.
+    pub const MAX_DOC_EDITORS: usize = 20;
+    /// Ancestors a document may have (`parent`, its parent, ...).
+    pub const MAX_DOC_PARENT_DEPTH: usize = 8;
+    /// Characters of a kind's name and of a required section's title.
+    pub const MAX_DOC_KIND_NAME_CHARS: usize = 32;
+    pub const MAX_DOC_SECTION_NAME_CHARS: usize = 200;
+    /// Default budget of `GET /docs/index`: lines and characters.
+    pub const DOC_INDEX_LINES: i64 = 60;
+    pub const DOC_INDEX_CHARS: i64 = 3_000;
+    /// Default hits of `GET /docs/search`.
+    pub const DOC_SEARCH_HITS: i64 = 20;
+    /// Characters of a search snippet.
+    pub const DOC_SNIPPET_CHARS: usize = 200;
+    /// Candidates a new document's answer lists, and the trigram similarity
+    /// above which an existing document is one.
+    pub const DOC_CANDIDATES: usize = 5;
+    pub const DOC_CANDIDATE_SIMILARITY: f64 = 0.3;
+    /// Events in `GET /docs/{num}`.
+    pub const DOC_SHOWN_EVENTS: i64 = 20;
+    /// Largest page of `GET /docs` and of the history's events.
+    pub const MAX_DOC_PAGE: i64 = 500;
+    /// Hours between two reminders about one document's dangling links.
+    pub const DOC_DANGLING_REMIND_HOURS: i64 = 24;
+    /// Bytes counted against the storage quota for each document, section,
+    /// link, relation and event, on top of their texts.
+    pub const STORED_BYTES_PER_DOC: i64 = 512;
+    pub const STORED_BYTES_PER_DOC_ROW: i64 = 128;
 
     /// Characters of `s`, or an error naming `field` and the limit.
     pub fn check_chars(field: &str, s: &str, max: usize) -> Result<(), String> {
@@ -784,6 +837,10 @@ pub struct ThreadResponse {
     /// thread it is.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tasks: Vec<TaskRef>,
+    /// Documents of the caller's org this thread cites (`[d12]` in a
+    /// subject), or whose discussion thread it is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub docs: Vec<DocRef>,
     /// Older messages were left out (a thread answers at most its newest
     /// 500 messages, and headers of at most [`limits::MAX_PAGE_BYTES`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -1227,6 +1284,11 @@ pub struct OrgInfo {
     /// links), counted against the storage quota with `stored_bytes`.
     #[serde(default)]
     pub task_bytes: i64,
+    /// Bytes of the org's documents (every revision, the sections and
+    /// links of the current one, events and relations), counted against
+    /// the storage quota with `stored_bytes` and `task_bytes`.
+    #[serde(default)]
+    pub doc_bytes: i64,
     /// A one-time notice for the user (user tokens), for example that an
     /// upgrade closed what links used to open; cleared with
     /// `DELETE /v1/org/notice`.
@@ -1370,6 +1432,10 @@ pub struct Team {
     /// the team).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub primaries: Vec<TeamPrimary>,
+    /// `human`: every document of the team's seats waits for the user to
+    /// activate it, whatever its kind says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc_activate_by: Option<ActivateBy>,
     pub created_at: String,
 }
 
@@ -1400,6 +1466,14 @@ pub struct TeamPut {
     pub contacts: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed: Option<bool>,
+    /// `human`: every document of the team's seats waits for the user to
+    /// activate it; `null` or `owner`: the kind decides.
+    #[serde(
+        default,
+        deserialize_with = "double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub doc_activate_by: Option<Option<ActivateBy>>,
 }
 
 /// An opening: the org shows `target` (a seat or a team) to `audience`

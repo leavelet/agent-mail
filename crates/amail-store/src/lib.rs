@@ -9,10 +9,13 @@
 //! rate limits, address resolution) lives in the server.
 
 mod budget;
+pub mod docmd;
 #[macro_use]
 mod common;
 #[macro_use]
 mod tasks;
+#[macro_use]
+mod docs;
 mod model;
 mod postgres;
 mod sqlite;
@@ -715,4 +718,162 @@ pub trait Store: Send + Sync + 'static {
     /// `review` tasks not changed and not reminded for the org's stale
     /// period, marked reminded (at most `limit` per org).
     async fn claim_stale_tasks(&self, now: i64, limit: i64) -> Result<Vec<TaskRec>>;
+
+    // --- documents ---------------------------------------------------------------
+    //
+    // Writes take the org's row, record events, charge the org's
+    // `doc_bytes` and are refused with `StoreError::Refused` (a code and a
+    // message: `not_owner`, `frozen`, `stale`, `sections_missing`,
+    // `body_too_large`, `nothing_to_split`, ...) when they break a rule.
+
+    /// Create a document (`draft`) with its first revision. A `client_key`
+    /// that created a document of the org in the last 24 hours answers
+    /// that document (`existing`).
+    async fn create_doc(&self, doc: &NewDocRec) -> Result<DocChanged>;
+    /// A document by number, with its current body.
+    async fn doc(&self, org_id: i64, num: i64) -> Result<Option<DocRec>>;
+    /// The number of the document with this slug.
+    async fn doc_num_by_slug(&self, org_id: i64, slug: &str) -> Result<Option<i64>>;
+    /// A document with its sections, relatives, links, threads, tasks,
+    /// comments and newest `events` events.
+    async fn doc_detail(&self, org_id: i64, num: i64, events: i64) -> Result<Option<DocDetailRec>>;
+    /// One revision with its body.
+    async fn doc_revision(&self, org_id: i64, num: i64, rev: i64) -> Result<Option<DocRevRec>>;
+    /// Every revision, without bodies, oldest first.
+    async fn doc_revisions(&self, org_id: i64, num: i64) -> Result<Vec<DocRevRec>>;
+    /// Events after `after_seq` (at most `limit`); `None`: no such document.
+    async fn doc_events(
+        &self,
+        org_id: i64,
+        num: i64,
+        after_seq: i64,
+        limit: i64,
+    ) -> Result<Option<Vec<DocEventRec>>>;
+    /// The events after the one that wrote revision `rev`.
+    async fn doc_events_since_rev(
+        &self,
+        org_id: i64,
+        num: i64,
+        rev: i64,
+        limit: i64,
+    ) -> Result<Vec<DocEventRec>>;
+    /// Replace the body or one section (refused for an active decision,
+    /// `frozen`); a body equal to the current one writes nothing
+    /// (`unchanged`).
+    async fn write_doc_body(&self, w: &DocWrite, body: &DocBodyRec) -> Result<DocChanged>;
+    /// Change fields; title and description changes write a revision.
+    async fn change_doc(&self, w: &DocWrite, change: &DocChange) -> Result<DocChanged>;
+    /// Document `by` replaces `w.num`, which becomes `superseded`.
+    async fn supersede_doc(&self, w: &DocWrite, by: i64) -> Result<DocChanged>;
+    /// Confirm the content now, valid for `valid_ms` (`None`: the kind's
+    /// interval; `Some(None)`: no expiry).
+    async fn verify_doc(&self, w: &DocWrite, valid_ms: Option<Option<i64>>) -> Result<DocChanged>;
+    /// Each heading of `level` becomes a child document; links to the moved
+    /// sections are rewritten in other documents and in task bodies.
+    async fn split_doc(&self, w: &DocWrite, level: i64) -> Result<DocMovedRec>;
+    /// Move one section into a new document that supplements this one.
+    async fn extract_doc(
+        &self,
+        w: &DocWrite,
+        anchor: &str,
+        title: &str,
+        kind: Option<&str>,
+    ) -> Result<DocMovedRec>;
+    /// Append `w.num` to `into` as a section; `w.num` becomes superseded.
+    async fn merge_doc(&self, w: &DocWrite, into: i64) -> Result<DocMovedRec>;
+    /// Documents by [`DocQuery`] (without bodies), newest first.
+    async fn docs(&self, q: &DocQuery) -> Result<Vec<DocRec>>;
+    /// Sections (or, for terms all shorter than 3 characters, titles and
+    /// descriptions) containing every term.
+    async fn search_docs(&self, q: &DocSearchQuery) -> Result<DocSearchRes>;
+    /// The documents of the per-turn index, in order (at most `scan`), and
+    /// how many there are.
+    async fn doc_index(
+        &self,
+        org_id: i64,
+        team_id: Option<i64>,
+        now: i64,
+        scan: Option<i64>,
+    ) -> Result<(Vec<DocRec>, i64)>;
+    /// Documents of `kind` like a new one (see `docs/concepts.md`).
+    #[allow(clippy::too_many_arguments)]
+    async fn doc_candidates(
+        &self,
+        org_id: i64,
+        kind: &str,
+        title: &str,
+        description: &str,
+        slug: Option<&str>,
+        except: i64,
+        scan: Option<i64>,
+    ) -> Result<Vec<(DocRec, f64)>>;
+    /// Links out of a document and into it.
+    async fn doc_links(
+        &self,
+        org_id: i64,
+        num: i64,
+    ) -> Result<Option<(Vec<DocLinkRec>, Vec<DocLinkRec>)>>;
+    /// Dangling and stale links of the org's draft and active documents
+    /// (of a team).
+    async fn doc_check(
+        &self,
+        org_id: i64,
+        team_id: Option<i64>,
+        limit: i64,
+    ) -> Result<Vec<DocLinkRec>>;
+    async fn doc_kinds(&self, org_id: i64) -> Result<Vec<DocKindRec>>;
+    async fn doc_kind(&self, org_id: i64, name: &str) -> Result<Option<DocKindRec>>;
+    /// Add a kind or change one (`max`: kinds per org).
+    async fn put_doc_kind(
+        &self,
+        org_id: i64,
+        kind: &DocKindPut,
+        max: Option<i64>,
+    ) -> Result<DocKindRec>;
+    /// Record a comment (message `message_id` in `thread_id`, on section
+    /// `anchor` with heading path `path`); the first one makes `thread_id`
+    /// the document's discussion thread.
+    async fn record_doc_comment(
+        &self,
+        w: &DocWrite,
+        message_id: i64,
+        thread_id: i64,
+        anchor: Option<&str>,
+        path: Option<&str>,
+    ) -> Result<DocRec>;
+    /// Seats that commented, in the order of their first comment.
+    async fn doc_commenters(&self, org_id: i64, num: i64) -> Result<Vec<String>>;
+    /// Link a thread that cites the document (`[d12]`); false when nothing
+    /// was linked.
+    async fn add_doc_thread(&self, w: &DocWrite, thread_id: i64, note: &str) -> Result<bool>;
+    /// Link a task whose title cites documents; the numbers newly linked.
+    async fn link_task_docs(
+        &self,
+        w: &DocWrite,
+        task_id: i64,
+        task_num: i64,
+        nums: &[i64],
+    ) -> Result<Vec<i64>>;
+    /// Documents of the org whose discussion thread this is or that it
+    /// cites.
+    async fn thread_docs(&self, org_id: i64, thread_id: i64) -> Result<Vec<DocRec>>;
+    /// Record a reminder mail about a document (`reminder_sent`).
+    async fn record_doc_reminder(
+        &self,
+        org_id: i64,
+        doc_id: i64,
+        kind: &str,
+        to: &str,
+        message_id: i64,
+    ) -> Result<()>;
+    /// Draft and active documents whose `expires_at` passed, not reminded
+    /// of it, marked reminded (at most `limit`; each once).
+    async fn claim_expired_docs(&self, now: i64, limit: i64) -> Result<Vec<DocRec>>;
+    /// Draft and active documents with dangling links not reminded of them
+    /// for a day, marked reminded, with those links.
+    async fn claim_dangling_docs(
+        &self,
+        now: i64,
+        limit: i64,
+    ) -> Result<Vec<(DocRec, Vec<DocLinkRec>)>>;
 }

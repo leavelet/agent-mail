@@ -42,7 +42,7 @@ macro_rules! seat_select {
 macro_rules! team_select {
     () => {
         "SELECT t.id, t.org_id, t.name, t.description, t.root_seat_id, rs.name AS root, t.parent_id, \
-         pt.name AS parent, t.managed, t.created_at FROM teams t \
+         pt.name AS parent, t.managed, t.doc_activate_by, t.created_at FROM teams t \
          LEFT JOIN seats rs ON rs.id = t.root_seat_id AND rs.deleted_at IS NULL \
          LEFT JOIN teams pt ON pt.id = t.parent_id"
     };
@@ -161,7 +161,7 @@ macro_rules! auth_select {
          o.max_recipients, o.max_thread_depth, o.webhook_url, o.ack_timeout_min, o.focus_max_min, \
          o.digest_interval_min, o.created_at, o.suspended_at, o.stored_bytes, o.kept_bytes, \
          o.display_name, o.description, o.visibility, o.outbound, o.new_threads_per_hour, o.notice, \
-         o.task_stale_hours, o.task_bytes, s.id AS s_id, \
+         o.task_stale_hours, o.task_bytes, o.doc_bytes, s.id AS s_id, \
          s.org_id AS s_org_id, s.name AS s_name, \
          s.kind AS s_kind, s.parent_id AS s_parent_id, p.name AS s_parent_name, \
          s.display_name AS s_display_name, s.role AS s_role, s.harness AS s_harness, \
@@ -427,6 +427,7 @@ pub(crate) struct OrgRow {
     notice: Option<String>,
     task_stale_hours: i64,
     task_bytes: i64,
+    doc_bytes: i64,
 }
 
 impl From<OrgRow> for Org {
@@ -458,6 +459,7 @@ impl From<OrgRow> for Org {
             notice: r.notice,
             task_stale_hours: r.task_stale_hours,
             task_bytes: r.task_bytes,
+            doc_bytes: r.doc_bytes,
         }
     }
 }
@@ -652,6 +654,7 @@ pub(crate) struct TeamRow {
     parent_id: Option<i64>,
     parent: Option<String>,
     managed: bool,
+    doc_activate_by: Option<String>,
     created_at: i64,
 }
 
@@ -667,6 +670,7 @@ impl From<TeamRow> for Team {
             parent_id: r.parent_id,
             parent: r.parent,
             managed: r.managed,
+            doc_activate_by: r.doc_activate_by,
             created_at: r.created_at,
         }
     }
@@ -1232,13 +1236,18 @@ macro_rules! impl_store_common {
                     Some(d) => d.clone(),
                 };
                 sqlx::query(
-                    "UPDATE teams SET description = $1, root_seat_id = $2, parent_id = $3, managed = $4 WHERE id = $5",
+                    "UPDATE teams SET description = $1, root_seat_id = $2, parent_id = $3, managed = $4, \
+                     doc_activate_by = $6 WHERE id = $5",
                 )
                 .bind(description)
                 .bind(root)
                 .bind(parent)
                 .bind(ch.managed.unwrap_or(team.managed))
                 .bind(id)
+                .bind(match &ch.doc_activate_by {
+                    None => team.doc_activate_by.clone(),
+                    Some(v) => v.clone(),
+                })
                 .execute(&mut *c)
                 .await?;
                 if let Some(contacts) = &ch.contacts {
@@ -1276,6 +1285,10 @@ macro_rules! impl_store_common {
                     .execute(&mut *c)
                     .await?;
                 sqlx::query("UPDATE tasks SET team_id = NULL WHERE team_id = $1")
+                    .bind(team.id)
+                    .execute(&mut *c)
+                    .await?;
+                sqlx::query("UPDATE docs SET team_id = NULL WHERE team_id = $1")
                     .bind(team.id)
                     .execute(&mut *c)
                     .await?;
@@ -1542,6 +1555,8 @@ macro_rules! impl_store_common {
                 insert_token(c, &token).await?;
                 // The user seat is open to every linked org.
                 add_grant(c, id, Some(seat.id), None, None, false).await?;
+                // The built-in document kinds.
+                super::dq::insert_builtin_kinds(c, id).await?;
                 let org = org_by_id(c, id).await?.ok_or_else(|| StoreError::NotFound("org".into()))?;
                 Ok((org, seat))
             }
@@ -3609,7 +3624,16 @@ macro_rules! impl_store_common {
                 }
                 // After its deliveries are gone, the mail it sent that no
                 // other org received has no deliveries left.
-                let steps: [&str; 30] = [
+                let steps: [&str; 39] = [
+                    "DELETE FROM doc_task_links WHERE org_id = $1",
+                    "DELETE FROM doc_threads WHERE org_id = $1",
+                    "DELETE FROM doc_events WHERE org_id = $1",
+                    "DELETE FROM doc_relations WHERE org_id = $1",
+                    "DELETE FROM doc_links WHERE org_id = $1",
+                    "DELETE FROM doc_sections WHERE org_id = $1",
+                    "DELETE FROM doc_revisions WHERE org_id = $1",
+                    "DELETE FROM docs WHERE org_id = $1",
+                    "DELETE FROM doc_kinds WHERE org_id = $1",
                     "DELETE FROM task_events WHERE org_id = $1",
                     "DELETE FROM task_links WHERE org_id = $1",
                     "DELETE FROM task_deps WHERE org_id = $1",
@@ -3722,7 +3746,7 @@ macro_rules! impl_store_common {
                 if kept {
                     sqlx::query(
                         "UPDATE orgs SET deleted_at = $1, deleted_name = name, name = $2, \
-                         webhook_url = NULL, stored_bytes = 0, kept_bytes = 0, task_bytes = 0 WHERE id = $3",
+                         webhook_url = NULL, stored_bytes = 0, kept_bytes = 0, task_bytes = 0, doc_bytes = 0 WHERE id = $3",
                     )
                     .bind(now)
                     .bind(format!("deleted:{org_id}"))
@@ -4970,8 +4994,178 @@ macro_rules! impl_store_common {
             async fn claim_stale_tasks(&self, now: i64, limit: i64) -> $crate::Result<Vec<$crate::TaskRec>> {
                 run!(self.write, |c| tq::claim_stale(c, now, limit).await)
             }
+
+            // --- documents (see `docs.rs`) ---
+
+            async fn create_doc(&self, doc: &$crate::NewDocRec) -> $crate::Result<$crate::DocChanged> {
+                let doc = doc.clone();
+                run!(self.write, |c| dq::create(c, &doc).await)
+            }
+
+            async fn doc(&self, org_id: i64, num: i64) -> $crate::Result<Option<$crate::DocRec>> {
+                run!(self.read, |c| dq::by_num(c, org_id, num).await)
+            }
+
+            async fn doc_num_by_slug(&self, org_id: i64, slug: &str) -> $crate::Result<Option<i64>> {
+                let slug = slug.to_string();
+                run!(self.read, |c| dq::num_by_slug(c, org_id, &slug).await)
+            }
+
+            async fn doc_detail(&self, org_id: i64, num: i64, events: i64) -> $crate::Result<Option<$crate::DocDetailRec>> {
+                run!(self.read, |c| dq::detail(c, org_id, num, events).await)
+            }
+
+            async fn doc_revision(&self, org_id: i64, num: i64, rev: i64) -> $crate::Result<Option<$crate::DocRevRec>> {
+                run!(self.read, |c| dq::revision(c, org_id, num, rev).await)
+            }
+
+            async fn doc_revisions(&self, org_id: i64, num: i64) -> $crate::Result<Vec<$crate::DocRevRec>> {
+                run!(self.read, |c| dq::revisions(c, org_id, num).await)
+            }
+
+            async fn doc_events(&self, org_id: i64, num: i64, after_seq: i64, limit: i64) -> $crate::Result<Option<Vec<$crate::DocEventRec>>> {
+                run!(self.read, |c| dq::events(c, org_id, num, after_seq, limit).await)
+            }
+
+            async fn doc_events_since_rev(&self, org_id: i64, num: i64, rev: i64, limit: i64) -> $crate::Result<Vec<$crate::DocEventRec>> {
+                run!(self.read, |c| dq::events_since_rev(c, org_id, num, rev, limit).await)
+            }
+
+            async fn write_doc_body(&self, w: &$crate::DocWrite, body: &$crate::DocBodyRec) -> $crate::Result<$crate::DocChanged> {
+                let (w, body) = (w.clone(), body.clone());
+                run!(self.write, |c| dq::write_body(c, &w, &body).await)
+            }
+
+            async fn change_doc(&self, w: &$crate::DocWrite, change: &$crate::DocChange) -> $crate::Result<$crate::DocChanged> {
+                let (w, change) = (w.clone(), change.clone());
+                run!(self.write, |c| dq::change(c, &w, &change).await)
+            }
+
+            async fn supersede_doc(&self, w: &$crate::DocWrite, by: i64) -> $crate::Result<$crate::DocChanged> {
+                let w = w.clone();
+                run!(self.write, |c| dq::supersede(c, &w, by).await)
+            }
+
+            async fn verify_doc(&self, w: &$crate::DocWrite, valid_ms: Option<Option<i64>>) -> $crate::Result<$crate::DocChanged> {
+                let w = w.clone();
+                run!(self.write, |c| dq::verify(c, &w, valid_ms).await)
+            }
+
+            async fn split_doc(&self, w: &$crate::DocWrite, level: i64) -> $crate::Result<$crate::DocMovedRec> {
+                let w = w.clone();
+                run!(self.write, |c| dq::split(c, &w, level).await)
+            }
+
+            async fn extract_doc(&self, w: &$crate::DocWrite, anchor: &str, title: &str, kind: Option<&str>) -> $crate::Result<$crate::DocMovedRec> {
+                let (w, anchor, title, kind) = (w.clone(), anchor.to_string(), title.to_string(), kind.map(str::to_string));
+                run!(self.write, |c| dq::extract(c, &w, &anchor, &title, kind.as_deref()).await)
+            }
+
+            async fn merge_doc(&self, w: &$crate::DocWrite, into: i64) -> $crate::Result<$crate::DocMovedRec> {
+                let w = w.clone();
+                run!(self.write, |c| dq::merge(c, &w, into).await)
+            }
+
+            async fn docs(&self, q: &$crate::DocQuery) -> $crate::Result<Vec<$crate::DocRec>> {
+                let q = q.clone();
+                run!(self.read_query, |c| dq::list(c, &q).await)
+            }
+
+            async fn search_docs(&self, q: &$crate::DocSearchQuery) -> $crate::Result<$crate::DocSearchRes> {
+                let q = q.clone();
+                run!(self.read_query, |c| dq::search(c, &q).await)
+            }
+
+            async fn doc_index(&self, org_id: i64, team_id: Option<i64>, now: i64, scan: Option<i64>) -> $crate::Result<(Vec<$crate::DocRec>, i64)> {
+                run!(self.read_query, |c| dq::index(c, org_id, team_id, now, scan).await)
+            }
+
+            async fn doc_candidates(
+                &self,
+                org_id: i64,
+                kind: &str,
+                title: &str,
+                description: &str,
+                slug: Option<&str>,
+                except: i64,
+                scan: Option<i64>,
+            ) -> $crate::Result<Vec<($crate::DocRec, f64)>> {
+                let (kind, title, description, slug) = (kind.to_string(), title.to_string(), description.to_string(), slug.map(str::to_string));
+                run!(self.read_query, |c| dq::candidates(c, org_id, &kind, &title, &description, slug.as_deref(), except, scan).await)
+            }
+
+            async fn doc_links(&self, org_id: i64, num: i64) -> $crate::Result<Option<(Vec<$crate::DocLinkRec>, Vec<$crate::DocLinkRec>)>> {
+                run!(self.read, |c| {
+                    match dq::by_num(c, org_id, num).await? {
+                        Some(d) => Ok(Some(dq::links(c, org_id, &d).await?)),
+                        None => Ok(None),
+                    }
+                })
+            }
+
+            async fn doc_check(&self, org_id: i64, team_id: Option<i64>, limit: i64) -> $crate::Result<Vec<$crate::DocLinkRec>> {
+                run!(self.read_query, |c| dq::check(c, org_id, team_id, limit).await)
+            }
+
+            async fn doc_kinds(&self, org_id: i64) -> $crate::Result<Vec<$crate::DocKindRec>> {
+                run!(self.read, |c| dq::kinds(c, org_id).await)
+            }
+
+            async fn doc_kind(&self, org_id: i64, name: &str) -> $crate::Result<Option<$crate::DocKindRec>> {
+                let name = name.to_string();
+                run!(self.read, |c| dq::kind(c, org_id, &name).await)
+            }
+
+            async fn put_doc_kind(&self, org_id: i64, kind: &$crate::DocKindPut, max: Option<i64>) -> $crate::Result<$crate::DocKindRec> {
+                let kind = kind.clone();
+                run!(self.write, |c| dq::put_kind(c, org_id, &kind, max).await)
+            }
+
+            async fn record_doc_comment(
+                &self,
+                w: &$crate::DocWrite,
+                message_id: i64,
+                thread_id: i64,
+                anchor: Option<&str>,
+                path: Option<&str>,
+            ) -> $crate::Result<$crate::DocRec> {
+                let (w, anchor, path) = (w.clone(), anchor.map(str::to_string), path.map(str::to_string));
+                run!(self.write, |c| dq::comment(c, &w, message_id, thread_id, anchor.as_deref(), path.as_deref()).await)
+            }
+
+            async fn doc_commenters(&self, org_id: i64, num: i64) -> $crate::Result<Vec<String>> {
+                run!(self.read, |c| dq::commenters(c, org_id, num).await)
+            }
+
+            async fn add_doc_thread(&self, w: &$crate::DocWrite, thread_id: i64, note: &str) -> $crate::Result<bool> {
+                let (w, note) = (w.clone(), note.to_string());
+                run!(self.write, |c| dq::add_thread(c, &w, thread_id, &note).await)
+            }
+
+            async fn link_task_docs(&self, w: &$crate::DocWrite, task_id: i64, task_num: i64, nums: &[i64]) -> $crate::Result<Vec<i64>> {
+                let (w, nums) = (w.clone(), nums.to_vec());
+                run!(self.write, |c| dq::link_task(c, &w, task_id, task_num, &nums).await)
+            }
+
+            async fn thread_docs(&self, org_id: i64, thread_id: i64) -> $crate::Result<Vec<$crate::DocRec>> {
+                run!(self.read, |c| dq::thread_docs(c, org_id, thread_id).await)
+            }
+
+            async fn record_doc_reminder(&self, org_id: i64, doc_id: i64, kind: &str, to: &str, message_id: i64) -> $crate::Result<()> {
+                let (kind, to) = (kind.to_string(), to.to_string());
+                run!(self.write, |c| dq::reminder(c, org_id, doc_id, &kind, &to, message_id).await)
+            }
+
+            async fn claim_expired_docs(&self, now: i64, limit: i64) -> $crate::Result<Vec<$crate::DocRec>> {
+                run!(self.write, |c| dq::claim_expired(c, now, limit).await)
+            }
+
+            async fn claim_dangling_docs(&self, now: i64, limit: i64) -> $crate::Result<Vec<($crate::DocRec, Vec<$crate::DocLinkRec>)>> {
+                run!(self.write, |c| dq::claim_dangling(c, now, limit).await)
+            }
         }
 
         impl_task_queries!($db, $dialect);
+        impl_doc_queries!($db, $dialect);
     };
 }

@@ -46,6 +46,9 @@ pub struct Org {
     /// Bytes of the org's tasks, counted against the storage quota with
     /// `stored_bytes`.
     pub task_bytes: i64,
+    /// Bytes of the org's documents, counted against the storage quota
+    /// with `stored_bytes` and `task_bytes`.
+    pub doc_bytes: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,6 +139,9 @@ pub struct Team {
     pub parent_id: Option<i64>,
     pub parent: Option<String>,
     pub managed: bool,
+    /// `human`: every document of the team waits for the user to activate
+    /// it.
+    pub doc_activate_by: Option<String>,
     pub created_at: i64,
 }
 
@@ -151,6 +157,8 @@ pub struct TeamChange {
     /// Replace the contacts (member seat names).
     pub contacts: Option<Vec<String>>,
     pub managed: Option<bool>,
+    /// `human` or `None` (see [`Team::doc_activate_by`]).
+    pub doc_activate_by: Option<Option<String>>,
 }
 
 /// The visible part of a seat or team: what a card shows.
@@ -1075,4 +1083,364 @@ pub struct TaskBoardRec {
     pub overdue: Vec<TaskRec>,
     /// Unfinished tasks with unfinished blockers.
     pub chains: Vec<TaskRec>,
+}
+
+// --- documents -------------------------------------------------------------------
+
+pub use amail_proto::{ActivateBy, DocEventKind, DocStatus};
+
+/// The resource rules of documents that a public server configures (see
+/// `amail_server::config::DocLimits`); `None`: no limit.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DocBounds {
+    /// Documents of one org (numbers given out).
+    pub docs_per_org: Option<i64>,
+    /// Sections of one revision that are stored and searched.
+    pub sections_per_doc: Option<usize>,
+    /// Links of one revision that are recorded.
+    pub links_per_rev: Option<usize>,
+    /// Kinds of one org.
+    pub kinds_per_org: Option<i64>,
+    /// Documents the per-turn index is built from.
+    pub index_scan: Option<i64>,
+    /// Documents of a kind a new document is compared with.
+    pub candidates_scan: Option<i64>,
+}
+
+/// A document kind of an org.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocKindRec {
+    pub id: i64,
+    pub org_id: i64,
+    pub name: String,
+    pub description: String,
+    pub required_sections: Vec<String>,
+    pub activate_by: ActivateBy,
+    pub in_index: bool,
+    pub body_cap_bytes: i64,
+    pub verify_days: Option<i64>,
+    pub builtin: bool,
+    pub disabled: bool,
+    /// Documents of the kind ([`crate::Store::doc_kinds`] only).
+    pub docs: i64,
+}
+
+/// A kind to add or change ([`crate::Store::put_doc_kind`]): a missing
+/// field keeps its value (a new kind: the default).
+#[derive(Debug, Clone, Default)]
+pub struct DocKindPut {
+    pub name: String,
+    pub description: Option<String>,
+    pub required_sections: Option<Vec<String>>,
+    pub activate_by: Option<ActivateBy>,
+    pub in_index: Option<bool>,
+    pub body_cap_bytes: Option<i64>,
+    /// `Some(None)`: no expiry.
+    pub verify_days: Option<Option<i64>>,
+    pub disabled: Option<bool>,
+}
+
+/// A document as stored, with the names of its owner and team and its
+/// relations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocRec {
+    pub id: i64,
+    pub org_id: i64,
+    pub num: i64,
+    pub slug: Option<String>,
+    pub kind: String,
+    pub title: String,
+    pub description: String,
+    /// The current revision's body; empty in listings.
+    pub body: String,
+    pub status: DocStatus,
+    pub owner_id: i64,
+    pub owner: String,
+    pub team_id: Option<i64>,
+    pub team: Option<String>,
+    pub labels: Vec<String>,
+    pub editors: Vec<String>,
+    pub pinned: bool,
+    pub rev: i64,
+    pub body_bytes: i64,
+    pub tokens: i64,
+    pub sha256: String,
+    pub verified_at: Option<i64>,
+    pub verified_by: Option<String>,
+    pub expires_at: Option<i64>,
+    pub thread_id: Option<i64>,
+    pub event_seq: i64,
+    pub created_at: i64,
+    pub updated_at: i64,
+    /// Relations, as numbers.
+    pub parent: Option<i64>,
+    pub supplements: Option<i64>,
+    pub superseded_by: Option<i64>,
+    pub replaces: Vec<i64>,
+    pub related: Vec<i64>,
+}
+
+impl DocRec {
+    /// `expires_at` has passed.
+    pub fn stale(&self, now: i64) -> bool {
+        self.expires_at.is_some_and(|e| e <= now)
+    }
+}
+
+/// One revision; `body` is empty in lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocRevRec {
+    pub rev: i64,
+    pub title: String,
+    pub description: String,
+    pub body: String,
+    pub bytes: i64,
+    pub sha256: String,
+    pub message: Option<String>,
+    pub author: Option<String>,
+    pub written_by: Option<String>,
+    pub at: i64,
+}
+
+/// A section of the current revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocSectionRec {
+    pub anchor: String,
+    pub level: i64,
+    pub heading: String,
+    pub path: String,
+    pub start: i64,
+    pub end: i64,
+    pub tokens: i64,
+}
+
+/// A link of a current revision, with what is known of its target now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocLinkRec {
+    /// The number of the document the link is in.
+    pub src: i64,
+    pub src_anchor: String,
+    /// `doc`, `task`, `message`, `thread`, `seat`, `path`.
+    pub kind: String,
+    pub id: String,
+    pub num: Option<i64>,
+    pub anchor: Option<String>,
+    pub line: Option<i64>,
+    pub title_at_write: Option<String>,
+    pub title: Option<String>,
+    pub dangling: bool,
+    pub stale: bool,
+}
+
+/// A document event as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocEventRec {
+    pub doc_id: i64,
+    pub seq: i64,
+    pub at: i64,
+    pub actor: Option<String>,
+    pub written_by: Option<String>,
+    pub kind: DocEventKind,
+    pub field: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub note: Option<String>,
+    pub message_id: Option<i64>,
+    pub rev: Option<i64>,
+}
+
+/// A comment ([`DocDetailRec::comments`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocCommentRec {
+    pub message_id: i64,
+    pub by: Option<String>,
+    pub at: i64,
+    pub anchor: Option<String>,
+    pub path: Option<String>,
+    /// The current revision has no section `anchor`.
+    pub removed: bool,
+}
+
+/// [`crate::Store::doc_detail`].
+#[derive(Debug, Clone)]
+pub struct DocDetailRec {
+    pub doc: DocRec,
+    pub sections: Vec<DocSectionRec>,
+    /// Every document related to this one (parent, children, supersession,
+    /// supplements, related), without bodies.
+    pub relatives: Vec<DocRec>,
+    /// Numbers of the children (`parent` is this document).
+    pub children: Vec<i64>,
+    pub supplemented_by: Vec<i64>,
+    pub links: Vec<DocLinkRec>,
+    pub linked_from: Vec<DocLinkRec>,
+    /// Threads citing the document.
+    pub threads: Vec<TaskLinkRec>,
+    /// Tasks whose title cites the document.
+    pub tasks: Vec<TaskRec>,
+    pub comments: Vec<DocCommentRec>,
+    /// The newest events, oldest first.
+    pub events: Vec<DocEventRec>,
+}
+
+/// Who writes which document. The store checks the rights: `is_user` (the
+/// org's user) may do everything; the owner may change every field; seats in
+/// `editors` may revise the body, title, description, labels, slug, team
+/// and parent.
+#[derive(Debug, Clone, Default)]
+pub struct DocWrite {
+    pub org_id: i64,
+    pub num: i64,
+    /// The seat recorded as the actor; `None` for the server itself.
+    pub actor_id: Option<i64>,
+    pub is_user: bool,
+    pub written_by: Option<String>,
+    /// Refuse growth ([`crate::StoreError::StorageQuota`]) beyond this
+    /// many bytes of mail, tasks and documents.
+    pub quota: Option<i64>,
+    /// Refuse with `stale` unless the document's `rev` is this.
+    pub if_rev: Option<i64>,
+    pub bounds: DocBounds,
+}
+
+/// A new document ([`crate::Store::create_doc`]).
+#[derive(Debug, Clone, Default)]
+pub struct NewDocRec {
+    pub w: DocWrite,
+    pub owner_id: i64,
+    pub kind: String,
+    pub title: String,
+    pub description: String,
+    pub body: String,
+    pub slug: Option<String>,
+    /// `None`: the owner's team.
+    pub team_id: Option<i64>,
+    pub labels: Vec<String>,
+    pub editors: Vec<String>,
+    pub parent: Option<i64>,
+    pub supplements: Option<i64>,
+    pub message: Option<String>,
+    pub client_key: Option<String>,
+    /// (path, exists) as the node found them.
+    pub paths: Vec<(String, bool)>,
+}
+
+/// A write of the body or of one section.
+#[derive(Debug, Clone, Default)]
+pub struct DocBodyRec {
+    pub body: String,
+    pub section: Option<String>,
+    pub message: Option<String>,
+    pub paths: Vec<(String, bool)>,
+}
+
+/// Changes of a document's fields: a missing field is unchanged,
+/// `Some(None)` clears it. Seats and teams are ids of the org's; documents
+/// are numbers.
+#[derive(Debug, Clone, Default)]
+pub struct DocChange {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub slug: Option<Option<String>>,
+    pub labels: Option<Vec<String>>,
+    pub team_id: Option<Option<i64>>,
+    pub parent: Option<Option<i64>>,
+    pub supplements: Option<Option<i64>>,
+    pub related: Option<Vec<i64>>,
+    pub owner_id: Option<i64>,
+    pub editors: Option<Vec<String>>,
+    pub status: Option<DocStatus>,
+    pub pinned: Option<bool>,
+    pub expires_at: Option<Option<i64>>,
+    pub message: Option<String>,
+}
+
+/// What a write did.
+#[derive(Debug, Clone)]
+pub struct DocChanged {
+    pub before: DocRec,
+    pub doc: DocRec,
+    /// Fields that changed (`body`, `title`, `status`, ...).
+    pub fields: Vec<String>,
+    /// A new revision was written.
+    pub revised: bool,
+    /// The write's text equals the current revision: nothing was written.
+    pub unchanged: bool,
+    /// Dangling links of the current revision after the write.
+    pub dangling: Vec<DocLinkRec>,
+    /// Documents this write newly related this one to, with the relation
+    /// (`supplements`, `supersedes`), for their owners' mail.
+    pub related_to: Vec<(String, DocRec)>,
+    /// `create_doc` with a `client_key` used before.
+    pub existing: bool,
+}
+
+/// What `split`, `extract` or `merge` did.
+#[derive(Debug, Clone, Default)]
+pub struct DocMovedRec {
+    /// The document the command was run on, after it.
+    pub doc: Option<DocRec>,
+    /// New documents (split, extract) or the target (merge).
+    pub created: Vec<DocRec>,
+    /// Other documents whose links were rewritten (numbers).
+    pub rewritten: Vec<i64>,
+    /// Tasks whose bodies were rewritten (numbers).
+    pub tasks_rewritten: Vec<i64>,
+    /// (`#anchor`, `d31` or `d12#anchor`).
+    pub moved: Vec<(String, String)>,
+}
+
+/// [`crate::Store::docs`].
+#[derive(Debug, Clone, Default)]
+pub struct DocQuery {
+    pub org_id: i64,
+    pub kind: Option<String>,
+    /// Empty: `draft` and `active`.
+    pub statuses: Vec<DocStatus>,
+    pub team_id: Option<i64>,
+    pub owner_id: Option<i64>,
+    pub label: Option<String>,
+    /// Only documents past `expires_at` (at `now`).
+    pub stale: bool,
+    pub pinned: bool,
+    /// Title, slug and description contain every term (`find`).
+    pub terms: Vec<String>,
+    pub before: Option<i64>,
+    pub limit: i64,
+    pub now: i64,
+}
+
+/// [`crate::Store::search_docs`].
+#[derive(Debug, Clone, Default)]
+pub struct DocSearchQuery {
+    pub org_id: i64,
+    pub terms: Vec<String>,
+    pub kind: Option<String>,
+    /// Empty: `active` only.
+    pub statuses: Vec<DocStatus>,
+    pub team_id: Option<i64>,
+    pub label: Option<String>,
+    pub owner_id: Option<i64>,
+    /// Hits of this team's documents come first.
+    pub caller_team: Option<i64>,
+    pub limit: i64,
+    pub now: i64,
+}
+
+/// One hit: the document (without body), the section and its own text.
+#[derive(Debug, Clone)]
+pub struct DocHitRec {
+    pub doc: DocRec,
+    pub anchor: String,
+    pub path: String,
+    pub text: String,
+}
+
+/// [`crate::Store::search_docs`].
+#[derive(Debug, Clone, Default)]
+pub struct DocSearchRes {
+    pub hits: Vec<DocHitRec>,
+    /// Every term was shorter than 3 characters: titles and descriptions
+    /// were searched.
+    pub titles_only: bool,
 }
