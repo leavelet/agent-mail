@@ -745,7 +745,6 @@ fn valid_model(m: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "._-:/@[]+".contains(c))
 }
 
-/// RFC 3339 to Unix ms.
 /// After a refresh of pending counts: the seats to ask again, and the
 /// seats the server refused for good (a permanent error of a per-seat
 /// request: asking again cannot help). A failed request for the whole org
@@ -772,6 +771,7 @@ fn after_refresh(
     (retry, refused)
 }
 
+/// RFC 3339 to Unix ms.
 fn parse_ts(s: &str) -> Option<i64> {
     s.parse::<jiff::Timestamp>()
         .ok()
