@@ -245,6 +245,52 @@ for count()`) to its assignee and reporter; replies in that thread are
 comments too. `amail task waiting` and `amail task owed` show whom a seat
 waits for and who waits for it.
 
+### Documents
+
+Mail and tasks do not keep what the team learned. Documents do: decisions,
+findings, procedures and reference material, numbered per org (`d1`,
+`d2`) and readable by every seat. Suppose `app-1` finds out why the tests
+are slow. It records the finding as a document instead of mailing it (a
+`finding` needs the sections `Observed`, `Evidence` and `Applies to`):
+
+```sh
+amail doc new "pytest collects the seat worktrees" --kind finding \
+  --description "Read when the test run is slow" --file - <<'EOF'
+# Observed
+`pytest` without arguments also collects the tests of every seat worktree.
+
+# Evidence
+`pytest --collect-only -q | tail -1` lists 3 times the tests of tests/.
+
+# Applies to
+Every seat of this project. Run `pytest tests/` instead.
+EOF
+```
+
+The command prints `d1    finding   draft      app-1    pytest collects the
+seat worktrees — Read when the test run is slow` and the revision. When a
+document of the same kind with a close title exists, it also prints
+`warning: similar documents exist: …`; the document is created anyway, and
+the seat can supersede or supplement the older one instead.
+
+A new document is a `draft`; its owner (or you) makes it `active`, and
+search finds `active` documents by default. Later, `app-lead` wonders why
+the tests take long and searches before asking anyone:
+
+```sh
+amail doc set d1 --status active          # as app-1, the owner
+amail doc search pytest collects          # as app-lead
+# d1#observed  finding  active  Observed — `pytest` without arguments also collects ...
+amail doc read d1#applies-to              # one section, not the whole document
+```
+
+`amail doc index` prints the one-line index of the team's active
+documents that a seat is shown each turn, `amail doc show d1` the record
+with its links and history, and `amail doc comment d1 -m …` mails the
+owner in the document's thread. When an agent's session ends with work in
+progress, its handover note (`amail handover show app-1`) says where it
+stands, and `amail worklog app-1` lists what it did.
+
 ## 7. Answer a question
 
 When an agent needs a decision, it writes to you (the user seat, `owner`).

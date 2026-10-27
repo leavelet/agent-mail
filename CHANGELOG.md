@@ -180,8 +180,8 @@ The first public version.
   `keep`. One pending request per task; it ends with the answer, with a
   change of the task's assignee or state, or after 24 hours, and the
   requester is told. Migration `0024_task_steal.sql`.
-- Documents, M9 (server and API; the command line, MCP tools, node
-  injection and web pages follow): an org's knowledge base under
+- Documents, M9 (server and API; the command line and MCP tools are
+  below; node injection and web pages follow): an org's knowledge base under
   `/v1/docs…` (migration `0026_docs.sql`). A document has a number per org
   (`d12`), an optional slug, a kind, a title, a one-line description, a
   Markdown body kept whole per revision, a status (`draft`, `active`,
@@ -241,6 +241,23 @@ The first public version.
     oldest entries. Worklog retention (`--worklog-days`) and the entries
     per request (`--max-worklog-batch`) are limits of public servers
     (defaults 90 days and 5,000).
+- Documents and seat handover on the command line, M9: `amail doc new`,
+  `show`, `read`, `write`, `set`, `supersede`, `verify`, `split`,
+  `extract`, `merge`, `list`, `search`, `find`, `index`, `history`,
+  `diff`, `backlinks`, `check`, `comment`, `kinds` and `kind add` (user
+  token); `amail handover show`, `write`, `template` and `request`; and
+  `amail worklog [seat] [--summary]`. A document is `d12`, `12` or a slug;
+  `d12#anchor` names a section to read, write, extract or comment on.
+  `doc show` prints the record, relations, links in and out (dangling and
+  stale marked), linked tasks and threads, comments, the last 20 events
+  and the first 2,000 characters of the body. `doc new` sends a
+  `client_key` derived from the caller, kind, title and description
+  (`--new` sends none) and prints similar existing documents as a
+  warning. Writes take `--if-rev`; a 409 `stale` prints the revisions and
+  events since and the diff. `split`, `extract` and `merge` print where
+  each section went (`#rollback -> d31`). `handover write` reads the note
+  from `-m`, a file or stdin; a note lacking fields prints the missing
+  labels and points to `amail handover template`.
 
 #### Running agents
 
@@ -250,13 +267,22 @@ The first public version.
   `task_show`, `task_list`, `task_mine`, `task_next`, `task_waiting`,
   `task_owed`, `task_board`, `task_set`, `task_take`, `task_dep`,
   `task_undep`, `task_link`, `task_unlink`, `task_comment`,
-  `task_history`, `task_steal`, `task_yield`, `task_keep`) as typed tools. Each answers the server's JSON with the
+  `task_history`, `task_steal`, `task_yield`, `task_keep`), the document
+  tools (`doc_new`, `doc_show`, `doc_read`, `doc_write`, `doc_set`,
+  `doc_search`, `doc_find`, `doc_list`, `doc_index`, `doc_history`,
+  `doc_split`, `doc_extract`, `doc_verify`, `doc_comment`) and
+  `handover_show`, `handover_write` and `worklog` as typed tools. Each answers the server's JSON with the
   command's text rendering; API errors are tool errors with the server's
   code and message. The node registers it for the sessions it launches
   (Claude Code: `--mcp-config` and an allow rule for its tools; Codex:
   `[mcp_servers.amail]` in the node's Codex home, the seat found from the
   thread id of each call). The command line stays the documented
-  interface.
+  interface. The text of the document, handover and worklog tools is cut
+  at 25,000 characters with a line that says what to narrow, and
+  `doc_read` of a whole document above 20,000 characters answers its
+  section list unless `whole` is true. The server's instructions tell
+  the agent to search documents before deciding how something is done
+  and to record findings as documents rather than mail.
 - The node keeps Codex's app-server daemon at the `codex` command's
   version: it turns the daemon package's self-update off
   (`app-server-daemon/settings.json`) and removes a package of another

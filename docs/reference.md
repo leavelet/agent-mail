@@ -131,6 +131,58 @@ skipped), one per task:
   the same file twice gives `same` for every record.
 - Nothing is mailed: no reminders and no discussion threads.
 
+### Documents
+
+Every document command takes a document as `d12`, `12` or a slug, and
+`d12#anchor` (or `slug#anchor`) where a section is read, written,
+extracted or commented. Commands print the server's JSON with `--json`,
+and otherwise one line per document: number, kind, status, owner, title,
+the description, and marks (`· stale`, `· pinned`, `· superseded by
+d30`). See [concepts](concepts.md#documents) for kinds, statuses, who may
+write what, links and the index.
+
+The commands that write one document (`write`, `set`, `split`, `extract`,
+`merge`) take `--if-rev N`: when the document's revision is not `N`
+(`Rev:` in `doc show`), nothing is changed, the command prints the
+revisions and events since revision `N` and the diff to the current
+revision (with `--json`, the whole 409 answer), and fails with `stale`.
+`new`, `write`, `set` and `supersede` take `--silent`: the events are
+recorded, but no notification mail is sent.
+
+| command | |
+|---|---|
+| `amail doc new <title> [--kind k] [-m body \| --file f] [--description d] [--slug s] [--team t] [--label l]... [--parent dN] [--supplements dN] [--message m] [--silent] [--new]` | create a document (`draft`; kind `reference` by default). Prints the document's line and revision, `warning: similar documents exist: …` when documents of the same kind have a close title, description or slug (the create is never refused for them), and the links that are dangling. `--file -` reads the body from stdin. The command sends a `client_key` derived from you, the kind, the title and the description: the same command again within 24 hours prints the document it created and creates nothing. `--new` sends no key |
+| `amail doc show <dN>` | the fields one per line (`Kind:`, `Status:`, `Rev:` with the token estimate and size, `Owner:`, `Verified:` with the expiry, `Advice:`), the relations (parent, children, superseded by, replaces, supplements, supplemented by, related), the sections with anchors and token estimates (the first 30), the links out (`#evidence -> d99  (dangling)`, `(stale: the path no longer exists)`, `(renamed; was …)`), the links in (`Linked from:`), linked tasks and threads, comments (`on #rollback (Deploy > Rollback)`, `on a removed section (was: …)`), the last 20 events, and the body behind `  > ` up to 2,000 characters (1,000 for an `index` document), then `body not shown: amail doc read dN` |
+| `amail doc read <dN[#anchor]> [--rev N] [--sections]` | a header line (`d12#rollback rev 3 · Deploy > Rollback · ~120 tokens`), then the whole body, one section, or the body of revision `N`. `--sections` lists the sections, indented by level, with anchors and token estimates |
+| `amail doc write <dN[#anchor]> (-m text \| --file f \| stdin) [--section anchor] [--message m] [--if-rev N] [--silent]` | a new revision of the body, or of one section (the section's heading stays unless the text starts with a heading). Prints the document's line and the new revision, `unchanged` when the text equals the current one (no revision is written), dangling links and the advice to split |
+| `amail doc set <dN> [--title t] [--description d] [--slug s\|none] [--labels a,b\|none] [--team t\|none] [--parent dN\|none] [--supplements dN\|none] [--related dN,dM\|none] [--owner seat] [--editors a,b\|none] [--status draft\|active\|archived] [--pin \| --unpin] [--message m] [--if-rev N] [--silent]` | change fields; the lists replace the old ones. A new title or description is a revision |
+| `amail doc supersede <dN> --by <dM> [--silent]` | `dM` replaces `dN`: `dN` becomes `superseded` |
+| `amail doc verify <dN> [--for 30d]` | confirm the content: sets the verification time and the expiry (`30d`, `12h`, `2w`, `none`; default the kind's interval) |
+| `amail doc split <dN> [--level 1\|2] [--if-rev N]` | each heading of the level becomes a child document; prints where each section went (`#rollback -> d31`). Fails with `nothing_to_split` when there is no heading of that level |
+| `amail doc extract <dN#anchor> --into <title> [--kind k] [--if-rev N]` | the section moves into a new document that supplements `dN`; prints `#anchor -> d31` |
+| `amail doc merge <dM> --into <dN> [--if-rev N]` | `dM` is appended to `dN` as a section and becomes superseded by it; prints `dM -> dN#anchor` and each moved subsection |
+| `amail doc list [--kind k] [--status s,s\|all] [--team t] [--owner seat] [--label l] [--stale] [--pinned] [--limit n] [--before n]` | documents newest first; `draft` and `active` unless `--status`. Continue with `--before` (printed under the list) |
+| `amail doc search <terms>... [--kind k] [--status s\|all] [--team t] [--label l] [--owner seat] [--limit n]` | one line per section that matches: `d12#rollback  runbook  active  Deploy > Rollback — <snippet>  (verified 2026-10-20)`; `active` documents unless `--status`, your team first, stale documents last, at most 20 |
+| `amail doc find <words>... [--kind k] [--status s] [--limit n]` | documents whose title, slug or description contains every word, in any status |
+| `amail doc index [--team t]` | the index a seat of the team is shown each turn (default: your team): one line per document, `d12  runbook  <title> — <description>`, and how many were left out |
+| `amail doc history <dN> [--all]` | every revision (`rev 3  <time>  w1  <title>  1,234 bytes  (message)`), then the last 50 events (`--all`: every event) |
+| `amail doc diff <dN> [N] [M]` | a unified diff from revision `N` to `M` (default: the last change; with `N` only, from `N` to the current revision) |
+| `amail doc backlinks <dN>` | the links into the document (`d40#steps -> d12#rollback`) |
+| `amail doc check [--team t]` | the dangling and stale links of draft and active documents |
+| `amail doc comment <dN[#anchor]> [-m text]` | mail in the document's discussion thread (`[d12] <title>`) to its owner, `Cc` earlier commenters; the body comes from stdin without `-m` |
+| `amail doc kinds` | the org's kinds: who activates, whether active documents are in the index, the verification interval, the body cap, the number of documents, the required sections and the description |
+| `amail doc kind add <name> [--sections a,b,c] [--activate-by owner\|human] [--no-index] [--cap bytes] [--verify-days n] [--description d] [--disable \| --enable]` | user token: add a kind, or change one. A kind is never deleted; `--disable` stops new documents of it |
+
+### Seat handover
+
+| command | |
+|---|---|
+| `amail handover show [seat] [--rev N]` | a seat's handover note (default: yours): who wrote it and when, in which session, which session read it, whether the server filled in `Pointers`, an unanswered request, the fields behind `  > `, and the newest 20 revisions |
+| `amail handover write [file \| -m text] [--private \| --public] [--session id] [--seat s]` | write your note; the text comes from `-m`, a file (`-`: stdin) or stdin, with the fields as `Field:` lines or Markdown headings. A note lacking a field prints the labels it lacks and fails with `note_fields_missing`; an empty `Pointers` is filled in by the server from the worklog. `--private` limits the note to the seat, its lead and the user, `--public` lifts that; without either the previous note's setting is kept. `--seat`: a user token writes the note of an agent seat |
+| `amail handover template` | the note's fields in order, with what each holds (needs no server) |
+| `amail handover request <seat>` | the seat's lead or the user: ask the seat for its note; the seat gets mail |
+| `amail worklog [seat] [--since 2h\|time] [--task tN] [--kind k] [--limit n] [--before id] [--summary]` | a seat's worklog (default: yours), newest first, one entry per line: time, kind, text, the task and document it names. `--summary` prints the number of entries, the counts per kind, the tasks touched and the last ten entries. The seat, its team, its lead and the user may read it |
+
 ### Administration of an org (user token)
 
 | command | |
@@ -210,8 +262,9 @@ the database.
 ## MCP server
 
 `amail mcp` is an MCP server (stdio, newline-delimited JSON-RPC) in the
-same binary. It offers the mail and task commands as typed tools, so a
-harness can call them without a shell command. The command line stays the
+same binary. It offers the mail, task and document commands, the handover
+note and the worklog as typed tools, so a harness can call them without a
+shell command. The command line stays the
 documented interface: the hooks and the mail instructions name `amail`
 commands, and the MCP server is an addition to them.
 
@@ -220,8 +273,11 @@ the server's JSON (the same JSON as the command with `--json`) as
 structured content, with the command's text rendering as text content. An
 API error is a tool result with `isError: true` whose structured content
 is the server's `{"error": {"code", "message", "status"}}` (for 409
-`stale`, the whole answer with `rev`, `task` and `since`); a missing or
-malformed argument gives the code `invalid_arguments`. A line that is not
+`stale`, the whole answer with `rev`, `task` and `since`, or for a
+document `rev`, `doc`, `since` and `diff`, and the text shows the changes
+and the diff; for 422 `note_fields_missing`, `missing`, and the text
+gives the template); a missing or malformed argument gives the code
+`invalid_arguments`. A line that is not
 JSON is skipped without an answer; a request for an unknown method gets a
 JSON-RPC error.
 
@@ -254,9 +310,33 @@ JSON-RPC error.
 | `task_unlink` | `num`, `thread_id`, `if_rev?` | `DELETE /tasks/{num}/links/{thread}` |
 | `task_comment` | `num`, `body` | `POST /tasks/{num}/comments` |
 | `task_history` | `num`, `after_seq?`, `limit?` | `GET /tasks/{num}/events` |
+| `doc_new` | `title`, `kind?`, `body?`, `description?`, `slug?`, `team?`, `labels[]?`, `parent?`, `supplements?`, `message?`, `silent?`, `client_key?` (default: derived from the caller, kind, title and description, as `amail doc new`) | `POST /docs` |
+| `doc_show` | `doc` | `GET /docs/{num}`; the structured content leaves `doc.body` out and gives `doc.body_chars` |
+| `doc_read` | `doc` (`d12#anchor` reads a section), `section?`, `rev?`, `sections?`, `whole?` | `GET /docs/{num}` with `?section=`, `?rev=`. A whole document above 20,000 characters answers the section list (and `whole_chars`, without the body) unless `whole` is true |
+| `doc_write` | `doc` (`d12#anchor` writes a section), `body`, `section?`, `message?`, `if_rev?`, `silent?` | `PUT /docs/{num}/body` |
+| `doc_set` | `doc`, `title?`, `description?`, `slug?`, `labels[]?`, `team?`, `parent?`, `supplements?`, `related[]?`, `owner?`, `editors[]?`, `status?` (`draft`, `active`, `archived`), `pinned?`, `message?`, `if_rev?`, `silent?` (`null` clears `slug`, `team`, `parent`, `supplements`); or `superseded_by` alone (with `silent?`) | `PATCH /docs/{num}`; with `superseded_by`, `POST /docs/{num}/supersede` |
+| `doc_search` | `terms`, `kind?`, `status?`, `team?`, `label?`, `owner?`, `limit?` | `GET /docs/search` |
+| `doc_find` | `words`, `kind?`, `status?`, `limit?` | `GET /docs/find` |
+| `doc_list` | `kind?`, `status?`, `team?`, `owner?`, `label?`, `stale?`, `pinned?`, `limit?`, `before?` | `GET /docs` |
+| `doc_index` | `team?` | `GET /docs/index` |
+| `doc_history` | `doc`, `after_seq?`, `limit?` | `GET /docs/{num}/history` |
+| `doc_split` | `doc`, `level?`, `if_rev?` | `POST /docs/{num}/split` |
+| `doc_extract` | `doc` (`d12#anchor`), `anchor?`, `into`, `kind?`, `if_rev?` | `POST /docs/{num}/extract` |
+| `doc_verify` | `doc`, `for?` | `POST /docs/{num}/verify` |
+| `doc_comment` | `doc` (`d12#anchor` comments on a section), `anchor?`, `body` | `POST /docs/{num}/comment` |
+| `handover_show` | `seat?` (default: the caller), `rev?` | `GET /seats/{name}/handover` |
+| `handover_write` | `text` or `fields` (`{state, summary, next, waiting_on, traps, verify, pointers}`), `private?`, `session?` | `PUT /seats/{name}/handover` for the caller's seat. On `note_fields_missing` the text names the missing fields and gives the template |
+| `worklog` | `seat?` (default: the caller), `since?`, `task?`, `kind?`, `limit?`, `before?`, `summary?` | `GET /seats/{name}/worklog` |
 
-A task number is an integer or a string such as `"t12"`. Tools that only
-read are marked with the `readOnlyHint` annotation.
+A task number is an integer or a string such as `"t12"`; a document is an
+integer, a string such as `"d12"`, or a slug, and `"d12#anchor"` names a
+section. Tools that only read are marked with the `readOnlyHint`
+annotation. The text of the document, handover and worklog tools is cut
+at 25,000 characters, with a last line that says what to narrow (for
+`worklog`: `… cut at 25,000 of 41,200 characters: pass since, task, kind
+or a lower limit, or summary: true`); when
+the JSON is larger than that too, the structured content is `{cut: true,
+chars, narrow}` instead.
 
 **Identity.** Without `--node`, the server finds its server URL and token
 as the command line does ([above](#configuration-of-the-command-line)),
