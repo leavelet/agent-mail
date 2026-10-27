@@ -46,6 +46,7 @@ handover_tests!(
     idle_seat_with_work_is_asked,
     codex_index_and_compaction,
     slow_index_and_note_leave_mail_on_time,
+    ps_knows_the_note_from_the_start,
 );
 
 const ASK: &str = "Write your handover note now with `amail handover write`; then stop.";
@@ -941,4 +942,53 @@ async fn slow_index_and_note_leave_mail_on_time(b: Backend) {
     // Shown once.
     let v = quick("UserPromptSubmit").await;
     assert!(!hook_text(&v).unwrap_or_default().contains("Handover note"));
+}
+
+/// `amail ps` shows whether the note is current without waiting for the
+/// next check: after the seat wrote its note in a turn, and after a node
+/// restart.
+async fn ps_knows_the_note_from_the_start(b: Backend) {
+    let Some(mut h) = setup(b, "ps_knows_the_note_from_the_start").await else {
+        return;
+    };
+    let w1 = h.seat("w1", "claude").await;
+    let inbox = FakeInbox::start(h.dir.path().join("cc.sock"), None);
+    let env = claude_env("w1", &inbox.path);
+    h.hook("claude", env.clone(), claude("SessionStart")).await;
+    h.wait("no note", || async {
+        h.seat_status("w1").await["handover_note"] == "none"
+    })
+    .await;
+    h.hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    // The seat writes its note with a shell command in the turn.
+    write_note(&w1, "w1", "none").await;
+    let tool = with(
+        claude("PostToolUse"),
+        &[(
+            "tool_input",
+            json!({"command": "cd /work/app && amail handover write -m \"State: on track ...\""}),
+        )],
+    );
+    h.hook("claude", env.clone(), tool).await;
+    h.wait("note current after the write", || async {
+        h.seat_status("w1").await["handover_note"] == "current"
+    })
+    .await;
+    h.hook("claude", env.clone(), claude("Stop")).await;
+    h.wait("turn start in the worklog", || async {
+        !node_entries(&h, "w1", "turn_start").await.is_empty()
+    })
+    .await;
+    // After a restart the node fetches the note's state and the last turn
+    // from the server.
+    h.restart_node().await;
+    h.wait("note current after a restart", || async {
+        h.seat_status("w1").await["handover_note"] == "current"
+    })
+    .await;
+    // A turn after the note makes it stale.
+    h.hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    assert_eq!(h.seat_status("w1").await["handover_note"], "stale");
 }

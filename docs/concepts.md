@@ -947,7 +947,11 @@ less what the mail in the same answer needs. When it is longer, `State`,
 of `Traps` and `Pointers` as fits, and the text ends with `… the rest:
 amail handover show`. The node then records the read. `amail ps` shows
 for each seat whether its note is `current` (no turn started after it was
-written), `stale` or `none`, as far as the node has seen.
+written), `stale` or `none`. The node asks the server for the note's
+state when it connects, when a seat is added or starts, and after the
+seat runs `amail handover write` (or the MCP tool `handover_write`);
+after a restart it takes the start of the seat's last turn from the
+worklog.
 
 Who reads what:
 

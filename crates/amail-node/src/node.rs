@@ -1740,6 +1740,9 @@ impl Node {
                 }
             }
             st.seat(seat).last_activity = now_ms();
+            if connected && st.want_note_state(seat, false) {
+                self.jobs_kick.notify_one();
+            }
             {
                 let s = st.seat(seat);
                 s.harness = Some(adapter.harness());
@@ -1884,6 +1887,9 @@ impl Node {
                             // The task it holds may have changed: from now
                             // on the server fills it in.
                             ho.doing = None;
+                        }
+                        if hook.facts.note_tool && connected && st.want_note_state(seat, true) {
+                            self.jobs_kick.notify_one();
                         }
                         let text = if input.is_empty() {
                             tool.clone()
@@ -2624,6 +2630,10 @@ impl Node {
             st.save_dirty = true;
             // Its pending counts, in case the node did not keep them.
             st.dirty_pending.insert(seat.to_string());
+            // And its note's state, for `amail ps`.
+            if st.want_note_state(seat, false) {
+                self.jobs_kick.notify_one();
+            }
         }
         self.refresh_kick.notify_one();
         // A supervised seat resumes its last session when it has one;
@@ -2897,6 +2907,12 @@ impl Node {
                                 .filter(|(_, s)| s.harness.is_some())
                                 .map(|(n, _)| n.clone())
                                 .collect();
+                            // `amail ps` shows whether each note is current
+                            // from the start, not after the next check.
+                            for seat in &all {
+                                st.want_note_state(seat, false);
+                            }
+                            self.jobs_kick.notify_one();
                             st.dirty_presence.extend(all);
                             backoff = Duration::from_millis(250);
                             tracing::info!("connected to {}", self.cfg.url);

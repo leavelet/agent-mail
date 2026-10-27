@@ -109,6 +109,9 @@ pub struct HookFacts {
     /// `PostToolUse`: whether the call may change a task (see
     /// [`touches_tasks`]), judged on the whole input before it is cut.
     pub task_tool: bool,
+    /// `PostToolUse`: whether the call may have written the seat's
+    /// handover note (`amail handover write`, an amail handover tool).
+    pub note_tool: bool,
     /// `SessionEnd`: why the session ended.
     pub reason: Option<String>,
 }
@@ -124,7 +127,7 @@ impl HookFacts {
                 .map(str::to_string)
         };
         let tool = s("tool_name");
-        let mut task_tool = false;
+        let (mut task_tool, mut note_tool) = (false, false);
         let tool_input = input.get("tool_input").and_then(|v| {
             let text = match v {
                 Value::Null => return None,
@@ -142,12 +145,14 @@ impl HookFacts {
             };
             if let Some(tool) = &tool {
                 task_tool = touches_tasks(tool, &text);
+                note_tool = writes_note(tool, &text);
             }
             let line = amail_proto::text::line(text.trim()).into_owned();
             Some(cut_chars(&line, TOOL_INPUT_CHARS))
         });
-        if let (Some(tool), false) = (&tool, task_tool) {
-            task_tool = touches_tasks(tool, "");
+        if let Some(tool) = &tool {
+            task_tool |= touches_tasks(tool, "");
+            note_tool |= writes_note(tool, "");
         }
         HookFacts {
             cwd: s("cwd"),
@@ -155,6 +160,7 @@ impl HookFacts {
             tool,
             tool_input,
             task_tool,
+            note_tool,
             reason: s("reason"),
         }
     }
@@ -166,24 +172,35 @@ impl HookFacts {
 /// between `amail` and `task` are allowed).
 pub fn touches_tasks(tool: &str, input: &str) -> bool {
     let t = tool.to_ascii_lowercase();
-    if t.contains("amail") && t.contains("task") {
-        return true;
-    }
+    (t.contains("amail") && t.contains("task")) || runs_amail(input, &["task"])
+}
+
+/// Whether a tool call may write the seat's handover note: `amail handover
+/// write` in a shell command, or an amail MCP tool that writes the note.
+pub fn writes_note(tool: &str, input: &str) -> bool {
+    let t = tool.to_ascii_lowercase();
+    (t.contains("amail") && t.contains("handover_write"))
+        || runs_amail(input, &["handover", "write"])
+}
+
+/// Whether a shell command runs `amail` with the subcommand `words`
+/// anywhere in it (options before each word are skipped).
+fn runs_amail(input: &str, words: &[&str]) -> bool {
     if !input.contains("amail") {
         return false;
     }
     let is_sep = |c: char| matches!(c, ';' | '&' | '|' | '\n' | '(' | ')' | '`' | '{' | '}');
     input.split(is_sep).any(|segment| {
-        let words: Vec<&str> = segment
+        let args: Vec<&str> = segment
             .split_whitespace()
             .map(|w| w.trim_matches(|c| c == '"' || c == '\''))
             .collect();
-        words.iter().enumerate().any(|(i, w)| {
-            (*w == "amail" || w.ends_with("/amail"))
-                && words[i + 1..]
-                    .iter()
-                    .find(|w| !w.starts_with('-'))
-                    .is_some_and(|w| *w == "task")
+        args.iter().enumerate().any(|(i, a)| {
+            if *a != "amail" && !a.ends_with("/amail") {
+                return false;
+            }
+            let mut rest = args[i + 1..].iter().filter(|a| !a.starts_with('-'));
+            words.iter().all(|w| rest.next() == Some(w))
         })
     })
 }
@@ -580,6 +597,9 @@ mod tests {
         assert!(!touches_tasks("Bash", "cargo test"));
         assert!(!touches_tasks("Bash", "amail send lead -m 'task list'"));
         assert!(!touches_tasks("mcp__amail__send", "{}"));
+        assert!(writes_note("Bash", "cd /w; amail handover write -m x"));
+        assert!(writes_note("mcp__amail__handover_write", "{}"));
+        assert!(!writes_note("Bash", "amail handover show w1"));
     }
 
     /// The command that closes the task comes after the part kept for the
