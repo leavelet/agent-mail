@@ -262,7 +262,19 @@ pub async fn put(
     }
     let session = check_session(req.session.as_deref())?;
     let mut fields = match (req.text, req.fields) {
-        (Some(t), None) => p::parse_handover(&t).trimmed(),
+        (Some(t), None) => {
+            let f = p::parse_handover(&t).trimmed();
+            // A compaction summary without the note's labels is the
+            // draft's Summary.
+            if source == HandoverSource::Compaction && f.values().iter().all(|v| v.is_empty()) {
+                p::HandoverFields {
+                    summary: t.trim().to_string(),
+                    ..Default::default()
+                }
+            } else {
+                f
+            }
+        }
         (None, Some(f)) => f.trimmed(),
         (Some(_), Some(_)) => return Err(ApiError::bad_request("give text or fields, not both")),
         (None, None) => return Err(ApiError::bad_request("give the note as text or fields")),
