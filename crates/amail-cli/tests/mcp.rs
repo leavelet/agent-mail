@@ -121,6 +121,14 @@ fn drive(url: &str, t1: &str, t2: &str) {
         init["result"]["capabilities"]["tools"].is_object(),
         "{init}"
     );
+    // The instructions state the rule for findings concretely.
+    let instructions = init["result"]["instructions"].as_str().unwrap();
+    for part in [
+        "A fact you verified about the code, a tool or the environment is a `finding` document",
+        "`doc_comment` is for correcting or discussing an existing document",
+    ] {
+        assert!(instructions.contains(part), "{instructions}");
+    }
     m2.initialize();
 
     // Every tool is listed, with an object schema whose required fields

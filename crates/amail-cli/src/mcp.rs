@@ -314,8 +314,10 @@ per org (t12); `task_mine` and `task_next` show your work. Close a task with a r
 it is about); split work into child tasks (`parent`) so that the parent shows progress; \
 pass the task's `rev` as `if_rev` when you change a title or body. The team keeps decisions, \
 findings and procedures as documents (d12): search them with `doc_search` before you decide how \
-something is done here, read one section at a time with `doc_read`, and record a new finding or \
-decision as a document with `doc_new`, not as mail.";
+something is done here and read one section at a time with `doc_read`. A fact you verified \
+about the code, a tool or the environment is a `finding` document with its evidence (`doc_new` \
+with kind finding); a decision is a `decision` document; neither goes in mail. `doc_comment` is \
+for correcting or discussing an existing document.";
 
 /// One tool: its name, description, input schema and whether it only reads.
 struct ToolDef {

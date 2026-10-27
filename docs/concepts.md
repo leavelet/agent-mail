@@ -765,8 +765,14 @@ for at most a third of the harness's injection budget (about 3,000
 characters on Claude Code and dsh, 2,000 on Codex) and cuts the index
 further when the mail in the same answer leaves less room: mail always
 comes first. The mail instructions every seat gets tell the agent what the
-index is and to search before writing a new document
-([harness support](harnesses.md#what-the-node-does-with-hooks)).
+index is and to search before writing a new document, and state where
+knowledge goes: a fact the agent verified about the code, a tool or the
+environment is a `finding` document with its evidence, a decision is a
+`decision` document, neither goes in mail, and a comment is for correcting
+or discussing an existing document. The seat introduction adds that a
+verified fact belongs in a `finding` document, not only in a compaction
+summary; the MCP server's instructions say the same for `doc_new` and
+`doc_comment` ([harness support](harnesses.md#what-the-node-does-with-hooks)).
 
 ### Candidates on create
 
