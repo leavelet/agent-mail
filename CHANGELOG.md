@@ -412,6 +412,46 @@ The first public version.
   - Team files: `docs.activate_by` (`[team]` and `[[group]]`),
     `handover_idle`, and `handover = "private"` per seat; `amail up`
     applies them. `amail ps` has a NOTE column.
+- Documents and seat handover, fixes from the M9 acceptance run:
+  - The node finds `amail task` (and the amail task tools) in the whole
+    tool input, also after `cd`, `&&` or `;` and beyond the 200
+    characters kept for the worklog, so a closing command such as `cd ...;
+    git commit ...; amail send ...; amail task done t3` asks for the note.
+  - `amail ps` NOTE is right from the start: the node fetches the note's
+    state when it connects, when a seat is added and after the seat runs
+    `amail handover write`; after a restart it reads the last turn's start
+    from the worklog.
+  - After `/compact` in Claude Code (`SessionStart` before `PostCompact`)
+    the session is shown the compaction draft; the note before it is not
+    shown or recorded as read.
+  - A new Codex session's start is recorded in the worklog (and its note
+    shown) at the prompt that registers it.
+  - The node stops refreshing pending counts the server refuses (the user
+    seat, 403) until it reconnects.
+  - The worklog records an agent seat's document events (`doc`, with the
+    document's number): create, revision, status and field changes,
+    supersession, verification, split, extract, merge and comment.
+  - `doc set --owner X --silent` no longer mails the new owner; an owner's
+    comment on a document nobody else commented on mails nobody.
+  - A status change by someone other than the owner (activating a draft)
+    is mailed to the owner unless `silent`; the lead or user who asked for
+    a handover note is mailed when the seat writes it.
+  - The server's idle note replaces only a note older than the task's
+    closing and never an agent's note from the turn that closed the task
+    or later; replacing an agent's earlier note, it keeps its `Traps`.
+  - A section write keeps the document's spacing (no blank line added
+    after the heading).
+  - Search snippets show headings without `{#id}` and do not end inside a
+    code span.
+  - `amail thread`, the MCP `thread` tool and the web thread page list the
+    documents a thread cites and mark comments on removed sections
+    (`doc_comments` in `GET /v1/threads/{id}`).
+  - The web Needs you page at phone width no longer draws the reader over
+    the drafts and their Activate button.
+  - The agent instructions say concretely that a verified fact about the
+    code, a tool or the environment is a `finding` document with its
+    evidence and that a comment corrects or discusses an existing
+    document.
 
 #### Web interface
 

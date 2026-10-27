@@ -765,8 +765,14 @@ for at most a third of the harness's injection budget (about 3,000
 characters on Claude Code and dsh, 2,000 on Codex) and cuts the index
 further when the mail in the same answer leaves less room: mail always
 comes first. The mail instructions every seat gets tell the agent what the
-index is and to search before writing a new document
-([harness support](harnesses.md#what-the-node-does-with-hooks)).
+index is and to search before writing a new document, and state where
+knowledge goes: a fact the agent verified about the code, a tool or the
+environment is a `finding` document with its evidence, a decision is a
+`decision` document, neither goes in mail, and a comment is for correcting
+or discussing an existing document. The seat introduction adds that a
+verified fact belongs in a `finding` document, not only in a compaction
+summary; the MCP server's instructions say the same for `doc_new` and
+`doc_comment` ([harness support](harnesses.md#what-the-node-does-with-hooks)).
 
 ### Candidates on create
 
@@ -796,9 +802,12 @@ kind's interval). A document past its `expires_at` is stale: marked in
 lists, search and the index and sorted after fresh documents; nothing is
 hidden or deleted.
 
-Documents send mail to their owner only: a revision by another seat (not
-with `silent`), a new document that supplements or supersedes theirs, and
-two reminders of the background pass: once when `expires_at` passes,
+Documents send mail to their owner only: a revision by another seat, a
+change of the status by another seat or the user (`d12 was activated by
+owner: <title>`, also archived or set back to draft), a new owner
+(`d12 is now yours to keep`, to the new owner), a new document that
+supplements or supersedes theirs (none of these with `silent`), and two
+reminders of the background pass: once when `expires_at` passes,
 naming `amail doc verify d12` and `amail doc show d12`; and once a day
 while the document has dangling links, listing them.
 
@@ -808,8 +817,12 @@ A comment (`POST /docs/{num}/comment`) is a message in the document's
 discussion thread, subject `[d12] <title>`, to the owner, copied to the
 seats that commented before. A comment on a section starts with the line
 `On d12#rollback (Deploy > Rollback):`. Replies in the thread are comments
-too. When a later revision removes the section, the document lists the
-comment as on a removed section with the heading path it had.
+too. A comment by the owner on a document nobody else has commented on
+mails nobody: it is kept in the thread, addressed to the owner and
+already read. When a later revision removes the section, the document
+and the thread view (`amail thread`, the web thread page) list the
+comment as on a removed section with the heading path it had. The thread
+view also lists the documents the thread cites.
 
 Documents count against the org's storage quota (`doc_bytes`): every
 revision whole, the sections and links of the current one, events and
@@ -862,7 +875,9 @@ parts, kept apart on purpose.
 The **worklog** is an append-only record per agent seat of what the seat
 did. The server writes entries from its own events: mail the seat sent,
 read or acknowledged, task changes the seat made (`t12: open → doing`),
-focus on and off, note revisions, and document events. The node writes
+focus on and off, note revisions, and document events (created, revised,
+status and other fields changed, superseded, verified, split, extracted,
+merged, commented; each with the document's number). The node writes
 entries from the harness: session start, resume, compaction and end, turns
 and their failures, tool calls (the tool and a short cut of its input),
 and commits. Each entry has a time, a session id, a kind, a text of at
@@ -893,10 +908,18 @@ the harness's compaction summary as a draft revision (`source:
 compaction`), so that the next session has something even when the agent
 never wrote; and when a task closes and its assignee holds no other
 unfinished task, the server writes an idle note itself (`State: idle`,
-the summary from the task's title and result) without a model turn.
+the summary from the task's title and result) without a model turn. The
+server writes the idle note only when the seat's current note is older
+than the task's closing, and never over a note the agent (or the user in
+its name) wrote in the turn that closed the task or later: the turn is
+the seat's last `turn_start` its node reported, and when no turn is known
+the agent's note is kept. When the idle note replaces a note the agent
+wrote in an earlier turn, the agent's `Traps` are kept in it.
 
 The lead of a seat (its team's root seat) and the user can ask a seat for
 its note; the seat then gets system mail naming `amail handover write`.
+When the seat writes the note (a compaction draft does not count), the
+one who asked gets system mail `Handover note of <seat> written (rev N)`.
 When the node shows the note to a new session, it records the read with
 the session id, which the note then shows (`read_by_session`, `read_at`).
 
@@ -917,7 +940,9 @@ holds:
 
 The node asks the server about the note only when one of these may hold:
 the transcript shows the context over the threshold, the turn ran an
-`amail task` command or an amail task tool, or the node saw a request (at
+`amail task` command (anywhere in a shell command, also after `cd`, `&&`
+or `;` and beyond the 200 characters kept for the worklog) or an amail
+task tool, or the node saw a request (at
 session start, at the last turn's end, or as mail). Any other turn's end
 is answered from memory, as before. If the agent still does not write,
 the next `Stop` ends the turn. A seat idle with work in progress, for the
@@ -932,7 +957,9 @@ compacts and to write the note first when asked.
 `PostCompact` records the harness's summary in the worklog (`compact`) and,
 unless the note was written during the current turn, files the summary as
 a draft revision (`source: compaction`, `State: draft: from compaction
-summary`).
+summary`). The session start that follows a compaction is shown that
+draft: the node waits for it before fetching the note, also when the
+harness reports the session start before `PostCompact`.
 
 **When the note is read.** At session start with source `startup`,
 `resume`, `clear` or `compact` (not `fork`), the node shows the note
@@ -945,7 +972,11 @@ less what the mail in the same answer needs. When it is longer, `State`,
 of `Traps` and `Pointers` as fits, and the text ends with `… the rest:
 amail handover show`. The node then records the read. `amail ps` shows
 for each seat whether its note is `current` (no turn started after it was
-written), `stale` or `none`, as far as the node has seen.
+written), `stale` or `none`. The node asks the server for the note's
+state when it connects, when a seat is added or starts, and after the
+seat runs `amail handover write` (or the MCP tool `handover_write`);
+after a restart it takes the start of the seat's last turn from the
+worklog.
 
 Who reads what:
 

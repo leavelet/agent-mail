@@ -43,6 +43,7 @@ conformance!(
     pointers_from_the_worklog,
     read_acknowledgement_and_requests,
     idle_note,
+    idle_note_keeps_the_agents_note,
     worklog_queries,
     server_entries_take_session_and_task,
     storage_quota,
@@ -424,6 +425,124 @@ async fn idle_note(s: S) {
         n.fields.pointers
     );
     assert!(n.fields.missing().is_empty());
+}
+
+/// The idle note replaces only a note older than the task's closing, and
+/// never an agent's note written in the turn that closed the task or later;
+/// when it replaces an agent's note, the agent's Traps stay.
+async fn idle_note_keeps_the_agents_note(s: S) {
+    let o = setup(&s, "alpha").await;
+    let mk = |title: &str| NewTaskRec {
+        org_id: o.org.id,
+        reporter_id: o.user.id,
+        title: title.into(),
+        assignee_id: Some(o.a.id),
+        ..Default::default()
+    };
+    let close = |num: i64| {
+        let s = s.clone();
+        let (org, a) = (o.org.id, o.a.id);
+        async move {
+            s.change_task(
+                &TaskWrite {
+                    org_id: org,
+                    num,
+                    actor_id: Some(a),
+                    ..Default::default()
+                },
+                &TaskChange {
+                    state: Some(TaskState::Done),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            s.write_idle_note(org, a, num, None).await.unwrap()
+        }
+    };
+    let turn = |at: i64| {
+        let mut e = entry(&o.a, "s1", "turn_start", "turn started", None);
+        e.at = at;
+        e
+    };
+    let pause = || tokio::time::sleep(std::time::Duration::from_millis(5));
+    // A turn starts, the agent writes its note and closes its last task in
+    // the same turn: the note stays.
+    s.append_worklog(o.org.id, &[turn(now_ms())], None)
+        .await
+        .unwrap();
+    pause().await;
+    let t1 = s.create_task(&mk("parser")).await.unwrap();
+    s.write_handover_note(&note(&o, &o.a, full()))
+        .await
+        .unwrap();
+    pause().await;
+    assert_eq!(close(t1.num).await, None);
+    assert_eq!(
+        s.handover_note(o.org.id, o.a.id, None)
+            .await
+            .unwrap()
+            .unwrap()
+            .source,
+        HandoverSource::Agent
+    );
+    // Without any turn the node reported, an agent's note stays too.
+    s.write_handover_note(&note(&o, &o.b, full()))
+        .await
+        .unwrap();
+    let t2 = s
+        .create_task(&NewTaskRec {
+            assignee_id: Some(o.b.id),
+            ..mk("lexer")
+        })
+        .await
+        .unwrap();
+    s.change_task(
+        &TaskWrite {
+            org_id: o.org.id,
+            num: t2.num,
+            actor_id: Some(o.b.id),
+            ..Default::default()
+        },
+        &TaskChange {
+            state: Some(TaskState::Done),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        s.write_idle_note(o.org.id, o.b.id, t2.num, None)
+            .await
+            .unwrap(),
+        None
+    );
+    // The note is from an earlier turn: the next turn's close replaces it,
+    // keeping its Traps.
+    let t3 = s.create_task(&mk("checker")).await.unwrap();
+    pause().await;
+    s.append_worklog(o.org.id, &[turn(now_ms())], None)
+        .await
+        .unwrap();
+    pause().await;
+    let n = close(t3.num).await.unwrap();
+    assert_eq!(n.source, HandoverSource::Server);
+    assert_eq!(n.rev, 2);
+    assert!(
+        n.fields.traps.contains("Do not touch lexer.rs") && n.fields.traps.contains("rev 1"),
+        "{}",
+        n.fields.traps
+    );
+    // A server note is replaced at the next close without asking.
+    let t4 = s.create_task(&mk("printer")).await.unwrap();
+    pause().await;
+    let n = close(t4.num).await.unwrap();
+    assert_eq!(n.rev, 3);
+    assert!(
+        n.fields.traps.starts_with("none recorded"),
+        "{}",
+        n.fields.traps
+    );
 }
 
 async fn worklog_queries(s: S) {

@@ -715,6 +715,44 @@ async fn notify_related(st: &AppState, org: &Org, actor: i64, ch: &DocChanged, s
     crate::tasks::remind(st, org, Some(actor), rs).await;
 }
 
+/// The worklog entry of the caller's change of document `num` (agent
+/// seats only).
+async fn worklog(st: &AppState, auth: &Auth, num: i64, text: String) {
+    if let Ok(me) = actor(auth) {
+        crate::handover::doc_event(st, me, num, text).await;
+    }
+}
+
+/// `: message`, or nothing.
+fn with_message(m: Option<&str>) -> String {
+    m.map(str::trim)
+        .filter(|m| !m.is_empty())
+        .map(|m| format!(": {m}"))
+        .unwrap_or_default()
+}
+
+/// What a change of fields did, for the worklog: `draft → active`,
+/// `changed owner, labels`.
+fn change_text(ch: &DocChanged) -> Option<String> {
+    let mut parts = Vec::new();
+    if ch.before.status != ch.doc.status {
+        parts.push(format!("{} → {}", ch.before.status, ch.doc.status));
+    }
+    let rest: Vec<&str> = ch
+        .fields
+        .iter()
+        .map(String::as_str)
+        .filter(|f| *f != "status")
+        .collect();
+    if !rest.is_empty() {
+        parts.push(format!("changed {}", rest.join(", ")));
+    }
+    if ch.revised {
+        parts.push(format!("rev {}", ch.doc.rev));
+    }
+    (!parts.is_empty()).then(|| format!("d{}: {}", ch.doc.num, parts.join("; ")))
+}
+
 // --- handlers ------------------------------------------------------------------
 
 /// `POST /v1/docs`.
@@ -788,6 +826,16 @@ pub async fn create(
     }
     let num = ch.doc.num;
     publish(&st, org.id, num, "created", &[]);
+    worklog(
+        &st,
+        &auth,
+        num,
+        format!(
+            "d{num} created ({} {}): {}",
+            ch.doc.status, ch.doc.kind, ch.doc.title
+        ),
+    )
+    .await;
     let mut d = written(&st, &ch).await?;
     let now = amail_store::now_ms();
     let candidates = st
@@ -916,14 +964,15 @@ pub async fn put_body(
     let w = write_ctx(&st, &auth, num, req.if_rev)?;
     check_body(&req.body)?;
     let message = check_message(&req.message)?;
+    let section = req.section.or(anchor);
     let ch = match st
         .store
         .write_doc_body(
             &w,
             &DocBodyRec {
                 body: req.body,
-                section: req.section.or(anchor),
-                message,
+                section: section.clone(),
+                message: message.clone(),
                 paths: paths(&req.paths),
             },
         )
@@ -935,6 +984,18 @@ pub async fn put_body(
     if ch.revised {
         publish(&st, auth.org.id, num, "revised", &ch.fields);
         notify_revision(&st, &auth.org, actor(&auth)?, &ch, req.silent).await;
+        let at = section.map(|a| format!("#{a}")).unwrap_or_default();
+        worklog(
+            &st,
+            &auth,
+            num,
+            format!(
+                "d{num}{at} revised (rev {}){}",
+                ch.doc.rev,
+                with_message(message.as_deref())
+            ),
+        )
+        .await;
     }
     Ok(Json(written(&st, &ch).await?))
 }
@@ -1014,16 +1075,46 @@ pub async fn patch(
     let actor_id = w.actor_id.unwrap_or_default();
     notify_revision(&st, org, actor(&auth)?, &changed, req.silent).await;
     notify_related(&st, org, actor_id, &changed, req.silent).await;
-    if changed.fields.iter().any(|f| f == "owner") && changed.doc.owner_id != actor_id {
-        let d = &changed.doc;
-        let r = Reminder::doc(
+    let d = &changed.doc;
+    let mut owner_mail = Vec::new();
+    if changed.fields.iter().any(|f| f == "owner") && d.owner_id != actor_id && !req.silent {
+        owner_mail.push(Reminder::doc(
             d.owner_id,
             d.owner.clone(),
             "revised",
             d,
             format!("d{} is now yours to keep: {}", d.num, d.title),
-        );
-        crate::tasks::remind(&st, org, Some(actor_id), vec![r]).await;
+        ));
+    }
+    // The owner learns that someone else activated (or archived, or set
+    // back to draft) the document.
+    if changed.before.status != d.status && d.owner_id != actor_id && !req.silent {
+        let who = &actor(&auth)?.name;
+        let what = match d.status {
+            DocStatus::Active => "activated",
+            DocStatus::Archived => "archived",
+            DocStatus::Draft => "set back to draft",
+            DocStatus::Superseded => "marked superseded",
+        };
+        owner_mail.push(Reminder::doc(
+            d.owner_id,
+            d.owner.clone(),
+            "status",
+            d,
+            format!("d{} was {what} by {who}: {}", d.num, d.title),
+        ));
+    }
+    if !owner_mail.is_empty() {
+        crate::tasks::remind(&st, org, Some(actor_id), owner_mail).await;
+    }
+    if let Some(t) = change_text(&changed) {
+        worklog(
+            &st,
+            &auth,
+            num,
+            format!("{t}{}", with_message(req.message.as_deref())),
+        )
+        .await;
     }
     Ok(Json(written(&st, &changed).await?))
 }
@@ -1045,6 +1136,7 @@ pub async fn supersede(
         .map_err(|e| store_err(&st, e))?;
     publish(&st, auth.org.id, num, "relation", &ch.fields);
     publish(&st, auth.org.id, by, "relation", &["replaces".to_string()]);
+    worklog(&st, &auth, num, format!("d{num} superseded by d{by}")).await;
     notify_related(
         &st,
         &auth.org,
@@ -1104,6 +1196,11 @@ pub async fn verify(
         .await
         .map_err(|e| store_err(&st, e))?;
     publish(&st, auth.org.id, num, "verified", &ch.fields);
+    let until = match ch.doc.expires_at {
+        Some(t) => format!(" until {}", render::ts(t)),
+        None => String::new(),
+    };
+    worklog(&st, &auth, num, format!("d{num} verified{until}")).await;
     Ok(Json(written(&st, &ch).await?))
 }
 
@@ -1165,6 +1262,14 @@ pub async fn split(
         Ok(m) => m,
         Err(e) => return Err(write_failed(&st, &w, e).await),
     };
+    let into: Vec<String> = m.created.iter().map(|d| format!("d{}", d.num)).collect();
+    worklog(
+        &st,
+        &auth,
+        num,
+        format!("d{num} split into {}", into.join(", ")),
+    )
+    .await;
     Ok(Json(moved_out(&st, &auth.org, num, &m, "split").await?))
 }
 
@@ -1191,6 +1296,14 @@ pub async fn extract(
         Ok(m) => m,
         Err(e) => return Err(write_failed(&st, &w, e).await),
     };
+    let into: Vec<String> = m.created.iter().map(|d| format!("d{}", d.num)).collect();
+    worklog(
+        &st,
+        &auth,
+        num,
+        format!("d{num}#{anchor} extracted into {}", into.join(", ")),
+    )
+    .await;
     Ok(Json(moved_out(&st, &auth.org, num, &m, "extracted").await?))
 }
 
@@ -1208,6 +1321,7 @@ pub async fn merge(
         Ok(m) => m,
         Err(e) => return Err(write_failed(&st, &w, e).await),
     };
+    worklog(&st, &auth, num, format!("d{num} merged into d{into}")).await;
     Ok(Json(moved_out(&st, &auth.org, num, &m, "merged").await?))
 }
 
@@ -1435,9 +1549,24 @@ pub async fn find(
     }))
 }
 
+/// A heading line's text without its attribute block (`Rounding
+/// {#rounding}` is `Rounding`).
+fn heading_text(line: &str) -> &str {
+    let t = line.trim_start_matches('#').trim();
+    match t.rfind('{') {
+        Some(i) if t.ends_with('}') && matches!(t[i + 1..].chars().next(), Some('#' | '.')) => {
+            t[..i].trim_end()
+        }
+        _ => t,
+    }
+}
+
 /// The sentence of a section's text that holds the most terms (the heading
 /// line only when nothing else matches), cut to [`DOC_SNIPPET_CHARS`]
-/// characters.
+/// characters. A sentence ends at `.`, `!` or `?` followed by a space or
+/// the end of the line (not inside a code span), and at a line's end. A
+/// heading shows without its `{#id}` attribute, and a cut never ends inside
+/// a code span.
 pub fn snippet(text: &str, terms: &[String]) -> String {
     let t = text.trim_start();
     let content = if t.starts_with('#') {
@@ -1445,20 +1574,37 @@ pub fn snippet(text: &str, terms: &[String]) -> String {
     } else {
         text
     };
-    let stop = |c: char| matches!(c, '.' | '!' | '?' | '。' | '！' | '？' | '\n');
     let sentences = |t: &str| -> Vec<String> {
         let mut out = Vec::new();
         let mut cur = String::new();
-        for c in t.chars() {
+        let mut code = false;
+        let mut chars = t.chars().peekable();
+        while let Some(c) = chars.next() {
             cur.push(c);
-            if stop(c) {
-                out.push(std::mem::take(&mut cur));
+            match c {
+                '`' => code = !code,
+                '\n' => {
+                    code = false;
+                    out.push(std::mem::take(&mut cur));
+                }
+                '。' | '！' | '？' if !code => out.push(std::mem::take(&mut cur)),
+                '.' | '!' | '?' if !code && chars.peek().is_none_or(|n| n.is_whitespace()) => {
+                    out.push(std::mem::take(&mut cur))
+                }
+                _ => {}
             }
         }
         out.push(cur);
         out.into_iter()
+            .map(|s| {
+                let s = s.trim();
+                if s.starts_with('#') {
+                    heading_text(s).to_string()
+                } else {
+                    s.to_string()
+                }
+            })
             .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
-            .map(|s| s.trim_start_matches('#').trim().to_string())
             .filter(|s| !s.is_empty())
             .collect()
     };
@@ -1481,7 +1627,15 @@ pub fn snippet(text: &str, terms: &[String]) -> String {
     if s.chars().count() <= DOC_SNIPPET_CHARS {
         return s;
     }
-    let cut: String = s.chars().take(DOC_SNIPPET_CHARS - 1).collect();
+    let mut cut: String = s.chars().take(DOC_SNIPPET_CHARS - 1).collect();
+    // Not inside a code span: end before the span's opening backtick.
+    if cut.matches('`').count() % 2 == 1
+        && let Some(i) = cut.rfind('`')
+    {
+        cut.truncate(i);
+        let kept = cut.trim_end().len();
+        cut.truncate(kept);
+    }
     format!("{cut}…")
 }
 
@@ -1875,7 +2029,11 @@ pub async fn comment(
         .collect();
     to.retain(|n| live.contains(n));
     cc.retain(|n| live.contains(n));
-    if to.is_empty() && cc.is_empty() {
+    // A message needs a recipient: with nobody else to tell (the owner
+    // comments and nobody else has), the comment goes to the caller and is
+    // marked read at once, so that nobody is mailed.
+    let alone = to.is_empty() && cc.is_empty();
+    if alone {
         to.push(me.name.clone());
     }
     let subject: String = format!("[d{num}] {}", d.title)
@@ -1913,6 +2071,21 @@ pub async fn comment(
         .await
         .map_err(|e| store_err(&st, e))?;
     publish(&st, auth.org.id, num, "commented", &[]);
+    if alone {
+        match st.store.mark_read(sent.id, me.id).await {
+            Ok(Some((_, Some(b)))) => st.bus.publish(b.org_id, &[(me.name.clone(), b.seq)]),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("org {}: own comment not marked read: {e}", auth.org.id),
+        }
+    }
+    let at = anchor.map(|a| format!("#{a}")).unwrap_or_default();
+    worklog(
+        &st,
+        &auth,
+        num,
+        format!("d{num}{at} commented (m{})", sent.id),
+    )
+    .await;
     Ok(Json(p::DocCommentResponse {
         id: sent.id,
         thread_id: d.thread_id.unwrap_or(sent.thread_id),
@@ -1923,16 +2096,36 @@ pub async fn comment(
 // --- mail and tasks into documents ---------------------------------------------------
 
 /// Documents of the viewer's org that a thread cites (or whose discussion
-/// thread it is), for thread answers.
-pub async fn thread_refs(st: &AppState, org_id: i64, thread_id: i64) -> Vec<p::DocRef> {
+/// thread it is), and the comments of the thread on those documents whose
+/// discussion thread it is, for thread answers.
+pub async fn thread_refs(
+    st: &AppState,
+    org_id: i64,
+    thread_id: i64,
+) -> (Vec<p::DocRef>, Vec<p::ThreadDocComment>) {
     let now = amail_store::now_ms();
-    match st.store.thread_docs(org_id, thread_id).await {
-        Ok(v) => v.iter().map(|d| doc_ref(d, now)).collect(),
+    let docs = match st.store.thread_docs(org_id, thread_id).await {
+        Ok(v) => v,
         Err(e) => {
             tracing::warn!("documents of thread {thread_id}: {e}");
-            Vec::new()
+            return (Vec::new(), Vec::new());
+        }
+    };
+    let mut comments = Vec::new();
+    for d in docs.iter().filter(|d| d.thread_id == Some(thread_id)) {
+        match st.store.doc_detail(org_id, d.num, 0).await {
+            Ok(Some(r)) => comments.extend(r.comments.iter().map(|c| p::ThreadDocComment {
+                message_id: c.message_id,
+                doc: d.num,
+                anchor: c.anchor.clone(),
+                path: c.path.clone(),
+                removed: c.removed,
+            })),
+            Ok(None) => {}
+            Err(e) => tracing::warn!("comments of d{} for thread {thread_id}: {e}", d.num),
         }
     }
+    (docs.iter().map(|d| doc_ref(d, now)).collect(), comments)
 }
 
 /// Document numbers named as `[d12]` in a subject (at most 10).
@@ -2091,6 +2284,27 @@ mod tests {
             snippet(t, &["ROLLBACK script".into(), "script".into()]),
             "Run the rollback script now."
         );
+        // A heading's attribute is not shown; a period inside a code span
+        // or a word does not end the sentence.
+        assert_eq!(
+            snippet(
+                "## Rounding {#rounding}\n\nOther text.",
+                &["rounding".into()]
+            ),
+            "Rounding"
+        );
+        assert_eq!(
+            snippet(
+                "Tests may assert `format_cents(-1250) == \"-12.50\"` in tests/. Then more.",
+                &["tests".into()]
+            ),
+            "Tests may assert `format_cents(-1250) == \"-12.50\"` in tests/."
+        );
+        // A cut inside a code span ends before the span.
+        let code = format!("{} `{}`", "a ".repeat(90), "x".repeat(100));
+        let s = snippet(&code, &["a".into()]);
+        assert!(!s.contains('`'), "{s}");
+        assert!(s.ends_with("a…"), "{s}");
         let long = format!("{} needle {}", "a".repeat(300), "b".repeat(300));
         assert_eq!(
             snippet(&long, &["needle".into()]).chars().count(),

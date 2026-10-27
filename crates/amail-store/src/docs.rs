@@ -468,17 +468,29 @@ pub(crate) fn check_required(p: &Parsed, k: &DocKindRec) -> Result<()> {
 
 /// Replace the section `anchor` of `body` with `text`: the heading stays
 /// unless `text` starts with a heading.
+///
+/// The spacing of the original is kept: the line breaks between the heading
+/// and its text (a blank line when the section had no text), and those
+/// between the section and what follows it.
 pub(crate) fn replace_section(body: &str, p: &Parsed, anchor: &str, text: &str) -> Option<String> {
     let s = p.section(anchor)?;
+    let old = &body[s.start..s.end];
     let mut out = String::with_capacity(body.len() + text.len());
     if s.level > 0 && !text.trim_start().starts_with('#') {
         out.push_str(&body[..s.heading_end]);
-        out.push_str("\n\n");
+        let after = &body[s.heading_end..s.end];
+        let gap = &after[..after.len() - after.trim_start_matches(['\n', '\r']).len()];
+        if gap.len() == after.len() || gap.is_empty() {
+            out.push_str("\n\n");
+        } else {
+            out.push_str(gap);
+        }
     } else {
         out.push_str(&body[..s.start]);
     }
-    out.push_str(text.trim_matches('\n'));
-    out.push_str("\n\n");
+    out.push_str(text.trim_matches(['\n', '\r']));
+    let tail = &old[old.trim_end_matches(['\n', '\r']).len()..];
+    out.push_str(if tail.is_empty() { "\n\n" } else { tail });
     let rest = &body[s.end..];
     out.push_str(rest);
     let trimmed = out.trim_end_matches('\n').len();

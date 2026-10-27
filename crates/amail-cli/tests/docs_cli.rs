@@ -346,6 +346,30 @@ fn documents(owner: &Amail, w1: &Amail, w2: &Amail) {
     assert!(show.contains("by w2"), "{show}");
     assert!(show.contains("on #evidence (Evidence)"), "{show}");
 
+    // The thread lists the documents it cites and marks a comment whose
+    // section was removed, as `doc show` does.
+    let notes = w1.new_doc(&["Notes", "-m", "# Keep\nk\n\n# Gone\ng\n"]);
+    let out = w2.run(&["doc", "comment", &format!("d{notes}#gone"), "-m", "Why?"]);
+    let id: String = out
+        .split_once(": #")
+        .unwrap()
+        .1
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    w1.run(&["doc", "write", &format!("d{notes}"), "-m", "# Keep\nk\n"]);
+    let thread = w1.run(&["thread", &id]);
+    assert!(
+        thread.contains(&format!(
+            "[comment on a removed section of d{notes} (was: Gone)]"
+        )),
+        "{thread}"
+    );
+    assert!(
+        thread.contains(&format!("documents of this thread:\n  d{notes} ")),
+        "{thread}"
+    );
+
     // History and diff.
     let out = w1.run(&["doc", "history", "d1"]);
     assert!(out.contains("Revisions:\n  rev 1 "), "{out}");

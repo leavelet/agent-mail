@@ -1646,11 +1646,20 @@ async fn run(cli: Cli) -> Result<()> {
                 let mut text = t
                     .messages
                     .iter()
-                    .map(|m| output::message(m).trim_end().to_string())
+                    .map(|m| {
+                        let s = output::message(m).trim_end().to_string();
+                        match doc_cmd::thread_comment_mark(&t, m.header.id) {
+                            Some(mark) => format!("{mark}\n{s}"),
+                            None => s,
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join("\n---\n");
                 if let Some(tasks) = task_cmd::thread_tasks_text(&t.tasks) {
                     text.push_str(&format!("\n---\n{tasks}"));
+                }
+                if let Some(docs) = doc_cmd::thread_docs_text(&t.docs) {
+                    text.push_str(&format!("\n---\n{docs}"));
                 }
                 if !t.participants.is_empty() {
                     text.push_str(

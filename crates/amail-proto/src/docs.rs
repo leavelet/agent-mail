@@ -248,6 +248,22 @@ pub struct DocComment {
     pub removed: bool,
 }
 
+/// A comment on a document, as a thread lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadDocComment {
+    pub message_id: i64,
+    /// The document's number.
+    pub doc: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<String>,
+    /// The section's heading path when the comment was written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// The current revision no longer has the section.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub removed: bool,
+}
+
 /// A thread linked to a document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DocThreadLink {

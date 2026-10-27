@@ -106,6 +106,12 @@ pub struct HookFacts {
     /// `PostToolUse`: the tool's input, cut to [`TOOL_INPUT_CHARS`]
     /// characters: a shell command as it is, other input as compact JSON.
     pub tool_input: Option<String>,
+    /// `PostToolUse`: whether the call may change a task (see
+    /// [`touches_tasks`]), judged on the whole input before it is cut.
+    pub task_tool: bool,
+    /// `PostToolUse`: whether the call may have written the seat's
+    /// handover note (`amail handover write`, an amail handover tool).
+    pub note_tool: bool,
     /// `SessionEnd`: why the session ended.
     pub reason: Option<String>,
 }
@@ -120,6 +126,8 @@ impl HookFacts {
                 .filter(|v| !v.is_empty())
                 .map(str::to_string)
         };
+        let tool = s("tool_name");
+        let (mut task_tool, mut note_tool) = (false, false);
         let tool_input = input.get("tool_input").and_then(|v| {
             let text = match v {
                 Value::Null => return None,
@@ -135,17 +143,66 @@ impl HookFacts {
                 },
                 other => other.to_string(),
             };
+            if let Some(tool) = &tool {
+                task_tool = touches_tasks(tool, &text);
+                note_tool = writes_note(tool, &text);
+            }
             let line = amail_proto::text::line(text.trim()).into_owned();
             Some(cut_chars(&line, TOOL_INPUT_CHARS))
         });
+        if let Some(tool) = &tool {
+            task_tool |= touches_tasks(tool, "");
+            note_tool |= writes_note(tool, "");
+        }
         HookFacts {
             cwd: s("cwd"),
             model: s("model"),
-            tool: s("tool_name"),
+            tool,
             tool_input,
+            task_tool,
+            note_tool,
             reason: s("reason"),
         }
     }
+}
+
+/// Whether a tool call may change a task: an amail MCP tool about tasks,
+/// or a shell command that runs `amail task` anywhere in it (after `cd`,
+/// `&&`, `;`, `|` or on another line; global flags such as `--json`
+/// between `amail` and `task` are allowed).
+pub fn touches_tasks(tool: &str, input: &str) -> bool {
+    let t = tool.to_ascii_lowercase();
+    (t.contains("amail") && t.contains("task")) || runs_amail(input, &["task"])
+}
+
+/// Whether a tool call may write the seat's handover note: `amail handover
+/// write` in a shell command, or an amail MCP tool that writes the note.
+pub fn writes_note(tool: &str, input: &str) -> bool {
+    let t = tool.to_ascii_lowercase();
+    (t.contains("amail") && t.contains("handover_write"))
+        || runs_amail(input, &["handover", "write"])
+}
+
+/// Whether a shell command runs `amail` with the subcommand `words`
+/// anywhere in it (options before each word are skipped).
+fn runs_amail(input: &str, words: &[&str]) -> bool {
+    if !input.contains("amail") {
+        return false;
+    }
+    let is_sep = |c: char| matches!(c, ';' | '&' | '|' | '\n' | '(' | ')' | '`' | '{' | '}');
+    input.split(is_sep).any(|segment| {
+        let args: Vec<&str> = segment
+            .split_whitespace()
+            .map(|w| w.trim_matches(|c| c == '"' || c == '\''))
+            .collect();
+        args.iter().enumerate().any(|(i, a)| {
+            if *a != "amail" && !a.ends_with("/amail") {
+                return false;
+            }
+            let mut rest = args[i + 1..].iter().filter(|a| !a.starts_with('-'));
+            words.iter().all(|w| rest.next() == Some(w))
+        })
+    })
 }
 
 /// `s` cut to `max` characters.
@@ -517,5 +574,57 @@ pub fn shell_quote(s: &str) -> String {
         s.to_string()
     } else {
         format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_tools() {
+        assert!(touches_tasks("Bash", "amail task done t3 --result ok"));
+        assert!(touches_tasks("mcp__amail__task_set", "{}"));
+        assert!(touches_tasks(
+            "Bash",
+            "cd /w && git commit -m x; amail task done t3"
+        ));
+        assert!(touches_tasks("Bash", "make || amail --json task mine"));
+        assert!(touches_tasks(
+            "Bash",
+            "git push\n/usr/local/bin/amail task done t1"
+        ));
+        assert!(!touches_tasks("Bash", "cargo test"));
+        assert!(!touches_tasks("Bash", "amail send lead -m 'task list'"));
+        assert!(!touches_tasks("mcp__amail__send", "{}"));
+        assert!(writes_note("Bash", "cd /w; amail handover write -m x"));
+        assert!(writes_note("mcp__amail__handover_write", "{}"));
+        assert!(!writes_note("Bash", "amail handover show w1"));
+    }
+
+    /// The command that closes the task comes after the part kept for the
+    /// worklog.
+    #[test]
+    fn task_command_after_the_cut() {
+        let long = format!(
+            "cd /work/tally && git commit -am '{}' && amail send lead -s merge -m ok; amail task done t17 --result ok",
+            "x".repeat(400)
+        );
+        let f = HookFacts::from_input(&json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": long},
+        }));
+        assert!(f.task_tool);
+        assert_eq!(f.tool_input.unwrap().chars().count(), TOOL_INPUT_CHARS);
+        let f = HookFacts::from_input(&json!({
+            "tool_name": "mcp__amail__task_done",
+            "tool_input": {"num": 3},
+        }));
+        assert!(f.task_tool);
+        let f = HookFacts::from_input(&json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "cargo test"},
+        }));
+        assert!(!f.task_tool);
     }
 }

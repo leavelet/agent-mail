@@ -286,12 +286,27 @@
   .seatcard p {
     margin: 8px 0 0;
   }
+  /* One column: the queue (with the task and document sections) and the
+     reader stack and the page scrolls as a whole. With the desktop's fixed
+     height the queue's row shrank below its content, and the reader was
+     drawn over the document sections and their buttons. */
   @media (max-width: 1000px) {
     .needs {
       grid-template-columns: 1fr;
+      height: auto;
+      min-height: 100%;
+    }
+    .queue {
+      min-height: auto;
+      border-right: none;
+    }
+    .items {
+      flex: none;
+      overflow: visible;
     }
     .reader {
       border-top: 1px solid var(--border);
+      overflow: visible;
     }
   }
 </style>

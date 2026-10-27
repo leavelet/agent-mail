@@ -11,6 +11,8 @@
   import type { DeleteMailResponse, ThreadResponse } from '../lib/types';
   import MessageCard from '../components/MessageCard.svelte';
   import TaskRefRow from '../components/TaskRefRow.svelte';
+  import DocChip from '../components/DocChip.svelte';
+  import { docHref, docId } from '../lib/docs';
 
   let { id, focus }: { id: number; focus?: number } = $props();
   let data = $state.raw<ThreadResponse | null>(null);
@@ -74,6 +76,8 @@
     return d ? visible(d) : undefined;
   };
   const participants = $derived(data ? [...new Set(data.messages.map((m) => m.from))] : []);
+  // The section each comment on a document is on, by message id.
+  const commentInfo = $derived(new Map((data?.doc_comments ?? []).map((c) => [c.message_id, c])));
 </script>
 
 <div class="page thread">
@@ -97,9 +101,21 @@
         {#each data.tasks as x (x.num)}<TaskRefRow num={x.num} title={x.title} state={x.state} note={x.assignee} />{/each}
       </ul>
     {/if}
+    {#if data.docs?.length}
+      <ul class="tasks" data-testid="thread-docs" aria-label={t('thread.docs')}>
+        {#each data.docs as d (d.num)}<li><DocChip doc={d} /></li>{/each}
+      </ul>
+    {/if}
     <div class="msgs">
       {#each data.messages as m (m.id)}
+        {@const c = commentInfo.get(m.id)}
         <div>
+          {#if c?.anchor}
+            <p class="on" data-testid="comment-anchor">
+              {#if c.removed}<span class="chip attn">{t('doc.onRemoved', { path: c.path || c.anchor })}</span> <a class="mono" href={docHref(c.doc)}>{docId(c.doc)}</a>
+              {:else}{t('doc.onSection')} <a class="mono" href={docHref(c.doc, c.anchor)}>{docId(c.doc)}#{c.anchor}</a>{#if c.path} <span class="faint">({c.path})</span>{/if}{/if}
+            </p>
+          {/if}
           <MessageCard message={m} focus={m.id === focus}>
             {#snippet actions()}
               <button class="small" onclick={() => go(['compose'], { reply: m.id })}>{t('mail.reply')}</button>
@@ -130,6 +146,10 @@
     display: flex;
     flex-direction: column;
     gap: 2px;
+  }
+  .on {
+    margin: 0 0 4px;
+    font-size: 0.9em;
   }
   .parts {
     display: flex;

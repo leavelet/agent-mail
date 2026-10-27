@@ -58,6 +58,7 @@ node_tests!(
     node_under_path_prefix,
     run_adopts_a_session,
     session_start_shows_open_tasks,
+    refused_pending_counts_are_not_retried,
 );
 
 use amail_store::testutil::Backend;
@@ -3130,4 +3131,55 @@ async fn session_start_shows_open_tasks(b: Backend) {
         .hook("claude", env.clone(), claude("UserPromptSubmit"))
         .await;
     assert!(!hook_text(&v).unwrap_or_default().contains("open task"));
+}
+
+static PENDING_SQLITE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PENDING_PG: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn count_pending_sqlite(path: &str) -> bool {
+    if path == "/v1/pending" {
+        PENDING_SQLITE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    false
+}
+
+fn count_pending_pg(path: &str) -> bool {
+    if path == "/v1/pending" {
+        PENDING_PG.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    false
+}
+
+/// Mail to the user seat gives the node a mailbox event for a seat whose
+/// pending counts node tokens may not read (403). The node asks once and
+/// not again every few seconds.
+async fn refused_pending_counts_are_not_retried(b: Backend) {
+    let (count, counter): (SlowPath, &std::sync::atomic::AtomicUsize) = match b {
+        Backend::Sqlite => (count_pending_sqlite, &PENDING_SQLITE),
+        Backend::Postgres => (count_pending_pg, &PENDING_PG),
+    };
+    let opts = Opts {
+        slow_routes: Some((count, Duration::ZERO)),
+        ..Default::default()
+    };
+    let Some(h) = setup(b, "refused_pending_counts_are_not_retried", opts).await else {
+        return;
+    };
+    let w1 = h.seat("w1", "claude").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let before = counter.load(std::sync::atomic::Ordering::SeqCst);
+    w1.send(&["owner"], &[], "for the user", false).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let asked = counter.load(std::sync::atomic::Ordering::SeqCst) - before;
+    assert!(
+        (1..=2).contains(&asked),
+        "pending counts asked {asked} times after one mail to the user seat"
+    );
+    // A second mail to the user is not asked about either.
+    w1.send(&["owner"], &[], "again", false).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::SeqCst) - before,
+        asked
+    );
 }

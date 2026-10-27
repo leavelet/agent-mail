@@ -46,6 +46,8 @@ handover_tests!(
     idle_seat_with_work_is_asked,
     codex_index_and_compaction,
     slow_index_and_note_leave_mail_on_time,
+    ps_knows_the_note_from_the_start,
+    compact_start_shows_the_draft,
 );
 
 const ASK: &str = "Write your handover note now with `amail handover write`; then stop.";
@@ -456,8 +458,10 @@ async fn stop_asks_for_the_note_after_a_closed_task(b: Backend) {
     };
     let (t1, t2) = (task("first").await, task("second").await);
     h.wait_pending("w1", 2, 0, 0).await;
-    // The seat closes a task with `amail task done`, which its
-    // PostToolUse hook reports.
+    // The seat closes a task with `amail task done` at the end of a long
+    // shell command, which its PostToolUse hook reports: the node keeps
+    // 200 characters of it for the worklog but finds the task command in
+    // the whole input.
     let close = |n: i64| {
         let (h, w1, env) = (&h, w1.clone(), env.clone());
         async move {
@@ -471,7 +475,10 @@ async fn stop_asks_for_the_note_after_a_closed_task(b: Backend) {
                 claude("PostToolUse"),
                 &[(
                     "tool_input",
-                    json!({"command": format!("amail task done t{n} --result ok")}),
+                    json!({"command": format!(
+                        "cd /work/app && git commit -am '{}' && amail send lead -s merge -m ok; amail task done t{n} --result ok",
+                        "fix the login form ".repeat(15)
+                    )}),
                 )],
             );
             h.hook("claude", env, tool).await;
@@ -665,8 +672,12 @@ async fn note_shown_at_session_start(b: Backend) {
         )
         .await;
     assert!(!hook_text(&v).unwrap().contains("Handover note"));
-    // A short note is shown whole, after `compact` too.
+    // A short note is shown whole, after `compact` too (here the
+    // harness's `PostCompact` came first and brought no summary).
     write_note(&w1, "w1", "do not touch the schema").await;
+    let mut bare = claude("PostCompact");
+    bare.as_object_mut().unwrap().remove("compact_summary");
+    h.hook("claude", env.clone(), bare).await;
     let v = h
         .hook(
             "claude",
@@ -764,6 +775,8 @@ async fn codex_index_and_compaction(b: Backend) {
         return;
     };
     h.seat("cx", "codex").await;
+    // A note from an earlier session of the seat (written by the user).
+    write_note(&h.api, "cx", "none").await;
     let long: Vec<String> = (0..40)
         .map(|i| format!("topic {i:02} {}", "y".repeat(30)))
         .collect();
@@ -819,8 +832,19 @@ async fn codex_index_and_compaction(b: Backend) {
             with(codex("UserPromptSubmit"), &[("prompt", json!(prompt))]),
         )
         .await;
-    // Nothing cached yet: no index in this answer.
-    assert!(!hook_text(&v).unwrap_or_default().contains("Documents:"));
+    // The seat's note is shown: the Codex session's own `SessionStart`
+    // came before its registration, so this prompt starts the session
+    // (and waits a little for the note, so the index fetched alongside
+    // may come too), and the worklog records the start.
+    let t = hook_text(&v).unwrap_or_default();
+    assert!(t.contains("Handover note of this seat"), "{t}");
+    h.wait("session start entry", || async {
+        node_entries(&h, "cx", "session_start").await.len() == 1
+    })
+    .await;
+    let start = &node_entries(&h, "cx", "session_start").await[0];
+    assert_eq!(start["text"], "source: startup");
+    assert_eq!(start["session"], sid);
     h.wait("cx's index", || async {
         h.seat_status("cx").await["index_lines"]
             .as_u64()
@@ -829,8 +853,10 @@ async fn codex_index_and_compaction(b: Backend) {
     })
     .await;
     let v = h.hook("codex", env.clone(), codex("SessionStart")).await;
-    let t = hook_text(&v).unwrap();
-    assert!(t.starts_with("Documents:\n"), "{t}");
+    let all = hook_text(&v).unwrap();
+    // The note first (shown again: a session start), then the index.
+    let (_, t) = all.split_once("\n\nDocuments:\n").unwrap();
+    let t = format!("Documents:\n{t}");
     assert!(t.chars().count() <= 2_000, "{}", t.chars().count());
     assert!(t.contains("more: amail doc"), "{t}");
     assert_eq!(
@@ -936,4 +962,108 @@ async fn slow_index_and_note_leave_mail_on_time(b: Backend) {
     // Shown once.
     let v = quick("UserPromptSubmit").await;
     assert!(!hook_text(&v).unwrap_or_default().contains("Handover note"));
+}
+
+/// `amail ps` shows whether the note is current without waiting for the
+/// next check: after the seat wrote its note in a turn, and after a node
+/// restart.
+async fn ps_knows_the_note_from_the_start(b: Backend) {
+    let Some(mut h) = setup(b, "ps_knows_the_note_from_the_start").await else {
+        return;
+    };
+    let w1 = h.seat("w1", "claude").await;
+    let inbox = FakeInbox::start(h.dir.path().join("cc.sock"), None);
+    let env = claude_env("w1", &inbox.path);
+    h.hook("claude", env.clone(), claude("SessionStart")).await;
+    h.wait("no note", || async {
+        h.seat_status("w1").await["handover_note"] == "none"
+    })
+    .await;
+    h.hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    // The seat writes its note with a shell command in the turn.
+    write_note(&w1, "w1", "none").await;
+    let tool = with(
+        claude("PostToolUse"),
+        &[(
+            "tool_input",
+            json!({"command": "cd /work/app && amail handover write -m \"State: on track ...\""}),
+        )],
+    );
+    h.hook("claude", env.clone(), tool).await;
+    h.wait("note current after the write", || async {
+        h.seat_status("w1").await["handover_note"] == "current"
+    })
+    .await;
+    h.hook("claude", env.clone(), claude("Stop")).await;
+    h.wait("turn start in the worklog", || async {
+        !node_entries(&h, "w1", "turn_start").await.is_empty()
+    })
+    .await;
+    // After a restart the node fetches the note's state and the last turn
+    // from the server.
+    h.restart_node().await;
+    h.wait("note current after a restart", || async {
+        h.seat_status("w1").await["handover_note"] == "current"
+    })
+    .await;
+    // A turn after the note makes it stale.
+    h.hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    assert_eq!(h.seat_status("w1").await["handover_note"], "stale");
+}
+
+/// Claude Code runs `SessionStart` (source `compact`) a few milliseconds
+/// before `PostCompact`. The session is shown the compaction's draft, not
+/// the note before it, and the old note is not recorded as read; when the
+/// draft comes too late for the session start, the next hook shows it.
+async fn compact_start_shows_the_draft(b: Backend) {
+    let Some(h) = setup(b, "compact_start_shows_the_draft").await else {
+        return;
+    };
+    let w1 = h.seat("w1", "claude").await;
+    let inbox = FakeInbox::start(h.dir.path().join("cc.sock"), None);
+    let env = claude_env("w1", &inbox.path);
+    write_note(&w1, "w1", "the old trap").await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    h.hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    let compact = with(claude("SessionStart"), &[("source", json!("compact"))]);
+    let (v, _) = tokio::join!(h.hook("claude", env.clone(), compact.clone()), async {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        h.hook("claude", env.clone(), claude("PostCompact")).await
+    });
+    let t = hook_text(&v).unwrap();
+    assert!(t.contains("State: draft: from compaction summary"), "{t}");
+    assert!(t.contains("login form"), "{t}");
+    assert!(!t.contains("the old trap"), "{t}");
+    let sid = claude("SessionStart")["session_id"].clone();
+    h.wait("read of the draft recorded", || async {
+        note(&h, "w1").await["note"]["read_by_session"] == sid
+    })
+    .await;
+    assert_eq!(note(&h, "w1").await["current_rev"], 2);
+    let old = h.api.get("/seats/w1/handover?rev=1").await;
+    assert!(old["note"]["read_by_session"].is_null(), "{old}");
+
+    // The draft comes after the session start's wait: the session start
+    // shows no note, the next hook shows the draft.
+    h.hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    let v = h.hook("claude", env.clone(), compact).await;
+    let t = hook_text(&v).unwrap_or_default();
+    assert!(!t.contains("Handover note"), "{t}");
+    h.hook("claude", env.clone(), claude("PostCompact")).await;
+    h.wait("second draft", || async {
+        note(&h, "w1").await["current_rev"] == 3
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let v = h
+        .hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    let t = hook_text(&v).unwrap();
+    assert!(t.contains("State: draft: from compaction summary"), "{t}");
+    let old = h.api.get("/seats/w1/handover?rev=2").await;
+    assert_eq!(old["note"]["rev"], 2);
 }

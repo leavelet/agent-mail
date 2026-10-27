@@ -342,9 +342,12 @@ cannot wait.
 (`amail doc`). The lines under `Documents:` are the current index for your \
 team. Before you decide how something is done here or rely on how a tool \
 behaves, run `amail doc search <terms>`; read a section \
-(`amail doc read dN#anchor`) rather than a whole document. Record a new \
-finding or decision as a document, not as mail. When a document is wrong, \
-supersede it or comment; do not write a second one on the same subject.
+(`amail doc read dN#anchor`) rather than a whole document. A fact you \
+verified about the code, a tool or the environment is a `finding` document \
+with its evidence (`amail doc new --kind finding`); a decision is a \
+`decision` document; neither goes in mail. A comment is for correcting or \
+discussing an existing document. When a document is wrong, supersede it or \
+comment; do not write a second one on the same subject.
 ";
 
 /// Seat-specific part: identity, whom to ask, role.
@@ -381,7 +384,8 @@ pub fn seat_intro(info: &LaunchInfo) -> String {
 pub const HANDOVER_INSTRUCTIONS: &str = "When your context is compacted, keep in the \
 summary: the exact next step, approaches you rejected and why, files you must not touch, how \
 to verify the current state, and the ids of tasks, documents and mail you were working with. \
-When asked to write your handover note, do so before anything else and then stop.";
+A fact you verified belongs in a `finding` document, not only in the summary. When asked to \
+write your handover note, do so before anything else and then stop.";
 
 /// The `Stop` continuation that asks for the handover note.
 pub const HANDOVER_ASK: &str =
@@ -524,6 +528,20 @@ pub fn tasks_summary(tasks: &[amail_proto::Task], more: bool) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rule for findings is stated concretely where agents read it.
+    #[test]
+    fn finding_rule_in_the_instructions() {
+        for t in [MAIL_INSTRUCTIONS, HANDOVER_INSTRUCTIONS] {
+            assert!(t.contains("A fact you verified"), "{t}");
+            assert!(t.contains("`finding` document"), "{t}");
+        }
+        assert!(
+            MAIL_INSTRUCTIONS
+                .contains("A comment is for correcting or discussing an existing document")
+        );
+        assert!(MAIL_INSTRUCTIONS.contains("about the code, a tool or the environment"));
+    }
     use amail_proto::*;
 
     fn e(id: i64, src: Source, c: DeliveryClass, subject: &str, body: Option<&str>) -> InboxEntry {

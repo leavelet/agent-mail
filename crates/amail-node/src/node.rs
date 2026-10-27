@@ -399,6 +399,10 @@ struct State {
     seats: HashMap<String, SeatRt>,
     saved: Saved,
     dirty_pending: HashSet<String>,
+    /// Seats whose pending counts the server refused to give this node (the
+    /// user seat: node tokens read agent seats' mailboxes only). Their
+    /// mailbox events are ignored until the node connects again.
+    pending_refused: HashSet<String>,
     dirty_presence: HashSet<String>,
     /// `saved` changed and must be written.
     save_dirty: bool,
@@ -442,6 +446,7 @@ impl Default for State {
             seats: HashMap::new(),
             saved: Saved::default(),
             dirty_pending: HashSet::new(),
+            pending_refused: HashSet::new(),
             dirty_presence: HashSet::new(),
             save_dirty: false,
             sup: HashMap::new(),
@@ -740,6 +745,32 @@ fn valid_model(m: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || "._-:/@[]+".contains(c))
 }
 
+/// After a refresh of pending counts: the seats to ask again, and the
+/// seats the server refused for good (a permanent error of a per-seat
+/// request: asking again cannot help). A failed request for the whole org
+/// is asked again for every seat.
+fn after_refresh(
+    whole: bool,
+    dirty: &[String],
+    results: &[Result<amail_proto::PendingResponse>],
+) -> (Vec<String>, Vec<String>) {
+    let (mut retry, mut refused) = (Vec::new(), Vec::new());
+    if whole {
+        if results.iter().any(|r| r.is_err()) {
+            retry.extend(dirty.iter().cloned());
+        }
+        return (retry, refused);
+    }
+    for (seat, r) in dirty.iter().zip(results) {
+        match r {
+            Ok(_) => {}
+            Err(e) if crate::server::is_permanent(e) => refused.push(seat.clone()),
+            Err(_) => retry.push(seat.clone()),
+        }
+    }
+    (retry, refused)
+}
+
 /// RFC 3339 to Unix ms.
 fn parse_ts(s: &str) -> Option<i64> {
     s.parse::<jiff::Timestamp>()
@@ -768,6 +799,9 @@ pub struct Node {
     release_kick: Notify,
     check_kick: Notify,
     jobs_kick: Notify,
+    /// A compaction draft was filed (or will not be): see
+    /// [`handover::SeatHo::draft_wait`].
+    draft_done: Notify,
     started: Instant,
 }
 
@@ -962,6 +996,7 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
         release_kick: Notify::new(),
         check_kick: Notify::new(),
         jobs_kick: Notify::new(),
+        draft_done: Notify::new(),
         started: Instant::now(),
     });
 
@@ -1709,6 +1744,9 @@ impl Node {
                 }
             }
             st.seat(seat).last_activity = now_ms();
+            if connected && st.want_note_state(seat, false) {
+                self.jobs_kick.notify_one();
+            }
             {
                 let s = st.seat(seat);
                 s.harness = Some(adapter.harness());
@@ -1799,6 +1837,13 @@ impl Node {
                     ho.note_fetched = None;
                     ho.note_fetching = false;
                     ho.note_gen += 1;
+                    // Claude Code runs `SessionStart` (compact) before
+                    // `PostCompact`: the note is fetched once the
+                    // compaction's draft is filed, so that the session is
+                    // shown the draft and not the note before it.
+                    ho.draft_wait = (source == "compact" && ho.draft_expected())
+                        .then(|| Instant::now() + handover::DRAFT_WAIT);
+                    ho.compacted = None;
                     plan.index_wait = ho.index.is_none();
                     plan.note_wait = ho.note_pending;
                     st.log(seat, "session_start", format!("source: {source}"));
@@ -1808,6 +1853,18 @@ impl Node {
                     recheck = true;
                 }
                 Event::UserPromptSubmit { prompt } => {
+                    if registered {
+                        // The session's own `SessionStart` came before its
+                        // registration and could not be tied to the seat
+                        // (Codex): this prompt starts the session.
+                        st.log(seat, "session_start", "source: startup");
+                        let ho = &mut st.seat(seat).ho;
+                        ho.note_pending = true;
+                        ho.note_fetched = None;
+                        ho.note_fetching = false;
+                        ho.note_gen += 1;
+                        plan.note_wait = connected;
+                    }
                     st.seat(seat).restore_pending = false;
                     st.set_state(seat, SeatState::Busy);
                     self.turn_started(&mut st, seat);
@@ -1847,12 +1904,15 @@ impl Node {
                     st.set_state(seat, SeatState::Busy);
                     if let Some(tool) = &hook.facts.tool {
                         let input = hook.facts.tool_input.as_deref().unwrap_or_default();
-                        if handover::touches_tasks(tool, input) {
+                        if hook.facts.task_tool {
                             let ho = &mut st.seat(seat).ho;
                             ho.task_tool = true;
                             // The task it holds may have changed: from now
                             // on the server fills it in.
                             ho.doing = None;
+                        }
+                        if hook.facts.note_tool && connected && st.want_note_state(seat, true) {
+                            self.jobs_kick.notify_one();
                         }
                         let text = if input.is_empty() {
                             tool.clone()
@@ -1946,8 +2006,19 @@ impl Node {
                     let ho = &mut st.seat(seat).ho;
                     ho.index_hash = None;
                     ho.index_checked = None;
+                    // Kept for the session start that reports this
+                    // compaction, unless one is waiting for it already.
+                    ho.compacted = ho.draft_wait.is_none().then(Instant::now);
                     let turn_start = ho.turn_start;
-                    if let Some(summary) = summary.clone().filter(|_| connected) {
+                    let draft = summary.clone().filter(|_| connected);
+                    ho.draft_running = draft.is_some();
+                    if draft.is_none() {
+                        // No draft comes: a session start waiting for one
+                        // fetches the note now.
+                        ho.draft_wait = None;
+                        self.draft_done.notify_waiters();
+                    }
+                    if let Some(summary) = draft {
                         st.jobs.push_back(handover::Job::Draft {
                             seat: seat.to_string(),
                             summary,
@@ -2593,6 +2664,10 @@ impl Node {
             st.save_dirty = true;
             // Its pending counts, in case the node did not keep them.
             st.dirty_pending.insert(seat.to_string());
+            // And its note's state, for `amail ps`.
+            if st.want_note_state(seat, false) {
+                self.jobs_kick.notify_one();
+            }
         }
         self.refresh_kick.notify_one();
         // A supervised seat resumes its last session when it has one;
@@ -2857,6 +2932,7 @@ impl Node {
                             let mut st = self.lock();
                             self.apply_pending(&mut st, p);
                             st.connected = true;
+                            st.pending_refused.clear();
                             // The server (or another instance) may know
                             // nothing about the seats: report them all.
                             let all: Vec<String> = st
@@ -2865,6 +2941,12 @@ impl Node {
                                 .filter(|(_, s)| s.harness.is_some())
                                 .map(|(n, _)| n.clone())
                                 .collect();
+                            // `amail ps` shows whether each note is current
+                            // from the start, not after the next check.
+                            for seat in &all {
+                                st.want_note_state(seat, false);
+                            }
+                            self.jobs_kick.notify_one();
                             st.dirty_presence.extend(all);
                             backoff = Duration::from_millis(250);
                             tracing::info!("connected to {}", self.cfg.url);
@@ -2897,6 +2979,9 @@ impl Node {
                             continue;
                         };
                         let mut st = self.lock();
+                        if st.pending_refused.contains(&m.seat) {
+                            continue;
+                        }
                         if st
                             .server_seat(&m.seat)
                             .is_some_and(|s| m.seq > s.pending.seq)
@@ -2953,22 +3038,28 @@ impl Node {
                     futures::future::join_all(dirty.iter().map(|s| self.server.pending(Some(s))))
                         .await
                 };
-                let mut failed = false;
-                {
+                let failed = {
                     let mut st = self.lock();
+                    let (retry, refused) = after_refresh(whole, &dirty, &results);
                     for r in results {
                         match r {
                             Ok(p) => self.apply_pending(&mut st, p),
                             Err(e) => {
                                 tracing::debug!("refreshing pending counts: {e:#}");
-                                failed = true;
                             }
                         }
                     }
-                    if failed {
-                        st.dirty_pending.extend(dirty);
+                    for seat in refused {
+                        tracing::debug!(
+                            "seat {seat}: the server does not give this node its pending \
+                             counts; not asked again until the node reconnects"
+                        );
+                        st.pending_refused.insert(seat);
                     }
-                }
+                    let failed = !retry.is_empty();
+                    st.dirty_pending.extend(retry);
+                    failed
+                };
                 self.wake_kick.notify_one();
                 self.presence_kick.notify_one();
                 if failed {

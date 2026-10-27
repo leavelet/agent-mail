@@ -1234,6 +1234,11 @@ impl Node {
             let name = p.seat.clone();
             st.saved.managed.insert(name.clone(), m);
             st.seat(&name).harness = h;
+            // Its note's state, for `amail ps` (the jobs run once the node
+            // is connected).
+            if st.connected && st.want_note_state(&name, false) {
+                self.jobs_kick.notify_one();
+            }
             if let Some(id) = adopt {
                 let registers = h.is_some_and(|h| self.adapter(h).registers_sessions());
                 super::adopt::adopt_into(&mut st, &name, &id, registers);

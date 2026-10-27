@@ -347,13 +347,15 @@ pub async fn thread(
         truncated = true;
     }
     let tasks = crate::tasks::thread_refs(&st, auth.org.id, id).await;
+    let (docs, doc_comments) = crate::docs::thread_refs(&st, auth.org.id, id).await;
     Ok(Json(p::ThreadResponse {
         thread_id: id,
         truncated,
         messages,
         participants,
         tasks,
-        docs: crate::docs::thread_refs(&st, auth.org.id, id).await,
+        docs,
+        doc_comments,
     }))
 }
 

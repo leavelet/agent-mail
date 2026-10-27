@@ -314,8 +314,10 @@ per org (t12); `task_mine` and `task_next` show your work. Close a task with a r
 it is about); split work into child tasks (`parent`) so that the parent shows progress; \
 pass the task's `rev` as `if_rev` when you change a title or body. The team keeps decisions, \
 findings and procedures as documents (d12): search them with `doc_search` before you decide how \
-something is done here, read one section at a time with `doc_read`, and record a new finding or \
-decision as a document with `doc_new`, not as mail.";
+something is done here and read one section at a time with `doc_read`. A fact you verified \
+about the code, a tool or the environment is a `finding` document with its evidence (`doc_new` \
+with kind finding); a decision is a `decision` document; neither goes in mail. `doc_comment` is \
+for correcting or discussing an existing document.";
 
 /// One tool: its name, description, input schema and whether it only reads.
 struct ToolDef {
@@ -1508,9 +1510,18 @@ async fn thread(c: &Client, id: i64) -> Result<(Value, String)> {
     let mut text = t
         .messages
         .iter()
-        .map(|m| output::message(m).trim_end().to_string())
+        .map(|m| {
+            let s = output::message(m).trim_end().to_string();
+            match crate::doc_cmd::thread_comment_mark(&t, m.header.id) {
+                Some(mark) => format!("{mark}\n{s}"),
+                None => s,
+            }
+        })
         .collect::<Vec<_>>()
         .join("\n---\n");
+    if let Some(docs) = crate::doc_cmd::thread_docs_text(&t.docs) {
+        text.push_str(&format!("\n---\n{docs}"));
+    }
     if let Some(tasks) = v.get("tasks").and_then(Value::as_array)
         && !tasks.is_empty()
     {

@@ -229,6 +229,54 @@ test('needs you lists decision drafts and the user activates one', async ({ page
   await expect.poll(async () => (await getDoc(nums.decision)).status).toBe('active');
 });
 
+test('at phone width the reader does not cover the drafts and their Activate button', async ({ page }) => {
+  const s = state();
+  const num = await newDoc(s.seatTokens['be-lead'], {
+    title: 'Shard the archive index by month',
+    kind: 'decision',
+    body: '## Context\nBig index.\n## Decision\nMonthly shards.\n## Alternatives\nOne index.\n## Consequences\nMore files.\n',
+    team: 'backend',
+  });
+  await api(s.seatTokens['be-1'], 'POST', '/messages', { to: ['owner'], subject: 'Shards: which month boundary?', body: 'UTC or local time?' });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await login(page, s.userToken, { lang: 'en' });
+  await page.goto(`${s.base}/#/needs`);
+  // The first message is open in the reader below the queue.
+  await expect(page.locator('.needs .reader article, .needs .reader .card').first()).toBeVisible();
+  const button = page.getByTestId('needs-docs').locator(`li[data-doc="${num}"]`).getByRole('button', { name: 'Activate' });
+  await button.scrollIntoViewIfNeeded();
+  await expect(button).toBeVisible();
+  // Nothing is drawn over the button: the element at its centre is the
+  // button itself.
+  const onTop = await button.evaluate((b) => {
+    const r = b.getBoundingClientRect();
+    const el = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+    return !!el && b.contains(el);
+  });
+  expect(onTop).toBe(true);
+  const wide = await page.locator('#main').evaluate((m) => m.scrollWidth - m.clientWidth);
+  expect(wide).toBeLessThanOrEqual(1);
+  await button.click();
+  await expect.poll(async () => (await getDoc(num)).status).toBe('active');
+});
+
+test('the thread page lists the documents it cites and marks a comment on a removed section', async ({ page }) => {
+  const s = state();
+  const lead = s.seatTokens['be-lead'];
+  const num = await newDoc(lead, {
+    title: 'Archive import notes',
+    body: '# Import\n\nRun the importer.\n\n# Old format\n\nThe 2019 files.\n',
+    team: 'backend',
+  });
+  const c = await api<{ id: number; thread_id: number }>(s.userToken, 'POST', `/docs/${num}/comment`, { anchor: 'old-format', body: 'Do we still get these?' });
+  await api(lead, 'PUT', `/docs/${num}/body`, { body: '# Import\n\nRun the importer.\n' });
+  await login(page, s.userToken, { lang: 'en' });
+  await page.goto(`${s.base}/#/thread/${c.thread_id}`);
+  await expect(page.getByTestId('thread-docs')).toContainText(`d${num}`);
+  await expect(page.getByTestId('thread-docs')).toContainText('Archive import notes');
+  await expect(page.getByTestId('comment-anchor').first()).toContainText('on a removed section (was: Old format)');
+});
+
 test('a comment on a section shows its anchor in the discussion', async ({ page }) => {
   const s = state();
   await login(page, s.userToken, { lang: 'en' });

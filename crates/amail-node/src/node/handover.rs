@@ -58,6 +58,13 @@ const CLOCK_MARGIN_MS: i64 = 2_000;
 pub(super) const INDEX_WAIT: Duration = Duration::from_millis(500);
 /// The same for the handover note.
 pub(super) const NOTE_WAIT: Duration = Duration::from_millis(700);
+/// After a session start with source `compact`, how long the note's fetch
+/// waits for the compaction's draft (the harness may run `PostCompact`
+/// after `SessionStart`).
+pub(super) const DRAFT_WAIT: Duration = Duration::from_secs(3);
+/// A `PostCompact` this recent belongs to the compaction a session start
+/// with source `compact` reports.
+const COMPACT_RECENT: Duration = Duration::from_secs(30);
 /// How long a background fetch of the index or the note may take.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -111,6 +118,21 @@ pub(super) struct SeatHo {
     /// When the current note was written, as last fetched: `Some(None)`
     /// for no note, `None` for not known.
     pub(super) note_at: Option<Option<i64>>,
+    /// When the seat's last turn started as the server's worklog records it
+    /// (`Some(0)`: no turn recorded), fetched with the note's state when the
+    /// node has not seen a turn of the seat (after a restart).
+    pub(super) turn_seen: Option<i64>,
+    /// When `PostCompact` last came.
+    pub(super) compacted: Option<Instant>,
+    /// A [`Job::Draft`] is queued or running.
+    pub(super) draft_running: bool,
+    /// Set at a session start with source `compact` while the compaction's
+    /// draft may still be filed: until then (at most until this time) the
+    /// note is not fetched, so that the old note is neither shown nor
+    /// recorded as read.
+    pub(super) draft_wait: Option<Instant>,
+    /// A [`Job::NoteState`] for the seat is queued or running.
+    pub(super) note_state_queued: bool,
     /// The idle period (the seat's `since`) the node asked about.
     pub(super) idle_asked: Option<i64>,
     /// The working directory's last commit, as last looked at.
@@ -133,10 +155,17 @@ impl SeatHo {
         }
     }
 
+    /// At a session start with source `compact`: whether a draft of this
+    /// compaction may still come (its `PostCompact` has not come yet, or
+    /// its draft is being filed).
+    pub(super) fn draft_expected(&self) -> bool {
+        self.draft_running || self.compacted.is_none_or(|c| c.elapsed() > COMPACT_RECENT)
+    }
+
     /// Whether the note is current: no turn started after it was written.
     /// `None` when the node does not know.
     pub(super) fn note_current(&self) -> Option<bool> {
-        match (self.note_at?, self.turn_start) {
+        match (self.note_at?, self.turn_start.or(self.turn_seen)) {
             (None, _) => Some(false),
             (Some(n), Some(t)) => Some(n >= t),
             (Some(_), None) => None,
@@ -169,6 +198,10 @@ pub(super) enum Job {
         session: String,
         rev: i64,
     },
+    /// Fetch the note's state (when it was written) for `amail ps`: when
+    /// the node connects, when a seat is added, and after the seat wrote
+    /// its note.
+    NoteState { seat: String },
 }
 
 /// The hash of an index text.
@@ -177,13 +210,6 @@ pub(super) fn text_hash(t: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     t.hash(&mut h);
     h.finish()
-}
-
-/// Whether a tool call may change a task: an `amail task` command line,
-/// or an amail MCP tool about tasks.
-pub(super) fn touches_tasks(tool: &str, input: &str) -> bool {
-    let t = tool.to_ascii_lowercase();
-    (t.contains("amail") && t.contains("task")) || input.contains("amail task")
 }
 
 /// Whether a claimed message is the server's request for the note.
@@ -198,6 +224,20 @@ fn closes_task(text: &str) -> bool {
 }
 
 impl State {
+    /// Queue a [`Job::NoteState`] for `seat` unless one is queued; with
+    /// `known`, also when the node already knows the note's state.
+    pub(super) fn want_note_state(&mut self, seat: &str, known: bool) -> bool {
+        let ho = &mut self.seat(seat).ho;
+        if ho.note_state_queued || (ho.note_at.is_some() && !known) {
+            return false;
+        }
+        ho.note_state_queued = true;
+        self.jobs.push_back(Job::NoteState {
+            seat: seat.to_string(),
+        });
+        true
+    }
+
     /// Queue a worklog entry for `seat`, marked with the seat's current
     /// session and its `doing` task when the node knows them.
     pub(super) fn log(&mut self, seat: &str, kind: &str, text: impl Into<String>) {
@@ -285,6 +325,7 @@ impl Node {
         };
         let seat = seat.to_string();
         Some(tokio::spawn(async move {
+            me.wait_draft(&seat).await;
             let r = me.server.handover(&seat, FETCH_TIMEOUT).await;
             let mut st = me.lock();
             let ho = &mut st.seat(&seat).ho;
@@ -301,6 +342,24 @@ impl Node {
                 Err(e) => tracing::debug!("handover note of {seat}: {e:#}"),
             }
         }))
+    }
+
+    /// Wait until the compaction draft `seat`'s session start waits for is
+    /// filed (or will not be), at most until [`SeatHo::draft_wait`].
+    async fn wait_draft(&self, seat: &str) {
+        loop {
+            let done = self.draft_done.notified();
+            tokio::pin!(done);
+            done.as_mut().enable();
+            let until = self.lock().seats.get(seat).and_then(|s| s.ho.draft_wait);
+            let Some(until) = until.filter(|t| *t > Instant::now()) else {
+                return;
+            };
+            if tokio::time::timeout_at(until.into(), done).await.is_err() {
+                tracing::debug!("seat {seat}: no compaction draft in time; fetching the note");
+                return;
+            }
+        }
     }
 
     /// Whether the session's context passed the handover threshold, from
@@ -500,40 +559,100 @@ impl Node {
                     session,
                     turn_start,
                 } => {
-                    let h = match self.server.handover(&seat, Duration::from_secs(10)).await {
-                        Ok(h) => h,
-                        Err(e) => {
-                            tracing::debug!("handover note of {seat}: {e:#}");
-                            continue;
-                        }
-                    };
-                    let note_at = h.note.as_ref().and_then(|n| parse_ts(&n.written_at));
-                    let current = matches!((note_at, turn_start), (Some(n), Some(t)) if n >= t);
-                    if current {
-                        continue;
-                    }
-                    match self
-                        .server
-                        .handover_compaction(&seat, &summary, session.as_deref())
-                        .await
-                    {
-                        Ok(r) => {
-                            let at = r.note.as_ref().and_then(|n| parse_ts(&n.written_at));
-                            self.lock().seat(&seat).ho.note_at = Some(at);
-                            tracing::info!(
-                                "seat {seat}: compaction summary filed as draft note rev {}",
-                                r.current_rev
-                            );
-                        }
-                        Err(e) => tracing::warn!("seat {seat}: draft note not filed: {e:#}"),
-                    }
+                    self.file_draft(&seat, &summary, session.as_deref(), turn_start)
+                        .await;
+                    let mut st = self.lock();
+                    let ho = &mut st.seat(&seat).ho;
+                    ho.draft_running = false;
+                    ho.draft_wait = None;
+                    self.draft_done.notify_waiters();
                 }
                 Job::Read { seat, session, rev } => {
                     if let Err(e) = self.server.handover_read(&seat, &session, rev).await {
                         tracing::debug!("seat {seat}: note read not recorded: {e:#}");
                     }
                 }
+                Job::NoteState { seat } => self.note_state(&seat).await,
             }
+        }
+    }
+
+    /// File a compaction summary as a draft note unless the note was
+    /// written in the turn that started at `turn_start`.
+    async fn file_draft(
+        &self,
+        seat: &str,
+        summary: &str,
+        session: Option<&str>,
+        turn_start: Option<i64>,
+    ) {
+        let h = match self.server.handover(seat, Duration::from_secs(10)).await {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::debug!("handover note of {seat}: {e:#}");
+                return;
+            }
+        };
+        let note_at = h.note.as_ref().and_then(|n| parse_ts(&n.written_at));
+        let current = matches!((note_at, turn_start), (Some(n), Some(t)) if n >= t);
+        if current {
+            return;
+        }
+        match self
+            .server
+            .handover_compaction(seat, summary, session)
+            .await
+        {
+            Ok(r) => {
+                let at = r.note.as_ref().and_then(|n| parse_ts(&n.written_at));
+                self.lock().seat(seat).ho.note_at = Some(at);
+                tracing::info!(
+                    "seat {seat}: compaction summary filed as draft note rev {}",
+                    r.current_rev
+                );
+            }
+            Err(e) => tracing::warn!("seat {seat}: draft note not filed: {e:#}"),
+        }
+    }
+
+    /// Fetch when `seat`'s note was written and, when the node has seen no
+    /// turn of the seat, when its last turn started (from the worklog).
+    async fn note_state(&self, seat: &str) {
+        let wait = Duration::from_secs(10);
+        let note = self.server.handover(seat, wait).await;
+        let need_turn = {
+            let mut st = self.lock();
+            let ho = &mut st.seat(seat).ho;
+            ho.note_state_queued = false;
+            match &note {
+                Ok(h) => {
+                    ho.note_at = Some(
+                        h.note
+                            .as_ref()
+                            .map(|n| parse_ts(&n.written_at).unwrap_or(0)),
+                    );
+                    ho.requested = h.requested_at.is_some();
+                }
+                Err(e) => {
+                    tracing::debug!("handover note of {seat}: {e:#}");
+                    return;
+                }
+            }
+            ho.turn_start.is_none() && ho.turn_seen.is_none()
+        };
+        if !need_turn {
+            return;
+        }
+        match self
+            .server
+            .worklog(seat, "turn_start", "1970-01-01T00:00:00Z", 1, wait)
+            .await
+        {
+            Ok(p) => {
+                let at = p.entries.first().and_then(|e| parse_ts(&e.at)).unwrap_or(0);
+                self.lock().seat(seat).ho.turn_seen = Some(at);
+            }
+            Err(e) => tracing::debug!("worklog of {seat}: {e:#}"),
         }
     }
 
@@ -661,14 +780,6 @@ async fn last_commit(cwd: &str) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn task_tools() {
-        assert!(touches_tasks("Bash", "amail task done t3 --result ok"));
-        assert!(touches_tasks("mcp__amail__task_set", "{}"));
-        assert!(!touches_tasks("Bash", "cargo test"));
-        assert!(!touches_tasks("mcp__amail__send", "{}"));
-    }
 
     #[test]
     fn closes() {

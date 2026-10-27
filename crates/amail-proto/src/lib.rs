@@ -843,6 +843,11 @@ pub struct ThreadResponse {
     /// subject), or whose discussion thread it is.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub docs: Vec<DocRef>,
+    /// The messages of this thread that are comments on a document whose
+    /// discussion thread it is, with the section each is on (and whether
+    /// the current revision still has it).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub doc_comments: Vec<ThreadDocComment>,
     /// Older messages were left out (a thread answers at most its newest
     /// 500 messages, and headers of at most [`limits::MAX_PAGE_BYTES`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
