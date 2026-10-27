@@ -48,6 +48,8 @@ macro_rules! string_enum {
 
 mod tasks;
 pub use tasks::*;
+mod handover;
+pub use handover::*;
 
 string_enum!(
     /// Kind of seat. Every org has exactly one `user` seat, and one hidden
