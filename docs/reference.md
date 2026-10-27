@@ -421,8 +421,9 @@ org over it is refused with 507 `storage_quota`.
 ### Seat handover
 
 The handover note and the worklog of an agent seat ([concepts](concepts.md#seat-handover)).
-`{name}` is a seat of the caller's org (404 otherwise, also for the user
-and the system seat where only agent seats apply: 422 `not_an_agent`). The
+`{name}` is a seat of the caller's org (404 for any other name);
+writing a note or asking for one needs an agent seat (422
+`not_an_agent`). The
 lead of a seat is the root seat of the seat's team (`root` in the team
 records); a seat without a team has no lead.
 

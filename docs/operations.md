@@ -383,7 +383,7 @@ Public mode turns on:
 | requests per org whose database cost depends on the data (see below), in progress at the same time, in each of the three pools | `--max-org-queries` / `AMAIL_MAX_ORG_QUERIES` | 1 |
 | the same over all orgs, in each of the search pool and the other pool (two times this together; keep that below `--max-connections`, the database pool size, 32 by default) | `--max-queries` / `AMAIL_MAX_QUERIES` | 8 |
 | failed authentications per minute per client address (IPv6 per /64; bursts of three minutes' worth); beyond them, requests from that address with a credential the instance has not seen valid lately get 429 without a database lookup | `--max-auth-failures-per-min` / `AMAIL_MAX_AUTH_FAILURES_PER_MIN` | 10 |
-| days a seat's worklog entries are kept (an hourly pass deletes older ones; without it, entries are kept until the storage quota needs the room) | `--worklog-days` / `AMAIL_WORKLOG_DAYS` | 90 |
+| days a seat's worklog entries are kept (a pass every ten minutes deletes older ones; without it, entries are kept until the storage quota needs the room) | `--worklog-days` / `AMAIL_WORKLOG_DAYS` | 90 |
 | worklog entries per `POST /v1/worklog` request | `--max-worklog-batch` / `AMAIL_MAX_WORKLOG_BATCH` | 5000 |
 
 `0` turns a limit off. The limits also apply without `--public` when set
