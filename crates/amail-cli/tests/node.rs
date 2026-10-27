@@ -1055,6 +1055,16 @@ async fn hook_and_wake_inject_once(b: Backend) {
     for w in workers {
         w.join().unwrap();
     }
+    // On a loaded host the agent may never have been idle long enough for
+    // a wake-up during the race; make sure one happens before the sweep.
+    if inbox.count() == 0 {
+        let v = h.hook("claude", env.clone(), claude("Stop")).await;
+        seen.lock()
+            .unwrap()
+            .extend(injected_ids(&hook_text(&v).unwrap_or_default()));
+        sent.push(h.api.send(&["w1"], &[], "race late", false).await);
+        h.wait("a wake-up", || async { inbox.count() > 0 }).await;
+    }
     // Sweep whatever is still pending, then let in-flight wake-ups finish.
     for _ in 0..50 {
         let v = h
