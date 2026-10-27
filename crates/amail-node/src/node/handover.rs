@@ -53,6 +53,21 @@ const TASK_ENTRIES: u32 = 50;
 /// Margin before the turn's start when asking for the turn's task entries
 /// (the server's clock may differ a little).
 const CLOCK_MARGIN_MS: i64 = 2_000;
+/// At session start with nothing cached, how long a hook waits for the
+/// index at most (and at most half of what is left of its deadline).
+pub(super) const INDEX_WAIT: Duration = Duration::from_millis(500);
+/// The same for the handover note.
+pub(super) const NOTE_WAIT: Duration = Duration::from_millis(700);
+/// How long a background fetch of the index or the note may take.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Wait for `job` until `cap` or half of what is left before `deadline`,
+/// whichever comes first. The job goes on when the wait ends.
+pub(super) async fn wait_part(job: tokio::task::JoinHandle<()>, deadline: Instant, cap: Duration) {
+    let left = deadline.saturating_duration_since(Instant::now());
+    let _ = tokio::time::timeout((left / 2).min(cap), job).await;
+}
+
 /// The default of the team's `handover_idle`.
 pub const HANDOVER_IDLE_DEFAULT_MS: u64 = 30 * 60 * 1000;
 
@@ -67,6 +82,19 @@ pub(super) struct SeatHo {
     pub(super) index_hash: Option<u64>,
     /// When the index was last fetched for the seat.
     pub(super) index_checked: Option<Instant>,
+    /// The index as last fetched (hooks show it from here).
+    pub(super) index: Option<amail_proto::DocIndex>,
+    /// A fetch of the index is running.
+    pub(super) index_fetching: bool,
+    /// The session has not been shown its note yet (session start with
+    /// source `startup`, `resume`, `clear` or `compact`).
+    pub(super) note_pending: bool,
+    /// The note as fetched for the pending showing.
+    pub(super) note_fetched: Option<amail_proto::HandoverResponse>,
+    /// A fetch of the note is running.
+    pub(super) note_fetching: bool,
+    /// Counts session starts: a fetch made for an earlier one is dropped.
+    pub(super) note_gen: u64,
     /// When the current (or last) turn started (Unix ms).
     pub(super) turn_start: Option<i64>,
     /// The current turn's `Stop` was blocked to ask for the note.
@@ -219,6 +247,62 @@ pub(super) struct StopCheck {
 }
 
 impl Node {
+    /// Fetch `seat`'s document index into its cache, in a task of its own.
+    /// `None` (and nothing fetched) when the node is shutting down.
+    pub(super) fn spawn_index(
+        &self,
+        seat: &str,
+        max: usize,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let Some(me) = self.me.upgrade() else {
+            self.lock().seat(seat).ho.index_fetching = false;
+            return None;
+        };
+        let seat = seat.to_string();
+        Some(tokio::spawn(async move {
+            let r = me
+                .server
+                .docs_index(&seat, INDEX_MAX_LINES, max, FETCH_TIMEOUT)
+                .await;
+            let mut st = me.lock();
+            let ho = &mut st.seat(&seat).ho;
+            ho.index_fetching = false;
+            ho.index_checked = Some(Instant::now());
+            match r {
+                Ok(ix) => ho.index = Some(ix),
+                Err(e) => tracing::debug!("document index of {seat}: {e:#}"),
+            }
+        }))
+    }
+
+    /// Fetch `seat`'s handover note for the pending showing, in a task of
+    /// its own.
+    pub(super) fn spawn_note(&self, seat: &str) -> Option<tokio::task::JoinHandle<()>> {
+        let started = self.lock().seat(seat).ho.note_gen;
+        let Some(me) = self.me.upgrade() else {
+            self.lock().seat(seat).ho.note_fetching = false;
+            return None;
+        };
+        let seat = seat.to_string();
+        Some(tokio::spawn(async move {
+            let r = me.server.handover(&seat, FETCH_TIMEOUT).await;
+            let mut st = me.lock();
+            let ho = &mut st.seat(&seat).ho;
+            if ho.note_gen != started {
+                return;
+            }
+            ho.note_fetching = false;
+            match r {
+                Ok(r) => {
+                    ho.note_at = Some(r.note.as_ref().and_then(|n| parse_ts(&n.written_at)));
+                    ho.requested = r.requested_at.is_some();
+                    ho.note_fetched = Some(r);
+                }
+                Err(e) => tracing::debug!("handover note of {seat}: {e:#}"),
+            }
+        }))
+    }
+
     /// Whether the session's context passed the handover threshold, from
     /// the latest usage figure in its transcript (false when unknown).
     pub(super) fn context_over(&self, h: Harness, seat: &str) -> bool {

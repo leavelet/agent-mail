@@ -158,6 +158,9 @@ pub struct Harness {
     pub fake: PathBuf,
 }
 
+/// Which request paths [`Opts::slow_routes`] holds back.
+pub type SlowPath = fn(&str) -> bool;
+
 pub struct Opts {
     pub wake_window: Duration,
     pub wake_confirm: Duration,
@@ -174,6 +177,9 @@ pub struct Opts {
     /// Hold back the server's answers to the first `n` claims by this long
     /// (the claim itself is done), like an answer lost on the way.
     pub slow_claims: Option<(usize, Duration)>,
+    /// Hold back the server's answers to requests whose path (with `/v1`)
+    /// the function accepts by this long, as a slow server would.
+    pub slow_routes: Option<(SlowPath, Duration)>,
     /// Check who sends socket requests (default: only with `supervise`,
     /// where sessions are launched as they are in use; other tests send
     /// hooks from the test process).
@@ -199,6 +205,7 @@ impl Default for Opts {
             tweak: None,
             server_tweak: None,
             slow_claims: None,
+            slow_routes: None,
             check_callers: None,
             local_policy: None,
             notices: false,
@@ -229,11 +236,25 @@ impl Harness {
         if let Some(t) = opts.server_tweak {
             t(&mut state);
         }
-        match opts.slow_claims {
-            None => {
+        match (opts.slow_claims, opts.slow_routes) {
+            (None, Some((slow, delay))) => {
+                let _tasks = amail_server::start_background(&state);
+                let app = amail_server::router(state).layer(axum::middleware::from_fn(
+                    move |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                        let hold = slow(req.uri().path());
+                        let resp = next.run(req).await;
+                        if hold {
+                            tokio::time::sleep(delay).await;
+                        }
+                        resp
+                    },
+                ));
+                tokio::spawn(async move { axum::serve(listener, app).await });
+            }
+            (None, None) => {
                 tokio::spawn(amail_server::serve(listener, state, std::future::pending()));
             }
-            Some((n, delay)) => {
+            (Some((n, delay)), _) => {
                 let left = Arc::new(std::sync::atomic::AtomicUsize::new(n));
                 let _tasks = amail_server::start_background(&state);
                 let app = amail_server::router(state).layer(axum::middleware::from_fn(

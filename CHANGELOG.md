@@ -392,7 +392,10 @@ The first public version.
     `Pointers` as fits; a warning line past 7 days) and records the read,
     and the team's document index under `Documents:` after the task line
     (up to a third of the budget). A turn's start shows the index again
-    when it changed. Mail always comes first.
+    when it changed. Mail always comes first: the node keeps the index in
+    a cache it refreshes in the background, a hook waits for the index or
+    the note only at session start and only for a part of its time, and
+    what misses comes with the next hook.
   - The end of a turn asks once for the handover note when the note is
     older than the turn and the context passed `--handover-threshold`
     (70%) of the model's window (read from the transcript; windows from

@@ -531,11 +531,22 @@ thirds of the harness's injection budget and the index up to a third
 6,000, so about 4,000 and 2,000), each cut to what is left. The index is
 cut first.
 
+The index and the note never delay the mail. The node keeps each seat's
+index and fetches it in the background (when a hook finds it older than
+30 s, and after a compaction); a hook shows what has arrived. Only a
+session start with no index fetched yet waits for it, at most 500 ms and
+at most half of what is left of the hook's time once the mail calls are
+done; the note at session start waits the same way, at most 700 ms. What
+does not arrive in time is shown by the seat's next hook: the note stays
+due until it is shown. The end-of-turn check for the handover note has
+half of what is left of the hook's time and is skipped when less than
+300 ms is left.
+
 | hook | shows |
 |---|---|
 | `SessionStart` | the note (sources `startup`, `resume`, `clear`, `compact`), the unread summary, the task line, the index |
-| `UserPromptSubmit` | mail; the index when it changed since the seat last saw it (looked at most every 30 s per seat) |
-| `PostToolUse` | `to` and urgent mail |
+| `UserPromptSubmit` | mail; the index when it changed since the seat last saw it; a note still due |
+| `PostToolUse` | `to` and urgent mail; a note still due; refreshes the index in the background without showing it |
 | `Stop` | blocks to show mail; or, once per turn, to ask for the handover note; the index only in an answer that blocks anyway |
 | `PostCompact` | nothing; the next answer shows the whole index again |
 

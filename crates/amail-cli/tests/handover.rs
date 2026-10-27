@@ -45,6 +45,7 @@ handover_tests!(
     note_shown_at_session_start,
     idle_seat_with_work_is_asked,
     codex_index_and_compaction,
+    slow_index_and_note_leave_mail_on_time,
 );
 
 const ASK: &str = "Write your handover note now with `amail handover write`; then stop.";
@@ -129,6 +130,15 @@ fn transcript(h: &Harness, input: u64) -> PathBuf {
     path
 }
 
+/// Wait until the node's cached index of `seat` has `n` lines (the node
+/// refreshes it in the background).
+async fn wait_index(h: &Harness, seat: &str, n: usize) {
+    h.wait(&format!("{seat}'s index with {n} lines"), || async {
+        h.seat_status(seat).await["index_lines"] == n
+    })
+    .await;
+}
+
 async fn worklog(h: &Harness, seat: &str) -> Vec<Value> {
     h.api.get(&format!("/seats/{seat}/worklog?limit=200")).await["entries"]
         .as_array()
@@ -167,12 +177,21 @@ async fn index_at_start_and_when_changed(b: Backend) {
             json!({"title": "Draft", "kind": "index", "body": "# Draft\n\nx\n"}),
         )
         .await;
+    // Hooks show the index the node has cached; a hook starts a refresh
+    // in the background, and a later hook shows what it brought (this one
+    // when the refresh was quicker than the hook).
+    wait_index(&h, "w1", 0).await;
+    let want = format!("Documents:\nd{d1}  index  Deploy — how we deploy");
     let v = h.hook("claude", env.clone(), claude("SessionStart")).await;
-    let t = hook_text(&v).unwrap();
-    assert_eq!(
-        t,
-        format!("Documents:\nd{d1}  index  Deploy — how we deploy")
-    );
+    if v == Value::Null {
+        wait_index(&h, "w1", 1).await;
+        let v = h
+            .hook("claude", env.clone(), claude("UserPromptSubmit"))
+            .await;
+        assert_eq!(hook_text(&v).unwrap(), want);
+    } else {
+        assert_eq!(hook_text(&v).unwrap(), want);
+    }
     // A turn shows it only when it changed.
     assert_eq!(
         h.hook("claude", env.clone(), claude("UserPromptSubmit"))
@@ -180,6 +199,12 @@ async fn index_at_start_and_when_changed(b: Backend) {
         Value::Null
     );
     let d2 = active_doc(&h, "Testing", "how we test").await;
+    // A tool call refreshes the cache without showing it.
+    assert_eq!(
+        h.hook("claude", env.clone(), claude("PostToolUse")).await,
+        Value::Null
+    );
+    wait_index(&h, "w1", 2).await;
     let v = h
         .hook("claude", env.clone(), claude("UserPromptSubmit"))
         .await;
@@ -196,6 +221,8 @@ async fn index_at_start_and_when_changed(b: Backend) {
     );
     // A Stop with nothing to show does not block for the index.
     active_doc(&h, "Third", "another").await;
+    h.hook("claude", env.clone(), claude("PostToolUse")).await;
+    wait_index(&h, "w1", 3).await;
     assert_eq!(
         h.hook("claude", env.clone(), claude("Stop")).await,
         Value::Null
@@ -792,12 +819,20 @@ async fn codex_index_and_compaction(b: Backend) {
             with(codex("UserPromptSubmit"), &[("prompt", json!(prompt))]),
         )
         .await;
-    let t = hook_text(&v).unwrap();
-    let docs = &t[t.find("Documents:\n").expect(&t)..];
-    assert!(docs.chars().count() <= 2_000, "{}", docs.chars().count());
-    assert!(docs.contains("more: amail doc"), "{docs}");
+    // Nothing cached yet: no index in this answer.
+    assert!(!hook_text(&v).unwrap_or_default().contains("Documents:"));
+    h.wait("cx's index", || async {
+        h.seat_status("cx").await["index_lines"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+    })
+    .await;
     let v = h.hook("codex", env.clone(), codex("SessionStart")).await;
-    assert!(hook_text(&v).unwrap().starts_with("Documents:\n"));
+    let t = hook_text(&v).unwrap();
+    assert!(t.starts_with("Documents:\n"), "{t}");
+    assert!(t.chars().count() <= 2_000, "{}", t.chars().count());
+    assert!(t.contains("more: amail doc"), "{t}");
     assert_eq!(
         h.hook("codex", env.clone(), codex("PreCompact")).await,
         Value::Null
@@ -820,4 +855,85 @@ async fn codex_index_and_compaction(b: Backend) {
     })
     .await;
     assert_eq!(node_entries(&h, "cx", "compact").await[0]["session"], sid);
+}
+
+/// The document index and the handover note are slow to come: the mail a
+/// hook claimed is still answered within the hook's time, and the index
+/// and the note come with a later hook.
+async fn slow_index_and_note_leave_mail_on_time(b: Backend) {
+    fn slow(path: &str) -> bool {
+        path.ends_with("/docs/index")
+            || (path.starts_with("/v1/seats/") && path.ends_with("/handover"))
+    }
+    let Some(h) = Harness::start(
+        b,
+        "slow_index_and_note_leave_mail_on_time",
+        Opts {
+            tweak: Some(tweak),
+            slow_routes: Some((slow, Duration::from_millis(1500))),
+            ..Default::default()
+        },
+    )
+    .await
+    else {
+        return;
+    };
+    let w1 = h.seat("w1", "claude").await;
+    let inbox = FakeInbox::start(h.dir.path().join("cc.sock"), None);
+    let env = claude_env("w1", &inbox.path);
+    write_note(&w1, "w1", "none").await;
+    active_doc(&h, "Deploy", "how we deploy").await;
+    let m1 = h.api.send(&["w1"], &[], "m1", false).await;
+    h.wait_pending("w1", 1, 0, 0).await;
+    // A hook client that waits 500 ms, as a short hook timeout does.
+    let quick = |name: &str| {
+        let (sock, env) = (h.sock.clone(), env.clone());
+        let input = claude(name).to_string();
+        async move {
+            let (out, took, ok) = tokio::task::spawn_blocking(move || {
+                let env: Vec<(&str, &str)> =
+                    env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                run_hook(&sock, "claude", &env, &input, Some(500))
+            })
+            .await
+            .unwrap();
+            assert!(ok, "hook failed");
+            assert!(took < Duration::from_millis(1400), "{took:?}");
+            if out.is_empty() {
+                Value::Null
+            } else {
+                serde_json::from_str::<Value>(&out).unwrap()
+            }
+        }
+    };
+    // Session start: neither the note nor the index arrives in time.
+    let v = quick("SessionStart").await;
+    let t = hook_text(&v).unwrap_or_default();
+    assert!(
+        !t.contains("Handover note") && !t.contains("Documents:"),
+        "{t}"
+    );
+    assert_eq!(h.seat_status("w1").await["note_pending"], true);
+    // The turn's mail is answered in time.
+    let v = quick("UserPromptSubmit").await;
+    let t = hook_text(&v).unwrap_or_default();
+    assert_eq!(injected_ids(&t), vec![m1], "{t}");
+    assert!(!t.contains("Handover note"), "{t}");
+    // Once they have come, the next hook shows both.
+    h.wait("index and note fetched", || async {
+        h.seat_status("w1").await["index_lines"] == 1
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+    let v = quick("UserPromptSubmit").await;
+    let t = hook_text(&v).unwrap();
+    assert!(
+        t.starts_with("Handover note of this seat, written by the previous session at "),
+        "{t}"
+    );
+    assert!(t.contains("\n\nDocuments:\n"), "{t}");
+    assert_eq!(h.seat_status("w1").await["note_pending"], false);
+    // Shown once.
+    let v = quick("UserPromptSubmit").await;
+    assert!(!hook_text(&v).unwrap_or_default().contains("Handover note"));
 }
