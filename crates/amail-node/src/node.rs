@@ -45,6 +45,7 @@ use tokio::sync::{Notify, OnceCell};
 
 mod adopt;
 mod caller;
+mod handover;
 mod mirror;
 mod notices;
 mod supervise;
@@ -158,6 +159,18 @@ pub struct Config {
     /// followed only under its `projects` directory, or under that of the
     /// directory the session was started with.
     pub claude_config_dir: PathBuf,
+    /// Ask for the handover note at the end of a turn whose input passed
+    /// this percentage of the model's context window.
+    pub handover_threshold: f64,
+    /// Context windows by model (`--context-window`).
+    pub context_windows: crate::transcript::usage::ContextWindows,
+    /// How often queued worklog entries are sent.
+    pub worklog_every: Duration,
+    /// How often idle seats are looked at for an old handover note.
+    pub handover_scan: Duration,
+    /// The document index is fetched again at the start of a turn at most
+    /// this often per seat.
+    pub index_recheck: Duration,
 }
 
 /// The node's browser terminal: a `zellij web` server of its own (on its
@@ -224,6 +237,11 @@ impl Config {
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from)
                 .unwrap_or_else(|| crate::paths::home().join(".claude")),
+            handover_threshold: 70.0,
+            context_windows: Default::default(),
+            worklog_every: Duration::from_secs(3),
+            handover_scan: Duration::from_secs(60),
+            index_recheck: Duration::from_secs(30),
         }
     }
 }
@@ -301,6 +319,8 @@ struct SeatRt {
     /// A surviving Codex session restored without a current turn result.
     /// It cannot receive automatic mail wakes until positively reconciled.
     restore_pending: bool,
+    /// Documents and handover (see [`handover`]).
+    ho: handover::SeatHo,
 }
 
 impl SeatRt {
@@ -334,6 +354,7 @@ impl SeatRt {
             turn_quiet_checked: None,
             quiet: Default::default(),
             restore_pending: false,
+            ho: Default::default(),
         }
     }
 
@@ -406,6 +427,12 @@ struct State {
     hooks: VecDeque<(Instant, bool)>,
     /// When the user was last told that hooks miss the server.
     slow_notice_at: Option<Instant>,
+    /// Worklog entries not sent yet (see [`handover`]).
+    worklog: VecDeque<amail_proto::WorklogPostEntry>,
+    /// Entries dropped since the last warning.
+    worklog_dropped: u64,
+    /// Work off the hook path (see [`handover::Job`]).
+    jobs: VecDeque<handover::Job>,
 }
 
 impl Default for State {
@@ -428,6 +455,9 @@ impl Default for State {
             turn_fail_limit: 3,
             hooks: VecDeque::new(),
             slow_notice_at: None,
+            worklog: VecDeque::new(),
+            worklog_dropped: 0,
+            jobs: VecDeque::new(),
         }
     }
 }
@@ -659,6 +689,14 @@ struct Plan {
     /// The prompt is a wake-up nudge and the node is connected: when the
     /// hook then shows nothing, it says so, and the turn ends at once.
     wake_prompt: bool,
+    /// Fetch the document index: `Some(true)` show it (session start),
+    /// `Some(false)` show it only when it changed since the seat saw it.
+    index: Option<bool>,
+    /// Show the handover note (session start).
+    note: bool,
+    /// `Stop`: see whether to ask for the handover note before the turn
+    /// ends.
+    handover: bool,
 }
 
 impl Plan {
@@ -669,7 +707,10 @@ impl Plan {
             || self.claim_urgent_all
             || self.digest
             || self.summary
-            || self.tasks)
+            || self.tasks
+            || self.index.is_some()
+            || self.note
+            || self.handover)
             && self.stash.is_empty()
     }
 }
@@ -714,6 +755,7 @@ pub struct Node {
     retry_kick: Notify,
     release_kick: Notify,
     check_kick: Notify,
+    jobs_kick: Notify,
     started: Instant,
 }
 
@@ -905,6 +947,7 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
         retry_kick: Notify::new(),
         release_kick: Notify::new(),
         check_kick: Notify::new(),
+        jobs_kick: Notify::new(),
         started: Instant::now(),
     });
 
@@ -937,6 +980,12 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
     tasks.push(tokio::spawn(async move { n.release_loop().await }));
     let n = node.clone();
     tasks.push(tokio::spawn(async move { n.turn_check_loop().await }));
+    let n = node.clone();
+    tasks.push(tokio::spawn(async move { n.worklog_loop().await }));
+    let n = node.clone();
+    tasks.push(tokio::spawn(async move { n.jobs_loop().await }));
+    let n = node.clone();
+    tasks.push(tokio::spawn(async move { n.handover_idle_loop().await }));
     if node.cfg.notices {
         let n = node.clone();
         tasks.push(tokio::spawn(async move { n.notice_loop().await }));
@@ -1613,6 +1662,17 @@ impl Node {
         let plan = {
             let mut st = self.lock();
             let connected = st.connected;
+            if hook.event == Event::SessionEnd {
+                // Logged with the hook's own session: a late SessionEnd
+                // may belong to a session that is gone already.
+                let reason = hook.facts.reason.as_deref().unwrap_or("not given");
+                st.log_session(
+                    seat,
+                    hook.session_id.clone(),
+                    "session_end",
+                    format!("reason: {reason}"),
+                );
+            }
             if st.saved.managed.contains_key(seat) {
                 // Supervised: the process is watched directly. SessionEnd
                 // may come late (Codex: about a minute after the TUI ended,
@@ -1669,8 +1729,31 @@ impl Node {
                     st.save_dirty = true;
                 }
             }
+            {
+                let ho = &mut st.seat(seat).ho;
+                if let Some(c) = &hook.facts.cwd {
+                    ho.cwd = Some(c.clone());
+                }
+                if let Some(m) = &hook.facts.model {
+                    ho.model = Some(m.clone());
+                }
+            }
             let mut plan = Plan::default();
             let now = now_ms();
+            let index_due = {
+                let every = self.cfg.index_recheck;
+                let ho = &st.seat(seat).ho;
+                ho.index_checked.is_none_or(|t| t.elapsed() >= every)
+            };
+            let cwd = st.seat(seat).ho.cwd.clone();
+            let head_job = |log: bool| {
+                cwd.clone().map(|cwd| handover::Job::Head {
+                    seat: seat.to_string(),
+                    cwd,
+                    session: hook.session_id.clone(),
+                    log,
+                })
+            };
             // When a session starts or a turn ends with nothing to show, the
             // seat's pending count is fetched again: a mailbox event lost on
             // the way (a dropped stream, another server instance that died
@@ -1687,6 +1770,15 @@ impl Node {
                     st.seat(seat).listed.clear();
                     plan.summary = connected;
                     plan.tasks = connected;
+                    plan.index = connected.then_some(true);
+                    plan.note = connected
+                        && matches!(source.as_str(), "startup" | "resume" | "clear" | "compact");
+                    let ho = &mut st.seat(seat).ho;
+                    ho.index_hash = None;
+                    ho.asked = false;
+                    st.log(seat, "session_start", format!("source: {source}"));
+                    st.jobs.extend(head_job(false));
+                    self.jobs_kick.notify_one();
                     // Ask the server again (see `recheck_pending`).
                     recheck = true;
                 }
@@ -1699,7 +1791,12 @@ impl Node {
                     s.wake_out = None;
                     s.clear_wake_failure();
                     plan.stash = std::mem::take(&mut s.stash);
-                    plan.wake_prompt = connected && crate::inject::is_wake_text(prompt);
+                    let wake = crate::inject::is_wake_text(prompt);
+                    plan.wake_prompt = connected && wake;
+                    s.ho.turn_start = Some(now);
+                    s.ho.asked = false;
+                    // A wake-up whose mail is gone should end at once.
+                    plan.index = (connected && !wake && index_due).then_some(false);
                     if s.focused(now) {
                         plan.claim_urgent_all = connected && s.pending.urgent > 0;
                     } else {
@@ -1707,10 +1804,26 @@ impl Node {
                         plan.digest = connected && s.pending.digest > 0;
                     }
                     plan.summary = connected && registered;
+                    st.log(
+                        seat,
+                        "turn_start",
+                        if wake {
+                            "turn started by a wake-up"
+                        } else {
+                            "turn started"
+                        },
+                    );
                 }
                 Event::PostToolUse => {
                     st.seat(seat).restore_pending = false;
                     st.set_state(seat, SeatState::Busy);
+                    if let Some(tool) = &hook.facts.tool {
+                        let text = match &hook.facts.tool_input {
+                            Some(i) if !i.is_empty() => format!("{tool}: {i}"),
+                            _ => tool.clone(),
+                        };
+                        st.log(seat, "tool", text);
+                    }
                     let s = st.seat(seat);
                     plan.stash = std::mem::take(&mut s.stash);
                     if s.focused(now) {
@@ -1727,6 +1840,8 @@ impl Node {
                     self.check_kick.notify_one();
                 }
                 Event::Stop => {
+                    st.jobs.extend(head_job(true));
+                    self.jobs_kick.notify_one();
                     let s = st.seat(seat);
                     let focused = s.focused(now);
                     let pending = connected
@@ -1743,6 +1858,12 @@ impl Node {
                             plan.claim_all = pending && s.pending.total() > 0;
                             plan.digest = pending && s.pending.digest > 0;
                         }
+                        plan.index = (connected && index_due).then_some(false);
+                    } else if connected && !s.ho.asked {
+                        // The turn ends after the handover check (step 3).
+                        plan.handover = true;
+                        plan.index = index_due.then_some(false);
+                        recheck = true;
                     } else {
                         st.set_state(seat, SeatState::Idle);
                         self.turn_ended(&mut st, seat, turns::TurnEnd::Normal);
@@ -1764,6 +1885,37 @@ impl Node {
                     st.set_state(seat, SeatState::Offline);
                     st.seat(seat).session = None;
                     self.turn_ended(&mut st, seat, turns::TurnEnd::Person);
+                }
+                Event::PreCompact { trigger } => {
+                    let t = if trigger.is_empty() {
+                        "not given"
+                    } else {
+                        trigger
+                    };
+                    st.log(seat, "precompact", format!("trigger: {t}"));
+                }
+                Event::PostCompact { summary } => {
+                    st.log(
+                        seat,
+                        "compact",
+                        summary
+                            .clone()
+                            .unwrap_or_else(|| "context compacted (no summary given)".into()),
+                    );
+                    // The next injecting hook shows the whole index again.
+                    let ho = &mut st.seat(seat).ho;
+                    ho.index_hash = None;
+                    ho.index_checked = None;
+                    let turn_start = ho.turn_start;
+                    if let Some(summary) = summary.clone().filter(|_| connected) {
+                        st.jobs.push_back(handover::Job::Draft {
+                            seat: seat.to_string(),
+                            summary,
+                            session: hook.session_id.clone(),
+                            turn_start,
+                        });
+                        self.jobs_kick.notify_one();
+                    }
                 }
             }
             if !plan.stash.is_empty() {
@@ -1895,20 +2047,78 @@ impl Node {
         };
         let tasks_call = async {
             if !(plan.tasks && !failed) {
-                return (None, false);
+                return (None, None, false);
             }
             let left = deadline.saturating_duration_since(Instant::now());
             let call = self.server.tasks_mine(seat, TASKS_LIMIT, left);
             match tokio::time::timeout_at(deadline.into(), call).await {
-                Ok(Ok(r)) => (crate::inject::tasks_summary(&r.tasks, r.truncated), false),
+                Ok(Ok(r)) => {
+                    // The task the seat holds, when it is doing just one.
+                    let doing: Vec<i64> = r
+                        .tasks
+                        .iter()
+                        .filter(|t| t.state == amail_proto::TaskState::Doing)
+                        .map(|t| t.num)
+                        .collect();
+                    let doing = match doing.as_slice() {
+                        [one] => Some(Some(*one)),
+                        _ => Some(None),
+                    };
+                    (
+                        crate::inject::tasks_summary(&r.tasks, r.truncated),
+                        doing,
+                        false,
+                    )
+                }
                 Ok(Err(e)) => {
                     tracing::debug!("open tasks of {seat}: {e:#}");
-                    (None, Instant::now() >= deadline)
+                    (None, None, Instant::now() >= deadline)
                 }
-                Err(_) => (None, true),
+                Err(_) => (None, None, true),
             }
         };
-        let ((summary, late1), (tasks, late2)) = tokio::join!(summary_call, tasks_call);
+        // The document index, at the share of the budget it may take.
+        let index_call = async {
+            plan.index?;
+            let left = deadline.saturating_duration_since(Instant::now());
+            let max = handover::share(adapter.inject_budget(), handover::INDEX_SHARE);
+            let call = self
+                .server
+                .docs_index(seat, handover::INDEX_MAX_LINES, max, left);
+            match tokio::time::timeout_at(deadline.into(), call).await {
+                Ok(Ok(r)) => Some(r),
+                Ok(Err(e)) => {
+                    tracing::debug!("document index of {seat}: {e:#}");
+                    None
+                }
+                Err(_) => None,
+            }
+        };
+        let note_call = async {
+            if !plan.note {
+                return None;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            let call = self.server.handover(seat, left);
+            match tokio::time::timeout_at(deadline.into(), call).await {
+                Ok(Ok(r)) => Some(r),
+                Ok(Err(e)) => {
+                    tracing::debug!("handover note of {seat}: {e:#}");
+                    None
+                }
+                Err(_) => None,
+            }
+        };
+        let check_call = async {
+            if !plan.handover {
+                return handover::StopCheck::default();
+            }
+            let turn_start = self.lock().seats.get(seat).and_then(|s| s.ho.turn_start);
+            let over = self.context_over(adapter.harness(), seat);
+            self.stop_check(seat, turn_start, over, deadline).await
+        };
+        let ((summary, late1), (tasks, doing, late2), index, note, check) =
+            tokio::join!(summary_call, tasks_call, index_call, note_call, check_call);
         timed_out |= late1 || late2;
 
         // 3. Apply the outcome.
@@ -1941,12 +2151,30 @@ impl Node {
                 st.dirty_pending.insert(seat.to_string());
                 self.refresh_kick.notify_one();
             }
+            {
+                let ho = &mut st.seat(seat).ho;
+                if let Some(d) = doing {
+                    ho.doing = d;
+                }
+                if plan.index.is_some() && index.is_some() {
+                    ho.index_checked = Some(Instant::now());
+                }
+                if let Some(n) = &note {
+                    ho.note_at = Some(n.note.as_ref().and_then(|n| parse_ts(&n.written_at)));
+                }
+                if let Some(n) = check.note_at {
+                    ho.note_at = Some(n);
+                }
+            }
             if hook.event == Event::Stop {
-                if claimed.is_empty() && digest.is_empty() {
+                if !(claimed.is_empty() && digest.is_empty()) {
+                    st.seat(seat).stop_blocks += 1;
+                } else if check.ask.is_some() {
+                    // Once per turn; the next `Stop` ends the turn.
+                    st.seat(seat).ho.asked = true;
+                } else {
                     st.set_state(seat, SeatState::Idle);
                     self.turn_ended(&mut st, seat, turns::TurnEnd::Normal);
-                } else {
-                    st.seat(seat).stop_blocks += 1;
                 }
                 self.presence_kick.notify_one();
                 self.wake_kick.notify_one();
@@ -1986,6 +2214,72 @@ impl Node {
                 text.push_str("\n\n");
             }
             text.push_str(&t);
+        }
+        if check.ask.is_some() {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str(crate::inject::HANDOVER_ASK);
+        }
+        // The handover note goes first, within its share and what the mail
+        // left; then the index, which is cut first.
+        let budget = adapter.inject_budget();
+        let mut note_text = None;
+        let mut note_shown = None;
+        if let Some(n) = note.as_ref().and_then(|r| r.note.as_ref()) {
+            let room = handover::share(budget, handover::NOTE_SHARE)
+                .min(budget.saturating_sub(text.len() + 2));
+            match crate::inject::handover_note(n, now_ms(), room) {
+                Some((t, _)) => {
+                    note_text = Some(t);
+                    note_shown = Some(n.rev);
+                }
+                None => tracing::debug!("seat {seat}: no room for the handover note"),
+            }
+        }
+        // A `Stop` shows the index only in an answer that blocks anyway.
+        let blocks = hook.event == Event::Stop && !text.is_empty();
+        if let Some(ix) = &index
+            && (hook.event != Event::Stop || blocks)
+        {
+            let hash = handover::text_hash(&ix.text);
+            let seen = self.lock().seat(seat).ho.index_hash;
+            if plan.index == Some(true) || seen != Some(hash) {
+                let used = text.len() + note_text.as_ref().map_or(0, |t| t.len() + 2);
+                let room = handover::share(budget, handover::INDEX_SHARE)
+                    .min(budget.saturating_sub(used + 2));
+                let shown = if ix.lines.is_empty() {
+                    true
+                } else if let Some(t) = crate::inject::docs_index(ix, room) {
+                    if !text.is_empty() {
+                        text.push_str("\n\n");
+                    }
+                    text.push_str(&t);
+                    true
+                } else {
+                    false
+                };
+                if shown {
+                    self.lock().seat(seat).ho.index_hash = Some(hash);
+                }
+            }
+        }
+        if let Some(n) = note_text {
+            text = if text.is_empty() {
+                n
+            } else {
+                format!("{n}\n\n{text}")
+            };
+        }
+        if let (Some(rev), Some(session)) = (note_shown, hook.session_id.clone()) {
+            let mut st = self.lock();
+            st.jobs.push_back(handover::Job::Read {
+                seat: seat.to_string(),
+                session,
+                rev,
+            });
+            drop(st);
+            self.jobs_kick.notify_one();
         }
         let out = if text.is_empty() {
             // A wake-up whose mail is gone (shown by an earlier turn, or
@@ -2359,6 +2653,7 @@ impl Node {
                     "turn_failed": st.turn_failure(name, self.cfg.turn_fail_limit),
                     "recovery_unverified": s.restore_pending,
                     "quiet_recovery": turns::quiet_recovery_diagnostics(&st, name),
+                    "handover_note": s.ho.note_word(),
                 })
             })
             .collect();

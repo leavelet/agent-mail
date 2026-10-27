@@ -1113,6 +1113,18 @@ impl Node {
                 show_ms(settings.idle_sleep_ms)
             ));
         }
+        if !first && old.handover_idle_ms != settings.handover_idle_ms {
+            let show = |v: Option<u64>| match v {
+                None => "default".to_string(),
+                Some(0) => "off".to_string(),
+                Some(ms) => format!("{}s", ms / 1000),
+            };
+            changed.push(format!(
+                "handover_idle {} -> {}",
+                show(old.handover_idle_ms),
+                show(settings.handover_idle_ms)
+            ));
+        }
         if !first && old.max_live != settings.max_live {
             let show = |v: Option<u32>| v.map_or("none".to_string(), |n| n.to_string());
             changed.push(format!(
@@ -1533,6 +1545,7 @@ impl Node {
                     attention: tag,
                     hint,
                     restarts: m.failures,
+                    note: s.and_then(|s| s.ho.note_word()).map(str::to_string),
                 }
             })
             .collect();

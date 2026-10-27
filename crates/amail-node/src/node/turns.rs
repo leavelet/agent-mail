@@ -219,6 +219,14 @@ impl Node {
     /// Settle or release the mail `shown` in a turn that ended with `end`.
     fn apply_turn_end(&self, st: &mut State, seat: &str, shown: Vec<i64>, end: TurnEnd) {
         let limit = self.cfg.turn_fail_limit;
+        let text = match &end {
+            TurnEnd::Normal => "turn ended".to_string(),
+            TurnEnd::Person => {
+                "turn ended by the person (interrupted, or the session ended)".into()
+            }
+            TurnEnd::Failed(r) => format!("turn failed: {}", clean_reason(r)),
+        };
+        st.log(seat, "turn_end", text);
         match end {
             TurnEnd::Person => st.settle(seat, &shown),
             TurnEnd::Normal => {

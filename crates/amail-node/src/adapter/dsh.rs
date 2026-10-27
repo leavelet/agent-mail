@@ -606,6 +606,7 @@ impl Adapter for Dsh {
             event,
             session_id,
             transcript_path,
+            facts: HookFacts::from_input(input),
         })
     }
 
@@ -946,6 +947,7 @@ mod tests {
             event: Event::Stop,
             session_id: Some(sid.into()),
             transcript_path: None,
+            facts: Default::default(),
         };
         // No endpoint file yet (the session is being created): accepted.
         assert!(d.accepts(&env, &hook("s1")));

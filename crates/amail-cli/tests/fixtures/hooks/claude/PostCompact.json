@@ -1,0 +1,8 @@
+{
+ "session_id": "00000000-0000-4000-8000-000000000001",
+ "transcript_path": "/tmp/amail-fixture/session.jsonl",
+ "cwd": "/tmp/amail-fixture/work",
+ "hook_event_name": "PostCompact",
+ "trigger": "auto",
+ "compact_summary": "Summary: the user asked for a fix of the login form; the fix is in src/login.rs; next run cargo test."
+}

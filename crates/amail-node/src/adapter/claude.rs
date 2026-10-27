@@ -30,6 +30,8 @@ const EVENTS: &[&str] = &[
     "Notification",
     "PermissionRequest",
     "SessionEnd",
+    "PreCompact",
+    "PostCompact",
 ];
 
 /// Environment of the launching shell that must not leak into a new session.
@@ -173,7 +175,7 @@ impl Adapter for Claude {
                 _ => return None,
             },
             "SessionEnd" => Event::SessionEnd,
-            _ => return None,
+            other => compact_event(other, input)?,
         };
         Some(Hook {
             name,
@@ -182,6 +184,7 @@ impl Adapter for Claude {
             transcript_path: str_field(input, "transcript_path")
                 .filter(|p| !p.is_empty())
                 .map(str::to_string),
+            facts: HookFacts::from_input(input),
         })
     }
 

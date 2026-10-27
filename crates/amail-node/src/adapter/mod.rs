@@ -63,6 +63,17 @@ pub enum Event {
     /// The session waits for a permission decision.
     Awaiting,
     SessionEnd,
+    /// The harness is about to compact the session's context; `trigger`
+    /// is `manual` or `auto` as the harness says (empty when it says
+    /// nothing).
+    PreCompact {
+        trigger: String,
+    },
+    /// The harness compacted the context; `summary` is the summary it
+    /// wrote, when the hook input carries one.
+    PostCompact {
+        summary: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +84,98 @@ pub struct Hook {
     pub session_id: Option<String>,
     /// The session's transcript file, as the harness reports it.
     pub transcript_path: Option<String>,
+    /// Further facts of the input the node records.
+    pub facts: HookFacts,
+}
+
+/// Characters of a tool call's input kept for the worklog.
+pub const TOOL_INPUT_CHARS: usize = 200;
+
+/// Facts of a hook input the node records in the worklog and uses for the
+/// handover note. Every field is optional: the inputs are not a stable
+/// contract, and a missing or unreadable field is unknown.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HookFacts {
+    /// The session's working directory.
+    pub cwd: Option<String>,
+    /// The model, when the input names it (Claude Code `SessionStart`,
+    /// every Codex hook).
+    pub model: Option<String>,
+    /// `PostToolUse`: the tool's name.
+    pub tool: Option<String>,
+    /// `PostToolUse`: the tool's input, cut to [`TOOL_INPUT_CHARS`]
+    /// characters: a shell command as it is, other input as compact JSON.
+    pub tool_input: Option<String>,
+    /// `SessionEnd`: why the session ended.
+    pub reason: Option<String>,
+}
+
+impl HookFacts {
+    /// Read the facts from a hook input (Claude Code, Codex and dsh name
+    /// these fields alike).
+    pub fn from_input(input: &Value) -> HookFacts {
+        let s = |k: &str| {
+            str_field(input, k)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        let tool_input = input.get("tool_input").and_then(|v| {
+            let text = match v {
+                Value::Null => return None,
+                Value::String(t) => t.clone(),
+                Value::Object(o) => match o.get("command") {
+                    Some(Value::String(c)) => c.clone(),
+                    Some(Value::Array(parts)) => parts
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    _ => v.to_string(),
+                },
+                other => other.to_string(),
+            };
+            let line = amail_proto::text::line(text.trim()).into_owned();
+            Some(cut_chars(&line, TOOL_INPUT_CHARS))
+        });
+        HookFacts {
+            cwd: s("cwd"),
+            model: s("model"),
+            tool: s("tool_name"),
+            tool_input,
+            reason: s("reason"),
+        }
+    }
+}
+
+/// `s` cut to `max` characters.
+pub fn cut_chars(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => s[..i].to_string(),
+        None => s.to_string(),
+    }
+}
+
+/// The compaction events, read the same way for every harness: `PreCompact`
+/// carries `trigger`; `PostCompact` the summary (`compact_summary`, or
+/// `summary`).
+pub fn compact_event(name: &str, input: &Value) -> Option<Event> {
+    match name {
+        "PreCompact" => Some(Event::PreCompact {
+            trigger: str_field(input, "trigger")
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
+        }),
+        "PostCompact" => Some(Event::PostCompact {
+            summary: str_field(input, "compact_summary")
+                .or_else(|| str_field(input, "summary"))
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        }),
+        _ => None,
+    }
 }
 
 /// What a hook should answer.

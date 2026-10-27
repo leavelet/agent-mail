@@ -338,6 +338,13 @@ from another org (`external`) stays untrusted, whoever sent it.
 - To work undisturbed, `amail focus on --for 30m` holds all but urgent mail \
 until then (`amail focus off` ends it early). Use `--urgent` only for what \
 cannot wait.
+- The team keeps decisions, findings and procedures as documents \
+(`amail doc`). The lines under `Documents:` are the current index for your \
+team. Before you decide how something is done here or rely on how a tool \
+behaves, run `amail doc search <terms>`; read a section \
+(`amail doc read dN#anchor`) rather than a whole document. Record a new \
+finding or decision as a document, not as mail. When a document is wrong, \
+supersede it or comment; do not write a second one on the same subject.
 ";
 
 /// Seat-specific part: identity, whom to ask, role.
@@ -364,8 +371,119 @@ pub fn seat_intro(info: &LaunchInfo) -> String {
         out.push_str(&text::multiline(r.trim()));
     }
     out.push_str("\n\n");
+    out.push_str(HANDOVER_INSTRUCTIONS);
+    out.push_str("\n\n");
     out.push_str(TASK_INSTRUCTIONS);
     out
+}
+
+/// What the seat introduction says about compaction and the handover note.
+pub const HANDOVER_INSTRUCTIONS: &str = "When your context is compacted, keep in the \
+summary: the exact next step, approaches you rejected and why, files you must not touch, how \
+to verify the current state, and the ids of tasks, documents and mail you were working with. \
+When asked to write your handover note, do so before anything else and then stop.";
+
+/// The `Stop` continuation that asks for the handover note.
+pub const HANDOVER_ASK: &str =
+    "Write your handover note now with `amail handover write`; then stop.";
+
+/// The heading of the document index.
+pub const DOCS_HEADING: &str = "Documents:";
+
+/// The per-turn document index under [`DOCS_HEADING`], within `budget`
+/// characters: whole lines while they fit, then a line that says how many
+/// were left out (the server's own `more_line` when it cut the list and
+/// nothing more had to go). `None` when the index is empty or not even
+/// one line fits.
+pub fn docs_index(index: &amail_proto::DocIndex, budget: usize) -> Option<String> {
+    if index.lines.is_empty() {
+        return None;
+    }
+    let mut out = String::from(DOCS_HEADING);
+    let full_more = index
+        .more_line
+        .as_deref()
+        .map(|l| text::line(l).into_owned());
+    // Room for the longest more line we may write.
+    let reserve = 80 + full_more.as_ref().map_or(0, |l| l.chars().count());
+    let mut shown = 0;
+    for l in &index.lines {
+        let line = text::line(l);
+        let len = out.chars().count() + 1 + line.chars().count();
+        let last = shown + 1 == index.lines.len();
+        let room = if last && full_more.is_none() {
+            budget
+        } else {
+            budget.saturating_sub(reserve)
+        };
+        if len > room {
+            break;
+        }
+        out.push('\n');
+        out.push_str(&line);
+        shown += 1;
+    }
+    if shown == 0 {
+        return None;
+    }
+    let left = (index.lines.len() - shown) as i64 + index.more.max(0);
+    if shown == index.lines.len() {
+        if let Some(m) = full_more {
+            out.push('\n');
+            out.push_str(&m);
+        }
+    } else if left > 0 {
+        out.push_str(&format!("\n… and {left} more: amail doc index"));
+    }
+    Some(out)
+}
+
+/// The note shown at session start: a header line (with a warning line
+/// when the note is older than [`amail_proto::HANDOVER_STALE_DAYS`]), then
+/// the fields, within `budget` characters (see
+/// [`amail_proto::HandoverFields::render_within`]). Returns the text and
+/// whether something was left out. `None` when not even the header fits.
+pub fn handover_note(
+    note: &amail_proto::HandoverNote,
+    now_ms: i64,
+    budget: usize,
+) -> Option<(String, bool)> {
+    const REST: &str = "… the rest: amail handover show";
+    let written = note.written_at.parse::<jiff::Timestamp>().ok();
+    let when = written
+        .map(|t| t.strftime("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| text::line(&note.written_at).into_owned());
+    let mut head =
+        format!("Handover note of this seat, written by the previous session at {when}:");
+    if let Some(t) = written {
+        let days = (now_ms - t.as_millisecond()) / 86_400_000;
+        if days >= amail_proto::HANDOVER_STALE_DAYS {
+            head.push_str(&format!(
+                "\nWarning: this note is {days} days old; check it against the current state \
+                 before you rely on it."
+            ));
+        }
+    }
+    let room = budget.checked_sub(head.chars().count() + 1)?;
+    if room < 40 {
+        return None;
+    }
+    let (mut body, mut cut) = note.fields.render_within(room);
+    // The fields shown whole can be longer than the room: cut them too.
+    if body.chars().count() > room {
+        let keep = room.saturating_sub(REST.chars().count() + 1);
+        let mut part: String = body.chars().take(keep).collect();
+        if let Some(i) = part.rfind('\n') {
+            part.truncate(i + 1);
+        } else {
+            part.push('\n');
+        }
+        part.push_str(REST);
+        part.push('\n');
+        body = part;
+        cut = true;
+    }
+    Some((format!("{head}\n{}", body.trim_end()), cut))
 }
 
 /// The task lines of the seat introduction.
@@ -641,7 +759,7 @@ mod tests {
         let intro = seat_intro(&info);
         assert!(
             intro.ends_with(&format!(
-                "Build things.\nok\\u{{202e}}evil\\u{{200b}}\\u{{feff}}\\u{{2066}}\\u{{e0041}}\\u{{1b}}[31m\n\n{TASK_INSTRUCTIONS}"
+                "Build things.\nok\\u{{202e}}evil\\u{{200b}}\\u{{feff}}\\u{{2066}}\\u{{e0041}}\\u{{1b}}[31m\n\n{HANDOVER_INSTRUCTIONS}\n\n{TASK_INSTRUCTIONS}"
             )),
             "{intro}"
         );
@@ -771,5 +889,113 @@ mod tests {
         d.delivery.class = DeliveryClass::List;
         d.message.to = vec!["all".into()];
         assert!(entry(&d, false).contains(" · via list all · "));
+    }
+
+    fn index(lines: &[&str], more: i64) -> DocIndex {
+        let lines: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        let more_line = (more > 0).then(|| format!("… and {more} more: amail doc list"));
+        let mut text = lines.join("\n");
+        if let Some(m) = &more_line {
+            text.push('\n');
+            text.push_str(m);
+        }
+        DocIndex {
+            team: None,
+            lines,
+            more,
+            more_line,
+            text,
+        }
+    }
+
+    #[test]
+    fn docs_index_cut() {
+        assert_eq!(docs_index(&index(&[], 0), 3000), None);
+        let ix = index(
+            &["d1  runbook  Deploy — how", "d2  decision  Use X — why"],
+            0,
+        );
+        assert_eq!(
+            docs_index(&ix, 3000).unwrap(),
+            "Documents:\nd1  runbook  Deploy — how\nd2  decision  Use X — why"
+        );
+        // The server's more line is kept when every line fits.
+        let ix = index(&["d1  runbook  Deploy — how"], 4);
+        assert!(
+            docs_index(&ix, 3000)
+                .unwrap()
+                .ends_with("\n… and 4 more: amail doc list")
+        );
+        // Cut here: the count includes the server's.
+        let long: Vec<String> = (1..=40)
+            .map(|i| format!("d{i}  finding  {}", "x".repeat(60)))
+            .collect();
+        let refs: Vec<&str> = long.iter().map(String::as_str).collect();
+        let t = docs_index(&index(&refs, 5), 1000).unwrap();
+        assert!(t.chars().count() <= 1000, "{}", t.len());
+        let shown = t.lines().filter(|l| l.starts_with('d')).count();
+        assert!(t.ends_with(&format!("… and {} more: amail doc index", 40 - shown + 5)));
+        // Nothing fits.
+        assert_eq!(docs_index(&index(&refs, 0), 20), None);
+    }
+
+    #[test]
+    fn handover_note_cut() {
+        let fields = HandoverFields {
+            state: "on track".into(),
+            summary: "Fixing the login form.".into(),
+            next: "1. cargo test -p web".into(),
+            waiting_on: "nothing".into(),
+            traps: (1..=200)
+                .map(|i| format!("- trap number {i}: do not do this"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            verify: "cargo test passes".into(),
+            pointers: "t12, d3".into(),
+        };
+        let now = 1_800_000_000_000;
+        let note = HandoverNote {
+            seat: "w1".into(),
+            rev: 2,
+            text: fields.render(),
+            chars: fields.chars(),
+            fields,
+            pointers_filled: false,
+            private: false,
+            source: HandoverSource::Agent,
+            draft: false,
+            session: None,
+            written_by: None,
+            written_at: "2027-01-15T08:00:00Z".into(),
+            read_by_session: None,
+            read_at: None,
+        };
+        let (t, cut) = handover_note(&note, now, 2000).unwrap();
+        assert!(cut);
+        assert!(t.chars().count() <= 2000, "{}", t.chars().count());
+        assert!(t.starts_with(
+            "Handover note of this seat, written by the previous session at 2027-01-15 08:00 UTC:\n"
+        ));
+        for f in [
+            "State: on track",
+            "Summary: Fixing the login form.",
+            "Next: 1. cargo test -p web",
+            "Waiting on: nothing",
+            "Verify: cargo test passes",
+            "trap number 1:",
+        ] {
+            assert!(t.contains(f), "{f} in {t}");
+        }
+        assert!(!t.contains("trap number 200"));
+        assert!(t.ends_with("… the rest: amail handover show"), "{t}");
+        assert!(!t.contains("Warning"));
+        // Older than seven days: a warning line.
+        let (t, _) = handover_note(&note, now + 9 * 86_400_000 + 3_600_000, 20_000).unwrap();
+        let second = t.lines().nth(1).unwrap();
+        assert!(second.starts_with("Warning: this note is"), "{t}");
+        // Whole when it fits.
+        let (t, cut) = handover_note(&note, now, 20_000).unwrap();
+        assert!(!cut && t.contains("trap number 200") && t.contains("Pointers: t12, d3"));
+        assert_eq!(handover_note(&note, now, 50), None);
     }
 }

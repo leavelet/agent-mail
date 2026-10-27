@@ -244,6 +244,10 @@ pub struct PsRow {
     pub hint: Option<String>,
     #[serde(default)]
     pub restarts: u32,
+    /// The seat's handover note: `current` (no turn started after it was
+    /// written), `stale` or `none`; absent when the node does not know.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

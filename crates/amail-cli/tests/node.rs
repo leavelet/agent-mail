@@ -3043,10 +3043,15 @@ async fn session_start_shows_open_tasks(b: Backend) {
             Some(json!({"state": "done"})),
         )
         .await;
-    assert_eq!(
-        h.hook("claude", env.clone(), claude("SessionStart")).await,
-        Value::Null
+    // Closing w1's last task made the server write w1's idle note, which
+    // is shown; there is no task line.
+    let v = h.hook("claude", env.clone(), claude("SessionStart")).await;
+    let t = hook_text(&v).unwrap();
+    assert!(
+        t.starts_with("Handover note of this seat") && t.contains("State: idle"),
+        "{t}"
     );
+    assert!(!t.contains("open task"), "{t}");
     // Two open tasks of w1, one of them waiting on the other.
     let first = h
         .api
@@ -3067,9 +3072,10 @@ async fn session_start_shows_open_tasks(b: Backend) {
         )
         .await;
     let v = h.hook("claude", env.clone(), claude("SessionStart")).await;
-    assert_eq!(
-        hook_text(&v).unwrap(),
-        "[amail] you have 2 open task(s), 1 ready: amail task mine"
+    assert!(
+        hook_text(&v)
+            .unwrap()
+            .ends_with("\n\n[amail] you have 2 open task(s), 1 ready: amail task mine")
     );
     // With unread mail, the line comes after the summary.
     h.hook("claude", env.clone(), claude("UserPromptSubmit"))
@@ -3097,7 +3103,7 @@ async fn session_start_shows_open_tasks(b: Backend) {
         .await;
     let text = hook_text(&v).unwrap();
     assert!(
-        text.starts_with("[amail] w1 has 1 unread message(s):"),
+        text.contains("\n\n[amail] w1 has 1 unread message(s):"),
         "{text}"
     );
     assert!(
