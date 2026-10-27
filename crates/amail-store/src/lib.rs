@@ -13,11 +13,17 @@ mod budget;
 mod common;
 #[macro_use]
 mod tasks;
+#[macro_use]
+mod handover;
 mod model;
 mod postgres;
 mod sqlite;
 pub mod testutil;
 
+pub use handover::{
+    HandoverSeatRec, NewNoteRec, NewWorklogEntry, NoteRec, WorklogQuery, WorklogRec,
+    WorklogSummaryRec,
+};
 pub use model::*;
 
 /// How long a claim's idempotency key is kept: a retried claim with the
@@ -715,4 +721,70 @@ pub trait Store: Send + Sync + 'static {
     /// `review` tasks not changed and not reminded for the org's stale
     /// period, marked reminded (at most `limit` per org).
     async fn claim_stale_tasks(&self, now: i64, limit: i64) -> Result<Vec<TaskRec>>;
+
+    // --- seat handover (see `handover.rs`) ----------------------------------------
+
+    /// Write the next revision of a seat's note. An `agent` note lacking
+    /// one of the first six fields is refused with `note_fields_missing`,
+    /// a note over [`amail_proto::MAX_HANDOVER_NOTE_CHARS`] with
+    /// `note_too_large`. An empty `Pointers` is filled in from the worklog
+    /// (tasks and documents of the session, else of the entries since the
+    /// previous note, and the seat's last commit). Charged to the org's
+    /// `task_bytes`.
+    async fn write_handover_note(&self, note: &NewNoteRec) -> Result<NoteRec>;
+    /// The seat's current note, or revision `rev`.
+    async fn handover_note(
+        &self,
+        org_id: i64,
+        seat_id: i64,
+        rev: Option<i64>,
+    ) -> Result<Option<NoteRec>>;
+    /// The seat's newest `limit` revisions, newest first.
+    async fn handover_notes(&self, org_id: i64, seat_id: i64, limit: i64) -> Result<Vec<NoteRec>>;
+    /// The seat's latest revision, private setting and last request.
+    async fn handover_seat(&self, org_id: i64, seat_id: i64) -> Result<HandoverSeatRec>;
+    /// Record that `session` was shown revision `rev` (default: the
+    /// current one); `None` when there is no such note.
+    async fn record_handover_read(
+        &self,
+        org_id: i64,
+        seat_id: i64,
+        rev: Option<i64>,
+        session: &str,
+    ) -> Result<Option<NoteRec>>;
+    /// The team file's `handover = "private"` for the seat.
+    async fn set_handover_private(&self, org_id: i64, seat_id: i64, private: bool) -> Result<()>;
+    /// Record a request for the seat's note by seat `by`.
+    async fn request_handover(
+        &self,
+        org_id: i64,
+        seat_id: i64,
+        by: i64,
+        at: i64,
+    ) -> Result<HandoverSeatRec>;
+    /// The server's note after the seat's task `num` closed: written
+    /// (`State: idle`) only when the seat holds no other unfinished task.
+    async fn write_idle_note(
+        &self,
+        org_id: i64,
+        seat_id: i64,
+        num: i64,
+        quota: Option<i64>,
+    ) -> Result<Option<NoteRec>>;
+    /// Append worklog entries of seats of the org (others are left out);
+    /// the number written. Over the quota, the org's oldest entries are
+    /// deleted to make room.
+    async fn append_worklog(
+        &self,
+        org_id: i64,
+        entries: &[NewWorklogEntry],
+        quota: Option<i64>,
+    ) -> Result<usize>;
+    /// A seat's worklog entries, newest first.
+    async fn worklog(&self, query: &WorklogQuery) -> Result<Vec<WorklogRec>>;
+    /// Counts per kind, tasks touched and the last entries of a query.
+    async fn worklog_summary(&self, query: &WorklogQuery) -> Result<WorklogSummaryRec>;
+    /// Delete worklog entries older than `cutoff` (at most `limit`); the
+    /// number deleted.
+    async fn expire_worklog(&self, cutoff: i64, limit: i64) -> Result<u64>;
 }

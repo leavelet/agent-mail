@@ -549,8 +549,9 @@ pub struct WorklogPosted {
 pub fn valid_worklog_kind(k: &str) -> bool {
     !k.is_empty()
         && k.len() <= MAX_WORKLOG_KIND_CHARS
-        && k.bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-' | b'.'))
+        && k.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-' | b'.')
+        })
 }
 
 /// `s` cut to `max` characters.

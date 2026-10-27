@@ -3652,6 +3652,8 @@ macro_rules! impl_store_common {
                         .execute(&mut *c)
                         .await?;
                 }
+                // (Before its seats go: the handover rows refer to them.)
+                super::hq::delete_org(c, org_id).await?;
                 for sql in steps {
                     sqlx::query(sql).bind(org_id).execute(&mut *c).await?;
                 }
@@ -4970,8 +4972,64 @@ macro_rules! impl_store_common {
             async fn claim_stale_tasks(&self, now: i64, limit: i64) -> $crate::Result<Vec<$crate::TaskRec>> {
                 run!(self.write, |c| tq::claim_stale(c, now, limit).await)
             }
+
+            // --- seat handover (see `handover.rs`) ---
+
+            async fn write_handover_note(&self, note: &$crate::NewNoteRec) -> $crate::Result<$crate::NoteRec> {
+                let note = note.clone();
+                run!(self.write, |c| hq::write_note(c, &note, None).await)
+            }
+
+            async fn handover_note(&self, org_id: i64, seat_id: i64, rev: Option<i64>) -> $crate::Result<Option<$crate::NoteRec>> {
+                run!(self.read, |c| hq::note(c, org_id, seat_id, rev).await)
+            }
+
+            async fn handover_notes(&self, org_id: i64, seat_id: i64, limit: i64) -> $crate::Result<Vec<$crate::NoteRec>> {
+                run!(self.read, |c| hq::notes(c, org_id, seat_id, limit).await)
+            }
+
+            async fn handover_seat(&self, org_id: i64, seat_id: i64) -> $crate::Result<$crate::HandoverSeatRec> {
+                run!(self.read, |c| hq::seat_state(c, org_id, seat_id).await)
+            }
+
+            async fn record_handover_read(&self, org_id: i64, seat_id: i64, rev: Option<i64>, session: &str) -> $crate::Result<Option<$crate::NoteRec>> {
+                let session = session.to_string();
+                run!(self.write, |c| hq::record_read(c, org_id, seat_id, rev, &session).await)
+            }
+
+            async fn set_handover_private(&self, org_id: i64, seat_id: i64, private: bool) -> $crate::Result<()> {
+                run!(self.write, |c| hq::set_private(c, org_id, seat_id, private).await)
+            }
+
+            async fn request_handover(&self, org_id: i64, seat_id: i64, by: i64, at: i64) -> $crate::Result<$crate::HandoverSeatRec> {
+                run!(self.write, |c| hq::request(c, org_id, seat_id, by, at).await)
+            }
+
+            async fn write_idle_note(&self, org_id: i64, seat_id: i64, num: i64, quota: Option<i64>) -> $crate::Result<Option<$crate::NoteRec>> {
+                run!(self.write, |c| hq::write_idle_note(c, org_id, seat_id, num, quota).await)
+            }
+
+            async fn append_worklog(&self, org_id: i64, entries: &[$crate::NewWorklogEntry], quota: Option<i64>) -> $crate::Result<usize> {
+                let entries = entries.to_vec();
+                run!(self.write, |c| hq::append(c, org_id, &entries, quota).await)
+            }
+
+            async fn worklog(&self, query: &$crate::WorklogQuery) -> $crate::Result<Vec<$crate::WorklogRec>> {
+                let query = query.clone();
+                run!(self.read_query, |c| hq::query(c, &query).await)
+            }
+
+            async fn worklog_summary(&self, query: &$crate::WorklogQuery) -> $crate::Result<$crate::WorklogSummaryRec> {
+                let query = query.clone();
+                run!(self.read_query, |c| hq::summary(c, &query).await)
+            }
+
+            async fn expire_worklog(&self, cutoff: i64, limit: i64) -> $crate::Result<u64> {
+                run!(self.write, |c| hq::expire(c, cutoff, limit).await)
+            }
         }
 
         impl_task_queries!($db, $dialect);
+        impl_handover_queries!($db);
     };
 }
