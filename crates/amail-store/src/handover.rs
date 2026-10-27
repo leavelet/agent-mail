@@ -459,15 +459,47 @@ macro_rules! impl_handover_queries {
                 if open > 0 {
                     return Ok(None);
                 }
-                let t: Option<(String, String, Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
-                    "SELECT title, state, result, result_ref, result_note FROM tasks WHERE org_id = $1 AND num = $2",
+                let t: Option<(String, String, Option<String>, Option<String>, Option<String>, Option<i64>)> = sqlx::query_as(
+                    "SELECT title, state, result, result_ref, result_note, closed_at FROM tasks WHERE org_id = $1 AND num = $2",
                 )
                 .bind(org_id)
                 .bind(num)
                 .fetch_optional(&mut *c)
                 .await?;
-                let Some((title, state, result, result_ref, result_note)) = t else {
+                let Some((title, state, result, result_ref, result_note, closed_at)) = t else {
                     return Ok(None);
+                };
+                // The idle note replaces only a note older than the task's
+                // closing, and never a note the agent (or the user for it)
+                // wrote in the turn that closed the task or later. The turn
+                // is the seat's last `turn_start` the node reported; without
+                // one, an agent's note is kept.
+                let prev = note(c, org_id, seat_id, None).await?;
+                if let Some(p) = &prev {
+                    let closed = closed_at.unwrap_or_else(now_ms);
+                    if p.written_at >= closed {
+                        return Ok(None);
+                    }
+                    if p.source == HandoverSource::Agent {
+                        let turn: Option<i64> = sqlx::query_scalar(
+                            "SELECT MAX(at) FROM worklog WHERE seat_id = $1 AND kind = 'turn_start' AND source = 'node'",
+                        )
+                        .bind(seat_id)
+                        .fetch_one(&mut *c)
+                        .await?;
+                        if turn.is_none_or(|t| p.written_at >= t) {
+                            return Ok(None);
+                        }
+                    }
+                }
+                // What the agent recorded as traps stays in the note.
+                let traps = match prev.as_ref().filter(|p| p.source == HandoverSource::Agent) {
+                    Some(p) if !p.fields.traps.trim().is_empty() => format!(
+                        "From the seat's note rev {} (written by the agent before t{num} closed):\n{}",
+                        p.rev,
+                        p.fields.traps.trim()
+                    ),
+                    _ => "none recorded (this note was written by the server, not by the agent)".into(),
                 };
                 let mut summary = format!("t{num} ({title}) is {state}");
                 if let Some(r) = &result {
@@ -487,7 +519,7 @@ macro_rules! impl_handover_queries {
                     summary,
                     next: "Nothing assigned: read new mail, then `amail task next` for work that is ready.".into(),
                     waiting_on: "nothing".into(),
-                    traps: "none recorded (this note was written by the server, not by the agent)".into(),
+                    traps,
                     verify: format!("amail task show t{num}"),
                     pointers: String::new(),
                 };

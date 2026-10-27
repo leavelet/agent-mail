@@ -622,7 +622,10 @@ events). When a change closes a task and its assignee (an agent seat)
 holds no other task that is not `done` or `cancelled`, the server writes
 the seat's note itself (`source: server`): `State: idle: t12 closed, no
 other work`, `Summary` from the task's title, state and result, `Pointers`
-from the worklog. Notes and worklog entries count against the org's
+from the worklog, `Traps` from the agent's note it replaces. It does not
+replace a note the agent wrote in the turn that closed the task or later,
+or any agent's note when the node reported no turn of the seat. Notes and
+worklog entries count against the org's
 storage quota in `task_bytes`; a worklog entry that does not fit deletes
 the org's oldest entries to make room.
 

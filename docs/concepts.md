@@ -893,7 +893,13 @@ the harness's compaction summary as a draft revision (`source:
 compaction`), so that the next session has something even when the agent
 never wrote; and when a task closes and its assignee holds no other
 unfinished task, the server writes an idle note itself (`State: idle`,
-the summary from the task's title and result) without a model turn.
+the summary from the task's title and result) without a model turn. The
+server writes the idle note only when the seat's current note is older
+than the task's closing, and never over a note the agent (or the user in
+its name) wrote in the turn that closed the task or later: the turn is
+the seat's last `turn_start` its node reported, and when no turn is known
+the agent's note is kept. When the idle note replaces a note the agent
+wrote in an earlier turn, the agent's `Traps` are kept in it.
 
 The lead of a seat (its team's root seat) and the user can ask a seat for
 its note; the seat then gets system mail naming `amail handover write`.
