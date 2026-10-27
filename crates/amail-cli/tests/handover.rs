@@ -47,6 +47,7 @@ handover_tests!(
     codex_index_and_compaction,
     slow_index_and_note_leave_mail_on_time,
     ps_knows_the_note_from_the_start,
+    compact_start_shows_the_draft,
 );
 
 const ASK: &str = "Write your handover note now with `amail handover write`; then stop.";
@@ -671,8 +672,12 @@ async fn note_shown_at_session_start(b: Backend) {
         )
         .await;
     assert!(!hook_text(&v).unwrap().contains("Handover note"));
-    // A short note is shown whole, after `compact` too.
+    // A short note is shown whole, after `compact` too (here the
+    // harness's `PostCompact` came first and brought no summary).
     write_note(&w1, "w1", "do not touch the schema").await;
+    let mut bare = claude("PostCompact");
+    bare.as_object_mut().unwrap().remove("compact_summary");
+    h.hook("claude", env.clone(), bare).await;
     let v = h
         .hook(
             "claude",
@@ -991,4 +996,59 @@ async fn ps_knows_the_note_from_the_start(b: Backend) {
     h.hook("claude", env.clone(), claude("UserPromptSubmit"))
         .await;
     assert_eq!(h.seat_status("w1").await["handover_note"], "stale");
+}
+
+/// Claude Code runs `SessionStart` (source `compact`) a few milliseconds
+/// before `PostCompact`. The session is shown the compaction's draft, not
+/// the note before it, and the old note is not recorded as read; when the
+/// draft comes too late for the session start, the next hook shows it.
+async fn compact_start_shows_the_draft(b: Backend) {
+    let Some(h) = setup(b, "compact_start_shows_the_draft").await else {
+        return;
+    };
+    let w1 = h.seat("w1", "claude").await;
+    let inbox = FakeInbox::start(h.dir.path().join("cc.sock"), None);
+    let env = claude_env("w1", &inbox.path);
+    write_note(&w1, "w1", "the old trap").await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    h.hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    let compact = with(claude("SessionStart"), &[("source", json!("compact"))]);
+    let (v, _) = tokio::join!(h.hook("claude", env.clone(), compact.clone()), async {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        h.hook("claude", env.clone(), claude("PostCompact")).await
+    });
+    let t = hook_text(&v).unwrap();
+    assert!(t.contains("State: draft: from compaction summary"), "{t}");
+    assert!(t.contains("login form"), "{t}");
+    assert!(!t.contains("the old trap"), "{t}");
+    let sid = claude("SessionStart")["session_id"].clone();
+    h.wait("read of the draft recorded", || async {
+        note(&h, "w1").await["note"]["read_by_session"] == sid
+    })
+    .await;
+    assert_eq!(note(&h, "w1").await["current_rev"], 2);
+    let old = h.api.get("/seats/w1/handover?rev=1").await;
+    assert!(old["note"]["read_by_session"].is_null(), "{old}");
+
+    // The draft comes after the session start's wait: the session start
+    // shows no note, the next hook shows the draft.
+    h.hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    let v = h.hook("claude", env.clone(), compact).await;
+    let t = hook_text(&v).unwrap_or_default();
+    assert!(!t.contains("Handover note"), "{t}");
+    h.hook("claude", env.clone(), claude("PostCompact")).await;
+    h.wait("second draft", || async {
+        note(&h, "w1").await["current_rev"] == 3
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let v = h
+        .hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    let t = hook_text(&v).unwrap();
+    assert!(t.contains("State: draft: from compaction summary"), "{t}");
+    let old = h.api.get("/seats/w1/handover?rev=2").await;
+    assert_eq!(old["note"]["rev"], 2);
 }

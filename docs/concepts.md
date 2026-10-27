@@ -934,7 +934,9 @@ compacts and to write the note first when asked.
 `PostCompact` records the harness's summary in the worklog (`compact`) and,
 unless the note was written during the current turn, files the summary as
 a draft revision (`source: compaction`, `State: draft: from compaction
-summary`).
+summary`). The session start that follows a compaction is shown that
+draft: the node waits for it before fetching the note, also when the
+harness reports the session start before `PostCompact`.
 
 **When the note is read.** At session start with source `startup`,
 `resume`, `clear` or `compact` (not `fork`), the node shows the note

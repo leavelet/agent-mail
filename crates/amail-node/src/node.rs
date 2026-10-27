@@ -799,6 +799,9 @@ pub struct Node {
     release_kick: Notify,
     check_kick: Notify,
     jobs_kick: Notify,
+    /// A compaction draft was filed (or will not be): see
+    /// [`handover::SeatHo::draft_wait`].
+    draft_done: Notify,
     started: Instant,
 }
 
@@ -993,6 +996,7 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
         release_kick: Notify::new(),
         check_kick: Notify::new(),
         jobs_kick: Notify::new(),
+        draft_done: Notify::new(),
         started: Instant::now(),
     });
 
@@ -1833,6 +1837,13 @@ impl Node {
                     ho.note_fetched = None;
                     ho.note_fetching = false;
                     ho.note_gen += 1;
+                    // Claude Code runs `SessionStart` (compact) before
+                    // `PostCompact`: the note is fetched once the
+                    // compaction's draft is filed, so that the session is
+                    // shown the draft and not the note before it.
+                    ho.draft_wait = (source == "compact" && ho.draft_expected())
+                        .then(|| Instant::now() + handover::DRAFT_WAIT);
+                    ho.compacted = None;
                     plan.index_wait = ho.index.is_none();
                     plan.note_wait = ho.note_pending;
                     st.log(seat, "session_start", format!("source: {source}"));
@@ -1983,8 +1994,19 @@ impl Node {
                     let ho = &mut st.seat(seat).ho;
                     ho.index_hash = None;
                     ho.index_checked = None;
+                    // Kept for the session start that reports this
+                    // compaction, unless one is waiting for it already.
+                    ho.compacted = ho.draft_wait.is_none().then(Instant::now);
                     let turn_start = ho.turn_start;
-                    if let Some(summary) = summary.clone().filter(|_| connected) {
+                    let draft = summary.clone().filter(|_| connected);
+                    ho.draft_running = draft.is_some();
+                    if draft.is_none() {
+                        // No draft comes: a session start waiting for one
+                        // fetches the note now.
+                        ho.draft_wait = None;
+                        self.draft_done.notify_waiters();
+                    }
+                    if let Some(summary) = draft {
                         st.jobs.push_back(handover::Job::Draft {
                             seat: seat.to_string(),
                             summary,

@@ -538,7 +538,12 @@ session start with no index fetched yet waits for it, at most 500 ms and
 at most half of what is left of the hook's time once the mail calls are
 done; the note at session start waits the same way, at most 700 ms. What
 does not arrive in time is shown by the seat's next hook: the note stays
-due until it is shown. The end-of-turn check for the handover note has
+due until it is shown. After a compaction, Claude Code runs `SessionStart`
+(source `compact`) a few milliseconds before `PostCompact`; the node then
+fetches the note only once the compaction's draft is filed (or `PostCompact`
+brought no summary, or 3 s passed), so the session is shown the draft and
+the previous note is not recorded as read. When the draft comes after the
+session start's wait, the next hook shows it. The end-of-turn check for the handover note has
 half of what is left of the hook's time and is skipped when less than
 300 ms is left.
 
