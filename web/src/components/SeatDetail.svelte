@@ -4,7 +4,7 @@
   // Lists of the org, to say through which one mail arrived.
   const isList = (a: string) => store.lists.some((l) => l.name === a);
   import { t, ui } from '../lib/ui.svelte';
-  import { href, go } from '../lib/router.svelte';
+  import { href, go, router } from '../lib/router.svelte';
   import { get, patch, qs, enc, ApiError } from '../lib/api';
   import { grantsOf } from '../lib/openings';
   import OpeningsEditor from './OpeningsEditor.svelte';
@@ -16,11 +16,19 @@
   import Transcript from './Transcript.svelte';
   import MailList from './MailList.svelte';
   import SeatTasks from './SeatTasks.svelte';
+  import SeatHandover from './SeatHandover.svelte';
+  import SeatWorklog from './SeatWorklog.svelte';
 
   let { name }: { name: string } = $props();
 
-  type Tab = 'mirror' | 'inbox' | 'sent';
+  type Tab = 'mirror' | 'inbox' | 'sent' | 'handover' | 'worklog';
+  const TABS: Tab[] = ['mirror', 'inbox', 'sent', 'handover', 'worklog'];
+  // `?tab=handover` in the URL opens that tab.
+  const asked = $derived(router.route.query.get('tab') as Tab | null);
   let tab = $state<Tab>('mirror');
+  $effect(() => {
+    if (asked && TABS.includes(asked)) tab = asked;
+  });
   let rows = $state.raw<MailRow[]>([]);
   let mailError = $state<string | null>(null);
   let opMsg = $state<string | null>(null);
@@ -43,7 +51,7 @@
   // Reload the mail tab when the seat's mailbox changes.
   $effect(() => {
     void seq;
-    if (tab === 'mirror') return;
+    if (tab !== 'inbox' && tab !== 'sent') return;
     const which = tab;
     mailError = null;
     const load =
@@ -231,12 +239,20 @@
         {t('seat.inbox')}{#if store.counts.get(name)?.unread}<span class="count hot">{store.counts.get(name)?.unread}</span>{/if}
       </button>
       <button role="tab" aria-selected={tab === 'sent'} onclick={() => (tab = 'sent')}>{t('seat.sent')}</button>
+      {#if seat.kind === 'agent'}
+        <button role="tab" aria-selected={tab === 'handover'} onclick={() => (tab = 'handover')} data-testid="tab-handover">{t('seat.handover')}</button>
+        <button role="tab" aria-selected={tab === 'worklog'} onclick={() => (tab = 'worklog')} data-testid="tab-worklog">{t('seat.worklog')}</button>
+      {/if}
     </div>
     <div class="tabbody">
       {#if tab === 'mirror' && seat.kind === 'agent'}
         <Transcript seat={seat.name} />
       {:else if tab === 'mirror'}
         <div class="empty">—</div>
+      {:else if tab === 'handover' && seat.kind === 'agent'}
+        <SeatHandover seat={seat.name} />
+      {:else if tab === 'worklog' && seat.kind === 'agent'}
+        <SeatWorklog seat={seat.name} />
       {:else if mailError}
         <p class="error">{mailError}</p>
       {:else if rows.length === 0}
