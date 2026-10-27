@@ -57,6 +57,7 @@ team_tests!(
     several_team_files_and_nested_teams,
     up_reconciles_its_openings,
     adopt_existing_sessions,
+    up_applies_document_and_handover_settings,
 );
 
 async fn setup(
@@ -2453,4 +2454,87 @@ harness = "codex"
     let (_, text) = cli(&h, &["ps"]).await;
     assert!(text.contains(cid3), "{text}");
     cli(&h, &["down"]).await;
+}
+
+const DOC_SETTINGS: &str = r#"
+[team]
+name = "plat"
+workroot = "@DIR@/work"
+docs.activate_by = "human"
+handover_idle = "10m"
+
+[defaults]
+harness = "claude"
+model = "test-model"
+
+[[seat]]
+name = "root"
+handover = "private"
+
+[[group]]
+name = "api"
+parent = "root"
+lead = { name = "api-lead" }
+docs.activate_by = "owner"
+"#;
+
+/// `docs.activate_by` reaches the teams and `handover = "private"` the
+/// seats; the next `up` changes nothing; a setting removed from the file
+/// is undone.
+async fn up_applies_document_and_handover_settings(b: Backend) {
+    let Some(h) = setup(b, "up_applies_document_and_handover_settings", None).await else {
+        return;
+    };
+    write_file(&h, "plat.toml", DOC_SETTINGS);
+    let out = up_file(&h, "plat.toml", &[]).await;
+    assert!(out.contains("seat root: handover notes private"), "{out}");
+    assert!(!out.contains("seat api-lead: handover"), "{out}");
+    assert_eq!(h.api.get("/teams/plat").await["doc_activate_by"], "human");
+    assert_eq!(
+        h.api.get("/teams/api").await["doc_activate_by"],
+        Value::Null
+    );
+    assert_eq!(
+        h.api.get("/seats/root/handover/private").await["private"],
+        true
+    );
+    assert_eq!(
+        h.api.get("/seats/api-lead/handover/private").await["private"],
+        false
+    );
+    assert_eq!(h.api.get("/seats/root/handover").await["private"], true);
+    let out = up_file(&h, "plat.toml", &[]).await;
+    assert!(!out.contains("handover notes"), "{out}");
+    assert!(!out.contains("updated team"), "{out}");
+    // Settings removed from the file are undone.
+    write_file(
+        &h,
+        "plat.toml",
+        &DOC_SETTINGS
+            .replace("handover = \"private\"\n", "")
+            .replace("docs.activate_by = \"human\"\n", ""),
+    );
+    let out = up_file(&h, "plat.toml", &[]).await;
+    assert!(
+        out.contains("seat root: handover notes readable by every seat of the org"),
+        "{out}"
+    );
+    assert!(out.contains("updated team plat: doc_activate_by"), "{out}");
+    assert_eq!(
+        h.api.get("/teams/plat").await["doc_activate_by"],
+        Value::Null
+    );
+    assert_eq!(
+        h.api.get("/seats/root/handover/private").await["private"],
+        false
+    );
+    // A wrong value is refused before anything changes.
+    write_file(
+        &h,
+        "bad.toml",
+        &DOC_SETTINGS.replace("handover = \"private\"", "handover = \"secret\""),
+    );
+    let f = h.dir.path().join("bad.toml").to_string_lossy().into_owned();
+    let (ok, text) = cli(&h, &["up", "-f", &f, "--no-start"]).await;
+    assert!(!ok && text.contains("handover \"secret\""), "{text}");
 }

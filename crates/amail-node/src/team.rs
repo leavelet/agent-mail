@@ -1472,6 +1472,69 @@ cwd = "docs"
     }
 
     #[test]
+    fn document_and_handover_settings() {
+        let t = team(
+            r#"
+[team]
+name = "plat"
+workroot = "/w"
+handover_idle = "10m"
+docs.activate_by = "human"
+[defaults]
+harness = "claude"
+handover = "private"
+[[seat]]
+name = "root"
+[[seat]]
+name = "open"
+parent = "root"
+handover = "org"
+[[group]]
+name = "api"
+parent = "root"
+lead = { name = "api-lead" }
+docs.activate_by = "owner"
+workers = { count = 1, prefix = "w", handover = "org" }
+[[group]]
+name = "ops"
+parent = "root"
+lead = { name = "ops-lead" }
+"#,
+        )
+        .unwrap();
+        assert_eq!(t.settings.handover_idle_ms, Some(600_000));
+        let private = |n: &str| t.seat(n).unwrap().handover_private;
+        assert!(private("root") && private("api-lead"));
+        assert!(!private("open") && !private("w-1"));
+        let act = |n: &str| t.teams.iter().find(|x| x.name == n).unwrap().doc_activation;
+        assert_eq!(act("plat"), DocActivation::Human);
+        assert_eq!(act("api"), DocActivation::Kind);
+        assert_eq!(act("ops"), DocActivation::Human);
+        let base = "[team]\nworkroot = \"/w\"\n";
+        let seat = "[defaults]\nharness = \"claude\"\n[[seat]]\nname = \"a\"\n";
+        let t = team(&format!("{base}{seat}")).unwrap();
+        assert_eq!(t.settings.handover_idle_ms, None);
+        assert!(!t.seat("a").unwrap().handover_private);
+        let t = team(&format!("{base}handover_idle = \"off\"\n{seat}")).unwrap();
+        assert_eq!(t.settings.handover_idle_ms, Some(0));
+        for (text, want) in [
+            (
+                format!("{base}docs.activate_by = \"bot\"\n{seat}"),
+                "docs.activate_by",
+            ),
+            (format!("{base}docs.other = 1\n{seat}"), "other"),
+            (format!("{base}{seat}handover = \"secret\"\n"), "handover"),
+            (
+                format!("{base}handover_idle = \"10x\"\n{seat}"),
+                "handover_idle",
+            ),
+        ] {
+            let e = team(&text).unwrap_err();
+            assert!(e.to_string().contains(want), "{want}: {e}");
+        }
+    }
+
+    #[test]
     fn mixed_groups_two_ways() {
         let t = team(
             r#"

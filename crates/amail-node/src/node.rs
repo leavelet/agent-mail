@@ -1795,6 +1795,8 @@ impl Node {
                     plan.wake_prompt = connected && wake;
                     s.ho.turn_start = Some(now);
                     s.ho.asked = false;
+                    // A turn whose end is still being checked stays open.
+                    s.ho.turns_open = s.ho.turns_open.min(u32::from(s.turn_check.is_some())) + 1;
                     // A wake-up whose mail is gone should end at once.
                     plan.index = (connected && !wake && index_due).then_some(false);
                     if s.focused(now) {

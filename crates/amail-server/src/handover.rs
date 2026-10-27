@@ -12,7 +12,7 @@
 //! | `POST /seats/{name}/handover/request` | the seat's lead, the user; node tokens (the node asks a seat idle with work in progress) |
 //! | `POST /seats/{name}/handover/read` | node tokens, the seat itself |
 //! | `GET`, `PUT /seats/{name}/handover/private` | the user (the team file's `handover = "private"`) |
-//! | `GET /seats/{name}/worklog` | the seat itself, seats of its team, its lead, the user |
+//! | `GET /seats/{name}/worklog` | the seat itself, seats of its team, its lead, the user, node tokens |
 //! | `POST /worklog` | node tokens, for the org's agent seats |
 //!
 //! The server writes worklog entries from its own events (mail sent, read
@@ -607,13 +607,16 @@ pub async fn worklog(
 ) -> ApiResult<axum::response::Response> {
     use axum::response::IntoResponse;
     let seat = target(&st, &auth.org, &name).await?;
-    let allowed = is_close(&st, &auth, &seat).await?
+    // Node tokens read it too: the node looks at the tasks a seat closed in
+    // a turn when it decides whether to ask for the note.
+    let allowed = auth.scope == TokenScope::Node
+        || is_close(&st, &auth, &seat).await?
         || (auth.scope == TokenScope::Seat
             && seat.team_id.is_some()
             && auth.mail_seat()?.team_id == seat.team_id);
     if !allowed {
         return Err(ApiError::forbidden(format!(
-            "the worklog of {} is read by the seat, its team, its lead and the user",
+            "the worklog of {} is read by the seat, its team, its lead, the user and nodes",
             seat.name
         )));
     }

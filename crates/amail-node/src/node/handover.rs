@@ -67,6 +67,9 @@ pub(super) struct SeatHo {
     pub(super) turn_start: Option<i64>,
     /// The current turn's `Stop` was blocked to ask for the note.
     pub(super) asked: bool,
+    /// Turns started whose end was not logged yet (a Codex turn's end is
+    /// settled after the next one may have started).
+    pub(super) turns_open: u32,
     /// When the current note was written, as last fetched: `Some(None)`
     /// for no note, `None` for not known.
     pub(super) note_at: Option<Option<i64>>,
