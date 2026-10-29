@@ -480,6 +480,49 @@ delivering its 1 waiting message(s)` or `c1: busy: its turn is running
 (last hook 20 s ago; its transcript shows the turn running; its pane shows
 the turn running)`.
 
+## Prompts and interrupts from the web
+
+The web interface's prompt box and interrupt button (`POST
+/seats/{name}/prompt` and `/interrupt`, see
+[concepts](concepts.md#web-control-of-seats)) reach the seat's node as
+commands on its event stream. The node gives the text or the interrupt to
+the session through the harness's own interface; it never types into the
+pane.
+
+| harness | prompt | interrupt |
+|---|---|---|
+| Claude Code | one line on the session's inbox socket, as a wake-up is sent, with the user's text: an idle session starts a turn on it, a busy one reads it between tool calls | none: Claude Code has no structured interrupt. The server refuses the route (409 `no_structured_interrupt`); a command that arrives anyway is logged by the node and ignored. Use the seat's terminal (Escape) |
+| Codex | `codex queue --thread <id> --message <text>`, after the node asked the app-server about the thread as for a wake-up. A wake-up is not queued while a turn runs or a wake-up is queued already; a prompt is queued in both cases, and the thread takes it when its current turn ends | `turn/interrupt` on the thread's turn in progress (the newest turn with status `inProgress` in `thread/turns/list`), through the app-server's control socket. No turn in progress: nothing is sent |
+| dsh | `session/prompt` (mode `queue`) on the seat's dsh host, as a wake-up is sent | `session/cancel` on the seat's dsh host. dsh fires no hook after a cancelled turn; the node ends the turn itself |
+
+A prompt is not a wake-up: the node does not wait for it to start a turn,
+does not send it again, and the turn it starts is an ordinary turn (mail
+that waits is shown with it as with any prompt). A prompt whose text would
+read as a wake-up notice (`[amail] You have new mail`) is given with
+`Prompt from the user: ` in front. A prompt for a supervised seat that is
+asleep or stopped starts the seat first and is given to the new session
+once it reports (at most 60 s); a seat that is not supervised and has no
+running session does not get it. After an interrupt the node marks the
+seat idle and ends its turn as it ends one the person interrupted.
+
+The node records each command in the seat's worklog, after the server's
+own entries (`prompt_from_user`, `interrupt`): `prompt` (the prompt was
+given to the session, and how, or why not), `interrupt` (the running turn
+was interrupted, no turn was running, or the error).
+
+Answers to `attention` requests reach the node the same way (command
+`attention_action`), for supervised seats: `restart` stops the seat's
+process and starts it again at once, resuming its session (a seat that is
+not running is started; a failed seat's failures are cleared, as `amail
+wake` does), and `sleep` puts the seat to sleep as `amail sleep` does (mail
+already waiting does not start it again, new mail does). Recorded as
+`attention_action` with the request's number.
+
+Not built: relaying a harness's permission prompts to the web (Claude
+Code's `PermissionRequest` hook, Codex approval requests). The teams run
+unattended, so their seats get none; a seat with prompts answers them in
+its pane.
+
 ## Settings after sleep and wake
 
 `amail up` updates a running seat's settings on the server and names the
