@@ -90,6 +90,7 @@ pub fn publish(st: &AppState, r: &RequestRec, change: &str) {
         change: change.to_string(),
         state: r.state,
         seat: r.seat.clone(),
+        task: r.task,
     };
     st.requests.deliver(r.org_id, ev.clone());
     if let Some(c) = &st.cluster {
@@ -123,6 +124,7 @@ pub fn request_out(r: &RequestRec) -> p::Request {
         deadline: r.deadline.map(render::ts),
         answer,
         thread: r.thread_id,
+        message_id: r.message_id,
         source: r.source,
         attention: r.attention.clone(),
         rev: r.rev,
@@ -501,6 +503,27 @@ async fn mail_answer(st: &AppState, org: &Org, r: &RequestRec, from: &Seat) {
     mail(st, org, from, &seat, thread_of(r), subject, body, false).await;
 }
 
+/// A request is no longer open (answered, its default taken, or
+/// withdrawn): the user's delivery of its creation mail is marked read, so
+/// that the mail leaves the user's unread list. Best effort.
+async fn read_creation_mail(st: &AppState, r: &RequestRec) {
+    let Some(mid) = r.message_id else {
+        return;
+    };
+    let Some(user) = user_seat(st, r.org_id).await else {
+        return;
+    };
+    match st.store.mark_read(mid, user.id).await {
+        Ok(Some((_, Some(bump)))) => st.bus.publish(r.org_id, &[(user.name.clone(), bump.seq)]),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(
+            "org {}: creation mail of r{} not marked read: {e}",
+            r.org_id,
+            r.num
+        ),
+    }
+}
+
 /// Worklog entry `request` for the seat a request is about.
 async fn log(st: &AppState, r: &RequestRec, what: &str) {
     let text = format!("r{} {what}: {}", r.num, r.title);
@@ -811,6 +834,7 @@ async fn answered(
     by: &Seat,
     mail: bool,
 ) -> Option<String> {
+    read_creation_mail(st, r).await;
     publish(st, r, "answered");
     log(st, r, &format!("answered: {}", answer_line(r))).await;
     if r.kind == RequestKind::Attention {
@@ -889,6 +913,7 @@ pub async fn withdraw(
             });
         }
     };
+    read_creation_mail(&st, &r).await;
     publish(&st, &r, "withdrawn");
     log(&st, &r, "withdrawn").await;
     // The other party is told in the thread: the user when a seat withdrew
@@ -1124,6 +1149,7 @@ pub async fn due_reminders(st: &AppState, now: i64) -> amail_store::Result<Vec<(
     let due = st.store.claim_due_requests(now, 500).await?;
     let mut orgs: HashMap<i64, Option<Org>> = HashMap::new();
     for r in &due.expired {
+        read_creation_mail(st, r).await;
         publish(st, r, "expired");
         log(st, r, &format!("expired: {}", answer_line(r))).await;
         if let std::collections::hash_map::Entry::Vacant(e) = orgs.entry(r.org_id) {

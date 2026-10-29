@@ -67,6 +67,26 @@ fn seat_items(presence: &HashMap<String, Presence>) -> Vec<AttentionItem> {
         .collect()
 }
 
+/// The seat an `attention` request item is about: its seat entry in the
+/// same list describes the same condition.
+fn covered_seat(it: &AttentionItem) -> Option<&str> {
+    let r = it.request.as_deref()?;
+    (r.kind == p::RequestKind::Attention).then_some(r.seat.as_str())
+}
+
+/// How many things wait for the user: the items, where a seat entry and
+/// the `attention` request of that seat count once.
+fn needs_count(items: &[AttentionItem]) -> i64 {
+    let covered: std::collections::HashSet<&str> = items.iter().filter_map(covered_seat).collect();
+    items
+        .iter()
+        .filter(|i| {
+            !(i.kind == AttentionKind::Seat
+                && i.seat.as_deref().is_some_and(|s| covered.contains(s)))
+        })
+        .count() as i64
+}
+
 async fn attention_items(st: &AppState, auth: &Auth) -> ApiResult<Vec<AttentionItem>> {
     let user = auth.mail_seat()?;
     let entries = st.store.attention(user.id, ATTENTION_LIMIT).await?;
@@ -107,8 +127,21 @@ async fn attention_items(st: &AppState, auth: &Auth) -> ApiResult<Vec<AttentionI
     // Timestamps are RFC 3339 in UTC with a fixed format, so they sort as
     // strings.
     seats.sort_by(|a, b| (&a.since, &a.seat).cmp(&(&b.since, &b.seat)));
-    // Open requests first, then the entries as before.
+    // Open requests first, then the entries as before. An `attention`
+    // request carries the details of its seat's entry (the hint, the
+    // failed turns), which stays in the list as well.
     let mut items = crate::requests::attention_items(st, auth.org.id).await?;
+    for it in &mut items {
+        let Some(seat) = covered_seat(it) else {
+            continue;
+        };
+        if let Some(e) = seats.iter().find(|e| e.seat.as_deref() == Some(seat)) {
+            it.state = e.state;
+            it.hint = e.hint.clone();
+            it.wake_failed = e.wake_failed;
+            it.turn_failed = e.turn_failed.clone();
+        }
+    }
     items.append(&mut urgent);
     items.append(&mut seats);
     items.append(&mut normal);
@@ -201,7 +234,7 @@ async fn overview_of(st: &AppState, auth: &Auth) -> ApiResult<p::Overview> {
         .await?
         .first()
         .map_or(0, |c| c.unread);
-    out.attention = attention_items(st, auth).await?.len() as i64;
+    out.attention = needs_count(&attention_items(st, auth).await?);
     Ok(out)
 }
 

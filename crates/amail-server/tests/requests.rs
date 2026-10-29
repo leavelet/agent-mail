@@ -56,6 +56,7 @@ request_tests!(
     subject_links_and_events,
     prompt_and_interrupt,
     public_limits,
+    closing_reads_creation_mail,
 );
 
 struct Server {
@@ -809,6 +810,11 @@ async fn attention_from_presence(srv: Server) {
     assert_eq!(items[0]["kind"], "request");
     assert_eq!(items[0]["request"]["num"], 1);
     assert!(items.iter().any(|i| i["kind"] == "seat"));
+    // The request item carries the seat entry's details; the overview
+    // counts the seat once.
+    assert_eq!(items[0]["hint"], "Do you trust the files in this folder?");
+    assert_eq!(items[0]["state"], "offline");
+    assert_eq!(org.get("/overview").await["attention"], 1);
     // The same report again: no second request.
     node.post("/presence", report(Some("trust-prompt"))).await;
     assert_eq!(
@@ -849,6 +855,18 @@ async fn attention_from_presence(srv: Server) {
         open,
         vec![(2, "trust-prompt".into()), (3, "turn-failed".into())]
     );
+    let v = org.get("/attention").await;
+    let item = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["kind"] == "request" && i["request"]["num"] == 3)
+        .unwrap()
+        .clone();
+    assert_eq!(item["turn_failed"]["count"], 3, "{item}");
+    assert_eq!(item["turn_failed"]["reason"], "rate limited", "{item}");
+    assert_eq!(item["hint"], "rate limited", "{item}");
+    assert_eq!(org.get("/overview").await["attention"], 2);
     // A node may also make one itself; the live one is answered.
     let v = node
         .post(
@@ -959,6 +977,16 @@ async fn subject_links_and_events(srv: Server) {
     );
     // Seats get no `request` events.
     assert!(seat_events.next_of(&["request"], 1).await.is_none());
+    // The event names the task of a request that has one.
+    a.post("/tasks", json!({ "title": "ship" })).await;
+    let mut q = question("Ship t1?");
+    q["task"] = json!("t1");
+    a.post("/requests", q).await;
+    let (_, d) = events.next_of(&["request"], 5).await.unwrap();
+    assert_eq!(
+        d,
+        json!({ "num": 2, "change": "created", "state": "open", "seat": "a", "task": 1 })
+    );
     // `[r1]` in a subject links the thread.
     let sent = b
         .post(
@@ -1157,4 +1185,66 @@ async fn public_limits(srv: Server) {
     org.post("/requests/1/answer", json!({ "option": "yes" }))
         .await;
     org.post("/requests", q).await;
+}
+
+/// Whenever a request stops being open (answered through the API or by a
+/// reply, its default taken at the deadline, withdrawn), the user's
+/// delivery of its creation mail is marked read. The request carries the
+/// id of that mail (`message_id`).
+async fn closing_reads_creation_mail(srv: Server) {
+    let org = srv.org("alpha").await;
+    let a = org.seat("a").await;
+    let unread = |org: Client| async move {
+        org.get("/inbox?unread=1").await["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["message"]["subject"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    for t in ["One", "Two", "Three", "Four"] {
+        let mut q = question(t);
+        if t == "Three" {
+            q["default"] = json!("no");
+            q["deadline_s"] = json!(0);
+        }
+        a.post("/requests", q).await;
+    }
+    let all = unread(org.clone()).await;
+    for s in ["[r1] One", "[r2] Two", "[r3] Three", "[r4] Four"] {
+        assert!(all.contains(&s.to_string()), "{all:?}");
+    }
+    // Found without reading it (`GET /messages/{id}` would mark it read).
+    let first = org
+        .inbox()
+        .await
+        .into_iter()
+        .find(|e| e["message"]["subject"] == "[r1] One")
+        .unwrap()["message"]["id"]
+        .as_i64()
+        .unwrap();
+    let r = org.get("/requests/1").await;
+    assert_eq!(r["request"]["message_id"], first);
+    // Through the API.
+    org.post("/requests/1/answer", json!({ "option": "yes" }))
+        .await;
+    // By a reply.
+    let second = org.get("/requests/2").await["request"]["message_id"].clone();
+    org.post(
+        "/messages",
+        json!({ "to": ["a"], "subject": "Re: [r2] Two", "body": "no", "in_reply_to": second }),
+    )
+    .await;
+    assert_eq!(org.get("/requests/2").await["request"]["state"], "answered");
+    // At the deadline.
+    amail_server::tasks::scan(&srv.state).await.unwrap();
+    assert_eq!(org.get("/requests/3").await["request"]["state"], "expired");
+    // Withdrawn by the seat: the creation mail is read; the mail that
+    // tells the user about the withdrawal is not.
+    a.post("/requests/4/withdraw", json!({})).await;
+    let left = unread(org.clone()).await;
+    for s in ["[r1] One", "[r2] Two", "[r3] Three", "[r4] Four"] {
+        assert!(!left.contains(&s.to_string()), "{s}: {left:?}");
+    }
+    assert!(left.contains(&"Re: [r4] Four".to_string()), "{left:?}");
 }

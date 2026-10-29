@@ -1941,7 +1941,8 @@ pub struct Overview {
     pub mail_last_day: i64,
     /// Unread messages in the user's mailbox.
     pub user_unread: i64,
-    /// Entries of `GET /v1/attention`.
+    /// Entries of `GET /v1/attention`, where a seat entry and the
+    /// `attention` request of the same seat count once.
     pub attention: i64,
 }
 

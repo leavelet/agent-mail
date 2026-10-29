@@ -836,8 +836,9 @@ async fn attention_overview_counts(srv: Server) {
     assert_eq!(o["wake_failed"], 1);
     assert_eq!(o["mail_last_hour"], 9);
     assert_eq!(o["mail_last_day"], 9);
-    // Three entries and the two seats' attention requests.
-    assert_eq!(o["attention"], 5);
+    // Three entries and the two seats' attention requests, where a seat
+    // entry and the request of that seat count once.
+    assert_eq!(o["attention"], 3);
     assert_eq!(o["user_unread"], 3);
 
     // Counts per seat.

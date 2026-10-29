@@ -240,6 +240,10 @@ pub struct Request {
     /// The mail thread of the request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread: Option<i64>,
+    /// The request's creation mail to the user (the first message of
+    /// `thread`); absent for `attention` requests, which are not mailed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<i64>,
     pub source: RequestSource,
     /// `attention`: the seat's attention code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -325,6 +329,9 @@ pub struct RequestBusEvent {
     pub change: String,
     pub state: RequestState,
     pub seat: String,
+    /// The task the request belongs to, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<i64>,
 }
 
 /// Body of `POST /v1/seats/{name}/prompt`.
