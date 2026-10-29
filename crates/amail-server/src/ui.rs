@@ -11,7 +11,7 @@ use amail_proto::{
     self as p, AttentionItem, AttentionKind, NodeCommand, Presence, Priority, SeatKind, SeatState,
     TokenScope,
 };
-use amail_store::{ArchiveQuery, SearchHit, SearchQuery};
+use amail_store::{ArchiveQuery, ReadSelection, SearchHit, SearchQuery};
 use axum::extract::State;
 use axum::http::StatusCode;
 use serde::Deserialize;
@@ -428,6 +428,49 @@ pub async fn mark_unread(
     Ok(Json(p::AckResponse {
         delivery: render::delivery(&d, &auth.org),
     }))
+}
+
+/// `POST /v1/inbox/read` (user tokens): mark many of the user's deliveries
+/// read in one transaction, each as `POST /messages/{id}/read` does: those
+/// of the messages in `ids`, or with `all: true` every unread one (with
+/// `before_seq`, those with `seq < before_seq`). Ids of messages the user
+/// has no delivery of are skipped; withdrawn deliveries are left as they
+/// are. `marked` says how many changed.
+pub async fn mark_inbox_read(
+    State(st): State<AppState>,
+    auth: Auth,
+    Json(req): Json<p::MarkReadRequest>,
+) -> ApiResult<Json<p::MarkReadResponse>> {
+    auth.require_user()?;
+    let seat = auth.mail_seat()?.clone();
+    let selection = match (req.ids, req.all) {
+        (Some(ids), false) => {
+            if req.before_seq.is_some() {
+                return Err(ApiError::bad_request(
+                    "before_seq goes with all, not with ids",
+                ));
+            }
+            ReadSelection::Ids(ids)
+        }
+        (None, true) => ReadSelection::All {
+            before_seq: req.before_seq,
+        },
+        _ => {
+            return Err(ApiError::bad_request("give either ids or all: true"));
+        }
+    };
+    // The cost depends on how much mail is marked: run it in the pool of
+    // such requests.
+    let store = st.store.clone();
+    let seat_id = seat.id;
+    let (marked, bump) = crate::mail::limited(&st, &auth, Pool::Other, async move {
+        Ok(store.mark_read_many(seat_id, &selection).await?)
+    })
+    .await?;
+    if let Some(b) = bump {
+        st.bus.publish(b.org_id, &[(seat.name.clone(), b.seq)]);
+    }
+    Ok(Json(p::MarkReadResponse { marked }))
 }
 
 async fn seat_op(

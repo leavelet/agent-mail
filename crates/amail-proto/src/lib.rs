@@ -794,6 +794,26 @@ pub struct AckResponse {
     pub delivery: Delivery,
 }
 
+/// Request of `POST /v1/inbox/read` (user tokens): either `ids` (message
+/// ids), or `all: true` with an optional `before_seq` (only deliveries with
+/// `seq < before_seq`, as in `GET /v1/inbox`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MarkReadRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ids: Option<Vec<i64>>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub all: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_seq: Option<i64>,
+}
+
+/// Response of `POST /v1/inbox/read`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MarkReadResponse {
+    /// How many deliveries changed from unread to read.
+    pub marked: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub message_id: i64,

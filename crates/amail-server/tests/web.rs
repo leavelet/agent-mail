@@ -48,6 +48,7 @@ web_tests!(
     seat_commands_reach_nodes,
     live_directory_and_node_events,
     mark_unread_and_notices,
+    bulk_mark_read,
     transcript_relay,
     embedded_app_and_headers,
 );
@@ -1372,4 +1373,147 @@ async fn embedded_app_and_headers(srv: Server) {
     }
     let r = http.post(format!("{}/", srv.base)).send().await.unwrap();
     assert_eq!(r.status(), StatusCode::NOT_FOUND);
+}
+
+/// `POST /inbox/read`: the user marks many deliveries read at once, by
+/// message id or all of them (below a seq); ids that are not the user's
+/// deliveries are skipped.
+async fn bulk_mark_read(srv: Server) {
+    let user = srv.org("acme").await;
+    let a = user.seat("a").await;
+    let mut ids = Vec::new();
+    for i in 0..5 {
+        ids.push(
+            a.send(json!({ "to": ["owner"], "subject": format!("r{i}"), "body": "b" }))
+                .await,
+        );
+    }
+    // Not the user's deliveries: mail the user sent, another org's mail.
+    let own = user
+        .send(json!({ "to": ["a"], "subject": "x", "body": "y" }))
+        .await;
+    let other = srv.org("bravo").await;
+    let foreign = other
+        .send(json!({ "to": ["owner"], "subject": "z", "body": "w" }))
+        .await;
+    let unread = |c: Value| {
+        c["seats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["seat"] == "owner")
+            .unwrap()["unread"]
+            .clone()
+    };
+    assert_eq!(unread(user.ok(Method::GET, "/counts", None).await), 5);
+
+    // Only user tokens; exactly one of the two forms.
+    assert_eq!(
+        a.call(Method::POST, "/inbox/read", Some(json!({ "all": true })))
+            .await
+            .0,
+        StatusCode::FORBIDDEN
+    );
+    for bad in [
+        json!({}),
+        json!({ "all": false }),
+        json!({ "ids": [ids[0]], "all": true }),
+        json!({ "ids": [ids[0]], "before_seq": 3 }),
+    ] {
+        assert_eq!(
+            user.call(Method::POST, "/inbox/read", Some(bad.clone()))
+                .await
+                .0,
+            StatusCode::BAD_REQUEST,
+            "{bad}"
+        );
+    }
+
+    // By id; the change reaches the user's event stream.
+    let mut events = Sse::new(user.stream("/events").await);
+    let seq_before = user.ok(Method::GET, "/inbox?limit=50", None).await["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["delivery"]["mod_seq"].as_i64().unwrap())
+        .max()
+        .unwrap();
+    let r = user
+        .ok(
+            Method::POST,
+            "/inbox/read",
+            Some(json!({ "ids": [ids[0], ids[1], ids[1], own, foreign, 999_999] })),
+        )
+        .await;
+    assert_eq!(r, json!({ "marked": 2 }));
+    assert_eq!(unread(user.ok(Method::GET, "/counts", None).await), 3);
+    let mut seen = false;
+    while let Some((_, e)) = events.next_of(&["mailbox"], 5).await {
+        if e["seat"] == "owner" && e["seq"].as_i64().unwrap() >= seq_before + 2 {
+            seen = true;
+            break;
+        }
+    }
+    assert!(seen, "no mailbox event after the bulk read");
+    let changes = user
+        .ok(Method::GET, &format!("/changes?since={seq_before}"), None)
+        .await;
+    let changed: Vec<i64> = changes["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["message"]["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(changed, vec![ids[0], ids[1]]);
+    // Again: nothing left to mark.
+    let r = user
+        .ok(
+            Method::POST,
+            "/inbox/read",
+            Some(json!({ "ids": [ids[0]] })),
+        )
+        .await;
+    assert_eq!(r["marked"], 0);
+    // The other org's mail and the user's own sent mail are untouched.
+    let o = other.ok(Method::GET, "/inbox?unread=true", None).await;
+    assert_eq!(o["entries"].as_array().unwrap().len(), 1);
+
+    // All below a seq: only the deliveries before r4.
+    let inbox = user.ok(Method::GET, "/inbox?limit=50", None).await;
+    let seq_of = |id: i64| {
+        inbox["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["message"]["id"] == id)
+            .unwrap()["delivery"]["seq"]
+            .as_i64()
+            .unwrap()
+    };
+    let r = user
+        .ok(
+            Method::POST,
+            "/inbox/read",
+            Some(json!({ "all": true, "before_seq": seq_of(ids[4]) })),
+        )
+        .await;
+    assert_eq!(r["marked"], 2);
+    let left = user.ok(Method::GET, "/inbox?unread=true", None).await;
+    let left: Vec<i64> = left["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["message"]["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(left, vec![ids[4]]);
+    // All: the rest.
+    let r = user
+        .ok(Method::POST, "/inbox/read", Some(json!({ "all": true })))
+        .await;
+    assert_eq!(r["marked"], 1);
+    assert_eq!(unread(user.ok(Method::GET, "/counts", None).await), 0);
+    assert_eq!(
+        user.ok(Method::GET, "/attention", None).await["items"],
+        json!([])
+    );
 }

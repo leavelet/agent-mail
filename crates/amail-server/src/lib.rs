@@ -291,6 +291,7 @@ pub fn router(state: AppState) -> Router {
         .route("/docs/{num}/links", get(docs::links))
         .route("/docs/{num}/comment", post(docs::comment))
         .route("/inbox", get(mail::inbox))
+        .route("/inbox/read", post(ui::mark_inbox_read))
         .route("/claim", post(mail::claim))
         .route("/claim/release", post(mail::release))
         .route("/changes", get(mail::changes))
