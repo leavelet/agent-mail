@@ -146,7 +146,7 @@
             </div>
             {#if groupMsg?.cls === g.cls}<p class={groupMsg.error ? 'error' : 'ok'} role="status">{groupMsg.text}</p>{/if}
             {#each g.requests as r (r.num)}
-              <RequestCard request={r} onresolved={setResolved} ondismiss={r.state === 'open' ? undefined : () => hide(r.num)} />
+              <RequestCard request={r} item={store.needs.items.get(r.num)} onresolved={setResolved} ondismiss={r.state === 'open' ? undefined : () => hide(r.num)} />
             {/each}
           </section>
         {/each}

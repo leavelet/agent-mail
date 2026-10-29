@@ -268,11 +268,12 @@ class Store {
       }
     });
     // A request for the person changed: the queue, the request views and
-    // the tasks it blocks reload.
+    // the views of the task it belongs to (if any) reload.
     es.addEventListener('request', (e) => {
       try {
         const ev = JSON.parse((e as MessageEvent).data) as RequestBusEvent;
         if (typeof ev.num === 'number') this.coalescer.add(`q:${ev.num}`);
+        if (typeof ev.task === 'number') this.coalescer.add(`t:${ev.task}`);
       } catch {
         // Ignore malformed events.
       }
@@ -350,10 +351,6 @@ class Store {
     if (anyRequest) {
       this.requestChanged = reqs;
       this.requestSeq++;
-      // A task shows the open request that blocks it (the event does not
-      // say which task).
-      anyTask = true;
-      tasks = null;
     }
     if (anyDoc) {
       this.docChanged = docs;
@@ -506,6 +503,10 @@ class Store {
   async requestsChanged(r: Request): Promise<void> {
     this.requestChanged = new Set([r.num]);
     this.requestSeq++;
+    if (r.task) {
+      this.taskChanged = new Set([r.task]);
+      this.taskSeq++;
+    }
     await this.refreshAttention().catch(() => undefined);
   }
 

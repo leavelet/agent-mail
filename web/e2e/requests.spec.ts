@@ -18,6 +18,7 @@ interface Req {
   num: number;
   state: string;
   thread?: number;
+  message_id?: number;
   rev: number;
   answer?: { option?: string; text?: string; by: string; note?: string };
 }
@@ -126,6 +127,56 @@ test('needs you: request cards by class; an answer by option', async ({ page }) 
   await expect(nav).toHaveText(String(before - 1));
   await c.getByRole('button', { name: 'Hide' }).click();
   await expect(c).toHaveCount(0);
+  // The server marked the creation mail read when the request was answered.
+  expect(done.message_id).toBeGreaterThan(0);
+  const unread = await api<{ entries: { message: { id: number } }[] }>(s.userToken, 'GET', '/inbox?unread=1&limit=500');
+  expect(unread.entries.map((e) => e.message.id)).not.toContain(done.message_id);
+});
+
+test('an attention card shows the failed turns of its seat, counted once', async ({ page }) => {
+  const s = state();
+  await pushPresence();
+  await api(s.nodeToken, 'POST', '/presence', {
+    node: 'build-01',
+    seats: [{ seat: 'fe-2', state: 'idle', harness: 'codex', turn_failed: { reason: 'no API key for provider route', at: new Date().toISOString(), count: 3, retrying: false } }],
+  });
+  const list = await api<{ requests: Req[] }>(s.userToken, 'GET', '/requests?kind=attention&seat=fe-2');
+  expect(list.requests).toHaveLength(1);
+  const num = list.requests[0].num;
+  await login(page, s.userToken, { lang: 'en' });
+  await page.goto(`${s.base}/#/needs`);
+  const c = card(page, num);
+  await expect(c.getByTestId('req-seat-detail')).toContainText('3 failed turn(s) in a row. Last error: no API key for provider route');
+  await expect(c.getByTestId('req-seat-detail')).toContainText('A person must look.');
+  // The seat's entry stays below; the count has the seat once.
+  await expect(page.locator('.item[data-kind="seat"]', { hasText: 'fe-2' })).toBeVisible();
+  const nav = page.locator('nav.nav a', { hasText: 'Needs you' }).locator('.count');
+  const before = Number(await nav.textContent());
+  // The condition ends: the request is closed and the count drops (by the
+  // seat, and by the server's notice of the failed turns, which is marked
+  // read when the turns work again).
+  await pushPresence();
+  await expect(c).toHaveCount(0);
+  await expect.poll(async () => Number(await nav.textContent())).toBeLessThan(before);
+});
+
+test('a seat that waits for an answer: the org tree and the seat page say which request', async ({ page }) => {
+  const s = state();
+  await pushPresence();
+  const r = await ask('fe-1', { title: 'Which grid for the org tree?', options: YESNO, class: 'later' });
+  // The node reports that fe-1 sleeps until r is answered (`waiting_for`).
+  await api(s.nodeToken, 'POST', '/presence', { node: 'build-01', seats: [{ seat: 'fe-1', state: 'dormant', harness: 'claude', waiting_for: r.num }] });
+  await login(page, s.userToken, { lang: 'en' });
+  await page.goto(`${s.base}/#/org`);
+  await expect(page.locator('.trow[data-seat="fe-1"]').getByTestId('waiting-chip')).toHaveText(`waiting for r${r.num}`);
+  await page.goto(`${s.base}/#/org/fe-1`);
+  await expect(page.getByTestId('seat-waiting-chip')).toHaveText(`waiting for r${r.num}`);
+  await expect(page.getByTestId('seat-waiting')).toContainText(`r${r.num}`);
+  // The next report without it clears it.
+  await pushPresence();
+  await expect(page.getByTestId('seat-waiting-chip')).toHaveCount(0);
+  // Not left in the queue for the tests after this one.
+  await api(s.userToken, 'POST', `/requests/${r.num}/withdraw`, {});
 });
 
 test('a free-text answer, and an answer that lost the race', async ({ page }) => {

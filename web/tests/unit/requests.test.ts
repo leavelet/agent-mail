@@ -57,12 +57,12 @@ describe('request numbers and subjects', () => {
     expect(subjectRequestTags('r4 without brackets')).toEqual([]);
     expect(subjectRequestTags(undefined)).toEqual([]);
   });
-  it('knows the creation mail of a request', () => {
-    const r = req(4, { thread: 40 });
-    expect(isCreationMail({ subject: '[r4] Question 4', thread_id: 40 }, r)).toBe(true);
-    expect(isCreationMail({ subject: 'Re: [r4] Question 4', thread_id: 40 }, r)).toBe(false);
-    expect(isCreationMail({ subject: '[r4] Question 4', thread_id: 41 }, r)).toBe(false);
-    expect(isCreationMail({ subject: '[r40] other', thread_id: 40 }, r)).toBe(false);
+  it('knows the creation mail of a request by its message_id', () => {
+    const r = req(4, { thread: 40, message_id: 40 });
+    expect(isCreationMail({ id: 40 }, r)).toBe(true);
+    expect(isCreationMail({ id: 41 }, r)).toBe(false);
+    // Without message_id (an `attention` request) no mail is its creation mail.
+    expect(isCreationMail({ id: 40 }, req(4, { thread: 40 }))).toBe(false);
   });
 });
 
@@ -86,9 +86,9 @@ describe('the queue', () => {
   });
   it('splits the requests from the other entries without duplicates', () => {
     const attn = req(7, { kind: 'attention', seat: 'fe-lead', attention: 'permission' });
-    const q = req(8, { thread: 80 });
+    const q = req(8, { thread: 80, message_id: 80 });
     const items: AttentionItem[] = [
-      { kind: 'request', since: attn.created_at, seat: 'fe-lead', request: attn },
+      { kind: 'request', since: attn.created_at, seat: 'fe-lead', request: attn, hint: 'answer it in the pane' },
       { kind: 'request', since: q.created_at, seat: 'be-1', request: q },
       mail(80, '[r8] Question 8'),
       mail(81, 'Re: [r8] Question 8', 80),
@@ -98,8 +98,11 @@ describe('the queue', () => {
       { kind: 'future' as AttentionItem['kind'], since: '', seat: 'x' },
       { kind: 'request', since: '', seat: 'y' },
     ];
-    const { requests, rest } = splitAttention(items);
+    const { requests, items: byNum, rest } = splitAttention(items);
     expect(requests.map((r) => r.num)).toEqual([7, 8]);
+    // The item of a request keeps the seat's details.
+    expect(byNum.get(7)?.hint).toBe('answer it in the pane');
+    expect([...byNum.keys()]).toEqual([7, 8]);
     expect(rest.map((i) => i.message?.id ?? i.seat)).toEqual([81, 90, 'fe-lead', 'be-2']);
     // fe-lead counts once, with its attention request.
     expect(countNeeds(requests, rest)).toBe(2 + 3);
@@ -138,10 +141,10 @@ describe('seats', () => {
   it('reads the request a seat waits for', () => {
     expect(waitingRequest(undefined)).toBeUndefined();
     expect(waitingRequest({})).toBeUndefined();
-    expect(waitingRequest({ waiting: 12 })).toBe(12);
-    expect(waitingRequest({ waiting: 'r12' })).toBe(12);
-    expect(waitingRequest({ waiting: true })).toBeUndefined();
-    expect(waitingRequest({ waiting_request: 5, waiting: 'r9' })).toBe(5);
+    expect(waitingRequest({ waiting_for: 12 })).toBe(12);
+    expect(waitingRequest({ waiting_for: 0 })).toBeUndefined();
+    // The names guessed before the node's field existed are not read.
+    expect(waitingRequest({ waiting: 12, waiting_request: 5 } as never)).toBeUndefined();
   });
   it('offers an interrupt except for Claude Code', () => {
     expect(interruptKind('codex', undefined)).toBe('interrupt');

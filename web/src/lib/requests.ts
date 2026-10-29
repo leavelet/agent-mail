@@ -65,21 +65,21 @@ export function answerText(r: Request): string {
   return a.text ?? '';
 }
 
-/** A message is the creation mail of request `r` (subject `[r12] …`, not a
- * reply, in the request's thread). */
-export function isCreationMail(m: { subject: string; thread_id: number }, r: Pick<Request, 'num' | 'thread'>): boolean {
-  if (r.thread !== undefined && m.thread_id !== r.thread) return false;
-  return m.subject.trimStart().startsWith(`[r${r.num}]`);
+/** A message is the creation mail of request `r` (its `message_id`). */
+export function isCreationMail(m: { id: number }, r: Pick<Request, 'message_id'>): boolean {
+  return r.message_id !== undefined && m.id === r.message_id;
 }
 
 const REST_KINDS: string[] = ['ack', 'reply', 'seat', 'notice'];
 
-/** The "needs you" queue split: the open requests, and the other entries
+/** The "needs you" queue split: the open requests, the items that carry
+ * them by request number (an `attention` request's item has the details
+ * of its seat's entry: the hint, the failed turns), and the other entries
  * of the kinds this interface knows, without the creation mail of an open
  * request (its card shows it). */
-
-export function splitAttention(items: AttentionItem[]): { requests: Request[]; rest: AttentionItem[] } {
-  const requests = items.filter((i) => i.kind === 'request' && i.request).map((i) => i.request as Request);
+export function splitAttention(items: AttentionItem[]): { requests: Request[]; items: Map<number, AttentionItem>; rest: AttentionItem[] } {
+  const carried = items.filter((i) => i.kind === 'request' && i.request);
+  const requests = carried.map((i) => i.request as Request);
   const rest = items.filter((i) => {
     // Kinds this interface does not know (a newer server) are left out
     // rather than shown without words.
@@ -91,7 +91,7 @@ export function splitAttention(items: AttentionItem[]): { requests: Request[]; r
     if (m && requests.some((r) => isCreationMail(m, r))) return false;
     return true;
   });
-  return { requests, rest };
+  return { requests, items: new Map(carried.map((i) => [(i.request as Request).num, i])), rest };
 }
 
 /** How many things wait for the user: the shown requests, and the other
@@ -132,13 +132,9 @@ export function addSnooze(s: Record<string, number>, num: number, now: number, m
 }
 
 /** The request a seat sleeps on, if its presence says so. */
-export function waitingRequest(p: Pick<Presence, 'waiting' | 'waiting_request'> | undefined): number | undefined {
-  if (!p) return undefined;
-  if (typeof p.waiting_request === 'number' && p.waiting_request > 0) return p.waiting_request;
-  const w = p.waiting;
-  if (typeof w === 'number') return w > 0 ? w : undefined;
-  if (typeof w === 'string') return parseRequestNum(w) ?? undefined;
-  return undefined;
+export function waitingRequest(p: Pick<Presence, 'waiting_for'> | undefined): number | undefined {
+  const w = p?.waiting_for;
+  return typeof w === 'number' && Number.isInteger(w) && w > 0 ? w : undefined;
 }
 
 /** How a seat's current turn is stopped from the web: Claude Code has no

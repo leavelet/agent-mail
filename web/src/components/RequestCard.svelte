@@ -17,15 +17,20 @@
   import { answerText, optionOf, requestId } from '../lib/requests';
   import { answerRequest, conflictRequest, requestError } from '../lib/requestops';
   import { taskId } from '../lib/tasks';
-  import type { Request, RequestOption } from '../lib/types';
+  import type { AttentionItem, Request, RequestOption } from '../lib/types';
 
   let {
     request,
+    item,
     mode = 'card',
     onresolved,
     ondismiss,
   }: {
     request: Request;
+    /** The request's item in "needs you": for an `attention` request it
+     * carries the details of the seat's condition (the hint, the failed
+     * turns). */
+    item?: AttentionItem;
     mode?: 'card' | 'page' | 'strip';
     /** The request is no longer open (answered here, or found answered). */
     onresolved?: (r: Request) => void;
@@ -52,6 +57,10 @@
   const attention = $derived(r.kind === 'attention');
   const age = $derived(duration(ui.now - parseTime(r.created_at), ui.lang));
   const def = $derived(optionOf(r, r.default));
+  /** The seat's condition as its entry reports it now, when it says more
+   * than the request's body. */
+  const tf = $derived(attention && open ? item?.turn_failed : undefined);
+  const hint = $derived(attention && open && item?.hint && item.hint.trim() !== (r.body ?? '').trim() ? item.hint : undefined);
 
   function label(o: RequestOption): string {
     // The system's options of an `attention` request have words here.
@@ -136,6 +145,12 @@
     {/if}
   </header>
 
+  {#if tf || hint}
+    <p class="seatinfo" data-testid="req-seat-detail">
+      {#if tf}{t('flag.turnFailed.long', { reason: tf.reason, n: tf.count })} {t(tf.retrying ? 'seat.turnFailed.retrying' : 'seat.turnFailed.stopped')}{:else if hint}<Vis text={hint} />{/if}
+    </p>
+  {/if}
+
   {#if r.body && mode !== 'strip'}
     {#if mode === 'page'}
       <div class="body"><DocBody body={r.body} sections={[]} num={null} /></div>
@@ -206,6 +221,12 @@
 </article>
 
 <style>
+  .seatinfo {
+    margin: 0;
+    font-size: 13px;
+    color: var(--danger);
+    overflow-wrap: anywhere;
+  }
   .rcard {
     display: flex;
     flex-direction: column;

@@ -2,8 +2,6 @@
 // their errors are shown.
 
 import { ApiError, enc, get, post, qs } from './api';
-import { markReadMany } from './mailops';
-import { isCreationMail } from './requests';
 import { store } from './store.svelte';
 import { t } from './ui.svelte';
 import type { Request, RequestDetail, RequestList, SeatControlResponse } from './types';
@@ -23,25 +21,18 @@ export interface AnswerBody {
   if_rev?: number;
 }
 
-/** Answer a request; the creation mail of the request in the user's
- * queue is then marked read (the answer took care of it). */
+/** Answer a request. The server marks the user's creation mail of the
+ * request read (as for every way a request is closed). */
 export async function answerRequest(num: number, body: AnswerBody): Promise<RequestDetail> {
   const r = await post<RequestDetail>(`/v1/requests/${num}/answer`, body);
-  await readCreationMail(r.request);
   void store.requestsChanged(r.request);
   return r;
 }
 
 export async function withdrawRequest(num: number, note?: string): Promise<RequestDetail> {
   const r = await post<RequestDetail>(`/v1/requests/${num}/withdraw`, note ? { note } : {});
-  await readCreationMail(r.request);
   void store.requestsChanged(r.request);
   return r;
-}
-
-async function readCreationMail(r: Request): Promise<void> {
-  const ids = store.attention.filter((i) => i.message && i.kind !== 'request' && isCreationMail(i.message, r)).map((i) => i.message!.id);
-  if (ids.length) await markReadMany(ids).catch(() => undefined);
 }
 
 export function promptSeat(name: string, text: string): Promise<SeatControlResponse> {

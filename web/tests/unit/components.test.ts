@@ -50,6 +50,26 @@ describe('TreeRow', () => {
     expect(text).toContain('+2');
     expect(el.querySelector('.below')?.textContent).toContain('2');
   });
+  it('shows the request a sleeping seat waits for', () => {
+    ui.lang = 'en';
+    const el = render(TreeRow, {
+      row: { name: 'be-1', depth: 0, hasChildren: false, expanded: false, context: false },
+      seat: {
+        name: 'be-1',
+        kind: 'agent',
+        created_at: 'x',
+        presence: { state: 'dormant', since: '2026-10-04T11:50:00Z', updated_at: '2026-10-04T11:59:50Z', waiting_for: 12 },
+      },
+      now,
+    });
+    expect(el.querySelector('[data-testid="waiting-chip"]')?.textContent).toBe('waiting for r12');
+    const idle = render(TreeRow, {
+      row: { name: 'be-2', depth: 0, hasChildren: false, expanded: false, context: false },
+      seat: { name: 'be-2', kind: 'agent', created_at: 'x', presence: { state: 'idle', since: 'x', updated_at: 'x' } },
+      now,
+    });
+    expect(idle.querySelector('[data-testid="waiting-chip"]')).toBeNull();
+  });
   it('flags a seat whose turns fail, and a seat starting at a prompt', () => {
     ui.lang = 'en';
     const failing = render(TreeRow, {

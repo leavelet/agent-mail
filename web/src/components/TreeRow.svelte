@@ -7,6 +7,7 @@
   import { shortTime } from '../lib/time';
   import { t, ui } from '../lib/ui.svelte';
   import StateBadge from './StateBadge.svelte';
+  import { requestId, waitingRequest } from '../lib/requests';
 
   let {
     row,
@@ -47,6 +48,7 @@
   const attnTitle = $derived(
     p?.attention_hint ?? (p?.turn_failed ? t('flag.turnFailed.long', { reason: p.turn_failed.reason, n: p.turn_failed.count }) : t('flag.attention')),
   );
+  const waitingFor = $derived(waitingRequest(p));
   const failing = $derived(status.failing);
   const starting = $derived(status.starting);
 </script>
@@ -101,6 +103,7 @@
     {#if attnLabel}<span class="chip attn" title={visible(attnTitle)}>⚠ {attnLabel}</span>{/if}
     {#if p?.turn_failed && tag !== 'turn-failed'}<span class="chip attn" title={visible(t('flag.turnFailed.long', { reason: p.turn_failed.reason, n: p.turn_failed.count }))}>⚠ {t('attn.turn-failed')}</span>{/if}
     {#if p?.wake_failed && tag !== 'wake-failed'}<span class="chip attn" title={t('flag.wakeFailed.long')}>{t('flag.wakeFailed')}</span>{/if}
+    {#if waitingFor}<span class="chip neutral" data-testid="waiting-chip" title={t('req.waitingFor.long', { id: requestId(waitingFor) })}>{t('req.waitingFor')} {requestId(waitingFor)}</span>{/if}
     {#if focus}<span class="chip focus" title={t('flag.focus.long')}>◐ {t('flag.focus', { time: shortTime(focus, now, ui.lang) })}</span>{/if}
     {#if waiting}<span class="chip you" title={t('flag.waitingYou.long')}>✉ {t('flag.waitingYou')}</span>{/if}
   </div>

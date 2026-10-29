@@ -44,10 +44,9 @@ export interface Presence {
   terminal_url?: string;
   turn_failed?: TurnFailure;
   node_connected?: boolean;
-  /** The open request the seat sleeps on (a node may report it as a
-   * number, `r12`, or in `waiting_request`); not reported by every node. */
-  waiting?: number | string | boolean;
-  waiting_request?: number;
+  /** The seat asked the person (request `r<n>`), ended its turn and waits
+   * for the answer; cleared when its next turn starts. */
+  waiting_for?: number;
 }
 
 export interface Seat {
@@ -1088,6 +1087,8 @@ export interface Request {
   deadline?: string;
   answer?: RequestAnswer;
   thread?: number;
+  /** The request's creation mail to the user (absent for `attention`). */
+  message_id?: number;
   source: string;
   attention?: string;
   rev: number;
@@ -1123,6 +1124,8 @@ export interface RequestBusEvent {
   change: string;
   state: RequestState;
   seat: string;
+  /** The task the request belongs to, if any. */
+  task?: number;
 }
 
 /** Answer of `POST /v1/seats/{name}/prompt` and `/interrupt`. */
