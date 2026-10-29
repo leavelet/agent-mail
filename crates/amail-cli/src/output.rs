@@ -209,6 +209,9 @@ pub fn seat_line(s: &p::Seat) -> String {
     }
     if let Some(p) = &s.presence {
         out.push_str(&format!(" state={}", l(&p.state.to_string())));
+        if let Some(n) = p.waiting_for {
+            out.push_str(&format!(" waiting for r{n}"));
+        }
         if p.wake_failed {
             out.push_str(" wake_failed");
         }
@@ -670,6 +673,18 @@ mod tests {
             "{}",
             entry_line(&e)
         );
+    }
+
+    #[test]
+    fn seat_line_shows_the_request_a_seat_waits_for() {
+        let seat: p::Seat = serde_json::from_value(serde_json::json!({
+            "name": "w1", "kind": "agent", "created_at": "2026-10-04T10:00:00Z",
+            "presence": { "state": "dormant", "since": "2026-10-04T10:00:00Z",
+                "updated_at": "2026-10-04T10:00:00Z", "waiting_for": 12 }
+        }))
+        .unwrap();
+        let s = seat_line(&seat);
+        assert!(s.contains(" state=dormant waiting for r12"), "{s}");
     }
 
     #[test]

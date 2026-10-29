@@ -602,4 +602,18 @@ async fn controls(owner: &Amail, w1: &Amail) {
     let v = owner.try_run(&["--json", "interrupt", "w2"]);
     assert!(!v.status.success());
     drop(stream);
+    // The server's entries of the controls and the requests read as
+    // sentences in `amail worklog`.
+    let out = owner.run(&["worklog", "w1"]);
+    for want in [
+        "prompt_from_user owner sent a prompt: Run the tests again.",
+        "interrupt  owner interrupted the seat's turn",
+    ] {
+        assert!(out.contains(want), "{want}: {out}");
+    }
+    assert!(
+        out.lines()
+            .any(|l| l.contains(" request ") && l.contains("r1 created: ")),
+        "{out}"
+    );
 }
