@@ -1503,6 +1503,42 @@ impl Node {
         json!({"seat": seat, "action": action, "detail": detail, "pending": pending})
     }
 
+    /// Start the seat's session again (the user answered its `attention`
+    /// request with `restart`): a running process is stopped and started
+    /// again at once (resuming its session), a seat that is not running is
+    /// started; a failed seat's failures are cleared, as `amail wake` does.
+    pub(super) async fn sup_restart(&self, seat: &str) -> Value {
+        if let Err(e) = self.targets(&[seat.to_string()]) {
+            return json!({"error": e});
+        }
+        let action = {
+            let mut st = self.lock();
+            if let Some(m) = st.saved.managed.get_mut(seat) {
+                m.up = true;
+                m.dormant = false;
+                m.held = None;
+                m.failed = false;
+                m.failures = 0;
+                m.adopt_failed = None;
+            }
+            if let Some(rt) = st.sup.get_mut(seat) {
+                rt.retry_at = None;
+            }
+            st.save_dirty = true;
+            self.turns_retry(&mut st, seat);
+            let running = st.saved.managed.get(seat).is_some_and(|m| m.pid.is_some());
+            if running {
+                self.begin_stop(&mut st, seat, Intent::Restart);
+                "restarting"
+            } else {
+                "starting"
+            }
+        };
+        self.sup_kick.notify_one();
+        self.presence_kick.notify_one();
+        json!({"seat": seat, "action": action})
+    }
+
     pub(super) fn sup_ps(&self) -> Value {
         let (policy, source) = (self.local_policy(), self.policy_source());
         let st = self.lock();
@@ -1551,6 +1587,7 @@ impl Node {
                     hint,
                     restarts: m.failures,
                     note: s.and_then(|s| s.ho.note_word()).map(str::to_string),
+                    waiting_for: s.and_then(|s| s.rq.waiting_for),
                 }
             })
             .collect();
