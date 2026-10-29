@@ -1053,6 +1053,12 @@ wait on `GET /requests/{num}/wait`, which returns when the request is
 answered (at most 10 minutes per call). Questions a lead asks a worker
 stay mail; requests are for the person.
 
+The asker's lead (the root seat of the asker's team, when that is another
+seat) reads along: it gets the creation mail and the answer mail in `Cc`
+(which does not wake it), may read the requests of its team's seats
+(`amail request show r12`), and lists them with `amail requests --team
+<team>` (`GET /requests?team=`).
+
 **The waiting seat.** The node notices a turn that ran `amail ask` (or
 the `ask` tool). When that turn ends, the node asks the server for the
 seat's open requests; if the seat made a `question`, `plan` or `merge`

@@ -57,6 +57,7 @@ request_tests!(
     prompt_and_interrupt,
     public_limits,
     closing_reads_creation_mail,
+    lead_reads_along,
 );
 
 struct Server {
@@ -1264,4 +1265,73 @@ async fn closing_reads_creation_mail(srv: Server) {
         assert!(!left.contains(&s.to_string()), "{s}: {left:?}");
     }
     assert!(left.contains(&"Re: [r4] Four".to_string()), "{left:?}");
+}
+
+/// The asker's lead (the root seat of its team) gets the creation mail and
+/// the answer mail in `Cc`, reads the requests of its team's seats and
+/// lists them with `team=`; other seats may not list the team's requests.
+async fn lead_reads_along(srv: Server) {
+    let org = srv.org("alpha").await;
+    let w = org.seat("w").await;
+    let other = org.seat("other").await;
+    let lead = org.seat("lead").await;
+    for s in ["w", "lead"] {
+        org.ok(
+            Method::PATCH,
+            &format!("/seats/{s}"),
+            Some(json!({ "group": "core" })),
+        )
+        .await;
+    }
+    org.ok(Method::PUT, "/teams/core", Some(json!({ "root": "lead" })))
+        .await;
+    w.post("/requests", question("Ship v2?")).await;
+    // The creation mail: `To` the user, `Cc` the lead.
+    let (e, body) = lead.mail("[r1] Ship v2?").await;
+    assert_eq!(e["delivery"]["class"], "cc", "{e}");
+    assert!(body.contains("1. yes — Ship it"), "{body}");
+    let (e, _) = org.mail("[r1] Ship v2?").await;
+    assert_eq!(e["delivery"]["class"], "to", "{e}");
+    // The lead reads the request and lists its team's.
+    assert_eq!(lead.get("/requests/r1").await["request"]["seat"], "w");
+    let list = lead.get("/requests?team=core").await;
+    let nums: Vec<i64> = list["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["num"].as_i64().unwrap())
+        .collect();
+    assert_eq!(nums, vec![1], "{list}");
+    // Without `team`, its own only (none).
+    assert_eq!(lead.get("/requests").await["requests"], json!([]));
+    // Another seat neither reads nor lists them.
+    let (s, _) = other.refused(Method::GET, "/requests/r1", None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (s, _) = other
+        .refused(Method::GET, "/requests?team=core", None)
+        .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _) = w.refused(Method::GET, "/requests?team=core", None).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    // The user lists by team too.
+    assert_eq!(
+        org.get("/requests?team=core").await["requests"][0]["num"],
+        1
+    );
+    // The answer: `To` the asker, `Cc` the lead.
+    org.post(
+        "/requests/1/answer",
+        json!({ "option": "yes", "note": "go" }),
+    )
+    .await;
+    let (e, body) = lead.mail("Re: [r1] Ship v2?").await;
+    assert_eq!(e["delivery"]["class"], "cc", "{e}");
+    assert!(body.contains("Answer: 1. yes — Ship it"), "{body}");
+    assert!(body.contains("Note: go"), "{body}");
+    let (e, _) = w.mail("Re: [r1] Ship v2?").await;
+    assert_eq!(e["delivery"]["class"], "to", "{e}");
+    // A request of the lead itself has no lead to copy.
+    lead.post("/requests", question("The lead asks")).await;
+    let (e, _) = org.mail("[r2] The lead asks").await;
+    assert_eq!(e["message"]["cc"], json!([]), "{e}");
 }

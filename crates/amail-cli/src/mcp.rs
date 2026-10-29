@@ -1215,8 +1215,9 @@ const TOOLS: &[ToolDef] = &[
     ToolDef {
         name: "requests",
         description: "Requests for the person: by default your open ones (for the user: the \
-            org's), open `now` first, with age and deadline. With `num`, one request: its \
-            options, the answer, the events and the thread.",
+            org's), open `now` first, with age and deadline. With `team`, those of the \
+            team you lead (its root seat). With `num`, one request: its options, the answer, \
+            the events and the thread.",
         read_only: true,
         schema: || {
             obj(
@@ -1227,6 +1228,7 @@ const TOOLS: &[ToolDef] = &[
                     "seat": {"type": "string"},
                     "class": {"type": "string", "enum": ["now", "soon", "later"]},
                     "task": {"type": ["integer", "string"]},
+                    "team": {"type": "string", "description": "The requests of this team's seats (you must be its lead)."},
                     "limit": {"type": "integer", "minimum": 1, "maximum": 500},
                 }),
                 &[],
@@ -1647,6 +1649,7 @@ async fn requests(c: &Client, name: &str, a: &Args<'_>) -> Result<(Value, String
                         ("seat", a.str("seat")?),
                         ("class", a.str("class")?),
                         ("task", a.task("task")?.map(|t| format!("t{t}"))),
+                        ("team", a.str("team")?),
                         ("limit", a.int("limit")?.map(|n| n.to_string())),
                     ],
                 )

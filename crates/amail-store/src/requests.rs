@@ -150,6 +150,9 @@ pub struct RequestQuery {
     pub seat_id: Option<i64>,
     /// Requests about this seat or made by it.
     pub mine: Option<i64>,
+    /// Requests about one of these seats or made by one of them (a team's
+    /// seats); `Some` and empty matches nothing.
+    pub among: Option<Vec<i64>>,
     pub class: Option<RequestClass>,
     /// The task's number.
     pub task: Option<i64>,
@@ -815,6 +818,20 @@ macro_rules! impl_request_queries {
                     b.push(" AND (r.seat_id = ").push_bind(m);
                     b.push(" OR r.asker_id = ").push_bind(m);
                     b.push(")");
+                }
+                if let Some(ids) = &q.among {
+                    if ids.is_empty() {
+                        b.push(" AND 1 = 0");
+                    } else {
+                        for col in [" AND (r.seat_id IN (", ") OR r.asker_id IN ("] {
+                            b.push(col);
+                            let mut sep = b.separated(", ");
+                            for id in ids {
+                                sep.push_bind(*id);
+                            }
+                        }
+                        b.push("))");
+                    }
                 }
                 if let Some(cl) = q.class {
                     b.push(" AND r.class = ").push_bind(cl.as_str());

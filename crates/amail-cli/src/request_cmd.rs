@@ -83,6 +83,9 @@ pub struct ListArgs {
     /// A task (tN).
     #[arg(long)]
     pub task: Option<String>,
+    /// The requests of a team's seats (the user, or the team's lead).
+    #[arg(long)]
+    pub team: Option<String>,
     /// At most this many (default 200, at most 500).
     #[arg(long)]
     pub limit: Option<u32>,
@@ -816,6 +819,7 @@ pub async fn run_list(c: &Client, out: &Out, a: ListArgs) -> Result<()> {
             ("seat", a.seat),
             ("class", a.class),
             ("task", a.task),
+            ("team", a.team),
             ("limit", a.limit.map(|n| n.to_string())),
         ],
     )

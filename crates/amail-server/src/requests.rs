@@ -8,7 +8,10 @@
 //!   record but no route creates it yet.
 //! - A new request (other than `attention`) is mailed to the user: `To`,
 //!   subject `[r12] <title>`, the options as numbered lines; class `now`
-//!   is urgent mail. The request's thread is that mail's thread.
+//!   is urgent mail. The request's thread is that mail's thread. The
+//!   asker's lead (the root seat of its team, when that is another seat)
+//!   gets the creation mail and the answer mail in `Cc`, and may read and
+//!   list the requests of its team (`GET /requests?team=`).
 //! - The user answers (`POST /requests/{num}/answer`, or a reply in the
 //!   thread whose first line names an option). The answer is mailed in the
 //!   thread `To` the seat the request is about, so a sleeping seat wakes.
@@ -316,8 +319,30 @@ async fn agent_seat(st: &AppState, org: &Org, name: &str) -> ApiResult<Seat> {
     Ok(seat)
 }
 
+/// The lead of `seat`: the root seat of its team, when that is an agent
+/// seat other than `seat`.
+async fn lead_of(st: &AppState, seat: &Seat) -> Option<Seat> {
+    let team = seat.team_id?;
+    let teams = match st.store.teams(seat.org_id).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("org {}: teams: {e}", seat.org_id);
+            return None;
+        }
+    };
+    let root = teams.into_iter().find(|t| t.id == team)?.root?;
+    if root == seat.name {
+        return None;
+    }
+    match st.store.seat_by_name(seat.org_id, &root).await {
+        Ok(Some(s)) if s.kind == SeatKind::Agent => Some(s),
+        _ => None,
+    }
+}
+
 /// The request if the caller may see it: user and node tokens any of the
-/// org's, seat tokens those about them or made by them.
+/// org's, seat tokens those about them or made by them, and the lead of
+/// the seat a request is about.
 async fn visible(st: &AppState, auth: &Auth, num: i64) -> ApiResult<RequestRec> {
     let r = st
         .store
@@ -329,6 +354,13 @@ async fn visible(st: &AppState, auth: &Auth, num: i64) -> ApiResult<RequestRec> 
         TokenScope::Seat => {
             let me = auth.mail_seat()?;
             if r.seat_id == me.id || r.asker_id == Some(me.id) {
+                return Ok(r);
+            }
+            let lead = match st.store.seat_by_name(auth.org.id, &r.seat).await? {
+                Some(seat) => lead_of(st, &seat).await,
+                None => None,
+            };
+            if lead.is_some_and(|l| l.id == me.id) {
                 Ok(r)
             } else {
                 Err(ApiError::not_found(format!("no request r{num}")))
@@ -361,7 +393,38 @@ async fn mail(
     body: String,
     urgent: bool,
 ) -> Option<(i64, i64)> {
+    mail_cc(st, org, from, to, None, thread, subject, body, urgent).await
+}
+
+/// [`mail`] with a seat in `Cc` (a `Cc` delivery never wakes the seat).
+#[allow(clippy::too_many_arguments)]
+async fn mail_cc(
+    st: &AppState,
+    org: &Org,
+    from: &Seat,
+    to: &Seat,
+    cc: Option<&Seat>,
+    thread: Option<(i64, i64)>,
+    subject: String,
+    body: String,
+    urgent: bool,
+) -> Option<(i64, i64)> {
     let subject = amail_proto::text::line(&p::cut_chars(&subject, MAX_SUBJECT_CHARS)).into_owned();
+    let cc = cc.filter(|c| c.id != to.id && c.id != from.id);
+    let mut deliveries = vec![NewDelivery {
+        seat_id: to.id,
+        org_id: org.id,
+        class: p::DeliveryClass::To,
+        mode: p::DeliveryMode::Immediate,
+    }];
+    if let Some(c) = cc {
+        deliveries.push(NewDelivery {
+            seat_id: c.id,
+            org_id: org.id,
+            class: p::DeliveryClass::Cc,
+            mode: p::DeliveryMode::Immediate,
+        });
+    }
     let sent = st
         .store
         .send(&NewMessage {
@@ -373,7 +436,10 @@ async fn mail(
             subject,
             body,
             to_addrs: vec![format!("{}@{}", to.name, org.name)],
-            cc_addrs: Vec::new(),
+            cc_addrs: cc
+                .map(|c| format!("{}@{}", c.name, org.name))
+                .into_iter()
+                .collect(),
             priority: if urgent {
                 p::Priority::Urgent
             } else {
@@ -381,12 +447,7 @@ async fn mail(
             },
             ack_required: false,
             meta: Default::default(),
-            deliveries: vec![NewDelivery {
-                seat_id: to.id,
-                org_id: org.id,
-                class: p::DeliveryClass::To,
-                mode: p::DeliveryMode::Immediate,
-            }],
+            deliveries,
             ack_due: None,
             written_by: None,
             // Mail of a request is never refused: its record was charged.
@@ -397,8 +458,12 @@ async fn mail(
         .await;
     match sent {
         Ok(s) => {
+            let name = |id: i64| match cc {
+                Some(c) if c.id == id => c.name.clone(),
+                _ => to.name.clone(),
+            };
             let events: Vec<(String, i64)> =
-                s.seqs.iter().map(|b| (to.name.clone(), b.seq)).collect();
+                s.seqs.iter().map(|b| (name(b.seat_id), b.seq)).collect();
             st.bus.publish(org.id, &events);
             st.activity.record(std::iter::once(org.id));
             Some((s.message_id, s.thread_id))
@@ -470,7 +535,20 @@ async fn mail_created(st: &AppState, org: &Org, r: &RequestRec, from: &Seat) {
     body.push_str(&how_to_answer(r));
     let subject = format!("[r{}] {}", r.num, r.title);
     let urgent = r.class == RequestClass::Now;
-    if let Some((mid, tid)) = mail(st, org, from, &user, None, subject, body, urgent).await
+    // The asker's lead reads along (`Cc`, which does not wake it).
+    let lead = lead_of(st, from).await;
+    if let Some((mid, tid)) = mail_cc(
+        st,
+        org,
+        from,
+        &user,
+        lead.as_ref(),
+        None,
+        subject,
+        body,
+        urgent,
+    )
+    .await
         && let Err(e) = st.store.set_request_thread(org.id, r.num, tid, mid).await
     {
         tracing::warn!("org {}: thread of r{} not recorded: {e}", org.id, r.num);
@@ -517,7 +595,19 @@ async fn mail_answer(st: &AppState, org: &Org, r: &RequestRec, from: &Seat) {
         r.num, r.title, r.num
     ));
     let subject = format!("Re: [r{}] {}", r.num, r.title);
-    mail(st, org, from, &seat, thread_of(r), subject, body, false).await;
+    let lead = lead_of(st, &seat).await;
+    mail_cc(
+        st,
+        org,
+        from,
+        &seat,
+        lead.as_ref(),
+        thread_of(r),
+        subject,
+        body,
+        false,
+    )
+    .await;
 }
 
 /// A request is no longer open (answered, its default taken, or
@@ -700,12 +790,15 @@ pub struct ListParams {
     class: Option<RequestClass>,
     task: Option<String>,
     limit: Option<i64>,
+    /// The requests of a team's seats: user tokens, and seat tokens of
+    /// the team's lead (its root seat).
+    team: Option<String>,
 }
 
 /// `GET /v1/requests`: user tokens the org's requests, seat tokens their
-/// own (about them or made by them), node tokens those of one seat
-/// (`seat` is required; a node checks whether a seat that ended its turn
-/// waits for an answer).
+/// own (about them or made by them) or, with `team`, those of the team
+/// they lead; node tokens those of one seat (`seat` is required; a node
+/// checks whether a seat that ended its turn waits for an answer).
 pub async fn list(
     State(st): State<AppState>,
     auth: Auth,
@@ -733,9 +826,37 @@ pub async fn list(
     if let Some(t) = &q.task {
         query.task = Some(parse_task(&serde_json::Value::String(t.clone()))?);
     }
+    let team = match q.team.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        Some(name) => Some(
+            st.store
+                .teams(auth.org.id)
+                .await?
+                .into_iter()
+                .find(|t| t.name == name)
+                .ok_or_else(|| ApiError::not_found(format!("no team {name:?}")))?,
+        ),
+        None => None,
+    };
     match auth.scope {
         TokenScope::User => {}
-        TokenScope::Seat => query.mine = Some(auth.mail_seat()?.id),
+        TokenScope::Seat => {
+            let me = auth.mail_seat()?;
+            match &team {
+                Some(t) if t.root_seat_id == Some(me.id) => {}
+                Some(t) => {
+                    return Err(ApiError::forbidden(format!(
+                        "only the lead of team {} (its root seat) and the user list its requests",
+                        t.name
+                    )));
+                }
+                None => query.mine = Some(me.id),
+            }
+        }
+        TokenScope::Node if team.is_some() => {
+            return Err(ApiError::bad_request(
+                "node tokens list one seat's requests",
+            ));
+        }
         TokenScope::Node if q.seat.is_some() => {}
         TokenScope::Node => {
             return Err(ApiError::bad_request(
@@ -751,6 +872,17 @@ pub async fn list(
             .await?
             .ok_or_else(|| ApiError::not_found(format!("no seat {name:?}")))?;
         query.seat_id = Some(seat.id);
+    }
+    if let Some(t) = &team {
+        query.among = Some(
+            st.store
+                .seats(auth.org.id)
+                .await?
+                .into_iter()
+                .filter(|s| s.team_id == Some(t.id))
+                .map(|s| s.id)
+                .collect(),
+        );
     }
     let (rows, truncated) = st.store.requests(&query).await?;
     Ok(Json(p::RequestList {
