@@ -122,6 +122,7 @@ pub fn task_out(t: &TaskRec) -> p::Task {
         import_key: t.import_key.clone(),
         steal_requested_by: t.steal_requested_by.clone(),
         steal_requested_at: t.steal_requested_at.map(render::ts),
+        blocked_on_human: t.blocked_on_human,
         created_at: render::ts(t.created_at),
         updated_at: render::ts(t.updated_at),
         closed_at: t.closed_at.map(render::ts),

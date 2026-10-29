@@ -153,6 +153,11 @@ pub struct Task {
     pub steal_requested_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub steal_requested_at: Option<String>,
+    /// The number of the oldest open request for the person on this task
+    /// (`r12`, see `POST /requests`): the task shows `blocked-on-human`,
+    /// and `take`, `steal` and `GET /tasks/next` skip it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_on_human: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -571,6 +571,7 @@ async fn renew(st: AppState, key: (i64, String)) {
             lease_ms: Some(cfg.lease.as_millis() as u64),
             backfill: need_backfill.then_some(cfg.backfill),
             node,
+            ..Default::default()
         };
         if st.nodes.send(key.0, cmd) == 0 {
             need_backfill = true;

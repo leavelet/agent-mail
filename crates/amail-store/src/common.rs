@@ -161,7 +161,7 @@ macro_rules! auth_select {
          o.max_recipients, o.max_thread_depth, o.webhook_url, o.ack_timeout_min, o.focus_max_min, \
          o.digest_interval_min, o.created_at, o.suspended_at, o.stored_bytes, o.kept_bytes, \
          o.display_name, o.description, o.visibility, o.outbound, o.new_threads_per_hour, o.notice, \
-         o.task_stale_hours, o.task_bytes, o.doc_bytes, s.id AS s_id, \
+         o.task_stale_hours, o.task_bytes, o.doc_bytes, o.request_bytes, s.id AS s_id, \
          s.org_id AS s_org_id, s.name AS s_name, \
          s.kind AS s_kind, s.parent_id AS s_parent_id, p.name AS s_parent_name, \
          s.display_name AS s_display_name, s.role AS s_role, s.harness AS s_harness, \
@@ -428,6 +428,7 @@ pub(crate) struct OrgRow {
     task_stale_hours: i64,
     task_bytes: i64,
     doc_bytes: i64,
+    request_bytes: i64,
 }
 
 impl From<OrgRow> for Org {
@@ -460,6 +461,7 @@ impl From<OrgRow> for Org {
             task_stale_hours: r.task_stale_hours,
             task_bytes: r.task_bytes,
             doc_bytes: r.doc_bytes,
+            request_bytes: r.request_bytes,
         }
     }
 }
@@ -3742,6 +3744,7 @@ macro_rules! impl_store_common {
                         .await?;
                 }
                 // (Before its seats go: the handover rows refer to them.)
+                super::rq::delete_org(c, org_id).await?;
                 super::hq::delete_org(c, org_id).await?;
                 for sql in steps {
                     sqlx::query(sql).bind(org_id).execute(&mut *c).await?;
@@ -3813,7 +3816,7 @@ macro_rules! impl_store_common {
                 if kept {
                     sqlx::query(
                         "UPDATE orgs SET deleted_at = $1, deleted_name = name, name = $2, \
-                         webhook_url = NULL, stored_bytes = 0, kept_bytes = 0, task_bytes = 0, doc_bytes = 0 WHERE id = $3",
+                         webhook_url = NULL, stored_bytes = 0, kept_bytes = 0, task_bytes = 0, doc_bytes = 0, request_bytes = 0 WHERE id = $3",
                     )
                     .bind(now)
                     .bind(format!("deleted:{org_id}"))
@@ -5290,10 +5293,83 @@ macro_rules! impl_store_common {
             async fn expire_worklog(&self, cutoff: i64, limit: i64) -> $crate::Result<u64> {
                 run!(self.write, |c| hq::expire(c, cutoff, limit).await)
             }
+
+            // --- requests for the person (see `requests.rs`) ---
+
+            async fn create_request(&self, r: &$crate::NewRequestRec) -> $crate::Result<($crate::RequestRec, bool)> {
+                let r = r.clone();
+                run!(self.write, |c| rq::create(c, &r).await)
+            }
+
+            async fn request(&self, org_id: i64, num: i64) -> $crate::Result<Option<$crate::RequestRec>> {
+                run!(self.read, |c| rq::by_num(c, org_id, num).await)
+            }
+
+            async fn request_events(&self, org_id: i64, num: i64, limit: i64) -> $crate::Result<Vec<$crate::RequestEventRec>> {
+                run!(self.read, |c| rq::events(c, org_id, num, limit).await)
+            }
+
+            async fn request_threads(&self, org_id: i64, num: i64) -> $crate::Result<Vec<i64>> {
+                run!(self.read, |c| rq::threads(c, org_id, num).await)
+            }
+
+            async fn requests(&self, q: &$crate::RequestQuery) -> $crate::Result<(Vec<$crate::RequestRec>, bool)> {
+                let q = q.clone();
+                run!(self.read_query, |c| rq::list(c, &q).await)
+            }
+
+            async fn set_request_thread(&self, org_id: i64, num: i64, thread_id: i64, message_id: i64) -> $crate::Result<()> {
+                run!(self.write, |c| rq::set_thread(c, org_id, num, thread_id, message_id).await)
+            }
+
+            async fn answer_request(&self, a: &$crate::RequestAnswerRec) -> $crate::Result<$crate::RequestRec> {
+                let a = a.clone();
+                run!(self.write, |c| rq::answer(c, &a).await)
+            }
+
+            async fn withdraw_request(&self, org_id: i64, num: i64, actor: &str, note: Option<&str>) -> $crate::Result<$crate::RequestRec> {
+                let (actor, note) = (actor.to_string(), note.map(str::to_string));
+                run!(self.write, |c| rq::withdraw(c, org_id, num, &actor, note.as_deref()).await)
+            }
+
+            async fn record_request_event(
+                &self,
+                org_id: i64,
+                num: i64,
+                actor: Option<&str>,
+                kind: amail_proto::RequestEventKind,
+                note: Option<&str>,
+                message_id: Option<i64>,
+            ) -> $crate::Result<Option<$crate::RequestRec>> {
+                let (actor, note) = (actor.map(str::to_string), note.map(str::to_string));
+                run!(self.write, |c| rq::note(c, org_id, num, actor.as_deref(), kind, note.as_deref(), message_id).await)
+            }
+
+            async fn link_request_thread(&self, org_id: i64, num: i64, thread_id: i64, actor: Option<&str>, note: &str) -> $crate::Result<bool> {
+                let (actor, note) = (actor.map(str::to_string), note.to_string());
+                run!(self.write, |c| rq::link_thread(c, org_id, num, thread_id, actor.as_deref(), &note).await)
+            }
+
+            async fn thread_requests(&self, org_id: i64, thread_id: i64) -> $crate::Result<Vec<$crate::RequestRec>> {
+                run!(self.read, |c| rq::thread_requests(c, org_id, thread_id).await)
+            }
+
+            async fn claim_due_requests(&self, now: i64, limit: i64) -> $crate::Result<$crate::RequestsDue> {
+                run!(self.write, |c| rq::claim_due(c, now, limit).await)
+            }
+
+            async fn live_attention_requests(&self, org_id: i64) -> $crate::Result<Vec<$crate::RequestRec>> {
+                run!(self.read, |c| rq::live_attention(c, org_id).await)
+            }
+
+            async fn end_attention_request(&self, org_id: i64, num: i64) -> $crate::Result<Option<$crate::RequestRec>> {
+                run!(self.write, |c| rq::end_attention(c, org_id, num).await)
+            }
         }
 
         impl_task_queries!($db, $dialect);
         impl_doc_queries!($db, $dialect);
         impl_handover_queries!($db);
+        impl_request_queries!($db);
     };
 }

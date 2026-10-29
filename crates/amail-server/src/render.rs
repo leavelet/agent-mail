@@ -239,6 +239,7 @@ pub fn org(o: &Org, storage_quota: Option<i64>) -> p::OrgInfo {
         task_stale_hours: o.task_stale_hours,
         task_bytes: o.task_bytes,
         doc_bytes: o.doc_bytes,
+        request_bytes: o.request_bytes,
         notice: o.notice.clone(),
     }
 }

@@ -1,0 +1,94 @@
+-- M10: requests for the person (the user's queue). One record per thing
+-- that waits for the org's user, numbered per org (`r12`), with its
+-- options, default, deadline, answer and mail thread; an append-only
+-- history; and the threads that name it. Charged to `orgs.request_bytes`
+-- (the storage quota counts it with the mail, task and document bytes).
+-- Keep in sync with migrations/postgres.
+
+-- The last request number the org gave out (numbers are never reused).
+ALTER TABLE orgs ADD COLUMN org_request_seq BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE orgs ADD COLUMN request_bytes BIGINT NOT NULL DEFAULT 0;
+
+CREATE TABLE requests (
+    id              INTEGER PRIMARY KEY,
+    org_id          BIGINT  NOT NULL REFERENCES orgs(id),
+    num             BIGINT  NOT NULL,
+    -- question, permission, plan, merge, attention.
+    kind            TEXT    NOT NULL,
+    -- The seat the request is about (it waits for the answer).
+    seat_id         BIGINT  NOT NULL REFERENCES seats(id),
+    -- The seat that made it (NULL: a node).
+    asker_id        BIGINT  REFERENCES seats(id),
+    -- The task it belongs to: the task is `blocked-on-human` while the
+    -- request is open (derived, nothing is stored on the task).
+    task_id         BIGINT  REFERENCES tasks(id),
+    title           TEXT    NOT NULL,
+    body            TEXT    NOT NULL DEFAULT '',
+    -- JSON array of {key, label, description?}.
+    options         TEXT    NOT NULL DEFAULT '[]',
+    free_text       BOOLEAN NOT NULL DEFAULT FALSE,
+    -- The key of the option taken at the deadline.
+    default_key     TEXT,
+    -- now, soon, later.
+    class           TEXT    NOT NULL,
+    -- open, answered, expired, withdrawn, superseded.
+    state           TEXT    NOT NULL DEFAULT 'open',
+    -- With a default: when it is taken. Without: the first reminder.
+    deadline        BIGINT,
+    -- The next reminder of an open request without a default.
+    remind_at       BIGINT,
+    answer_key      TEXT,
+    answer_text     TEXT,
+    answer_note     TEXT,
+    -- The user's name, a seat's name, or `deadline`.
+    answer_by       TEXT,
+    answered_at     BIGINT,
+    -- The mail thread and its first message.
+    thread_id       BIGINT,
+    message_id      BIGINT,
+    -- cli, mcp, hook, node, mail.
+    source          TEXT    NOT NULL,
+    -- attention: the seat's attention code, and whether the node still
+    -- reports it (one live request per seat and code).
+    attention       TEXT,
+    attention_live  BOOLEAN NOT NULL DEFAULT FALSE,
+    -- The last event's seq.
+    rev             BIGINT  NOT NULL DEFAULT 0,
+    -- Bytes counted against the storage quota.
+    bytes           BIGINT  NOT NULL DEFAULT 0,
+    created_at      BIGINT  NOT NULL,
+    updated_at      BIGINT  NOT NULL
+);
+CREATE UNIQUE INDEX requests_org_num ON requests(org_id, num);
+CREATE INDEX requests_org_state ON requests(org_id, state, created_at);
+CREATE INDEX requests_seat ON requests(seat_id, created_at);
+CREATE INDEX requests_asker ON requests(asker_id, created_at);
+CREATE INDEX requests_task ON requests(task_id) WHERE task_id IS NOT NULL;
+CREATE INDEX requests_thread ON requests(org_id, thread_id) WHERE thread_id IS NOT NULL;
+CREATE INDEX requests_deadline ON requests(deadline) WHERE state = 'open' AND deadline IS NOT NULL AND default_key IS NOT NULL;
+CREATE INDEX requests_remind ON requests(remind_at) WHERE state = 'open' AND remind_at IS NOT NULL;
+CREATE INDEX requests_live ON requests(org_id, seat_id) WHERE attention_live;
+
+-- The history: appended, never changed while the request exists.
+CREATE TABLE request_events (
+    request_id  BIGINT NOT NULL REFERENCES requests(id),
+    seq         BIGINT NOT NULL,
+    org_id      BIGINT NOT NULL REFERENCES orgs(id),
+    at          BIGINT NOT NULL,
+    -- A seat's name, `deadline` or `node` (NULL: the mail system).
+    actor       TEXT,
+    kind        TEXT   NOT NULL,
+    note        TEXT,
+    message_id  BIGINT,
+    PRIMARY KEY (request_id, seq)
+);
+
+-- Threads that name a request (`[r12]` in a subject).
+CREATE TABLE request_threads (
+    request_id  BIGINT NOT NULL REFERENCES requests(id),
+    thread_id   BIGINT NOT NULL,
+    org_id      BIGINT NOT NULL REFERENCES orgs(id),
+    created_at  BIGINT NOT NULL,
+    PRIMARY KEY (request_id, thread_id)
+);
+CREATE INDEX request_threads_thread ON request_threads(org_id, thread_id);

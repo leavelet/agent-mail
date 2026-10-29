@@ -52,6 +52,8 @@ mod docs;
 pub use docs::*;
 mod handover;
 pub use handover::*;
+mod requests;
+pub use requests::*;
 
 string_enum!(
     /// Kind of seat. Every org has exactly one `user` seat, and one hidden
@@ -1316,6 +1318,10 @@ pub struct OrgInfo {
     /// the storage quota with `stored_bytes` and `task_bytes`.
     #[serde(default)]
     pub doc_bytes: i64,
+    /// Bytes of the org's requests for the person and their events,
+    /// counted against the storage quota with the others.
+    #[serde(default)]
+    pub request_bytes: i64,
     /// A one-time notice for the user (user tokens), for example that an
     /// upgrade closed what links used to open; cleared with
     /// `DELETE /v1/org/notice`.
@@ -2035,9 +2041,28 @@ pub struct SeatOpResponse {
 
 /// A command for the node hosting `seat`. Nodes ignore unknown ops and
 /// seats they do not host.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// The ops:
+///
+/// - `transcript`: forward the seat's conversation (`lease_ms`,
+///   `backfill`).
+/// - `sleep`, `wake`: put the seat to sleep, start it.
+/// - `prompt` (M10): give the seat `text` as a prompt from the user,
+///   through the harness's structured interface (Claude Code: the inbox
+///   socket; Codex: `thread/queue/add` after the daemon check of the wake
+///   path; dsh: `session/prompt`). The server recorded it in the seat's
+///   worklog and the mail archive before sending.
+/// - `interrupt` (M10): stop the seat's current turn (Codex:
+///   `turn/interrupt`; dsh: `session/cancel`). A Claude Code seat has no
+///   structured interrupt: the node leaves it alone (the web offers the
+///   terminal instead).
+/// - `attention_action` (M10): the user answered the seat's `attention`
+///   request `request` with `action`: `restart` (restart the seat's
+///   session) or `sleep`. (`open_terminal` and `dismiss` send nothing.)
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeCommand {
-    /// `transcript`, `sleep` or `wake`.
+    /// `transcript`, `sleep`, `wake`, `prompt`, `interrupt` or
+    /// `attention_action`.
     pub op: String,
     pub seat: String,
     /// `transcript`: forward until this many milliseconds from now.
@@ -2050,6 +2075,15 @@ pub struct NodeCommand {
     /// nodes ignore the command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
+    /// `prompt`: the text to give the seat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// `attention_action`: the request's number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<i64>,
+    /// `attention_action`: `restart` or `sleep`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

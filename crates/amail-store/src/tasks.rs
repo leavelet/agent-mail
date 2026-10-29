@@ -63,6 +63,11 @@ pub(crate) const OPEN_BLOCKER: &str = concat!(
     ")"
 );
 
+/// True for task `t` when a request for the person on it is open (the
+/// task is `blocked-on-human`).
+pub(crate) const OPEN_REQUEST: &str =
+    "EXISTS (SELECT 1 FROM requests rq WHERE rq.task_id = t.id AND rq.state = 'open')";
+
 /// Refuse a write with `stale` when the task is not at the revision the
 /// writer expects.
 pub(crate) fn check_rev(w: &TaskWrite, t: &TaskRec) -> Result<()> {
@@ -182,6 +187,7 @@ impl TaskRow {
             result_at: self.result_at,
             import_key: self.import_key,
             waits_on_ok: Vec::new(),
+            blocked_on_human: None,
         })
     }
 }
@@ -434,7 +440,17 @@ macro_rules! impl_task_queries {
                     }
                     let progress: std::collections::HashMap<i64, (i64, i64)> =
                         q.fetch_all(&mut *c).await?.into_iter().map(|(p, d, n)| (p, (d, n))).collect();
+                    let sql = format!(
+                        "SELECT task_id, MIN(num) FROM requests WHERE task_id IN ({}) AND state = 'open' GROUP BY task_id",
+                        placeholders(1, chunk.len())
+                    );
+                    let mut q = sqlx::query_as::<Db, (i64, i64)>(&sql);
+                    for t in chunk.iter() {
+                        q = q.bind(t.id);
+                    }
+                    let human: std::collections::HashMap<i64, i64> = q.fetch_all(&mut *c).await?.into_iter().collect();
                     for t in chunk.iter_mut() {
+                        t.blocked_on_human = human.get(&t.id).copied();
                         t.waits_on = m.remove(&t.id).unwrap_or_default();
                         t.waits_on_ok = m_ok.remove(&t.id).unwrap_or_default();
                         t.progress = progress.get(&t.id).copied();
@@ -527,7 +543,7 @@ macro_rules! impl_task_queries {
                 }
                 let ok: Option<i64> = sqlx::query_scalar(
                     "UPDATE orgs SET task_bytes = task_bytes + $1 WHERE id = $2 \
-                     AND ($1 <= 0 OR CAST($3 AS BIGINT) IS NULL OR stored_bytes + task_bytes + doc_bytes + $1 <= $3) RETURNING id",
+                     AND ($1 <= 0 OR CAST($3 AS BIGINT) IS NULL OR stored_bytes + task_bytes + doc_bytes + request_bytes + $1 <= $3) RETURNING id",
                 )
                 .bind(delta)
                 .bind(org_id)
@@ -535,7 +551,7 @@ macro_rules! impl_task_queries {
                 .fetch_optional(&mut *c)
                 .await?;
                 if ok.is_none() {
-                    let stored: i64 = sqlx::query_scalar("SELECT stored_bytes + task_bytes + doc_bytes FROM orgs WHERE id = $1")
+                    let stored: i64 = sqlx::query_scalar("SELECT stored_bytes + task_bytes + doc_bytes + request_bytes FROM orgs WHERE id = $1")
                         .bind(org_id)
                         .fetch_one(&mut *c)
                         .await?;
@@ -1078,6 +1094,12 @@ macro_rules! impl_task_queries {
                 if owner == actor {
                     return Err(refused("own_task", format!("t{} is assigned to you", before.num)));
                 }
+                if let Some(r) = before.blocked_on_human {
+                    return Err(refused(
+                        "blocked_on_human",
+                        format!("t{} waits for the person's answer to r{r}", before.num),
+                    ));
+                }
                 if before.state != TaskState::Open {
                     return Err(refused(
                         "started",
@@ -1234,6 +1256,12 @@ macro_rules! impl_task_queries {
                 }
                 if before.state.is_closed() {
                     return Err(refused("closed", format!("t{} is {}", before.num, before.state)));
+                }
+                if let Some(r) = before.blocked_on_human {
+                    return Err(refused(
+                        "blocked_on_human",
+                        format!("t{} waits for the person's answer to r{r}", before.num),
+                    ));
                 }
                 let n = sqlx::query("UPDATE tasks SET assignee_id = $2, updated_at = $3 WHERE id = $1 AND assignee_id IS NULL")
                     .bind(before.id)
@@ -1673,6 +1701,9 @@ macro_rules! impl_task_queries {
                         }
                     }
                     b.push(")");
+                }
+                if q.skip_blocked_on_human {
+                    b.push(format!(" AND NOT {OPEN_REQUEST}"));
                 }
                 if q.waiting_only {
                     b.push(format!(" AND t.state NOT IN {CLOSED} AND {OPEN_BLOCKER}"));

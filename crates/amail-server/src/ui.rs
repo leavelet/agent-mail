@@ -501,6 +501,7 @@ async fn seat_op(
             .get(auth.org.id, &seat.name)
             .await?
             .and_then(|p| p.node),
+        ..Default::default()
     };
     let nodes = st.nodes.send(auth.org.id, cmd);
     if nodes == 0 {
