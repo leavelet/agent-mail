@@ -1196,6 +1196,45 @@ impl Codex {
         Ok(None)
     }
 
+    /// The TUI can apply the shared home's default effort on attach.
+    /// Restore this seat's intended value before submitting any input, so
+    /// its next model turn cannot race the delayed resume settings.
+    async fn restore_effort(&self, target: &str) -> Result<()> {
+        if let Some(effort) = self.resume_effort(target)? {
+            crate::codex_rpc::socket_calls(
+                &self.control_socket(),
+                &[(
+                    "thread/settings/update",
+                    json!({"threadId": target, "effort": effort}),
+                )],
+            )
+            .await
+            .context("restoring Codex effort before queueing input")?;
+        }
+        Ok(())
+    }
+
+    /// `codex queue --thread <target> --message <text>`.
+    async fn queue(&self, target: &str, text: &str) -> Result<()> {
+        let out = tokio::process::Command::new(&self.env.codex_bin)
+            .args(["queue", "--thread", target, "--message", text])
+            .env("CODEX_HOME", self.home())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .output();
+        let out = tokio::time::timeout(Duration::from_secs(15), out)
+            .await
+            .context("codex queue timed out")??;
+        if !out.status.success() {
+            bail!(
+                "codex queue failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
     /// The node persists the intended effort with a seat's resume ID.
     /// Read it at wake time too: a controller restart does not relaunch
     /// live seats, and must not discard this per-thread setting.
@@ -1422,20 +1461,7 @@ impl Adapter for Codex {
     }
 
     async fn wake(&self, target: &str, text: &str) -> Result<()> {
-        // The TUI can apply the shared home's default effort on attach.
-        // Restore this seat's intended value before submitting any nudge,
-        // so its next model turn cannot race the delayed resume settings.
-        if let Some(effort) = self.resume_effort(target)? {
-            crate::codex_rpc::socket_calls(
-                &self.control_socket(),
-                &[(
-                    "thread/settings/update",
-                    json!({"threadId": target, "effort": effort}),
-                )],
-            )
-            .await
-            .context("restoring Codex effort before queueing wake-up")?;
-        }
+        self.restore_effort(target).await?;
         match self.wake_held(target).await {
             Ok(Some(why)) => {
                 tracing::info!("codex thread {target}: not queueing a wake-up: {why}");
@@ -1447,23 +1473,46 @@ impl Adapter for Codex {
                 tracing::debug!("codex thread {target}: asking the daemon before queueing: {e:#}")
             }
         }
-        let out = tokio::process::Command::new(&self.env.codex_bin)
-            .args(["queue", "--thread", target, "--message", text])
-            .env("CODEX_HOME", self.home())
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::piped())
-            .output();
-        let out = tokio::time::timeout(Duration::from_secs(15), out)
-            .await
-            .context("codex queue timed out")??;
-        if !out.status.success() {
-            bail!(
-                "codex queue failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+        self.queue(target, text).await
+    }
+
+    /// A prompt from the person is queued whatever the thread does: the
+    /// daemon is asked first, as for a wake-up, but a running turn or a
+    /// queued wake-up does not hold it back (the queue gives it to the
+    /// thread when its current turn ends).
+    async fn send_prompt(&self, target: &str, text: &str) -> Result<()> {
+        self.restore_effort(target).await?;
+        match self.wake_held(target).await {
+            Ok(Some(why)) => tracing::info!("codex thread {target}: queueing a prompt: {why}"),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::debug!("codex thread {target}: asking the daemon before queueing: {e:#}")
+            }
         }
-        Ok(())
+        self.queue(target, text).await
+    }
+
+    /// `turn/interrupt` on the thread's running turn (the newest turn in
+    /// progress, from `thread/turns/list`).
+    async fn interrupt(&self, target: &str) -> Result<bool> {
+        let turns = self.last_turns(target).await?;
+        let Some(turn) = turns
+            .iter()
+            .find(|t| t.status == TurnStatus::InProgress)
+            .and_then(|t| t.id.clone())
+        else {
+            return Ok(false);
+        };
+        crate::codex_rpc::socket_calls(
+            &self.control_socket(),
+            &[(
+                "turn/interrupt",
+                json!({"threadId": target, "turnId": turn}),
+            )],
+        )
+        .await
+        .context("turn/interrupt")?;
+        Ok(true)
     }
 
     async fn prepare(&self) -> Result<()> {

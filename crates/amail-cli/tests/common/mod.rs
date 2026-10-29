@@ -837,3 +837,28 @@ impl Drop for McpProc {
         let _ = self.child.wait();
     }
 }
+
+/// The node's worklog entries of `seat` with `kind`, oldest first. Waits
+/// (up to 15 s) for at least one: the node sends its worklog in batches.
+pub async fn node_worklog(h: &Harness, seat: &str, kind: &str) -> Vec<Value> {
+    let t0 = Instant::now();
+    loop {
+        let all = h.api.get(&format!("/seats/{seat}/worklog?limit=200")).await;
+        let mut v: Vec<Value> = all["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["source"] == "node" && e["kind"] == kind)
+            .cloned()
+            .collect();
+        if !v.is_empty() {
+            v.reverse();
+            return v;
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(15),
+            "no worklog entry {kind} for {seat}: {all}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}

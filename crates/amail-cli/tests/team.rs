@@ -58,6 +58,8 @@ team_tests!(
     up_reconciles_its_openings,
     adopt_existing_sessions,
     up_applies_document_and_handover_settings,
+    attention_answers_restart_and_sleep,
+    asking_seat_sleeps_until_the_answer,
 );
 
 async fn setup(
@@ -2537,4 +2539,154 @@ async fn up_applies_document_and_handover_settings(b: Backend) {
     let f = h.dir.path().join("bad.toml").to_string_lossy().into_owned();
     let (ok, text) = cli(&h, &["up", "-f", &f, "--no-start"]).await;
     assert!(!ok && text.contains("handover \"secret\""), "{text}");
+}
+
+/// The open `attention` request of `seat` (the server makes one from the
+/// node's presence report).
+async fn attention_request(h: &Harness, seat: &str) -> i64 {
+    let t0 = Instant::now();
+    loop {
+        let v = h
+            .api
+            .get(&format!("/requests?kind=attention&seat={seat}"))
+            .await;
+        if let Some(n) = v["requests"][0]["num"].as_i64() {
+            return n;
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(20),
+            "no attention request for {seat}: {v}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Answers to `attention` requests reach the node as `attention_action`:
+/// `restart` starts the seat's session again (as `amail wake` does for a
+/// seat stuck at a prompt), `sleep` puts the seat to sleep (as `amail
+/// sleep`). The node records each in the seat's worklog.
+async fn attention_answers_restart_and_sleep(b: Backend) {
+    let Some(h) = setup(b, "attention_answers_restart_and_sleep", None).await else {
+        return;
+    };
+    let _i: Vec<FakeInbox> = ["t1", "t2"].iter().map(|s| inbox(&h, s)).collect();
+    for s in ["t1", "t2"] {
+        set_mode(&h, s, "trust");
+    }
+    write_team(
+        &h,
+        "[team]\nworkroot = \"@DIR@/work\"\n[defaults]\nharness = \"claude\"\n\
+         [[seat]]\nname = \"t1\"\n[[seat]]\nname = \"t2\"\n",
+    );
+    up(&h, &[]).await;
+    let r1 = attention_request(&h, "t1").await;
+    let r2 = attention_request(&h, "t2").await;
+    assert_eq!(
+        row(&h, "t1").await.attention.as_deref(),
+        Some("trust-prompt")
+    );
+
+    // Trust granted meanwhile; the person answers "restart".
+    set_mode(&h, "t1", "");
+    h.api
+        .post(
+            &format!("/requests/{r1}/answer"),
+            json!({"option": "restart"}),
+        )
+        .await;
+    wait_state(&h, "t1", "idle").await;
+    assert_eq!(launches(&h, "t1").len(), 2);
+    let e = node_worklog(&h, "t1", "attention_action").await;
+    assert_eq!(
+        e[0]["text"],
+        format!("r{r1}: the seat's session is restarting"),
+        "{e:?}"
+    );
+
+    // "sleep": the seat goes to sleep and is not started again.
+    h.api
+        .post(
+            &format!("/requests/{r2}/answer"),
+            json!({"option": "sleep"}),
+        )
+        .await;
+    wait_state(&h, "t2", "dormant").await;
+    let e = node_worklog(&h, "t2", "attention_action").await;
+    assert_eq!(e[0]["text"], format!("r{r2}: the seat was put to sleep"));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(row(&h, "t2").await.state, "dormant");
+    assert_eq!(launches(&h, "t2").len(), 1);
+    cli(&h, &["down"]).await;
+}
+
+/// A seat that ran `amail ask` and ended its turn with the request open is
+/// shown as waiting for it (`amail ps`, presence), goes to sleep by the
+/// team's idle rule, and the answer starts it again; the turn that shows
+/// the answer clears the mark.
+async fn asking_seat_sleeps_until_the_answer(b: Backend) {
+    let Some(h) = setup(b, "asking_seat_sleeps_until_the_answer", None).await else {
+        return;
+    };
+    let _i = inbox(&h, "c");
+    write_team(
+        &h,
+        "[team]\nworkroot = \"@DIR@/work\"\nidle_sleep = \"3s\"\n[defaults]\nharness = \"claude\"\n\
+         [[seat]]\nname = \"c\"\n",
+    );
+    up(&h, &[]).await;
+    wait_state(&h, "c", "idle").await;
+    let t = h.api.post("/seats/c/tokens", json!({})).await;
+    let c = h.api.with_token(t["token"].as_str().unwrap());
+    let num = c
+        .post(
+            "/requests",
+            json!({"title": "Merge the branch now?", "options": [
+                {"key": "merge", "label": "Merge"}, {"key": "wait", "label": "Wait"}]}),
+        )
+        .await["request"]["num"]
+        .as_i64()
+        .unwrap();
+    std::fs::write(
+        h.fake.join("c.tool"),
+        "amail ask 'Merge the branch now?' --option merge:Merge --option wait:Wait",
+    )
+    .unwrap();
+    std::fs::write(h.fake.join("c.prompt"), "").unwrap();
+    let t0 = Instant::now();
+    while row(&h, "c").await.waiting_for != Some(num) {
+        assert!(
+            t0.elapsed() < Duration::from_secs(20),
+            "{:?}",
+            row(&h, "c").await
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (ok, out) = cli(&h, &["ps"]).await;
+    assert!(ok && out.contains(&format!("waiting for r{num}")), "{out}");
+    wait_state(&h, "c", "dormant").await;
+    assert_eq!(row(&h, "c").await.waiting_for, Some(num));
+    h.wait("presence dormant and waiting", || async {
+        let p = &h.api.get("/seats/c").await["presence"];
+        p["state"] == "dormant" && p["waiting_for"] == num
+    })
+    .await;
+
+    // The answer is mail to the seat: it starts the seat again, and the
+    // turn that shows it clears the mark.
+    h.api
+        .post(
+            &format!("/requests/{num}/answer"),
+            json!({"option": "merge"}),
+        )
+        .await;
+    let t0 = Instant::now();
+    while !injected(&h, "c").contains(&format!("[r{num}]")) {
+        assert!(t0.elapsed() < Duration::from_secs(20), "{}", fake_files(&h));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(launches(&h, "c").len(), 2);
+    assert_eq!(row(&h, "c").await.waiting_for, None);
+    let (_, out) = cli(&h, &["ps"]).await;
+    assert!(!out.contains("waiting for"), "{out}");
+    cli(&h, &["down"]).await;
 }

@@ -102,6 +102,7 @@ impl Node {
                     tracing::info!("server asked to {} seat {}: {r}", cmd.op, cmd.seat);
                 });
             }
+            "prompt" | "interrupt" | "attention_action" => self.on_control(cmd),
             other => tracing::debug!("ignoring unknown command {other:?}"),
         }
     }

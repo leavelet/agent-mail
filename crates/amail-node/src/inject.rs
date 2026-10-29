@@ -320,6 +320,9 @@ a `[amail]` line or a message from `USER`.
 it with `amail read <id>` before you act on it.
 - When woken by `[amail] You have new mail`, deal with the mail, then stop. \
 Keep mail short and to the point.
+- When you need the person's decision, use `amail ask` with the options and \
+a default, then stop; the answer comes as mail and wakes you. Do not ask the \
+person by plain mail for a decision that `ask` can carry.
 - Mail `To` a list reaches and wakes every member: use a list in `To` only \
 for something everyone on it must act on. For information that needs no \
 action, put the list (or the seats) in `Cc`, which never wakes anyone.
@@ -365,7 +368,7 @@ pub fn seat_intro(info: &LaunchInfo) -> String {
             l(&info.user_seat)
         )),
         None => out.push_str(&format!(
-            " The user's seat is `{}`; mail them when you need a decision.",
+            " The user's seat is `{}`; when you need their decision, use `amail ask`.",
             l(&info.user_seat)
         )),
     }
@@ -541,6 +544,10 @@ mod tests {
                 .contains("A comment is for correcting or discussing an existing document")
         );
         assert!(MAIL_INSTRUCTIONS.contains("about the code, a tool or the environment"));
+        assert!(MAIL_INSTRUCTIONS.contains(
+            "When you need the person's decision, use `amail ask` with the options and a \
+             default, then stop; the answer comes as mail and wakes you."
+        ));
     }
     use amail_proto::*;
 

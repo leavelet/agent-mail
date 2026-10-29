@@ -248,6 +248,10 @@ pub struct PsRow {
     /// written), `stale` or `none`; absent when the node does not know.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// The seat asked the person and waits for the answer to this request
+    /// (`r<num>`); see `docs/concepts.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_for: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -1692,6 +1692,11 @@ pub struct Presence {
     /// The seat's last turn failed (see [`TurnFailure`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_failed: Option<TurnFailure>,
+    /// The seat asked the person (a `question`, `plan` or `merge` request,
+    /// `r<num>`), ended its turn and waits for the answer, which comes as
+    /// mail and wakes it. Cleared when its next turn starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_for: Option<i64>,
     /// Some node of the org has its event stream open, so commands (sleep,
     /// wake, transcript) can reach it. Set by the server when rendering.
     #[serde(default)]
@@ -1719,6 +1724,9 @@ pub struct PresenceUpdate {
     pub terminal_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_failed: Option<TurnFailure>,
+    /// See [`Presence::waiting_for`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_for: Option<i64>,
 }
 
 /// Body of `POST /v1/presence` (node tokens).

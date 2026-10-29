@@ -1095,7 +1095,7 @@ pub fn ps(out: &Out) -> Result<()> {
                     .map(ago)
                     .unwrap_or_else(|| "-".into()),
                 r.note.clone().unwrap_or_else(|| "-".into()),
-                r.attention.clone().unwrap_or_else(|| "-".into()),
+                ps_attention(r),
             ]);
         }
         let widths: Vec<usize> = (0..7)
@@ -1130,6 +1130,16 @@ pub fn ps(out: &Out) -> Result<()> {
         lines.extend(policy_line(&v));
         Ok(lines.join("\n"))
     })
+}
+
+/// The ATTENTION column of `amail ps`: what needs a person, else the
+/// request the seat waits for.
+fn ps_attention(r: &PsRow) -> String {
+    match (&r.attention, r.waiting_for) {
+        (Some(a), _) => a.clone(),
+        (None, Some(n)) => format!("waiting for r{n}"),
+        (None, None) => "-".into(),
+    }
 }
 
 pub fn attach(target: &str) -> Result<()> {

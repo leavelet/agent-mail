@@ -48,6 +48,7 @@ mod caller;
 mod handover;
 mod mirror;
 mod notices;
+mod requests;
 mod supervise;
 mod turns;
 
@@ -321,6 +322,8 @@ struct SeatRt {
     restore_pending: bool,
     /// Documents and handover (see [`handover`]).
     ho: handover::SeatHo,
+    /// Requests for the person (see [`requests`]).
+    rq: requests::SeatRq,
 }
 
 impl SeatRt {
@@ -355,6 +358,7 @@ impl SeatRt {
             quiet: Default::default(),
             restore_pending: false,
             ho: Default::default(),
+            rq: Default::default(),
         }
     }
 
@@ -1878,6 +1882,10 @@ impl Node {
                     s.ho.turn_start = Some(now);
                     s.ho.asked = false;
                     s.ho.task_tool = false;
+                    if s.rq.turn_started() {
+                        st.dirty_presence.insert(seat.to_string());
+                    }
+                    let s = st.seat(seat);
                     // A turn whose end is still being checked stays open.
                     s.ho.turns_open = s.ho.turns_open.min(u32::from(s.turn_check.is_some())) + 1;
                     // A wake-up whose mail is gone should end at once.
@@ -1910,6 +1918,9 @@ impl Node {
                             // The task it holds may have changed: from now
                             // on the server fills it in.
                             ho.doing = None;
+                        }
+                        if hook.facts.ask_tool {
+                            st.seat(seat).rq.asked = true;
                         }
                         if hook.facts.note_tool && connected && st.want_note_state(seat, true) {
                             self.jobs_kick.notify_one();
@@ -1947,7 +1958,19 @@ impl Node {
                         } else {
                             s.pending.total() > 0 || s.pending.digest > 0
                         };
-                    if (pending || !s.stash.is_empty()) && s.stop_blocks < cap {
+                    let blocks = (pending || !s.stash.is_empty()) && s.stop_blocks < cap;
+                    // The seat asked the person in this turn, and the turn
+                    // ends: the node looks for the open request (see
+                    // `requests`).
+                    if !blocks && connected && std::mem::take(&mut s.rq.asked) {
+                        let job = handover::Job::Waiting {
+                            seat: seat.to_string(),
+                            turn_start: s.ho.turn_start,
+                        };
+                        st.jobs.push_back(job);
+                    }
+                    let s = st.seat(seat);
+                    if blocks {
                         plan.stash = std::mem::take(&mut s.stash);
                         if focused {
                             plan.claim_urgent_all = pending;
@@ -2829,6 +2852,7 @@ impl Node {
                     // Lines of the cached document index (none: not fetched).
                     "index_lines": s.ho.index.as_ref().map(|i| i.lines.len()),
                     "note_pending": s.ho.note_pending,
+                    "waiting_for": s.rq.waiting_for,
                 })
             })
             .collect();
@@ -3397,6 +3421,7 @@ impl Node {
                             _ => None,
                         },
                         turn_failed: failures.get(name).cloned(),
+                        waiting_for: s.rq.waiting_for,
                     });
                 }
                 (out, names)

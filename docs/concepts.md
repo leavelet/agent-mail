@@ -1052,6 +1052,18 @@ wait on `GET /requests/{num}/wait`, which returns when the request is
 answered (at most 10 minutes per call). Questions a lead asks a worker
 stay mail; requests are for the person.
 
+**The waiting seat.** The node notices a turn that ran `amail ask` (or
+the `ask` tool). When that turn ends, the node asks the server for the
+seat's open requests; if the seat made a `question`, `plan` or `merge`
+request that is still open, and no mail waits for the seat, the node marks
+the seat as waiting for it: presence carries `waiting_for` (the request's
+number), and `amail ps` shows `waiting for r12` in the seat's row. The
+mark changes nothing else. A supervised seat goes to sleep by the team's
+`idle_sleep` rule as any idle seat does; the answer arrives as mail `To`
+the seat, which wakes it or starts it again, and the next turn clears the
+mark. A seat whose node restarts loses the mark (the request stays open,
+and the answer still wakes the seat).
+
 **Classes, deadlines and defaults.** The class says how soon the user
 should answer:
 
@@ -1144,7 +1156,9 @@ never as keystrokes typed into its pane:
   no structured interrupt: the route refuses it with 409
   `no_structured_interrupt`, and the seat's terminal is the way to do it.
 
-Both answer 409 `no_node` when no connected node reports the seat. The
+Both answer 409 `no_node` when no connected node reports the seat. What
+the node does with each harness is in
+[harnesses](harnesses.md#prompts-and-interrupts-from-the-web). The
 terminal (`amail node --web-terminal-port`) stays the fallback for what
 has no structured path: login and trust dialogs, and interrupting a Claude
 Code session.

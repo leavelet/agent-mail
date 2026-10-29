@@ -967,6 +967,7 @@ pub(crate) struct PresenceRow {
     terminal_url: Option<String>,
     /// [`amail_proto::TurnFailure`] as JSON.
     turn_failed: Option<String>,
+    waiting_for: Option<i64>,
 }
 
 impl PresenceRow {
@@ -987,6 +988,7 @@ impl PresenceRow {
                 .turn_failed
                 .as_deref()
                 .and_then(|t| serde_json::from_str(t).ok()),
+            waiting_for: self.waiting_for,
         })
     }
 }
@@ -2959,7 +2961,7 @@ macro_rules! impl_store_common {
             pub async fn presence(c: &mut Conn, org_id: i64, seat: Option<&str>) -> Result<Vec<PresenceRec>> {
                 let rows: Vec<PresenceRow> = sqlx::query_as(
                     "SELECT s.name AS seat, p.state, p.wake_failed, p.harness, p.node, p.since, p.updated_at, \
-                     p.attention, p.attention_hint, p.terminal_url, p.turn_failed \
+                     p.attention, p.attention_hint, p.terminal_url, p.turn_failed, p.waiting_for \
                      FROM presence p JOIN seats s ON s.id = p.seat_id \
                      WHERE p.org_id = $1 AND s.deleted_at IS NULL AND ($2 IS NULL OR s.name = $2) ORDER BY s.name",
                 )
@@ -3011,15 +3013,15 @@ macro_rules! impl_store_common {
                     stored.push((seat_id, rec));
                 }
                 for chunk in stored.chunks(500) {
-                    let rows: Vec<String> = (0..chunk.len()).map(|i| format!("({})", placeholders(i * 12 + 1, 12))).collect();
+                    let rows: Vec<String> = (0..chunk.len()).map(|i| format!("({})", placeholders(i * 13 + 1, 13))).collect();
                     let sql = format!(
                         "INSERT INTO presence (seat_id, org_id, state, wake_failed, harness, node, since, updated_at, \
-                         attention, attention_hint, terminal_url, turn_failed) VALUES {} \
+                         attention, attention_hint, terminal_url, turn_failed, waiting_for) VALUES {} \
                          ON CONFLICT (seat_id) DO UPDATE SET state = excluded.state, wake_failed = excluded.wake_failed, \
                          harness = excluded.harness, node = excluded.node, since = excluded.since, \
                          updated_at = excluded.updated_at, attention = excluded.attention, \
                          attention_hint = excluded.attention_hint, terminal_url = excluded.terminal_url, \
-                         turn_failed = excluded.turn_failed",
+                         turn_failed = excluded.turn_failed, waiting_for = excluded.waiting_for",
                         rows.join(", ")
                     );
                     let mut q = sqlx::query(&sql);
@@ -3036,7 +3038,8 @@ macro_rules! impl_store_common {
                             .bind(r.attention.clone())
                             .bind(r.attention_hint.clone())
                             .bind(r.terminal_url.clone())
-                            .bind(r.turn_failed.as_ref().and_then(|t| serde_json::to_string(t).ok()));
+                            .bind(r.turn_failed.as_ref().and_then(|t| serde_json::to_string(t).ok()))
+                            .bind(r.waiting_for);
                     }
                     q.execute(&mut *c).await?;
                 }

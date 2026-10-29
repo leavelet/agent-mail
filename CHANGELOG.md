@@ -327,6 +327,25 @@ The first public version.
   `interrupt_seat` (the last three for the user's seat); the MCP
   instructions tell seats to use `ask` for the person's decisions and to
   stop until the answer comes as mail.
+- Requests for the person and web control of seats, M10 phase C (node
+  side; migration `0029_presence_waiting.sql`):
+  - The node carries out `prompt` (Claude Code: a line on the inbox
+    socket; Codex: `codex queue` after the daemon check, also while a turn
+    runs; dsh: `session/prompt`; a supervised seat that is asleep is
+    started first), `interrupt` (Codex: `turn/interrupt` on the turn in
+    progress; dsh: `session/cancel`; Claude Code: ignored) and
+    `attention_action` (`restart` stops and starts the seat's session,
+    `sleep` as `amail sleep`). A prompt is not a wake-up. Each is recorded
+    in the seat's worklog (`prompt`, `interrupt`, `attention_action`).
+  - A seat whose turn ran `amail ask` (or the `ask` tool) and ended with
+    its `question`, `plan` or `merge` request still open and no mail
+    waiting is marked as waiting for it: presence `waiting_for`, `waiting
+    for r12` in `amail ps`, worklog `waiting`. It sleeps by the team's
+    idle rule; the answer's mail wakes it, and its next turn clears the
+    mark.
+  - `GET /requests` takes node tokens for one seat (`seat` required).
+  - The mail instructions tell seats to use `amail ask` for the person's
+    decisions, then stop.
 
 #### Running agents
 

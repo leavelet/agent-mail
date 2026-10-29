@@ -11,6 +11,8 @@
 #                    input box) | deafdialog (the same, with a dialog open)
 #   <seat>.busy      while it exists, a turn keeps making tool calls
 #   <seat>.prompt    created by the test: start a turn (like a person typing)
+#   <seat>.tool      a shell command line the next turn reports as one tool
+#                    call (PostToolUse), without running it
 #   <seat>.answer    answers the trust prompt (mode trust)
 #   <seat>.wake      created by the test when the node wakes the seat
 #                    (Claude: via the inbox socket; Codex: `codex queue`)
@@ -153,6 +155,13 @@ turn() {
             fi
             sleep 0.05
         done
+    fi
+    if [ -f "$D/$seat.tool" ]; then
+        # One tool call with the file's text as its shell command (as an
+        # agent running `amail ask ...`); the command is not run.
+        cmd=$(python3 -c 'import json, sys; print(json.dumps(open(sys.argv[1]).read().strip()))' "$D/$seat.tool")
+        rm -f "$D/$seat.tool"
+        hook "{\"hook_event_name\":\"PostToolUse\",\"session_id\":\"$sid\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":$cmd}}" > /dev/null
     fi
     while [ -f "$D/$seat.busy" ]; do
         hook "{\"hook_event_name\":\"PostToolUse\",\"session_id\":\"$sid\",\"tool_name\":\"Bash\"}" > /dev/null

@@ -511,6 +511,9 @@ pub struct PresenceRec {
     pub attention_hint: Option<String>,
     pub terminal_url: Option<String>,
     pub turn_failed: Option<amail_proto::TurnFailure>,
+    /// The request the seat waits for (see
+    /// [`amail_proto::Presence::waiting_for`]).
+    pub waiting_for: Option<i64>,
 }
 
 impl PresenceRec {
@@ -524,6 +527,7 @@ impl PresenceRec {
             && self.attention_hint == next.attention_hint
             && self.terminal_url == next.terminal_url
             && self.turn_failed == next.turn_failed
+            && self.waiting_for == next.waiting_for
     }
 }
 

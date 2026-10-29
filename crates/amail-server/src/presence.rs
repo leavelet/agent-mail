@@ -47,6 +47,7 @@ pub fn wire(r: &PresenceRec) -> Presence {
         attention_hint: r.attention_hint.clone(),
         terminal_url: r.terminal_url.clone(),
         turn_failed: r.turn_failed.clone(),
+        waiting_for: r.waiting_for,
         node_connected: false,
     }
 }
@@ -161,6 +162,7 @@ impl PresenceBoard {
                 attention_hint: u.attention_hint.clone(),
                 terminal_url: u.terminal_url.clone(),
                 turn_failed: u.turn_failed.clone(),
+                waiting_for: u.waiting_for.filter(|n| *n > 0),
             })
             .collect();
         let stored = if self.shared {

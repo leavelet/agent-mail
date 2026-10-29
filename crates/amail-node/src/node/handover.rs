@@ -202,6 +202,13 @@ pub(super) enum Job {
     /// the node connects, when a seat is added, and after the seat wrote
     /// its note.
     NoteState { seat: String },
+    /// The seat asked the person in the turn that started at `turn_start`
+    /// and that has now ended: see whether it waits for an answer (see
+    /// [`super::requests`]).
+    Waiting {
+        seat: String,
+        turn_start: Option<i64>,
+    },
 }
 
 /// The hash of an index text.
@@ -573,6 +580,10 @@ impl Node {
                     }
                 }
                 Job::NoteState { seat } => self.note_state(&seat).await,
+                Job::Waiting { seat, turn_start } => {
+                    let me = self.clone();
+                    tokio::spawn(async move { me.check_waiting(&seat, turn_start).await });
+                }
             }
         }
     }

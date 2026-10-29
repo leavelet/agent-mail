@@ -318,6 +318,13 @@ impl Api {
             .await
             .map(drop)
     }
+
+    /// Stop `session`'s current turn.
+    pub async fn cancel(&self, session: &str) -> Result<()> {
+        self.call("session/cancel", json!({"request": {"sessionId": session}}))
+            .await
+            .map(drop)
+    }
 }
 
 /// A seat's dsh model `provider/model`; a bare name is a model of the
@@ -684,6 +691,16 @@ impl Adapter for Dsh {
         };
         let api = Api::login(&ep.url, &ep.token).await?;
         api.prompt(&session, text).await
+    }
+
+    /// `session/cancel`. dsh fires no hook after a cancelled turn.
+    async fn interrupt(&self, target: &str) -> Result<bool> {
+        let Some((ep, session)) = self.resolve(target).filter(|(ep, _)| ep.alive()) else {
+            bail!("no running dsh host for {target}");
+        };
+        let api = Api::login(&ep.url, &ep.token).await?;
+        api.cancel(&session).await?;
+        Ok(true)
     }
 
     async fn prepare(&self) -> Result<()> {
