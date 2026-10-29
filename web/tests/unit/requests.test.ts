@@ -6,12 +6,14 @@ import {
   countNeeds,
   answerText,
   groupByClass,
+  interleave,
   interruptKind,
   isCreationMail,
   isSnoozed,
   parseFilters,
   parseRequestNum,
   parseSnoozes,
+  requestMarks,
   splitAttention,
   subjectRequestTags,
   waitingRequest,
@@ -160,5 +162,50 @@ describe('the list filters', () => {
     expect(parseFilters(new URLSearchParams(''))).toEqual({ state: 'all', kind: '', seat: '', cls: '' });
     expect(parseFilters(new URLSearchParams('state=open&kind=plan&seat=be-1&class=now'))).toEqual({ state: 'open', kind: 'plan', seat: 'be-1', cls: 'now' });
     expect(parseFilters(new URLSearchParams('state=bogus&kind=x&class=y'))).toEqual({ state: 'all', kind: '', seat: '', cls: '' });
+  });
+});
+
+describe('request marks in the conversation mirror', () => {
+  const asked = req(1, { created_at: '2026-10-29T10:00:00Z' });
+  const answered = req(2, {
+    created_at: '2026-10-29T10:01:00Z',
+    state: 'answered',
+    answered_at: '2026-10-29T10:05:00Z',
+    answer: { option: 'no', by: 'owner', at: '2026-10-29T10:05:00Z' },
+  });
+  const expired = req(3, {
+    created_at: '2026-10-29T10:02:00Z',
+    state: 'expired',
+    answered_at: '2026-10-29T10:06:00Z',
+    answer: { option: 'yes', by: 'deadline', at: '2026-10-29T10:06:00Z' },
+  });
+  const withdrawn = req(4, { created_at: '2026-10-29T10:03:00Z', state: 'withdrawn' });
+
+  it('marks creation and closing, oldest first', () => {
+    const m = requestMarks([withdrawn, expired, answered, asked], new Map([[4, { at: '2026-10-29T10:04:00Z', by: 'owner' }]]));
+    expect(m.map((x) => [x.num, x.what])).toEqual([
+      [1, 'created'],
+      [2, 'created'],
+      [3, 'created'],
+      [4, 'created'],
+      [4, 'withdrawn'],
+      [2, 'answered'],
+      [3, 'expired'],
+    ]);
+    expect(m.find((x) => x.what === 'answered')).toMatchObject({ answer: 'Hold it', by: 'owner' });
+    // A withdrawal without a known time is left out.
+    expect(requestMarks([withdrawn]).map((x) => x.what)).toEqual(['created']);
+  });
+
+  it('puts the marks between the events by time', () => {
+    const ev = (ts: string | undefined, text: string) => ({ ts, text });
+    const events = [ev('2026-10-29T10:00:30Z', 'a'), ev(undefined, 'b'), ev('2026-10-29T10:04:30Z', 'c')];
+    const marks = requestMarks([asked, answered]);
+    const out = interleave(events, marks).map((x) => ('mark' in x ? `r${x.mark.num}:${x.mark.what}` : x.ev.text));
+    // r1 was made before the first event shown: left out.
+    expect(out).toEqual(['a', 'b', 'r2:created', 'c', 'r2:answered']);
+    expect(interleave(events, []).map((x) => ('ev' in x ? x.i : -1))).toEqual([0, 1, 2]);
+    // Without times there is nothing to place the marks by.
+    expect(interleave([ev(undefined, 'x')], marks)).toEqual([{ ev: ev(undefined, 'x'), i: 0 }]);
   });
 });

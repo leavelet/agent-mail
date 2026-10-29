@@ -7,6 +7,8 @@
   import { shortTime } from '../lib/time';
   import { enc } from '../lib/api';
   import { apiUrl } from '../lib/base';
+  import { href } from '../lib/router.svelte';
+  import { interleave, requestId, type MirrorMark } from '../lib/requests';
 
   /**
    * The read-only conversation mirror of a seat. With `seat`, it subscribes
@@ -16,7 +18,8 @@
     seat,
     events: initialEvents = [],
     status: initialStatus = null,
-  }: { seat?: string; events?: TranscriptEvent[]; status?: TranscriptStatus | null } = $props();
+    marks = [],
+  }: { seat?: string; events?: TranscriptEvent[]; status?: TranscriptStatus | null; marks?: MirrorMark[] } = $props();
 
   const MAX_EVENTS = 2000;
   // svelte-ignore state_referenced_locally
@@ -135,7 +138,18 @@
       <div class="explain"><p>{t('tr.empty')}</p></div>
     {:else}
       {#if explain}<div class="inline-status">{explain}</div>{/if}
-      {#each events as ev, i (i)}
+      {#each interleave(events, marks) as item}
+        {#if 'mark' in item}
+          {@const m = item.mark}
+          <div class="mark mk-{m.what}" data-testid="tr-mark" data-request={m.num} data-what={m.what}>
+            <span class="ts faint">{shortTime(new Date(m.at).toISOString(), ui.now, ui.lang)}</span>
+            <span>
+              <a class="mono" href={href(['requests', requestId(m.num)])}>{requestId(m.num)}</a>
+              {t(`tr.mark.${m.what}`, { by: m.by ?? '' })}<Vis text={m.what === 'created' ? m.title : (m.answer ?? '')} />
+            </span>
+          </div>
+        {:else}
+        {@const ev = item.ev}
         {@const nk = ev.kind === 'notice' ? noticeKind(ev) : null}
         <div class="ev {ev.role} k-{ev.kind}" class:err={ev.error} class:failed={nk === 'error'} data-notice={nk}>
           <div class="gutter">
@@ -165,6 +179,7 @@
             {#if ev.truncated}<span class="chip neutral trunc">✂ {t('tr.truncated')}</span>{/if}
           </div>
         </div>
+        {/if}
       {/each}
     {/if}
   </div>
@@ -213,6 +228,26 @@
     50% {
       opacity: 0.3;
     }
+  }
+  .mark {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    margin: 4px 10px;
+    padding: 3px 8px;
+    border-left: 3px solid var(--accent);
+    background: var(--accent-weak);
+    border-radius: 4px;
+    font-size: 12px;
+    overflow-wrap: anywhere;
+  }
+  .mark.mk-answered,
+  .mark.mk-expired {
+    border-left-color: var(--ok);
+  }
+  .mark.mk-withdrawn {
+    border-left-color: var(--faint);
+    background: var(--surface-2);
   }
   .log {
     flex: 1;

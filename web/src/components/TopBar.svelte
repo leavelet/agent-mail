@@ -14,6 +14,14 @@
 </script>
 
 <header class="top">
+  <button
+    class="ghost small menu"
+    aria-label={t('top.menu')}
+    aria-controls="main-nav"
+    aria-expanded={ui.navOpen}
+    data-testid="nav-menu"
+    onclick={() => (ui.navOpen = !ui.navOpen)}>{ui.navOpen ? '✕' : '☰'}</button
+  >
   <a class="brand" href={href(['org'])}><span class="logo" aria-hidden="true">✉</span>amail</a>
   <span class="org mono" title={t('admin.org')}>{store.me?.org}</span>
   <div class="summary" aria-label={t('org.title')}>
@@ -42,11 +50,13 @@
     {/if}
   </div>
   <span class="spacer"></span>
-  <a class="needs" class:hot={needs > 0} href={href(['needs'])}>{t('top.needsYou', { n: needs })}</a>
+  <a class="needs" class:hot={needs > 0} href={href(['needs'])} data-testid="top-needs">{t('top.needsYou', { n: needs })}</a>
   {#if !store.live}<span class="live-off" title={t('app.offline')}>●</span>{/if}
-  <LangTheme />
-  <button class="ghost small" title={t('top.help')} aria-label={t('top.help')} onclick={() => (ui.helpOpen = true)}>?</button>
-  <button class="small" onclick={() => store.logout()}>{t('top.logout')}</button>
+  <div class="wide">
+    <LangTheme />
+    <button class="ghost small" title={t('top.help')} aria-label={t('top.help')} onclick={() => (ui.helpOpen = true)}>?</button>
+    <button class="small" onclick={() => store.logout()}>{t('top.logout')}</button>
+  </div>
 </header>
 
 <style>
@@ -170,19 +180,36 @@
   .live-off {
     color: var(--warn);
   }
+  .wide {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .menu {
+    display: none;
+    font-size: 16px;
+    min-width: 32px;
+  }
   @media (max-width: 900px) {
     .stat .lbl {
       display: none;
     }
   }
-  /* Phone width: the bar wraps instead of making the page scroll sideways. */
+  /* Phone width: one short row. The seat counts, the org name, language,
+     theme, help and sign out move into the menu (see NavBar); the "needs
+     you" count stays. */
   @media (max-width: 720px) {
     .top {
-      flex-wrap: wrap;
-      height: auto;
-      min-height: 42px;
-      padding: 4px 12px;
-      row-gap: 4px;
+      padding: 0 8px;
+      gap: 8px;
+    }
+    .menu {
+      display: inline-block;
+    }
+    .org,
+    .summary,
+    .wide {
+      display: none;
     }
   }
 </style>

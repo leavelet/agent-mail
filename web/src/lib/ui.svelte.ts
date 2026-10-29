@@ -22,6 +22,9 @@ class Ui {
   /** Ticks every few seconds so durations and presence staleness update. */
   now = $state(Date.now());
   helpOpen = $state(false);
+  /** At phone width the navigation is a menu behind a button in the top
+   * bar; this says whether it is open. */
+  navOpen = $state(false);
   /** The thread page in view and the folder its messages suggest (for the
    * sidebar when the thread was opened by its URL). */
   thread = $state<{ id: number; folder: 'inbox' | 'sent' | null } | null>(null);

@@ -1188,7 +1188,17 @@ seats, or for a Claude Code seat the explanation that it has no
 structured interrupt and its terminal link (`amail attach <seat>` when
 its node reported none). The harness the node reports decides, as on the
 server. The page also lists the seat's open requests, and shows "waiting
-for r12" when the node reports the request the seat waits for.
+for r12" when the node reports the request the seat waits for. The
+conversation mirror marks, at their times, where the seat's requests were
+made and where they were answered, took their default or were withdrawn
+(from the seat's requests and their events; the transcript itself has no
+record of it), each with a link to the request. The prompt to a seat
+reaches its model with `[amail] Prompt from the user: ` in front, which
+the injected instructions name as the user's own text.
+
+At phone width (720 px and less) the top bar is one short row with the
+"needs you" count and a menu button; the navigation, the seat counts,
+language, theme, help and sign out open from that button over the page.
 
 Opening a message in the web Inbox marks it read; **Mark unread** undoes
 that. Check boxes select several messages to mark read or unread at once,

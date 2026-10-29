@@ -163,3 +163,66 @@ export function parseFilters(q: URLSearchParams): RequestFilters {
     cls: (CLASSES as string[]).includes(cls) ? cls : '',
   };
 }
+
+/** A point in a seat's conversation where one of its requests was made or
+ * closed, for the conversation mirror (the mirror has no record of its own
+ * for it: the times come from the request list and its events). */
+export interface MirrorMark {
+  /** Unix ms. */
+  at: number;
+  num: number;
+  what: 'created' | 'answered' | 'expired' | 'withdrawn';
+  title: string;
+  /** The answer in words (answered, expired). */
+  answer?: string;
+  /** Who answered, or who withdrew it. */
+  by?: string;
+}
+
+/** The marks of `reqs`: each request's creation, and its answer (or the
+ * default taken at its deadline, or its withdrawal, whose time is in
+ * `withdrawn`: request number → ISO time and who), oldest first. */
+export function requestMarks(reqs: Request[], withdrawn: Map<number, { at: string; by?: string }> = new Map()): MirrorMark[] {
+  const out: MirrorMark[] = [];
+  const time = (s: string | undefined) => (s ? Date.parse(s) : NaN);
+  for (const r of reqs) {
+    const created = time(r.created_at);
+    if (!Number.isNaN(created)) out.push({ at: created, num: r.num, what: 'created', title: r.title });
+    if (r.state === 'answered' || r.state === 'expired') {
+      const at = time(r.answered_at ?? r.answer?.at);
+      if (!Number.isNaN(at)) {
+        out.push({ at, num: r.num, what: r.state, title: r.title, answer: answerText(r), by: r.answer?.by });
+      }
+    } else if (r.state === 'withdrawn') {
+      const w = withdrawn.get(r.num);
+      const at = time(w?.at);
+      if (!Number.isNaN(at)) out.push({ at, num: r.num, what: 'withdrawn', title: r.title, by: w?.by });
+    }
+  }
+  return out.sort((a, b) => a.at - b.at || a.num - b.num);
+}
+
+export type MirrorItem<E> = { ev: E; i: number } | { mark: MirrorMark };
+
+/** The mirror's events with the marks put in by time: a mark goes before
+ * the first event later than it, marks after the last event at the end.
+ * Marks older than the first event with a time are left out (the mirror
+ * shows only the end of a long conversation). Events without a time keep
+ * the time of the event before them. */
+export function interleave<E extends { ts?: string }>(events: E[], marks: MirrorMark[]): MirrorItem<E>[] {
+  if (marks.length === 0) return events.map((ev, i) => ({ ev, i }));
+  const first = events.map((e) => (e.ts ? Date.parse(e.ts) : NaN)).find((t) => !Number.isNaN(t));
+  if (first === undefined) return events.map((ev, i) => ({ ev, i }));
+  const pending = marks.filter((m) => m.at >= first);
+  const out: MirrorItem<E>[] = [];
+  let k = 0;
+  events.forEach((ev, i) => {
+    const t = ev.ts ? Date.parse(ev.ts) : NaN;
+    if (!Number.isNaN(t)) {
+      while (k < pending.length && pending[k].at < t) out.push({ mark: pending[k++] });
+    }
+    out.push({ ev, i });
+  });
+  while (k < pending.length) out.push({ mark: pending[k++] });
+  return out;
+}

@@ -365,6 +365,81 @@ test('an interrupt the server refuses for a Claude Code seat is shown plainly', 
   await expect(page.getByTestId('control-msg')).toHaveText('This seat runs Claude Code, which has no structured interrupt. Stop the turn in its terminal.');
 });
 
+test('the conversation mirror marks where a request was made and answered', async ({ page }) => {
+  const s = state();
+  test.skip(!s.node, 'needs the node that mirrors be-1');
+  await pushPresence();
+  const r = await ask('be-1', { title: 'Mirror mark check', options: YESNO, default: 'no' });
+  await login(page, s.userToken, { lang: 'en' });
+  await page.goto(`${s.base}/#/org/be-1`);
+  const log = page.getByTestId('transcript-log');
+  await expect(log).toContainText('I will add the trigram index', { timeout: 20_000 });
+  const made = log.locator(`[data-testid="tr-mark"][data-request="${r.num}"][data-what="created"]`);
+  await expect(made).toContainText('asked the person: Mirror mark check');
+  await api(s.userToken, 'POST', `/requests/${r.num}/answer`, { option: 'yes' });
+  const answered = log.locator(`[data-testid="tr-mark"][data-request="${r.num}"][data-what="answered"]`);
+  await expect(answered).toContainText('Ship it', { timeout: 15_000 });
+  await shot(page, 'web-mirror-request-marks');
+});
+
+test('phone width: a compact header leaves most of the screen to the page', async ({ page }) => {
+  const s = state();
+  await pushPresence();
+  // A request keeps the "needs you" count above zero.
+  const r = await ask('be-1', { title: 'Phone header check', options: YESNO, default: 'no' });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await login(page, s.userToken, { lang: 'en' });
+  const share = async () => {
+    const box = (await page.locator('#main').boundingBox())!;
+    return box.height / 844;
+  };
+  for (const route of ['#/needs', '#/org/be-lead', '#/inbox']) {
+    await page.goto(`${s.base}/${route}`);
+    await expect(page.locator('#main')).toBeVisible();
+    // The page gets at least 60% of the screen (it got 205 px of 844).
+    expect(await share(), route).toBeGreaterThanOrEqual(0.6);
+    // The navigation is behind the menu button; the count stays in view.
+    await expect(page.locator('#main-nav')).toBeHidden();
+    await expect(page.getByTestId('top-needs')).toBeInViewport();
+    await expect(page.getByTestId('top-needs')).not.toHaveText(/^0 /);
+  }
+  // The menu opens over the page and closes when a page is chosen.
+  await page.getByTestId('nav-menu').click();
+  await expect(page.locator('#main-nav')).toBeVisible();
+  await expect(page.getByTestId('nav-menu')).toHaveAttribute('aria-expanded', 'true');
+  await page.locator('#main-nav').getByRole('link', { name: 'Tasks' }).click();
+  await expect(page).toHaveURL(/#\/tasks/);
+  await expect(page.locator('#main-nav')).toBeHidden();
+  // Sign out and the language are in the menu at this width.
+  await page.getByTestId('nav-menu').click();
+  await expect(page.locator('#main-nav').getByRole('button', { name: 'Sign out' })).toBeVisible();
+  await page.getByTestId('nav-menu').click();
+
+  // The seat page: the mirror is not drawn over the prompt box.
+  await page.goto(`${s.base}/#/org/be-lead`);
+  const controls = page.getByTestId('seat-controls');
+  const send = controls.getByRole('button', { name: 'Send prompt' });
+  await send.scrollIntoViewIfNeeded();
+  await expect(send).toBeInViewport();
+  const topmost = async (loc: ReturnType<Page['locator']>) => {
+    const box = (await loc.boundingBox())!;
+    return loc.evaluate(
+      (el, [x, y]) => {
+        const hit = document.elementFromPoint(x, y);
+        return !!hit && (hit === el || el.contains(hit));
+      },
+      [box.x + box.width / 2, box.y + box.height / 2],
+    );
+  };
+  expect(await topmost(send)).toBe(true);
+  expect(await topmost(controls.locator('.hint'))).toBe(true);
+  const mirror = (await page.locator('.mirrorbox').boundingBox())!;
+  const ctl = (await controls.boundingBox())!;
+  expect(mirror.y + mirror.height).toBeLessThanOrEqual(ctl.y + 1);
+  await shot(page, 'web-seat-controls-phone');
+  await api(s.seatTokens['be-1'], 'POST', `/requests/${r.num}/withdraw`, {});
+});
+
 test('phone width: cards, buttons and the seat controls fit', async ({ page }) => {
   const s = state();
   await pushPresence();

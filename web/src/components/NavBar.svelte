@@ -3,6 +3,7 @@
   import { t, ui } from '../lib/ui.svelte';
   import { href, router } from '../lib/router.svelte';
   import { navSection, sectionOf } from '../lib/nav';
+  import LangTheme from './LangTheme.svelte';
 
   const route = $derived(sectionOf(router.route));
   // A thread belongs to no section of its own: it stays under the list it
@@ -18,9 +19,14 @@
   const invited = $derived(store.links.filter((l) => l.state === 'invited').length);
   const unread = $derived(store.me?.seat ? (store.counts.get(store.me.seat)?.unread ?? 0) : 0);
   const admin = ['seats', 'lists', 'openings', 'tokens', 'settings'] as const;
+  // The phone menu closes when the page changes.
+  $effect(() => {
+    void router.route;
+    ui.navOpen = false;
+  });
 </script>
 
-<nav class="nav" aria-label="main">
+<nav class="nav" id="main-nav" aria-label="main" class:open={ui.navOpen}>
   <a href={href(['needs'])} class:active={section === 'needs'}>
     <span>{t('nav.needs')}</span>
     {#if store.needsCount}<span class="count alert">{store.needsCount}</span>{/if}
@@ -45,6 +51,14 @@
   {#each admin as a}
     <a href={href(['admin', a])} class="sub" class:active={section === 'admin' && sub === a}><span>{t(`nav.${a}`)}</span></a>
   {/each}
+  <div class="phone">
+    {#if store.me?.org}<span class="org mono">{store.me.org}</span>{/if}
+    <LangTheme />
+    <div class="row">
+      <button class="ghost small" onclick={() => ((ui.navOpen = false), (ui.helpOpen = true))}>{t('top.help')}</button>
+      <button class="small" onclick={() => store.logout()}>{t('top.logout')}</button>
+    </div>
+  </div>
 </nav>
 
 <style>
@@ -85,6 +99,43 @@
   }
   .compose kbd {
     opacity: 0.7;
+  }
+  .phone {
+    display: none;
+  }
+  /* Phone width: a menu over the page, opened from the top bar. */
+  @media (max-width: 720px) {
+    .nav {
+      display: none;
+      position: fixed;
+      top: 42px;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 40;
+      border-right: none;
+      border-top: 1px solid var(--border);
+      padding: 8px 12px 24px;
+    }
+    .nav.open {
+      display: flex;
+    }
+    a {
+      padding: 9px 10px;
+    }
+    .phone {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin: 16px 9px 0;
+    }
+    .phone .row {
+      display: flex;
+      gap: 8px;
+    }
+    .org {
+      color: var(--muted);
+    }
   }
   .group {
     margin: 12px 9px 3px;

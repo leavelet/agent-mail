@@ -197,11 +197,13 @@
     white-space: pre-wrap;
     flex: 1;
   }
+  /* Phone width: the top bar and the page; the navigation is a menu over
+     the page (NavBar). */
   @media (max-width: 720px) {
     .shell {
-      grid-template-areas: 'top' 'nav' 'main';
+      grid-template-areas: 'top' 'main';
       grid-template-columns: 1fr;
-      grid-template-rows: auto auto 1fr;
+      grid-template-rows: auto 1fr;
     }
   }
 </style>

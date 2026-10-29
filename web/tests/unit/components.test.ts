@@ -155,6 +155,27 @@ describe('untrusted text', () => {
       ['system', 'system'],
     ]);
   });
+  it('marks where a request was made and answered', () => {
+    ui.lang = 'en';
+    const el = render(Transcript, {
+      status: { state: 'streaming' },
+      events: [
+        { ts: '2026-10-29T10:00:00Z', role: 'assistant', kind: 'text', text: 'first' },
+        { ts: '2026-10-29T10:02:00Z', role: 'assistant', kind: 'text', text: 'second' },
+      ],
+      marks: [
+        { at: Date.parse('2026-10-29T10:01:00Z'), num: 7, what: 'created', title: 'Ship <it>?' },
+        { at: Date.parse('2026-10-29T10:03:00Z'), num: 7, what: 'answered', title: 'Ship <it>?', answer: 'Ship it', by: 'owner' },
+      ],
+    });
+    const rows = [...el.querySelectorAll('.log > div')].map((d) => d.getAttribute('data-what') ?? 'ev');
+    expect(rows).toEqual(['ev', 'created', 'ev', 'answered']);
+    const marks = el.querySelectorAll('[data-testid="tr-mark"]');
+    expect(marks[0].textContent).toContain('r7');
+    expect(marks[0].textContent).toContain('asked the person: Ship <it>?');
+    expect(marks[1].textContent).toContain('answered by owner: Ship it');
+    expect(marks[0].querySelector('a')?.getAttribute('href')).toContain('requests/r7');
+  });
   it('explains a missing session instead of showing nothing', () => {
     const el = render(Transcript, { status: { state: 'node_offline' }, events: [] });
     expect(el.querySelector('[data-state="node_offline"]')?.textContent).toContain('No node');

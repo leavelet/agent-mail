@@ -20,9 +20,34 @@
   import SeatWorklog from './SeatWorklog.svelte';
   import SeatControls from './SeatControls.svelte';
   import SeatRequests from './SeatRequests.svelte';
-  import { requestId, waitingRequest } from '../lib/requests';
+  import { requestId, requestMarks, waitingRequest, type MirrorMark } from '../lib/requests';
+  import { getRequest, listRequests } from '../lib/requestops';
 
   let { name }: { name: string } = $props();
+
+  // Where the seat's requests were made and closed, for the mirror: the
+  // seat's requests (newest 50) and, for withdrawn ones, the time from
+  // their events. Reloaded on every round of `request` events.
+  let marks = $state.raw<MirrorMark[]>([]);
+  let marksGen = 0;
+  async function loadMarks(seat: string) {
+    const g = ++marksGen;
+    try {
+      const reqs = (await listRequests({ seat, state: 'all', limit: 50 })).requests;
+      const withdrawn = new Map<number, { at: string; by?: string }>();
+      for (const r of reqs.filter((r) => r.state === 'withdrawn').slice(0, 10)) {
+        const ev = (await getRequest(r.num)).events?.find((e) => e.kind === 'withdrawn');
+        if (ev) withdrawn.set(r.num, { at: ev.at, by: ev.actor });
+      }
+      if (g === marksGen) marks = requestMarks(reqs, withdrawn);
+    } catch {
+      // The mirror works without the marks.
+    }
+  }
+  $effect(() => {
+    void store.requestSeq;
+    void loadMarks(name);
+  });
 
   type Tab = 'mirror' | 'inbox' | 'sent' | 'handover' | 'worklog';
   const TABS: Tab[] = ['mirror', 'inbox', 'sent', 'handover', 'worklog'];
@@ -253,7 +278,7 @@
     </div>
     <div class="tabbody">
       {#if tab === 'mirror' && seat.kind === 'agent'}
-        <Transcript seat={seat.name} />
+        <div class="mirrorbox"><Transcript seat={seat.name} {marks} /></div>
         <SeatControls {seat} presence={p} />
       {:else if tab === 'mirror'}
         <div class="empty">—</div>
@@ -287,7 +312,7 @@
     padding: 12px 16px;
     height: 100%;
     min-height: 0;
-    overflow: hidden;
+    overflow: auto;
   }
   .head {
     display: flex;
@@ -407,6 +432,28 @@
     min-height: 0;
     display: flex;
     flex-direction: column;
+  }
+  /* The mirror takes the room the prompt box leaves, but never less than
+     its own minimum: below that the page scrolls instead of drawing the
+     mirror over the prompt box. */
+  .mirrorbox {
+    flex: 1;
+    min-height: 220px;
+    display: flex;
+    flex-direction: column;
+  }
+  @media (max-width: 720px) {
+    .detail {
+      height: auto;
+      overflow: visible;
+    }
+    .tabbody {
+      flex: none;
+    }
+    .mirrorbox {
+      flex: none;
+      height: 60vh;
+    }
   }
   .mail {
     overflow: auto;

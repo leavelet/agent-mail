@@ -316,4 +316,10 @@
       display: none;
     }
   }
+  /* Phone width: the seat's page scrolls as a whole (see SeatDetail). */
+  @media (max-width: 720px) {
+    .detailpane {
+      overflow: auto;
+    }
+  }
 </style>
