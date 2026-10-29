@@ -58,6 +58,15 @@
   export function doAck() {
     if (message?.ack_required && delivery && !delivery.acked_at) void run(() => ack(id));
   }
+  /** Fetch the delivery state again (after the list changed it). */
+  export function refresh() {
+    const mid = id;
+    get<MessageResponse>(`/v1/messages/${enc(String(mid))}?peek=1`)
+      .then((r) => {
+        if (mid === id) delivery = r.delivery;
+      })
+      .catch(() => undefined);
+  }
   export function doReply(all = false) {
     go(['compose'], { reply: id, all: all ? 1 : undefined });
   }

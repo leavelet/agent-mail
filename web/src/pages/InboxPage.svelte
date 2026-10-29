@@ -7,6 +7,18 @@
   import { get, qs } from '../lib/api';
   import { fromEntry, fromSent, newestFirst, type MailRow } from '../lib/mailrows';
   import { typing, moveIndex } from '../lib/keys';
+  import { markAllRead, markReadMany, markUnreadMany } from '../lib/mailops';
+  import {
+    CONFIRM_ABOVE,
+    headerState,
+    markAllBefore,
+    readable,
+    selectedRows,
+    toggleAll,
+    toggled,
+    unreadable,
+    withRead,
+  } from '../lib/selection';
   import type { ArchiveResponse, InboxEntry, InboxResponse } from '../lib/types';
   import MailList from '../components/MailList.svelte';
   import MessagePane from '../components/MessagePane.svelte';
@@ -24,15 +36,32 @@
   /** The selection was made by the person (not the automatic first row):
    * opening it marks it read. */
   let picked = $state(false);
+  /** Rows ticked with their check boxes (Inbox tab only). */
+  let checked = $state.raw<Set<number>>(new Set());
+  let busy = $state(false);
+  let actionError = $state<string | null>(null);
   $effect(() => {
     void tab;
     picked = false;
+    checked = new Set();
+    actionError = null;
   });
 
   const me = $derived(store.me?.seat);
   const seq = $derived(me ? (store.counts.get(me)?.seq ?? 0) : 0);
+  const unreadCount = $derived(me ? (store.counts.get(me)?.unread ?? 0) : 0);
   const rows = $derived(tab === 'inbox' ? newestFirst(entries.map((e) => fromEntry(e, isList))) : sent);
   const index = $derived(rows.findIndex((r) => r.id === selected));
+  const rowIds = $derived(rows.map((r) => r.id));
+  const picks = $derived(selectedRows(checked, rowIds));
+  const head = $derived(headerState(checked, rowIds));
+  const canRead = $derived(readable(entries, picks).length > 0);
+  const canUnread = $derived(unreadable(entries, picks).length > 0);
+
+  let allBox: HTMLInputElement | undefined = $state();
+  $effect(() => {
+    if (allBox) allBox.indeterminate = head === 'some';
+  });
 
   // (Re)load the newest page when the tab or the mailbox changes, keeping
   // older pages that were loaded.
@@ -77,12 +106,65 @@
     }
   }
 
-  function changed() {
-    void store.mailChanged();
-    // Reflect read/ack in the list right away.
+  /** Fetch the loaded entries again (their read and ack state). */
+  function refreshList() {
     get<InboxResponse>(`/v1/inbox${qs({ before_seq: Number.MAX_SAFE_INTEGER, limit: Math.max(PAGE, entries.length) })}`)
       .then((r) => (entries = r.entries))
       .catch(() => undefined);
+  }
+
+  function changed() {
+    void store.mailChanged();
+    // Reflect read/ack in the list right away.
+    refreshList();
+  }
+
+  /** Run a bulk action: the rows were changed in place already; then the
+   * list, the open message and (through mailops) the counts follow the
+   * server. */
+  async function bulk(f: () => Promise<unknown>) {
+    busy = true;
+    actionError = null;
+    try {
+      await f();
+    } catch (e) {
+      actionError = e instanceof Error ? e.message : String(e);
+    } finally {
+      busy = false;
+      refreshList();
+      pane?.refresh();
+    }
+  }
+
+  function readSelected() {
+    const ids = readable(entries, picks);
+    if (!ids.length) return;
+    entries = withRead(entries, ids, true, new Date().toISOString());
+    void bulk(() => markReadMany(ids));
+  }
+
+  function unreadSelected() {
+    const ids = unreadable(entries, picks);
+    if (!ids.length) return;
+    entries = withRead(entries, ids, false, '');
+    void bulk(() => markUnreadMany(ids));
+  }
+
+  function readAll() {
+    const before = markAllBefore(entries);
+    if (before === undefined || unreadCount === 0) return;
+    if (unreadCount > CONFIRM_ABOVE && !confirm(t('mail.markAllRead.confirm', { n: unreadCount }))) return;
+    entries = withRead(
+      entries,
+      entries.map((e) => e.message.id),
+      true,
+      new Date().toISOString(),
+    );
+    void bulk(() => markAllRead(before));
+  }
+
+  function check(id: number, on?: boolean) {
+    checked = toggled(checked, id, on);
   }
 
   function onKey(e: KeyboardEvent) {
@@ -112,6 +194,9 @@
     } else if (e.key === 'a') {
       pane?.doAck();
       e.preventDefault();
+    } else if (e.key === 'x' && tab === 'inbox') {
+      check(r.id);
+      e.preventDefault();
     }
   }
 </script>
@@ -126,6 +211,35 @@
       </button>
       <button role="tab" aria-selected={tab === 'sent'} onclick={() => go(['inbox'], { tab: 'sent' })}>{t('mail.sent')}</button>
     </div>
+    {#if tab === 'inbox'}
+      <div class="toolbar">
+        <label class="pickall">
+          <input
+            type="checkbox"
+            data-testid="check-all"
+            bind:this={allBox}
+            checked={head === 'all'}
+            disabled={rows.length === 0}
+            aria-label={t('mail.selectAll')}
+            title={t('mail.selectAll')}
+            onchange={() => (checked = toggleAll(checked, rowIds))}
+          />
+        </label>
+        <span class="spacer"></span>
+        <button class="small" data-testid="mark-all-read" title={t('mail.markAllRead.long')} disabled={busy || unreadCount === 0 || entries.length === 0} onclick={readAll}>
+          {t('mail.markAllRead')}
+        </button>
+      </div>
+      {#if picks.length}
+        <div class="selbar" role="region" aria-label={t('mail.selection')} data-testid="selection-bar">
+          <span class="selcount" data-testid="selected-count">{t('mail.selectedCount', { n: picks.length })}</span>
+          <button class="small" disabled={busy || !canRead} onclick={readSelected}>{t('mail.markRead')}</button>
+          <button class="small" disabled={busy || !canUnread} onclick={unreadSelected}>{t('mail.markUnread')}</button>
+          <button class="small ghost" onclick={() => (checked = new Set())}>{t('mail.clearSelection')}</button>
+        </div>
+      {/if}
+      {#if actionError}<p class="error pad" role="alert">{actionError}</p>{/if}
+    {/if}
     <div class="scroll">
       {#if error}
         <p class="error pad">{error}</p>
@@ -137,6 +251,8 @@
           {selected}
           showTo={tab === 'sent'}
           label={tab === 'sent' ? t('mail.sent') : t('mail.inbox')}
+          checked={tab === 'inbox' ? checked : undefined}
+          oncheck={(r, on) => check(r.id, on)}
           onselect={(r) => {
             selected = r.id;
             picked = true;
@@ -180,6 +296,37 @@
   .tabs .count {
     margin-left: 5px;
   }
+  .toolbar,
+  .selbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 12px 4px 0;
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+  .selbar {
+    padding-left: 12px;
+    background: var(--accent-weak);
+  }
+  .selcount {
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .pickall {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    min-height: 28px;
+    cursor: pointer;
+  }
+  .pickall input {
+    width: 16px;
+    height: 16px;
+    margin: 0;
+    cursor: pointer;
+  }
   .scroll {
     flex: 1;
     overflow-y: auto;
@@ -198,8 +345,30 @@
     padding: 12px;
   }
   @media (max-width: 1000px) {
+    /* One column: the list (with its own scroll) above the message; the
+     * page scrolls, so that the list keeps a usable height under the
+     * toolbar and the selection bar. */
     .inbox {
       grid-template-columns: 1fr;
+      height: auto;
+    }
+    .listpane {
+      border-right: none;
+      border-bottom: 1px solid var(--border);
+    }
+    .scroll {
+      flex: none;
+      max-height: 60vh;
+    }
+  }
+  @media (max-width: 720px) {
+    .pickall {
+      width: 40px;
+      min-height: 36px;
+    }
+    .pickall input {
+      width: 20px;
+      height: 20px;
     }
   }
 </style>

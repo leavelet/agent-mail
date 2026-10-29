@@ -13,6 +13,8 @@
     onopen,
     showTo = false,
     label,
+    checked,
+    oncheck,
   }: {
     rows: MailRow[];
     selected?: number;
@@ -20,7 +22,14 @@
     onopen?: (row: MailRow) => void;
     showTo?: boolean;
     label?: string;
+    /** With a set (even an empty one), each row has a check box; `oncheck`
+     * is called when the person ticks or clears one. */
+    checked?: ReadonlySet<number>;
+    oncheck?: (row: MailRow, on: boolean) => void;
   } = $props();
+
+  // A click on a row's check box (or around it) only changes the check box.
+  const inPick = (e: Event) => !!(e.target as Element | null)?.closest?.('.pick');
 </script>
 
 <div class="list" role="listbox" aria-label={label}>
@@ -29,16 +38,33 @@
       class="mrow"
       class:unread={r.unread}
       class:sel={r.id === selected}
+      class:checkable={checked !== undefined}
+      class:checked={checked?.has(r.id)}
       role="option"
       aria-selected={r.id === selected}
       tabindex="-1"
       data-msg={r.id}
-      onclick={() => onselect?.(r)}
-      ondblclick={() => onopen?.(r)}
+      onclick={(e) => {
+        if (!inPick(e)) onselect?.(r);
+      }}
+      ondblclick={(e) => {
+        if (!inPick(e)) onopen?.(r);
+      }}
       onkeydown={(e) => {
-        if (e.key === 'Enter') onopen?.(r);
+        if (e.key === 'Enter' && !inPick(e)) onopen?.(r);
       }}
     >
+      {#if checked !== undefined}
+        <label class="pick">
+          <input
+            type="checkbox"
+            data-testid="row-check"
+            checked={checked.has(r.id)}
+            aria-label={t('mail.selectRow', { subject: r.subject ? shortSubject(r.subject) : t('mail.noSubject') })}
+            onchange={(e) => oncheck?.(r, e.currentTarget.checked)}
+          />
+        </label>
+      {/if}
       <div class="who mono" title={showTo ? r.to.join(', ') : r.written_by ? `${r.from} (${t('mail.writtenBy', { user: r.written_by })})` : r.from}>
         {#if r.unread}<span class="udot" aria-label={t('mail.unread')}></span>{/if}
         {showTo ? `→ ${r.to.join(', ')}` : r.from}
@@ -82,6 +108,28 @@
     border-bottom: 1px solid var(--border);
     cursor: pointer;
     background: var(--surface);
+  }
+  .mrow.checkable {
+    grid-template-columns: auto minmax(90px, 160px) 1fr auto;
+    padding-left: 0;
+  }
+  .mrow.checked {
+    background: var(--surface-2);
+  }
+  .pick {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    align-self: stretch;
+    width: 32px;
+    margin-right: -6px;
+    cursor: pointer;
+  }
+  .pick input {
+    width: 16px;
+    height: 16px;
+    margin: 0;
+    cursor: pointer;
   }
   .mrow:hover {
     background: var(--surface-2);
@@ -171,5 +219,19 @@
   }
   .src-external {
     color: var(--src-external);
+  }
+  /* Phone width: a taller row and a larger check box to tap. */
+  @media (max-width: 720px) {
+    .mrow.checkable {
+      grid-template-columns: auto minmax(70px, 110px) 1fr auto;
+      height: 40px;
+    }
+    .pick {
+      width: 40px;
+    }
+    .pick input {
+      width: 20px;
+      height: 20px;
+    }
   }
 </style>

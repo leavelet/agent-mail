@@ -8,6 +8,7 @@
     [['r'], 'keys.reply'],
     [['e'], 'keys.markRead'],
     [['u'], 'keys.markUnread'],
+    [['x'], 'keys.select'],
     [['a'], 'keys.ack'],
     [['c'], 'keys.compose'],
     [['/'], 'keys.search'],
