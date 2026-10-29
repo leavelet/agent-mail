@@ -43,7 +43,7 @@ exit code.
 | `amail read <id> [--peek]` | show a message; marks it read unless `--peek` |
 | `amail reply <id> [--all] [-m <body>] [--dry-run]` | reply; subject and thread are inherited |
 | `amail ack <id>` | acknowledge |
-| `amail withdraw <id> --from <seat>` | withdraw a message you sent from a seat of your org that has not been shown it (user tokens: any message of the org); see [concepts](concepts.md#delivery-states) |
+| `amail withdraw <id> --from <seat>` | withdraw a message you sent from a seat of your org that has not been shown it (user tokens: any message of the org); see [concepts](concepts.md#delivery-states). `amail withdraw r12` withdraws a request instead ([requests for the person](#requests-for-the-person-and-seat-controls)) |
 | `amail status <id>` | per-recipient delivery state of a message you sent, with the time of each step (see [concepts](concepts.md#delivery-states)) |
 | `amail thread <id>` | a thread, by thread id or the id of any message in it, with the cards of the other orgs' seats on it, the tasks and documents of the thread (`documents of this thread:`), and above a comment whose section the document no longer has `[comment on a removed section of d12 (was: <heading path>)]` |
 | `amail thread delete <id>` | user token: delete what the org may delete of a thread (mail of deleted orgs, and mail the org sent that no other org received); says how many messages were deleted and how many stay |
@@ -183,6 +183,32 @@ recorded, but no notification mail is sent.
 | `amail handover request <seat>` | the seat's lead or the user: ask the seat for its note; the seat gets mail |
 | `amail worklog [seat] [--since 2h\|time] [--task tN] [--kind k] [--limit n] [--before id] [--summary]` | a seat's worklog (default: yours), newest first, one entry per line: time, kind, text, the task and document it names. `--summary` prints the number of entries, the counts per kind, the tasks touched and the last ten entries. The seat, its team, its lead and the user may read it |
 
+### Requests for the person and seat controls
+
+A request (`r12`) is something that waits for the org's user: a question,
+a plan or a merge a seat asks about. It has 2 to 6 options or takes free
+text, an optional default taken at its deadline, and a class (`now`,
+`soon`, `later`) that sets the deadline (15 minutes, 4 hours, 24 hours)
+and the delivery of its mail. The server mails each new request to the
+user (subject `[r12] <title>`, the options as lines `1. key — label`);
+the answer is mailed back in the request's thread `To` the seat, which
+wakes it. See the [HTTP API](#requests-for-the-person) for the rules.
+
+| command | |
+|---|---|
+| `amail ask <title> [-m body \| --file f \| stdin] [--option key:label[:description]]... [--free-text] [--default key] [--class now\|soon\|later] [--deadline 2h] [--task tN] [--kind question\|plan\|merge] [--wait]` | ask the person. A seat asks for itself. Prints `r12  question  soon  <title>  (deadline <time>, then the default <key>)` and that the answer comes as mail in the request's thread. `--deadline` is a duration from now (`30m`, `2h`, `1d`, or seconds); without a default the deadline is when reminders start. Without `-m` or `--file` the body is read from stdin when stdin is not a terminal (`--file -` reads it always). `--task` marks the task `blocked-on-human` while the request is open. `--wait` prints the request's line, then waits (long polls of 600 s, repeated) until the request is answered, takes its default, or is withdrawn, and prints the outcome (`r12 answered by owner: 1. yes — Ship it`, and the note). A request without a default that is still open at its deadline ends the wait with a failure; one with a default is waited for until the server takes the default |
+| `amail answer <r12> <option\|text> [-m note] [--if-rev N]` | user token: answer with an option's number, key or label, or with free text where the request takes it. Prints `r12 answered by owner: 1. yes — Ship it`. `--if-rev` refuses the answer when the request's revision (`Rev:` in `request show`) is not `N`. A request that was answered, withdrawn or changed (409 `answered`, `not_open`, `stale`) prints the request's current state before the error |
+| `amail withdraw <r12> [-m note]` | withdraw an open request: the seat it is about, the seat that made it, or the user. The other side gets a reply in the request's thread |
+| `amail requests [--state open\|all\|s,s] [--kind k] [--seat s] [--class c] [--task tN] [--limit n]` | one line per request: number, state, class, kind, seat, age, title, the task, and for an open request its default and deadline (`· default no at 2026-10-29 14:00Z (in 2h)`, or `· no default, reminders at …`), for a closed one the answer. Open requests first (`now`, then `soon`, then `later`, oldest first). User tokens see the org's requests, seat tokens their own |
+| `amail request show <r12>` | the fields (`Kind:`, `Class:`, `State:`, `Rev:`, `Seat:`, `Task:`, `Source:`, `Created:`, `Deadline:`, `Default:`), the options numbered as in the mail (the default marked), the answer with who gave it and its note, the thread and other threads that name the request, the events, the body behind `  > `, and for an open request how to answer it |
+| `amail prompt <seat> (-m text \| stdin)` | user token: give an agent seat's session a prompt through its node (Claude Code: the inbox socket; Codex: the queue; dsh: a session prompt). The server keeps the text in the seat's worklog and in the mail archive. Prints `prompt sent to w1 (through 1 node)`; fails with `no node is connected for this seat` when no connected node reports the seat |
+| `amail interrupt <seat>` | user token: stop the seat's current turn (Codex, dsh). For a Claude Code seat it fails with `Claude Code sessions have no structured interrupt; use the terminal` (`amail attach`, or the terminal link on the seat's web page); without a node, as `prompt` |
+
+Task lines and `amail task show` print `blocked-on-human (r12)` while a
+request on the task is open; `amail task take` and `amail task steal` of
+such a task fail with the server's `blocked_on_human` refusal (`t5 waits
+for the person's answer to r12`).
+
 ### Administration of an org (user token)
 
 | command | |
@@ -268,7 +294,8 @@ the database.
 
 `amail mcp` is an MCP server (stdio, newline-delimited JSON-RPC) in the
 same binary. It offers the mail, task and document commands, the handover
-note and the worklog as typed tools, so a harness can call them without a
+note, the worklog, requests for the person and the seat controls as typed
+tools, so a harness can call them without a
 shell command. The command line stays the
 documented interface: the hooks and the mail instructions name `amail`
 commands, and the MCP server is an addition to them.
@@ -332,6 +359,11 @@ JSON-RPC error.
 | `handover_show` | `seat?` (default: the caller), `rev?` | `GET /seats/{name}/handover` |
 | `handover_write` | `text` or `fields` (`{state, summary, next, waiting_on, traps, verify, pointers}`), `private?`, `session?` | `PUT /seats/{name}/handover` for the caller's seat. On `note_fields_missing` the text names the missing fields and gives the template |
 | `worklog` | `seat?` (default: the caller), `since?`, `task?`, `kind?`, `limit?`, `before?`, `summary?` | `GET /seats/{name}/worklog` |
+| `ask` | `title`, `body?`, `options[]?` (each `{key, label, description?}` or `"key:label[:description]"`), `free_text?`, `default?`, `class?`, `deadline?` (`2h` or seconds), `task?`, `kind?` (`question`, `plan`, `merge`) | `amail ask` without `--wait` (`source: "mcp"`): the tool answers at once, and its text tells the seat to stop; the answer comes as mail in the request's thread |
+| `requests` | `num?` (one request, as `amail request show`), `state?` (default `open`), `kind?`, `seat?`, `class?`, `task?`, `limit?` | `amail requests` (a seat's token: its own requests) |
+| `answer` | `num`, `option?` (number, key or label), `text?`, `note?`, `if_rev?` | `amail answer`; the user's seat only (other seats get the server's 403). A 409 `answered`, `stale` or `not_open` carries `request` |
+| `prompt_seat` | `seat`, `text` | `amail prompt`; the user's seat only |
+| `interrupt_seat` | `seat` | `amail interrupt`; the user's seat only |
 
 A task number is an integer or a string such as `"t12"`; a document is an
 integer, a string such as `"d12"`, or a slug, and `"d12#anchor"` names a

@@ -328,6 +328,35 @@ amail reply 4 -m "Yes: split on any Unicode whitespace."
 To be told about new entries while the tab is in the background, turn on
 **Admin → Settings → Notifications in this browser**.
 
+### Requests
+
+A worker that needs your decision on a fixed set of choices asks with
+`amail ask` (or the MCP tool `ask`) instead of plain mail:
+
+```sh
+amail ask "Split on Unicode whitespace?" -m "ASCII only breaks the tests in t4." \
+  --option yes:"Split on any Unicode whitespace" --option no:"Keep ASCII only" \
+  --default no --task t3
+# r1  question  soon  Split on Unicode whitespace?  (deadline 2026-10-29 14:00Z, then the default no)
+```
+
+The worker then stops its turn; task `t3` shows `blocked-on-human (r1)`
+until the request is answered. You get the request as mail with the
+subject `[r1] Split on Unicode whitespace?` and the options as numbered
+lines; it is listed first under **Needs you**. Answer it there, reply in
+its thread with the option's number, key or label on the first line, or
+from the command line:
+
+```sh
+amail requests                   # open requests, `now` first
+amail request show r1
+amail answer r1 1 -m "Use char::is_whitespace."
+```
+
+The answer is mailed to the worker in the request's thread and wakes it.
+If nobody answers by the deadline (4 hours for class `soon`), the request
+takes its default and the worker is told the same way.
+
 ## 8. Watch, pause, stop
 
 ```sh

@@ -311,6 +311,22 @@ The first public version.
   reports the seat, and `interrupt` 409 `no_structured_interrupt` for a
   Claude Code seat. Node commands gain the fields `text`, `request` and
   `action`.
+- Requests and seat controls, M10 phase B (command line and MCP):
+  `amail ask` (options as `--option key:label[:description]`, `--default`,
+  `--class`, `--deadline 2h`, `--task`, `--kind`; `--wait` long-polls
+  until the answer or the deadline and prints it), `amail answer r12
+  <option|text> [-m note] [--if-rev N]`, `amail withdraw r12 [-m note]`
+  (`amail withdraw <id> --from <seat>` still withdraws a message),
+  `amail requests` (open `now` first, with age, default and deadline;
+  filters by state, kind, seat, class and task), `amail request show r12`
+  (the options numbered as in the mail, the answer, the events, the
+  threads), `amail prompt <seat>` and `amail interrupt <seat>` (the 409s
+  in plain words). Task lines and `task show` print `blocked-on-human
+  (r12)`; `task take` and `task steal` of such a task print the server's
+  refusal. MCP tools `ask`, `requests`, `answer`, `prompt_seat` and
+  `interrupt_seat` (the last three for the user's seat); the MCP
+  instructions tell seats to use `ask` for the person's decisions and to
+  stop until the answer comes as mail.
 
 #### Running agents
 
@@ -323,8 +339,10 @@ The first public version.
   `task_history`, `task_steal`, `task_yield`, `task_keep`), the document
   tools (`doc_new`, `doc_show`, `doc_read`, `doc_write`, `doc_set`,
   `doc_search`, `doc_find`, `doc_list`, `doc_index`, `doc_history`,
-  `doc_split`, `doc_extract`, `doc_verify`, `doc_comment`) and
-  `handover_show`, `handover_write` and `worklog` as typed tools. Each answers the server's JSON with the
+  `doc_split`, `doc_extract`, `doc_verify`, `doc_comment`),
+  `handover_show`, `handover_write` and `worklog`, and the request tools
+  (`ask`, `requests`, `answer`, `prompt_seat`, `interrupt_seat`) as typed
+  tools. Each answers the server's JSON with the
   command's text rendering; API errors are tool errors with the server's
   code and message. The node registers it for the sessions it launches
   (Claude Code: `--mcp-config` and an allow rule for its tools; Codex:
