@@ -210,7 +210,7 @@ pub fn seat_line(s: &p::Seat) -> String {
     if let Some(p) = &s.presence {
         out.push_str(&format!(" state={}", l(&p.state.to_string())));
         if let Some(n) = p.waiting_for {
-            out.push_str(&format!(" waiting for r{n}"));
+            out.push_str(&format!(" waiting_for=r{n}"));
         }
         if p.wake_failed {
             out.push_str(" wake_failed");
@@ -684,7 +684,7 @@ mod tests {
         }))
         .unwrap();
         let s = seat_line(&seat);
-        assert!(s.contains(" state=dormant waiting for r12"), "{s}");
+        assert!(s.contains(" state=dormant waiting_for=r12"), "{s}");
     }
 
     #[test]
