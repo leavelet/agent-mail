@@ -1558,6 +1558,7 @@ mod tests {
             closed_at: None,
             steal_requested_by: None,
             steal_requested_at: None,
+            blocked_on_human: None,
             waits_on_ok: vec![11],
             rev: 3,
             progress: None,

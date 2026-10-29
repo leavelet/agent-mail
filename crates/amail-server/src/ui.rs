@@ -62,6 +62,7 @@ fn seat_items(presence: &HashMap<String, Presence>) -> Vec<AttentionItem> {
             wake_failed: p.wake_failed,
             turn_failed: p.turn_failed.clone(),
             preview: None,
+            request: None,
         })
         .collect()
 }
@@ -94,6 +95,7 @@ async fn attention_items(st: &AppState, auth: &Auth) -> ApiResult<Vec<AttentionI
             wake_failed: false,
             turn_failed: None,
             preview: Some(render::lead(&e.message.body, PREVIEW_CHARS)),
+            request: None,
         };
         if e.message.priority == Priority::Urgent {
             urgent.push(item);
@@ -105,7 +107,9 @@ async fn attention_items(st: &AppState, auth: &Auth) -> ApiResult<Vec<AttentionI
     // Timestamps are RFC 3339 in UTC with a fixed format, so they sort as
     // strings.
     seats.sort_by(|a, b| (&a.since, &a.seat).cmp(&(&b.since, &b.seat)));
-    let mut items = urgent;
+    // Open requests first, then the entries as before.
+    let mut items = crate::requests::attention_items(st, auth.org.id).await?;
+    items.append(&mut urgent);
     items.append(&mut seats);
     items.append(&mut normal);
     Ok(items)
@@ -501,6 +505,7 @@ async fn seat_op(
             .get(auth.org.id, &seat.name)
             .await?
             .and_then(|p| p.node),
+        ..Default::default()
     };
     let nodes = st.nodes.send(auth.org.id, cmd);
     if nodes == 0 {

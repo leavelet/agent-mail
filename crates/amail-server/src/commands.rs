@@ -197,6 +197,7 @@ mod tests {
             lease_ms: None,
             backfill: None,
             node: None,
+            ..Default::default()
         };
         assert_eq!(hub.send(1, cmd.clone()), 0);
         let (mut rx, conn) = hub.connect(1);

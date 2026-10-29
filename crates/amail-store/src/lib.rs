@@ -18,6 +18,8 @@ mod tasks;
 mod docs;
 #[macro_use]
 mod handover;
+#[macro_use]
+mod requests;
 mod model;
 mod postgres;
 mod sqlite;
@@ -28,6 +30,10 @@ pub use handover::{
     WorklogSummaryRec,
 };
 pub use model::*;
+pub use requests::{
+    NewRequestRec, RequestAnswerRec, RequestBounds, RequestEventRec, RequestQuery, RequestRec,
+    RequestsDue,
+};
 
 /// How long a claim's idempotency key is kept: a retried claim with the
 /// key returns what the first one took, and the claim can be released
@@ -958,4 +964,88 @@ pub trait Store: Send + Sync + 'static {
     /// Delete worklog entries older than `cutoff` (at most `limit`); the
     /// number deleted.
     async fn expire_worklog(&self, cutoff: i64, limit: i64) -> Result<u64>;
+
+    // --- requests for the person (see `requests.rs`) ------------------------------
+    //
+    // Writes take the org's row, record events, charge the org's
+    // `request_bytes` and are refused with `StoreError::Refused` (a code
+    // and a message) when they break a rule.
+
+    /// Create a request with the next number of the org (and its `created`
+    /// event). Refused over the format rules (`title_empty`,
+    /// `title_too_long`, `invalid_title`, `body_too_large`,
+    /// `options_count`, `invalid_option_key`, `duplicate_option`,
+    /// `invalid_option_label`, `option_label_too_long`,
+    /// `option_description_too_long`, `invalid_default`,
+    /// `free_text_not_allowed`) and the bounds (`too_many_open_requests`,
+    /// `request_rate`). An `attention` request for a seat and code with a
+    /// live request answers that one (true: it existed).
+    async fn create_request(&self, r: &NewRequestRec) -> Result<(RequestRec, bool)>;
+    async fn request(&self, org_id: i64, num: i64) -> Result<Option<RequestRec>>;
+    /// The newest `limit` events, oldest first.
+    async fn request_events(
+        &self,
+        org_id: i64,
+        num: i64,
+        limit: i64,
+    ) -> Result<Vec<RequestEventRec>>;
+    /// Threads other than its own that name the request.
+    async fn request_threads(&self, org_id: i64, num: i64) -> Result<Vec<i64>>;
+    /// Requests by [`RequestQuery`]: open ones first (`now`, `soon`,
+    /// `later`, oldest first), then the others, newest first; true when
+    /// cut at the limit.
+    async fn requests(&self, q: &RequestQuery) -> Result<(Vec<RequestRec>, bool)>;
+    /// Record the request's mail thread and its first message.
+    async fn set_request_thread(
+        &self,
+        org_id: i64,
+        num: i64,
+        thread_id: i64,
+        message_id: i64,
+    ) -> Result<()>;
+    /// Answer an open request. Refused with `answered` (answered or
+    /// expired already: the caller shows the first answer), `not_open`
+    /// (withdrawn or superseded), `stale` (`if_rev` differs),
+    /// `invalid_option`, `free_text_not_allowed`, `answer_required`,
+    /// `answer_too_long`, `note_too_long`.
+    async fn answer_request(&self, a: &RequestAnswerRec) -> Result<RequestRec>;
+    /// Withdraw an open request (`not_open` otherwise).
+    async fn withdraw_request(
+        &self,
+        org_id: i64,
+        num: i64,
+        actor: &str,
+        note: Option<&str>,
+    ) -> Result<RequestRec>;
+    /// Record an event that changes nothing else (`commented`, `mailed`);
+    /// `None`: no such request.
+    async fn record_request_event(
+        &self,
+        org_id: i64,
+        num: i64,
+        actor: Option<&str>,
+        kind: amail_proto::RequestEventKind,
+        note: Option<&str>,
+        message_id: Option<i64>,
+    ) -> Result<Option<RequestRec>>;
+    /// Link a thread that names the request (`[r12]`); false when nothing
+    /// was linked (linked already, the request's own thread, no request).
+    async fn link_request_thread(
+        &self,
+        org_id: i64,
+        num: i64,
+        thread_id: i64,
+        actor: Option<&str>,
+        note: &str,
+    ) -> Result<bool>;
+    /// Requests whose own thread this is.
+    async fn thread_requests(&self, org_id: i64, thread_id: i64) -> Result<Vec<RequestRec>>;
+    /// The deadline pass (see [`RequestsDue`]).
+    async fn claim_due_requests(&self, now: i64, limit: i64) -> Result<RequestsDue>;
+    /// The org's `attention` requests whose condition the node still
+    /// reports.
+    async fn live_attention_requests(&self, org_id: i64) -> Result<Vec<RequestRec>>;
+    /// The node reports an `attention` request's condition gone: it is no
+    /// longer live and, if open, withdrawn by `node`.
+    async fn end_attention_request(&self, org_id: i64, num: i64) -> Result<Option<RequestRec>>;
 }

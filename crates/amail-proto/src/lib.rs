@@ -52,6 +52,8 @@ mod docs;
 pub use docs::*;
 mod handover;
 pub use handover::*;
+mod requests;
+pub use requests::*;
 
 string_enum!(
     /// Kind of seat. Every org has exactly one `user` seat, and one hidden
@@ -1316,6 +1318,10 @@ pub struct OrgInfo {
     /// the storage quota with `stored_bytes` and `task_bytes`.
     #[serde(default)]
     pub doc_bytes: i64,
+    /// Bytes of the org's requests for the person and their events,
+    /// counted against the storage quota with the others.
+    #[serde(default)]
+    pub request_bytes: i64,
     /// A one-time notice for the user (user tokens), for example that an
     /// upgrade closed what links used to open; cleared with
     /// `DELETE /v1/org/notice`.
@@ -1955,8 +1961,9 @@ pub struct CountsResponse {
 string_enum!(
     /// Why an entry is in the user's "needs you" queue: an acknowledgement
     /// asked, mail to answer, a seat that needs a person, or a notice from
-    /// the server (read it; it asks for nothing).
-    AttentionKind { Ack => "ack", Reply => "reply", Seat => "seat", Notice => "notice" }
+    /// the server (read it; it asks for nothing), or an open request for
+    /// the person (M10; listed first).
+    AttentionKind { Ack => "ack", Reply => "reply", Seat => "seat", Notice => "notice", Request => "request" }
 );
 
 /// One entry of `GET /v1/attention`.
@@ -1985,9 +1992,13 @@ pub struct AttentionItem {
     /// The seat's last turn failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_failed: Option<TurnFailure>,
-    /// The beginning of `message`'s body, its lines joined.
+    /// The beginning of `message`'s body (or the request's), its lines
+    /// joined.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
+    /// `request`: the open request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<Box<Request>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2035,9 +2046,28 @@ pub struct SeatOpResponse {
 
 /// A command for the node hosting `seat`. Nodes ignore unknown ops and
 /// seats they do not host.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// The ops:
+///
+/// - `transcript`: forward the seat's conversation (`lease_ms`,
+///   `backfill`).
+/// - `sleep`, `wake`: put the seat to sleep, start it.
+/// - `prompt` (M10): give the seat `text` as a prompt from the user,
+///   through the harness's structured interface (Claude Code: the inbox
+///   socket; Codex: `thread/queue/add` after the daemon check of the wake
+///   path; dsh: `session/prompt`). The server recorded it in the seat's
+///   worklog and the mail archive before sending.
+/// - `interrupt` (M10): stop the seat's current turn (Codex:
+///   `turn/interrupt`; dsh: `session/cancel`). A Claude Code seat has no
+///   structured interrupt: the node leaves it alone (the web offers the
+///   terminal instead).
+/// - `attention_action` (M10): the user answered the seat's `attention`
+///   request `request` with `action`: `restart` (restart the seat's
+///   session) or `sleep`. (`open_terminal` and `dismiss` send nothing.)
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeCommand {
-    /// `transcript`, `sleep` or `wake`.
+    /// `transcript`, `sleep`, `wake`, `prompt`, `interrupt` or
+    /// `attention_action`.
     pub op: String,
     pub seat: String,
     /// `transcript`: forward until this many milliseconds from now.
@@ -2050,6 +2080,15 @@ pub struct NodeCommand {
     /// nodes ignore the command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
+    /// `prompt`: the text to give the seat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// `attention_action`: the request's number.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<i64>,
+    /// `attention_action`: `restart` or `sleep`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

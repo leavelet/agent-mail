@@ -122,6 +122,7 @@ pub fn task_out(t: &TaskRec) -> p::Task {
         import_key: t.import_key.clone(),
         steal_requested_by: t.steal_requested_by.clone(),
         steal_requested_at: t.steal_requested_at.map(render::ts),
+        blocked_on_human: t.blocked_on_human,
         created_at: render::ts(t.created_at),
         updated_at: render::ts(t.updated_at),
         closed_at: t.closed_at.map(render::ts),
@@ -400,6 +401,9 @@ fn store_err(st: &AppState, e: StoreError) -> ApiError {
             ApiError::new(StatusCode::CONFLICT, "children_open", m)
         }
         StoreError::Refused("stale", m) => ApiError::new(StatusCode::CONFLICT, "stale", m),
+        StoreError::Refused("blocked_on_human", m) => {
+            ApiError::new(StatusCode::CONFLICT, "blocked_on_human", m)
+        }
         StoreError::Refused(code, m) => ApiError::unprocessable(code, m),
         StoreError::StorageQuota(stored) => {
             let mut e = ApiError::storage_quota(stored, st.config.limits.org_storage_bytes);
@@ -1166,6 +1170,7 @@ pub async fn next(
             states: vec![TaskState::Ready],
             assignee_id: Some(Some(me.id)),
             pool_team_id: pool_team,
+            skip_blocked_on_human: true,
             limit: q.limit.unwrap_or(50).clamp(1, MAX_TASK_PAGE),
             order: TaskOrder::Priority,
             ..Default::default()
@@ -1678,6 +1683,7 @@ pub async fn after_send(
 pub enum About {
     Task(TaskRec),
     Doc(amail_store::DocRec),
+    Request(amail_store::RequestRec),
 }
 
 impl About {
@@ -1686,6 +1692,7 @@ impl About {
         match self {
             About::Task(t) => ('t', t.id),
             About::Doc(d) => ('d', d.id),
+            About::Request(r) => ('r', r.id),
         }
     }
 }
@@ -1698,7 +1705,8 @@ pub struct Reminder {
     /// Tasks: `assigned`, `unblocked`, `waiting`, `closed`, `urgent`,
     /// `stale`, `due`, `steal`, `steal_declined`, `steal_expired`,
     /// `children_done`, `blocker_rejected`. Documents: `revised`,
-    /// `supplemented`, `superseded`, `expired`, `dangling`.
+    /// `supplemented`, `superseded`, `expired`, `dangling`. Requests:
+    /// `request`.
     pub(crate) kind: &'static str,
     pub(crate) about: About,
     pub(crate) line: String,
@@ -1715,6 +1723,25 @@ impl Reminder {
             seat,
             kind,
             about: About::Task(task.clone()),
+            line,
+            cc: None,
+            extra: None,
+        }
+    }
+
+    /// A reminder about a request for the person.
+    pub fn request(
+        seat_id: i64,
+        seat: String,
+        kind: &'static str,
+        r: &amail_store::RequestRec,
+        line: String,
+    ) -> Self {
+        Reminder {
+            seat_id,
+            seat,
+            kind,
+            about: About::Request(r.clone()),
             line,
             cc: None,
             extra: None,
@@ -1896,6 +1923,10 @@ fn reminder_body(org: &Org, rs: &[&Reminder]) -> String {
                 body.push_str(&crate::docs::reminder_block(d));
                 continue;
             }
+            About::Request(r) => {
+                body.push_str(&crate::requests::reminder_block(r));
+                continue;
+            }
         };
         body.push_str(&format!(
             "\nt{}: {}\nState: {}  Priority: {}  Assignee: {}",
@@ -1928,7 +1959,7 @@ fn reminder_body(org: &Org, rs: &[&Reminder]) -> String {
         body.push_str(&format!("\nShow it: amail task show t{}\n", t.num));
     }
     body.push_str(&format!(
-        "\nThis is a reminder about the tasks and documents of org {}; the mail system sent it.\n",
+        "\nThis is a reminder about the tasks, documents and requests of org {}; the mail system sent it.\n",
         org.name
     ));
     body
@@ -2084,6 +2115,8 @@ pub async fn remind(st: &AppState, org: &Org, actor: Option<i64>, list: Vec<Remi
                     }
                     crate::docs::publish(st, org.id, d.num, "reminder", &[]);
                 }
+                // The deadline pass recorded the reminder when it claimed it.
+                About::Request(_) => {}
             }
         }
     }
@@ -2170,6 +2203,9 @@ pub async fn scan(st: &AppState) -> amail_store::Result<()> {
         by_org.entry(t.org_id).or_default().push(r);
     }
     for (org_id, r) in crate::docs::due_reminders(st, now).await? {
+        by_org.entry(org_id).or_default().push(r);
+    }
+    for (org_id, r) in crate::requests::due_reminders(st, now).await? {
         by_org.entry(org_id).or_default().push(r);
     }
     for (org_id, rs) in by_org {

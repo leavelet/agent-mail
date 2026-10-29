@@ -756,7 +756,7 @@ macro_rules! impl_doc_queries {
                 }
                 let ok: Option<i64> = sqlx::query_scalar(
                     "UPDATE orgs SET doc_bytes = doc_bytes + $1 WHERE id = $2 \
-                     AND ($1 <= 0 OR CAST($3 AS BIGINT) IS NULL OR stored_bytes + task_bytes + doc_bytes + $1 <= $3) RETURNING id",
+                     AND ($1 <= 0 OR CAST($3 AS BIGINT) IS NULL OR stored_bytes + task_bytes + doc_bytes + request_bytes + $1 <= $3) RETURNING id",
                 )
                 .bind(delta)
                 .bind(org_id)
@@ -764,7 +764,7 @@ macro_rules! impl_doc_queries {
                 .fetch_optional(&mut *c)
                 .await?;
                 if ok.is_none() {
-                    let stored: i64 = sqlx::query_scalar("SELECT stored_bytes + task_bytes + doc_bytes FROM orgs WHERE id = $1")
+                    let stored: i64 = sqlx::query_scalar("SELECT stored_bytes + task_bytes + doc_bytes + request_bytes FROM orgs WHERE id = $1")
                         .bind(org_id)
                         .fetch_one(&mut *c)
                         .await?;

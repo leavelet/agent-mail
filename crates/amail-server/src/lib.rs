@@ -8,6 +8,7 @@ mod boundary;
 pub mod cluster;
 pub mod commands;
 pub mod config;
+mod controls;
 mod deletion;
 mod directory;
 pub mod dirwatch;
@@ -26,6 +27,7 @@ pub mod peer;
 pub mod presence;
 pub mod public;
 mod render;
+pub mod requests;
 mod revoke;
 mod send;
 pub mod tasks;
@@ -72,6 +74,8 @@ pub struct AppState {
     pub tasks: Arc<tasks::TaskHub>,
     /// Document changes, for `doc` events.
     pub docs: Arc<docs::DocHub>,
+    /// Request changes, for `request` events and waits.
+    pub requests: Arc<requests::RequestHub>,
 }
 
 impl AppState {
@@ -95,6 +99,7 @@ impl AppState {
             directory: Arc::new(dirwatch::DirectoryHub::default()),
             tasks: Arc::new(tasks::TaskHub::default()),
             docs: Arc::new(docs::DocHub::default()),
+            requests: Arc::new(requests::RequestHub::default()),
         }
     }
 
@@ -290,6 +295,13 @@ pub fn router(state: AppState) -> Router {
         .route("/docs/{num}/diff", get(docs::diff))
         .route("/docs/{num}/links", get(docs::links))
         .route("/docs/{num}/comment", post(docs::comment))
+        .route("/requests", get(requests::list).post(requests::create))
+        .route("/requests/{num}", get(requests::get))
+        .route("/requests/{num}/answer", post(requests::answer))
+        .route("/requests/{num}/withdraw", post(requests::withdraw))
+        .route("/requests/{num}/wait", get(requests::wait))
+        .route("/seats/{name}/prompt", post(controls::prompt))
+        .route("/seats/{name}/interrupt", post(controls::interrupt))
         .route("/inbox", get(mail::inbox))
         .route("/inbox/read", post(ui::mark_inbox_read))
         .route("/claim", post(mail::claim))

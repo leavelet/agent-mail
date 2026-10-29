@@ -49,6 +49,9 @@ pub struct Org {
     /// Bytes of the org's documents, counted against the storage quota
     /// with `stored_bytes` and `task_bytes`.
     pub doc_bytes: i64,
+    /// Bytes of the org's requests for the person (and their events),
+    /// counted against the storage quota with the others.
+    pub request_bytes: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -752,6 +755,9 @@ pub struct TaskRec {
     pub result_at: Option<i64>,
     /// The id of the record the task was imported from.
     pub import_key: Option<String>,
+    /// The number of the oldest open request for the person on the task
+    /// (derived from `requests`, not stored on the task).
+    pub blocked_on_human: Option<i64>,
 }
 
 impl TaskRec {
@@ -945,6 +951,8 @@ pub struct TaskQuery {
     pub result: Option<Option<TaskResult>>,
     /// The task imported from the record with this id.
     pub import_key: Option<String>,
+    /// Leave out tasks with an open request for the person.
+    pub skip_blocked_on_human: bool,
 }
 
 /// The order of [`TaskQuery`].

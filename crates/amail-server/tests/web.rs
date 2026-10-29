@@ -690,6 +690,15 @@ async fn webhook_on_user_mail(srv: Server) {
     assert!(bad_got.lock().unwrap().is_empty());
 }
 
+/// `GET /attention` without its request entries (M10 lists open requests
+/// first; the tests here are about the entries after them).
+fn no_requests(mut v: Value) -> Value {
+    if let Some(a) = v["items"].as_array_mut() {
+        a.retain(|i| i["kind"] != "request");
+    }
+    v
+}
+
 async fn attention_overview_counts(srv: Server) {
     let user = srv.org("acme").await;
     let a = user.seat("a").await;
@@ -737,6 +746,17 @@ async fn attention_overview_counts(srv: Server) {
     .await;
 
     let v = user.ok(Method::GET, "/attention", None).await;
+    // Open requests for the person come first: here the two seats' attention
+    // requests (M10). The entries after them are as before.
+    let kinds: Vec<&str> = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .take(2)
+        .map(|i| i["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, vec!["request", "request"]);
+    let v = no_requests(v);
     assert_eq!(
         items(&v),
         vec![
@@ -765,20 +785,20 @@ async fn attention_overview_counts(srv: Server) {
     .await;
     user.ok(Method::POST, &format!("/messages/{fyi}/read"), None)
         .await;
-    let v = user.ok(Method::GET, "/attention", None).await;
+    let v = no_requests(user.ok(Method::GET, "/attention", None).await);
     let names: Vec<String> = items(&v).into_iter().map(|x| x.1).collect();
     assert_eq!(names, vec!["on fire", "a", "b", "please confirm"]);
     let confirm = v["items"][3]["message"]["id"].as_i64().unwrap();
     user.ok(Method::GET, &format!("/messages/{confirm}"), None)
         .await;
     assert_eq!(
-        items(&user.ok(Method::GET, "/attention", None).await).len(),
+        items(&no_requests(user.ok(Method::GET, "/attention", None).await)).len(),
         4
     );
     user.ok(Method::POST, &format!("/messages/{confirm}/ack"), None)
         .await;
     assert_eq!(
-        items(&user.ok(Method::GET, "/attention", None).await).len(),
+        items(&no_requests(user.ok(Method::GET, "/attention", None).await)).len(),
         3
     );
 
@@ -816,7 +836,8 @@ async fn attention_overview_counts(srv: Server) {
     assert_eq!(o["wake_failed"], 1);
     assert_eq!(o["mail_last_hour"], 9);
     assert_eq!(o["mail_last_day"], 9);
-    assert_eq!(o["attention"], 3);
+    // Three entries and the two seats' attention requests.
+    assert_eq!(o["attention"], 5);
     assert_eq!(o["user_unread"], 3);
 
     // Counts per seat.

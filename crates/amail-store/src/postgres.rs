@@ -257,7 +257,7 @@ impl PgStore {
                 let added: Option<i64> = sqlx::query_scalar(
                     "UPDATE orgs SET stored_bytes = stored_bytes + $1 \
                      WHERE id = $2 AND deleted_at IS NULL \
-                     AND ($3::bigint IS NULL OR stored_bytes + task_bytes + doc_bytes + $1 <= $3) RETURNING id",
+                     AND ($3::bigint IS NULL OR stored_bytes + task_bytes + doc_bytes + request_bytes + $1 <= $3) RETURNING id",
                 )
                 .bind(bytes)
                 .bind(m.org_id)

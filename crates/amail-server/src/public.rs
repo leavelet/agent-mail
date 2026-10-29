@@ -281,6 +281,7 @@ pub fn close_org(st: &AppState, org_id: i64) {
     st.directory.close_org(org_id);
     st.tasks.close_org(org_id);
     st.docs.close_org(org_id);
+    st.requests.close_org(org_id);
     st.nodes.close_org(org_id);
     st.mirror.close_org(org_id);
 }

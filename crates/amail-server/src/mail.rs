@@ -637,6 +637,21 @@ pub async fn events(
     } else {
         stream::empty().boxed()
     };
+    // User tokens also get `request` events (a request for the person
+    // changed).
+    let request_events = if auth.scope == TokenScope::User {
+        BroadcastStream::new(st.requests.subscribe(auth.org.id))
+            .filter_map(|r| {
+                std::future::ready(r.ok().map(|t| {
+                    Event::default()
+                        .event("request")
+                        .data(serde_json::to_string(&t).unwrap_or_default())
+                }))
+            })
+            .boxed()
+    } else {
+        stream::empty().boxed()
+    };
     // Node tokens also get `command` events (sleep, wake, transcript leases);
     // while the stream is open the node counts as connected.
     let commands = if auth.scope == TokenScope::Node {
@@ -662,7 +677,10 @@ pub async fn events(
         .chain(stream::once(std::future::ready(None)));
     let others = stream::select(
         stream::select(presence, commands),
-        stream::select(user_events, stream::select(task_events, doc_events)),
+        stream::select(
+            stream::select(user_events, request_events),
+            stream::select(task_events, doc_events),
+        ),
     )
     .map(Some);
     let stream = stream::select(mailbox, others)
