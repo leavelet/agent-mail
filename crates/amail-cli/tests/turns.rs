@@ -41,6 +41,7 @@ turn_tests!(
     codex_metadata_error_recovers_only_proven_completion,
     codex_restart_holds_failed_surviving_session,
     codex_wake_asks_the_daemon_first,
+    codex_prompt_and_interrupt,
 );
 
 fn claude(name: &str) -> Value {
@@ -353,8 +354,10 @@ async fn session_ending_mid_turn_is_a_failure(b: Backend) {
 }
 
 /// A stand-in for the Codex app-server's control socket that answers
-/// `thread/turns/list` with the turns set by the test.
+/// `thread/turns/list` with the turns set by the test, and records every
+/// request (`requests`).
 struct FakeAppServer {
+    requests: Arc<Mutex<Vec<Value>>>,
     turns: Arc<Mutex<Value>>,
     calls: Arc<Mutex<usize>>,
     history_error: Arc<Mutex<Option<Value>>>,
@@ -385,6 +388,8 @@ impl FakeAppServer {
         let history_error = Arc::new(Mutex::new(None::<Value>));
         let thread = Arc::new(Mutex::new(json!({})));
         let queue = Arc::new(Mutex::new(json!({"data":[],"nextCursor":null})));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let r2 = requests.clone();
         let (t2, c2, e2, th2, q2) = (
             turns.clone(),
             calls.clone(),
@@ -399,6 +404,7 @@ impl FakeAppServer {
                 };
                 let (turns, calls, history_error, thread, queue) =
                     (t2.clone(), c2.clone(), e2.clone(), th2.clone(), q2.clone());
+                let requests = r2.clone();
                 tokio::spawn(async move {
                     // Handshake: read the request, answer 101.
                     let mut hdr = Vec::new();
@@ -440,6 +446,7 @@ impl FakeAppServer {
                         let Ok(req) = serde_json::from_slice::<Value>(&data) else {
                             continue;
                         };
+                        requests.lock().unwrap().push(req.clone());
                         let Some(id) = req.get("id").cloned() else {
                             continue;
                         };
@@ -480,6 +487,7 @@ impl FakeAppServer {
             }
         });
         FakeAppServer {
+            requests,
             turns,
             calls,
             history_error,
@@ -491,6 +499,16 @@ impl FakeAppServer {
 
     fn set(&self, turns: Value) {
         *self.turns.lock().unwrap() = turns;
+    }
+
+    /// The methods of the requests received so far, in order.
+    fn methods(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r["method"].as_str().map(str::to_string))
+            .collect()
     }
 }
 
@@ -933,5 +951,154 @@ async fn codex_wake_asks_the_daemon_first(b: Backend) {
             "queue --thread {sid} --message [amail] You have new mail (wake #"
         )),
         "{call}"
+    );
+}
+
+/// The web controls of a Codex seat: a prompt from the user goes to the
+/// thread with `codex queue` after the node asked the daemon (as a wake-up
+/// does), also while a turn runs; an interrupt is `turn/interrupt` on the
+/// turn in progress, and the node ends the seat's turn.
+async fn codex_prompt_and_interrupt(b: Backend) {
+    let Some(h) = Harness::start(b, "codex_prompt_and_interrupt", opts(150, false)).await else {
+        return;
+    };
+    h.seat("cx", "codex").await;
+    let home = h.dir.path().join("state/codex-home");
+    let app = FakeAppServer::start(&home.join("app-server-control/app-server-control.sock"));
+    let sid = "00000000-0000-7000-8000-00000000c0e1";
+    *app.thread.lock().unwrap() = json!({"thread":{"id":sid,"status":{"type":"active"}}});
+    let cwd = h.dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let plan = h
+        .node
+        .as_ref()
+        .unwrap()
+        .node
+        .handle(amail_node::wire::Request::Launch {
+            seat: "cx".into(),
+            cwd: cwd.to_string_lossy().into(),
+            pid: std::process::id(),
+            harness: None,
+            extra: vec![],
+            pane: None,
+            mux_session: None,
+            permission_mode: Some(amail_proto::PermissionMode::Unattended),
+            git_access: None,
+            dsh_jail: None,
+            session: None,
+        })
+        .await;
+    assert!(plan.get("error").is_none(), "{plan}");
+    let args: Vec<String> = serde_json::from_value(plan["args"].clone()).unwrap();
+    let env = vec![
+        (
+            "CODEX_HOME".to_string(),
+            home.to_string_lossy().into_owned(),
+        ),
+        (
+            "AMAIL_CODEX_PASS".to_string(),
+            plan["env"]["AMAIL_CODEX_PASS"].as_str().unwrap().into(),
+        ),
+    ];
+    let hook = |name: &str, extra: &[(&str, Value)]| {
+        let mut fields = vec![("session_id", json!(sid))];
+        fields.extend(extra.iter().cloned());
+        with(fixture("codex", name), &fields)
+    };
+    h.hook(
+        "codex",
+        env.clone(),
+        hook(
+            "UserPromptSubmit",
+            &[("prompt", json!(args.last().unwrap()))],
+        ),
+    )
+    .await;
+    assert_eq!(h.state("cx").await, "busy");
+    h.wait("presence with a node", || async {
+        let p = &h.api.get("/seats/cx").await["presence"];
+        p["state"] == "busy" && p["node_connected"] == true
+    })
+    .await;
+
+    // A prompt while the daemon reports a running turn: queued all the same.
+    let text = "Stop after the current test and report.";
+    h.api
+        .post("/seats/cx/prompt", json!({ "text": text }))
+        .await;
+    let queued = || {
+        h.codex_calls()
+            .into_iter()
+            .filter(|c| c.starts_with("queue"))
+            .collect::<Vec<_>>()
+    };
+    h.wait("codex queue", || async { !queued().is_empty() })
+        .await;
+    assert_eq!(
+        queued(),
+        vec![format!("queue --thread {sid} --message {text}")]
+    );
+    let methods = app.methods();
+    assert!(
+        methods.iter().any(|m| m == "thread/read"),
+        "the daemon is asked first: {methods:?}"
+    );
+    let delivered = node_worklog(&h, "cx", "prompt").await;
+    assert!(
+        delivered[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("codex queue"),
+        "{delivered:?}"
+    );
+
+    // Interrupt: `turn/interrupt` on the turn in progress.
+    app.set(json!([
+        {"id": "turn-2", "status": "inProgress", "startedAt": 2},
+        {"id": "turn-1", "status": "completed", "startedAt": 1},
+    ]));
+    h.api.post("/seats/cx/interrupt", json!({})).await;
+    h.wait("turn/interrupt", || async {
+        app.methods().iter().any(|m| m == "turn/interrupt")
+    })
+    .await;
+    let call = app
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r["method"] == "turn/interrupt")
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        call["params"],
+        json!({"threadId": sid, "turnId": "turn-2"}),
+        "{call}"
+    );
+    h.wait("idle after the interrupt", || async {
+        h.state("cx").await == "idle"
+    })
+    .await;
+    let entries = node_worklog(&h, "cx", "interrupt").await;
+    assert_eq!(
+        entries[0]["text"], "the running turn was interrupted (codex)",
+        "{entries:?}"
+    );
+
+    // Nothing running: nothing is interrupted, and the node says so.
+    app.set(json!([{"id": "turn-2", "status": "interrupted", "startedAt": 2}]));
+    h.api.post("/seats/cx/interrupt", json!({})).await;
+    h.wait("the second interrupt recorded", || async {
+        node_worklog(&h, "cx", "interrupt").await.len() == 2
+    })
+    .await;
+    let entries = node_worklog(&h, "cx", "interrupt").await;
+    assert_eq!(entries[1]["text"], "not interrupted: no turn was running");
+    assert_eq!(
+        app.methods()
+            .iter()
+            .filter(|m| *m == "turn/interrupt")
+            .count(),
+        1
     );
 }

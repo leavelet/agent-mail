@@ -59,6 +59,8 @@ node_tests!(
     run_adopts_a_session,
     session_start_shows_open_tasks,
     refused_pending_counts_are_not_retried,
+    prompt_from_the_user_reaches_claude,
+    asking_seat_waits_for_the_answer,
 );
 
 use amail_store::testutil::Backend;
@@ -3182,4 +3184,167 @@ async fn refused_pending_counts_are_not_retried(b: Backend) {
         counter.load(std::sync::atomic::Ordering::SeqCst) - before,
         asked
     );
+}
+
+/// A prompt from the user (`POST /seats/{name}/prompt`) reaches a Claude
+/// Code session through its inbox socket with the user's text. It is not a
+/// wake-up: the node waits for no confirmation, and the turn it starts is
+/// an ordinary turn. The node records that it delivered the prompt.
+async fn prompt_from_the_user_reaches_claude(b: Backend) {
+    let Some(h) = setup(b, "prompt_from_the_user_reaches_claude", Opts::default()).await else {
+        return;
+    };
+    h.seat("w1", "claude").await;
+    let inbox = FakeInbox::start(h.dir.path().join("cc.sock"), None);
+    let env = claude_env("w1", &inbox.path);
+    h.hook("claude", env.clone(), claude("SessionStart")).await;
+    h.wait("presence with a node", || async {
+        let p = &h.api.get("/seats/w1").await["presence"];
+        p["state"] == "idle" && p["node_connected"] == true
+    })
+    .await;
+    let text = "Please look at the failing test in t3.";
+    let r = h
+        .api
+        .post("/seats/w1/prompt", json!({ "text": text }))
+        .await;
+    assert_eq!(r["queued"], true, "{r}");
+    h.wait("the prompt on the inbox socket", || async {
+        inbox.count() == 1
+    })
+    .await;
+    let line: Value = serde_json::from_str(&inbox.lines.lock().unwrap()[0]).unwrap();
+    let content = line["message"]["content"].as_str().unwrap();
+    assert!(content.contains(text), "{content}");
+    assert!(!content.contains("You have new mail"), "{content}");
+    // Not a wake-up: nothing waits for its confirmation.
+    let s = h.seat_status("w1").await;
+    assert_eq!(s["wakes"], 0, "{s}");
+    assert!(s["wake_unconfirmed"].is_null(), "{s}");
+    // The session starts a turn on it: an ordinary turn.
+    let v = h
+        .hook(
+            "claude",
+            env.clone(),
+            with(claude("UserPromptSubmit"), &[("prompt", json!(text))]),
+        )
+        .await;
+    assert!(
+        hook_text(&v).is_none_or(|t| !t.contains("Nothing is waiting for you")),
+        "{v}"
+    );
+    assert_eq!(h.state("w1").await, "busy");
+    h.hook("claude", env.clone(), claude("Stop")).await;
+    let delivered = node_worklog(&h, "w1", "prompt").await;
+    assert!(
+        delivered[0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Claude Code inbox socket"),
+        "{delivered:?}"
+    );
+    let starts = node_worklog(&h, "w1", "turn_start").await;
+    assert!(
+        starts.iter().all(|e| e["text"] == "turn started"),
+        "{starts:?}"
+    );
+    // The server refuses an interrupt for Claude Code (the terminal is the
+    // way); nothing reaches the session.
+    let resp = h
+        .api
+        .http
+        .post(format!("{}/v1/seats/w1/interrupt", h.api.base))
+        .bearer_auth(&h.api.token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    assert_eq!(inbox.count(), 1);
+}
+
+/// A seat that asks the person (`amail ask`) and ends its turn while the
+/// request is open is marked as waiting for it, in the node and in
+/// presence. The answer is mail `To` the seat: it wakes the seat, and the
+/// turn that starts clears the mark. A turn without `ask` does not look.
+async fn asking_seat_waits_for_the_answer(b: Backend) {
+    let Some(h) = setup(b, "asking_seat_waits_for_the_answer", Opts::default()).await else {
+        return;
+    };
+    let w1 = h.seat("w1", "claude").await;
+    let inbox = FakeInbox::start(h.dir.path().join("cc.sock"), None);
+    let env = claude_env("w1", &inbox.path);
+    h.hook("claude", env.clone(), claude("SessionStart")).await;
+    h.hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    let r = w1
+        .post(
+            "/requests",
+            json!({"title": "Ship the release?", "options": [
+                {"key": "yes", "label": "Ship it"}, {"key": "no", "label": "Hold it"}],
+                "default": "no"}),
+        )
+        .await;
+    let num = r["request"]["num"].as_i64().unwrap();
+    let ask = with(
+        claude("PostToolUse"),
+        &[(
+            "tool_input",
+            json!({"command": "amail ask 'Ship the release?' --option yes:'Ship it' --option no:'Hold it' --default no"}),
+        )],
+    );
+    h.hook("claude", env.clone(), ask).await;
+    h.hook("claude", env.clone(), claude("Stop")).await;
+    assert_eq!(h.state("w1").await, "idle");
+    h.wait("waiting for the request", || async {
+        h.seat_status("w1").await["waiting_for"] == num
+    })
+    .await;
+    h.wait("presence waiting_for", || async {
+        h.api.get("/seats/w1").await["presence"]["waiting_for"] == num
+    })
+    .await;
+    let waiting = node_worklog(&h, "w1", "waiting").await;
+    assert_eq!(
+        waiting[0]["text"],
+        format!("waits for the answer to r{num}"),
+        "{waiting:?}"
+    );
+
+    // The person answers: mail to the seat wakes it, and its turn clears
+    // the mark.
+    h.api
+        .post(&format!("/requests/{num}/answer"), json!({"option": "yes"}))
+        .await;
+    h.wait("wake-up for the answer", || async { inbox.count() == 1 })
+        .await;
+    let v = h
+        .hook(
+            "claude",
+            env.clone(),
+            with(
+                claude("UserPromptSubmit"),
+                &[("prompt", json!("[amail] You have new mail (wake #1)."))],
+            ),
+        )
+        .await;
+    assert!(hook_text(&v).unwrap().contains("Ship the release?"), "{v}");
+    assert!(h.seat_status("w1").await["waiting_for"].is_null());
+    h.wait("presence without waiting_for", || async {
+        h.api.get("/seats/w1").await["presence"]["waiting_for"].is_null()
+    })
+    .await;
+    h.hook("claude", env.clone(), claude("Stop")).await;
+
+    // An open request alone, from a turn that did not ask: no mark.
+    w1.post(
+        "/requests",
+        json!({"title": "Another one?", "free_text": true}),
+    )
+    .await;
+    h.hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    h.hook("claude", env.clone(), claude("PostToolUse")).await;
+    h.hook("claude", env.clone(), claude("Stop")).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(h.seat_status("w1").await["waiting_for"].is_null());
 }
