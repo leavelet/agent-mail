@@ -298,6 +298,17 @@ pub struct NewDelivery {
     pub mode: DeliveryMode,
 }
 
+/// Which of a seat's deliveries `Store::mark_read_many` marks read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadSelection {
+    /// The seat's deliveries of these messages (ids of messages the seat
+    /// has no delivery of are skipped).
+    Ids(Vec<i64>),
+    /// Every unread delivery of the seat; with `before_seq`, only those
+    /// with `seq < before_seq` (as `InboxQuery::before_seq`).
+    All { before_seq: Option<i64> },
+}
+
 /// A seat's sequence counter moved to `seq`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SeqBump {

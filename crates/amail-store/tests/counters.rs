@@ -232,6 +232,15 @@ async fn counters_follow_deliveries(db: TestDb) {
         s.ack(*id, x.id).await.unwrap();
     }
     check(&db).await;
+    // Reading many at once: some of c's by id, then all of b's.
+    s.mark_read_many(c.id, &ReadSelection::Ids(ids[5..9].to_vec()))
+        .await
+        .unwrap();
+    check(&db).await;
+    s.mark_read_many(b.id, &ReadSelection::All { before_seq: None })
+        .await
+        .unwrap();
+    check(&db).await;
     // The counts the endpoints read.
     let p = s.pending(acme.id, Some(a.id)).await.unwrap();
     let counted = db

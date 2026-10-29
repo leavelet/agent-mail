@@ -2507,6 +2507,71 @@ macro_rules! impl_store_common {
                 .await
             }
 
+            /// `mark_read` for many deliveries of one seat: the unread,
+            /// not withdrawn deliveries of the messages in `Ids`, or every
+            /// one (below `before_seq`) with `All`. The changed deliveries
+            /// get consecutive new mod_seqs in the order of their ids.
+            pub async fn mark_read_many(c: &mut Conn, seat_id: i64, sel: &ReadSelection) -> Result<(i64, Option<SeqBump>)> {
+                // Ids per statement: well below the bind parameter limits
+                // of both backends.
+                const CHUNK: usize = 500;
+                const SET: &str = "UPDATE deliveries SET read_at = $1, \
+                     notified_via = CASE WHEN notified_at IS NULL THEN 'read' ELSE notified_via END, \
+                     notified_at = COALESCE(notified_at, $1) \
+                     WHERE seat_id = $2 AND read_at IS NULL AND withdrawn_at IS NULL";
+                let now = now_ms();
+                let mut rows: Vec<(i64, i64)> = Vec::new();
+                match sel {
+                    ReadSelection::All { before_seq } => {
+                        let sql = format!("{SET} AND seq < $3 RETURNING id, org_id");
+                        rows = sqlx::query_as(&sql)
+                            .bind(now)
+                            .bind(seat_id)
+                            .bind(before_seq.unwrap_or(i64::MAX))
+                            .fetch_all(&mut *c)
+                            .await?;
+                    }
+                    ReadSelection::Ids(ids) => {
+                        let mut ids = ids.clone();
+                        ids.sort_unstable();
+                        ids.dedup();
+                        for chunk in ids.chunks(CHUNK) {
+                            let sql = format!("{SET} AND message_id IN ({}) RETURNING id, org_id", placeholders(3, chunk.len()));
+                            let mut q = sqlx::query_as::<_, (i64, i64)>(&sql).bind(now).bind(seat_id);
+                            for id in chunk {
+                                q = q.bind(*id);
+                            }
+                            rows.extend(q.fetch_all(&mut *c).await?);
+                        }
+                    }
+                }
+                if rows.is_empty() {
+                    return Ok((0, None));
+                }
+                rows.sort_unstable();
+                let n = rows.len() as i64;
+                let last = bump_seq(c, seat_id, n).await?;
+                let first = last - n + 1;
+                for (k, chunk) in rows.chunks(CHUNK).enumerate() {
+                    let base = first + (k * CHUNK) as i64;
+                    let cases: String = (0..chunk.len()).map(|i| format!(" WHEN ${} THEN ${}", 2 * i + 1, 2 * i + 2)).collect();
+                    let sql = format!(
+                        "UPDATE deliveries SET mod_seq = CASE id{cases} END WHERE id IN ({})",
+                        placeholders(2 * chunk.len() + 1, chunk.len())
+                    );
+                    let mut q = sqlx::query(&sql);
+                    for (i, (id, _)) in chunk.iter().enumerate() {
+                        q = q.bind(*id).bind(base + i as i64);
+                    }
+                    for (id, _) in chunk {
+                        q = q.bind(*id);
+                    }
+                    q.execute(&mut *c).await?;
+                }
+                let org_id = rows[0].1;
+                Ok((n, Some(SeqBump { org_id, seat_id, seq: last })))
+            }
+
             pub async fn mark_unread(c: &mut Conn, message_id: i64, seat_id: i64) -> Result<Option<(DeliveryRec, Option<SeqBump>)>> {
                 // `$1` (the time `touch` binds) is not needed here.
                 touch(
@@ -4550,6 +4615,11 @@ macro_rules! impl_store_common {
                     Some(_) => {}
                 }
                 run!(self.write, |c| q::mark_read(c, message_id, seat_id).await)
+            }
+
+            async fn mark_read_many(&self, seat_id: i64, selection: &$crate::ReadSelection) -> $crate::Result<(i64, Option<$crate::SeqBump>)> {
+                let selection = selection.clone();
+                run!(self.write, |c| q::mark_read_many(c, seat_id, &selection).await)
             }
 
             async fn mark_unread(&self, message_id: i64, seat_id: i64) -> $crate::Result<Option<($crate::DeliveryRec, Option<$crate::SeqBump>)>> {

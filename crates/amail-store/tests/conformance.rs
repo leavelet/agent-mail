@@ -66,6 +66,7 @@ conformance!(
     search_steps_are_bounded,
     grants_and_thread_peers,
     send_guards,
+    mark_read_many,
 );
 
 async fn org(s: &S, name: &str) -> (Org, Seat) {
@@ -2102,4 +2103,150 @@ async fn send_guards(s: S) {
         .len(),
         3
     );
+}
+
+async fn mark_read_many(s: S) {
+    let (o, u) = org(&s, "acme").await;
+    let a = seat(&s, o.id, "a").await;
+    let b = seat(&s, o.id, "b").await;
+    let mut ids = Vec::new();
+    for i in 0..6 {
+        let to: Vec<(&Seat, C)> = if i == 0 {
+            vec![(&a, C::To), (&b, C::To)]
+        } else {
+            vec![(&a, C::To)]
+        };
+        ids.push(
+            s.send(&msg(o.id, u.id, &format!("m{i}"), &to))
+                .await
+                .unwrap()
+                .message_id,
+        );
+    }
+    let b_only = s
+        .send(&msg(o.id, u.id, "b only", &[(&b, C::To)]))
+        .await
+        .unwrap()
+        .message_id;
+    // A withdrawn delivery is not unread mail and stays as it is.
+    s.withdraw(ids[5], a.id).await.unwrap().unwrap();
+    let unread =
+        |s: S, seat: i64| async move { s.counts(o.id, Some(seat)).await.unwrap()[0].unread };
+    assert_eq!(unread(s.clone(), a.id).await, 5);
+    let delivery = |s: S, id: i64| async move { s.delivery(id, a.id).await.unwrap().unwrap() };
+    let seq_before = s.counts(o.id, Some(a.id)).await.unwrap()[0].last_seq;
+
+    // By ids: duplicates count once; ids of messages the seat has no
+    // delivery of (b's, a missing one) are skipped.
+    let (n, bump) = s
+        .mark_read_many(
+            a.id,
+            &ReadSelection::Ids(vec![ids[1], ids[0], ids[1], b_only, 999_999]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(n, 2);
+    let bump = bump.unwrap();
+    assert_eq!((bump.org_id, bump.seat_id), (o.id, a.id));
+    assert_eq!(bump.seq, seq_before + 2);
+    let (d0, d1) = (
+        delivery(s.clone(), ids[0]).await,
+        delivery(s.clone(), ids[1]).await,
+    );
+    assert!(d0.read_at.is_some() && d1.read_at.is_some());
+    // Read counts as notified, as with `mark_read`.
+    assert_eq!(d0.notified_at, d0.read_at);
+    assert_eq!(d0.notified_via.as_deref(), Some("read"));
+    assert_eq!((d0.mod_seq, d1.mod_seq), (seq_before + 1, seq_before + 2));
+    let changed = s.changes(a.id, seq_before, 50).await.unwrap();
+    assert_eq!(
+        changed.iter().map(|e| e.message.id).collect::<Vec<_>>(),
+        vec![ids[0], ids[1]]
+    );
+    assert_eq!(unread(s.clone(), a.id).await, 3);
+    // Other seats' deliveries stay unread.
+    assert!(
+        s.delivery(ids[0], b.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .read_at
+            .is_none()
+    );
+    assert_eq!(unread(s.clone(), b.id).await, 2);
+    // Nothing left to change: no bump.
+    assert_eq!(
+        s.mark_read_many(a.id, &ReadSelection::Ids(vec![ids[0], ids[1]]))
+            .await
+            .unwrap(),
+        (0, None)
+    );
+    assert_eq!(
+        s.mark_read_many(a.id, &ReadSelection::Ids(vec![]))
+            .await
+            .unwrap(),
+        (0, None)
+    );
+
+    // All below a seq: m2 is acknowledged (so read) already; m3 is marked;
+    // m4 is at `before_seq` and stays unread.
+    s.ack(ids[2], a.id).await.unwrap().unwrap();
+    let d4 = delivery(s.clone(), ids[4]).await;
+    let (n, bump) = s
+        .mark_read_many(
+            a.id,
+            &ReadSelection::All {
+                before_seq: Some(d4.seq),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
+    assert!(bump.is_some());
+    assert!(delivery(s.clone(), ids[3]).await.read_at.is_some());
+    assert!(delivery(s.clone(), ids[4]).await.read_at.is_none());
+    assert_eq!(unread(s.clone(), a.id).await, 1);
+
+    // All: the rest; the withdrawn delivery is left as it is.
+    let (n, _) = s
+        .mark_read_many(a.id, &ReadSelection::All { before_seq: None })
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
+    assert_eq!(unread(s.clone(), a.id).await, 0);
+    assert!(delivery(s.clone(), ids[5]).await.read_at.is_none());
+    assert_eq!(
+        s.mark_read_many(a.id, &ReadSelection::All { before_seq: None })
+            .await
+            .unwrap(),
+        (0, None)
+    );
+    let p = s.pending(o.id, Some(a.id)).await.unwrap();
+    assert_eq!((p[0].to, p[0].cc, p[0].urgent), (0, 0, 0));
+
+    // More ids than one statement takes: every delivery gets its own
+    // mod_seq, in order.
+    let c = seat(&s, o.id, "c").await;
+    let mut many = Vec::new();
+    for i in 0..520 {
+        many.push(
+            s.send(&msg(o.id, u.id, &format!("n{i}"), &[(&c, C::To)]))
+                .await
+                .unwrap()
+                .message_id,
+        );
+    }
+    let before = s.counts(o.id, Some(c.id)).await.unwrap()[0].last_seq;
+    let (n, bump) = s
+        .mark_read_many(c.id, &ReadSelection::Ids(many.clone()))
+        .await
+        .unwrap();
+    assert_eq!(n, 520);
+    assert_eq!(bump.unwrap().seq, before + 520);
+    let changed = s.changes(c.id, before, 1000).await.unwrap();
+    assert_eq!(changed.len(), 520);
+    let mods: Vec<i64> = changed.iter().map(|e| e.delivery.mod_seq).collect();
+    assert_eq!(mods, (before + 1..=before + 520).collect::<Vec<_>>());
+    assert!(changed.iter().all(|e| e.delivery.read_at.is_some()));
+    assert_eq!(unread(s.clone(), c.id).await, 0);
 }

@@ -282,6 +282,16 @@ pub trait Store: Send + Sync + 'static {
         message_id: i64,
         seat_id: i64,
     ) -> Result<Option<(DeliveryRec, Option<SeqBump>)>>;
+    /// Mark several of the seat's deliveries read in one transaction, each
+    /// as `mark_read` does (read counts as notified). Only unread
+    /// deliveries that were not withdrawn change; each gets its own new
+    /// `mod_seq`. Returns how many changed and the seat's new seq (`None`
+    /// when nothing changed).
+    async fn mark_read_many(
+        &self,
+        seat_id: i64,
+        selection: &ReadSelection,
+    ) -> Result<(i64, Option<SeqBump>)>;
     /// Mark the seat's delivery not read again (an acknowledged delivery
     /// stays read). `None` if the seat has no delivery.
     async fn mark_unread(
