@@ -1175,6 +1175,9 @@ impl Codex {
 
     /// What the daemon says about a thread before the node adds input:
     /// its status, its queue, and whether its newest turn was interrupted.
+    /// The newest turn is asked for apart: when that fails, the status and
+    /// the queue still hold back a needless wake-up, and the thread counts
+    /// as not interrupted.
     async fn thread_view(&self, target: &str) -> Result<ThreadView> {
         let r = crate::codex_rpc::socket_calls(
             &self.control_socket(),
@@ -1184,15 +1187,17 @@ impl Codex {
                     json!({"threadId": target, "includeTurns": false}),
                 ),
                 ("thread/queue/list", json!({"threadId": target})),
-                (
-                    "thread/turns/list",
-                    json!({"threadId": target, "limit": 1, "sortDirection": "desc",
-                           "itemsView": "notLoaded"}),
-                ),
             ],
         )
         .await?;
-        Ok(ThreadView::from_answers(&r))
+        let newest = match self.last_turns(target).await {
+            Ok(turns) => turns.into_iter().next(),
+            Err(e) => {
+                tracing::debug!("codex thread {target}: its last turns: {e:#}");
+                None
+            }
+        };
+        Ok(ThreadView::from_answers(&r, newest.as_ref()))
     }
 
     /// `thread/queue/start`: start the head of the thread's queue as a
@@ -1393,9 +1398,9 @@ pub(crate) struct ThreadView {
 }
 
 impl ThreadView {
-    /// From the answers to `thread/read`, `thread/queue/list` and
-    /// `thread/turns/list` (newest first), in that order.
-    pub(crate) fn from_answers(r: &[Value]) -> Self {
+    /// From the answers to `thread/read` and `thread/queue/list`, in that
+    /// order, and the thread's newest turn (if known).
+    pub(crate) fn from_answers(r: &[Value], newest: Option<&TurnInfo>) -> Self {
         let items: &[Value] = r
             .get(1)
             .and_then(|q| q["data"].as_array())
@@ -1410,11 +1415,7 @@ impl ThreadView {
                 })
             })
         });
-        let interrupted = r
-            .get(2)
-            .map(parse_turns)
-            .and_then(|t| t.into_iter().next())
-            .is_some_and(|t| t.status == TurnStatus::Interrupted);
+        let interrupted = newest.is_some_and(|t| t.status == TurnStatus::Interrupted);
         ThreadView {
             status: r
                 .first()
@@ -1857,6 +1858,36 @@ impl Adapter for Codex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_queue_is_held_after_an_interrupted_turn_until_one_completes() {
+        let idle = json!({"thread": {"status": {"type": "idle"}}});
+        let active = json!({"thread": {"status": {"type": "active", "activeFlags": []}}});
+        let queue =
+            |text: &str| json!({"data": [{"id": "q", "input": [{"type": "text", "text": text}]}]});
+        let turn = |status| TurnInfo {
+            status,
+            started_at: None,
+            id: None,
+        };
+        let interrupted = turn(TurnStatus::Interrupted);
+        let v = ThreadView::from_answers(&[idle.clone(), queue("look at t3")], Some(&interrupted));
+        assert!(v.held_by_interrupt() && v.queued && !v.wake_queued);
+        assert_eq!(v.wake_held(), None);
+        let v = ThreadView::from_answers(
+            &[idle.clone(), queue("[amail] You have new mail (wake #2).")],
+            Some(&interrupted),
+        );
+        assert!(v.held_by_interrupt() && v.wake_queued);
+        // A running turn, a completed last turn, or no turn known: not held.
+        let v = ThreadView::from_answers(&[active, json!({"data": []})], Some(&interrupted));
+        assert!(!v.held_by_interrupt());
+        assert!(v.wake_held().is_some());
+        let completed = turn(TurnStatus::Completed);
+        let v = ThreadView::from_answers(&[idle.clone(), json!({"data": []})], Some(&completed));
+        assert!(!v.held_by_interrupt() && !v.queued);
+        assert!(!ThreadView::from_answers(&[idle], None).held_by_interrupt());
+    }
 
     #[test]
     fn marker() {

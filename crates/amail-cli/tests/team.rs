@@ -2695,7 +2695,17 @@ async fn asking_seat_sleeps_until_the_answer(b: Backend) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(launches(&h, "c").len(), 2);
-    assert_eq!(row(&h, "c").await.waiting_for, None);
+    // The node looks at the seat's requests once the answer is shown (its
+    // subject names the request) and clears the mark.
+    let t0 = Instant::now();
+    while row(&h, "c").await.waiting_for.is_some() {
+        assert!(
+            t0.elapsed() < Duration::from_secs(20),
+            "{:?}",
+            row(&h, "c").await
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     let (_, out) = cli(&h, &["ps"]).await;
     assert!(!out.contains("waiting for"), "{out}");
     cli(&h, &["down"]).await;
