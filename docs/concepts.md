@@ -1062,9 +1062,14 @@ number), and `amail ps` and `amail seat ls` show `waiting for r12` in the
 seat's line, as the web interface does in the seat's row of the org tree
 and on its page. The mark changes nothing else. A supervised seat goes to sleep by the team's
 `idle_sleep` rule as any idle seat does; the answer arrives as mail `To`
-the seat, which wakes it or starts it again, and the next turn clears the
-mark. A seat whose node restarts loses the mark (the request stays open,
-and the answer still wakes the seat).
+the seat, which wakes it or starts it again. The mark stays while the
+request is open, also through turns the seat has for other mail: the node
+looks at the seat's open requests again at the end of each of its turns,
+when mail with `[r12]` in its subject reaches the seat, and every minute
+while the seat is idle or asleep. It clears the mark when none of the
+seat's requests is open any more (answered, expired or withdrawn), and
+moves it to the newest one still open. A seat whose node restarts loses
+the mark (the request stays open, and the answer still wakes the seat).
 
 **Classes, deadlines and defaults.** The class says how soon the user
 should answer:

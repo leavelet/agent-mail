@@ -20,7 +20,13 @@
 //!   for that request (presence `waiting_for`, `amail ps`). Nothing else
 //!   changes: the team's idle-sleep rule puts the seat to sleep as for any
 //!   idle seat, and the answer, mail `To` the seat, wakes or starts it
-//!   through the usual path. The next turn clears the mark.
+//!   through the usual path. The mark stays through later turns while the
+//!   request is open: the node looks again at the end of every turn of a
+//!   seat known to have an open request, and every
+//!   [`Config::waiting_recheck`] while the seat is idle or asleep; it
+//!   clears the mark when none of the seat's requests is open any more
+//!   (answered, expired, withdrawn), and moves it to the newest one that
+//!   is still open.
 //!
 //! Not built: the relay of harness permission prompts (Claude Code's
 //! `PermissionRequest` hook, Codex approval requests). Every seat runs
@@ -43,15 +49,25 @@ const WAIT_SETTLE: Duration = Duration::from_secs(10);
 pub(super) struct SeatRq {
     /// The current turn ran `amail ask` or the `ask` tool.
     pub(super) asked: bool,
+    /// The seat made a request that was open when the node last looked
+    /// (with or without a mark: a turn that ended with mail waiting is
+    /// not marked).
+    pub(super) open: bool,
     /// The open request the seat waits for.
     pub(super) waiting_for: Option<i64>,
 }
 
 impl SeatRq {
-    /// A turn started. Returns whether the waiting mark was cleared.
-    pub(super) fn turn_started(&mut self) -> bool {
+    /// A turn started. The mark stays: the seat still waits for the answer
+    /// while it handles other mail.
+    pub(super) fn turn_started(&mut self) {
         self.asked = false;
-        self.waiting_for.take().is_some()
+    }
+
+    /// Whether the end of a turn should be followed by a look at the
+    /// seat's open requests.
+    pub(super) fn look_at_turn_end(&mut self) -> bool {
+        std::mem::take(&mut self.asked) || self.open || self.waiting_for.is_some()
     }
 }
 
@@ -222,6 +238,33 @@ impl Node {
         self.wake_kick.notify_one();
     }
 
+    /// Every [`Config::waiting_recheck`]: look again at the requests of
+    /// seats that are idle or asleep with an open request, so a mark goes
+    /// when its request closes without a turn of the seat (a withdrawal
+    /// whose mail did not wake it, an expiry), see the module docs.
+    pub(super) async fn waiting_loop(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(self.cfg.waiting_recheck).await;
+            let due: Vec<(String, Option<i64>)> = {
+                let st = self.lock();
+                if !st.connected {
+                    continue;
+                }
+                st.seats
+                    .iter()
+                    .filter(|(_, s)| {
+                        (s.rq.open || s.rq.waiting_for.is_some())
+                            && matches!(s.state, SeatState::Idle | SeatState::Dormant)
+                    })
+                    .map(|(name, s)| (name.clone(), s.ho.turn_start))
+                    .collect()
+            };
+            for (seat, turn_start) in due {
+                self.check_waiting(&seat, turn_start).await;
+            }
+        }
+    }
+
     /// Carry out the user's answer to an `attention` request.
     pub(super) async fn attention_action(&self, seat: &str, request: Option<i64>, action: &str) {
         let r = match action {
@@ -245,9 +288,11 @@ impl Node {
         self.lock().log(seat, "attention_action", line);
     }
 
-    /// After a turn that asked the person (it started at `turn_start`):
-    /// mark the seat as waiting when it made a request that is still open
-    /// and nothing else waits for it (see the module docs).
+    /// After a turn of a seat that asked the person (the turn started at
+    /// `turn_start`), and periodically while it is marked: mark the seat as
+    /// waiting when it made a request that is still open and nothing else
+    /// waits for it; keep an existing mark on the newest open request;
+    /// clear it when none is open (see the module docs).
     pub(super) async fn check_waiting(&self, seat: &str, turn_start: Option<i64>) {
         let list = match self.server.open_requests(seat).await {
             Ok(l) => l,
@@ -256,7 +301,7 @@ impl Node {
                 return;
             }
         };
-        let Some(num) = list
+        let open = list
             .requests
             .iter()
             .filter(|r| {
@@ -266,8 +311,36 @@ impl Node {
                     && r.asker.as_deref() == Some(seat)
             })
             .map(|r| r.num)
-            .max()
-        else {
+            .max();
+        {
+            let mut st = self.lock();
+            let Some(s) = st.seats.get_mut(seat) else {
+                return;
+            };
+            s.rq.open = open.is_some();
+            let line = match (s.rq.waiting_for, open) {
+                (Some(old), None) => {
+                    s.rq.waiting_for = None;
+                    Some(format!("no longer waits: r{old} is closed"))
+                }
+                (Some(old), Some(num)) if old != num => {
+                    s.rq.waiting_for = Some(num);
+                    Some(format!("waits for the answer to r{num}"))
+                }
+                // Marked, and the request is still open: nothing changes.
+                (Some(_), Some(_)) => return,
+                (None, None) => return,
+                (None, Some(_)) => None,
+            };
+            if let Some(line) = line {
+                st.dirty_presence.insert(seat.to_string());
+                st.log(seat, "waiting", line);
+                drop(st);
+                self.presence_kick.notify_one();
+                return;
+            }
+        }
+        let Some(num) = open else {
             return;
         };
         let until = Instant::now() + WAIT_SETTLE;
@@ -322,13 +395,22 @@ mod tests {
     }
 
     #[test]
-    fn a_new_turn_clears_the_mark() {
+    fn a_new_turn_keeps_the_mark_and_its_end_looks_again() {
         let mut r = SeatRq {
             asked: true,
+            open: true,
             waiting_for: Some(4),
         };
-        assert!(r.turn_started());
-        assert!(!r.asked && r.waiting_for.is_none());
-        assert!(!r.turn_started());
+        r.turn_started();
+        assert!(!r.asked);
+        assert_eq!(r.waiting_for, Some(4));
+        // A turn that did not ask still looks at its end: the seat has an
+        // open request.
+        assert!(r.look_at_turn_end());
+        let mut idle = SeatRq::default();
+        assert!(!idle.look_at_turn_end());
+        idle.asked = true;
+        assert!(idle.look_at_turn_end());
+        assert!(!idle.asked);
     }
 }

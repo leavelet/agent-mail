@@ -133,6 +133,9 @@ pub struct Config {
     /// to a new session only with an explicit missing-session diagnostic.
     pub resume_grace: Duration,
     pub supervise_interval: Duration,
+    /// How often the open requests of an idle or sleeping seat that waits
+    /// for an answer are looked at again (see `requests`).
+    pub waiting_recheck: Duration,
     /// How often a mirrored transcript file is checked for new lines.
     pub mirror_poll: Duration,
     /// Serve the supervised sessions in the browser (`zellij web`).
@@ -226,6 +229,7 @@ impl Config {
             stable_after: Duration::from_secs(600),
             resume_grace: Duration::from_secs(30),
             supervise_interval: Duration::from_millis(500),
+            waiting_recheck: Duration::from_secs(60),
             mirror_poll: Duration::from_millis(500),
             web_terminal: None,
             digest_every: None,
@@ -1039,6 +1043,8 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
     tasks.push(tokio::spawn(async move { n.jobs_loop().await }));
     let n = node.clone();
     tasks.push(tokio::spawn(async move { n.handover_idle_loop().await }));
+    let n = node.clone();
+    tasks.push(tokio::spawn(async move { n.waiting_loop().await }));
     if node.cfg.notices {
         let n = node.clone();
         tasks.push(tokio::spawn(async move { n.notice_loop().await }));
@@ -1882,9 +1888,7 @@ impl Node {
                     s.ho.turn_start = Some(now);
                     s.ho.asked = false;
                     s.ho.task_tool = false;
-                    if s.rq.turn_started() {
-                        st.dirty_presence.insert(seat.to_string());
-                    }
+                    s.rq.turn_started();
                     let s = st.seat(seat);
                     // A turn whose end is still being checked stays open.
                     s.ho.turns_open = s.ho.turns_open.min(u32::from(s.turn_check.is_some())) + 1;
@@ -1959,10 +1963,10 @@ impl Node {
                             s.pending.total() > 0 || s.pending.digest > 0
                         };
                     let blocks = (pending || !s.stash.is_empty()) && s.stop_blocks < cap;
-                    // The seat asked the person in this turn, and the turn
-                    // ends: the node looks for the open request (see
-                    // `requests`).
-                    if !blocks && connected && std::mem::take(&mut s.rq.asked) {
+                    // The seat asked the person in this turn, or has a
+                    // request open, and the turn ends: the node looks at
+                    // its open requests (see `requests`).
+                    if !blocks && connected && s.rq.look_at_turn_end() {
                         let job = handover::Job::Waiting {
                             seat: seat.to_string(),
                             turn_start: s.ho.turn_start,
@@ -2311,6 +2315,21 @@ impl Node {
                 }
                 st.dirty_pending.insert(seat.to_string());
                 self.refresh_kick.notify_one();
+            }
+            // Mail in the thread of the request the seat waits for (its
+            // subject names `[rN]`): the answer, or a comment. The node
+            // looks at the seat's requests now (see `requests`).
+            let s = st.seat(seat);
+            if let Some(num) = s.rq.waiting_for {
+                let tag = format!("[r{num}]");
+                if claimed.iter().any(|e| e.message.subject.contains(&tag)) {
+                    let job = handover::Job::Waiting {
+                        seat: seat.to_string(),
+                        turn_start: s.ho.turn_start,
+                    };
+                    st.jobs.push_back(job);
+                    self.jobs_kick.notify_one();
+                }
             }
             {
                 let ho = &mut st.seat(seat).ho;

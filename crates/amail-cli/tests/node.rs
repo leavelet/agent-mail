@@ -3269,10 +3269,20 @@ async fn prompt_from_the_user_reaches_claude(b: Backend) {
 
 /// A seat that asks the person (`amail ask`) and ends its turn while the
 /// request is open is marked as waiting for it, in the node and in
-/// presence. The answer is mail `To` the seat: it wakes the seat, and the
-/// turn that starts clears the mark. A turn without `ask` does not look.
+/// presence. Other mail and the turns it starts leave the mark in place.
+/// The answer is mail `To` the seat: it wakes the seat, and the node, seeing
+/// `[rN]` in the subject, looks again and clears the mark. A request closed
+/// without mail to the seat (withdrawn by the person) clears it at the
+/// node's periodic look. A turn without `ask`, of a seat with no request
+/// open, does not look.
 async fn asking_seat_waits_for_the_answer(b: Backend) {
-    let Some(h) = setup(b, "asking_seat_waits_for_the_answer", Opts::default()).await else {
+    let o = Opts {
+        tweak: Some(|c: &mut amail_node::Config| {
+            c.waiting_recheck = Duration::from_millis(300);
+        }),
+        ..Default::default()
+    };
+    let Some(h) = setup(b, "asking_seat_waits_for_the_answer", o).await else {
         return;
     };
     let w1 = h.seat("w1", "claude").await;
@@ -3315,13 +3325,12 @@ async fn asking_seat_waits_for_the_answer(b: Backend) {
         "{waiting:?}"
     );
 
-    // The person answers: mail to the seat wakes it, and its turn clears
-    // the mark.
-    h.api
-        .post(&format!("/requests/{num}/answer"), json!({"option": "yes"}))
-        .await;
-    h.wait("wake-up for the answer", || async { inbox.count() == 1 })
-        .await;
+    // Other mail wakes the seat; its turn neither asks nor ends the wait.
+    h.api.send(&["w1"], &[], "unrelated", false).await;
+    h.wait("wake-up for the other mail", || async {
+        inbox.count() == 1
+    })
+    .await;
     let v = h
         .hook(
             "claude",
@@ -3332,8 +3341,41 @@ async fn asking_seat_waits_for_the_answer(b: Backend) {
             ),
         )
         .await;
+    assert!(hook_text(&v).unwrap().contains("unrelated"), "{v}");
+    assert_eq!(h.state("w1").await, "busy");
+    assert_eq!(h.seat_status("w1").await["waiting_for"], num);
+    h.hook("claude", env.clone(), claude("Stop")).await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(h.seat_status("w1").await["waiting_for"], num);
+    assert_eq!(h.api.get("/seats/w1").await["presence"]["waiting_for"], num);
+
+    // The person answers: mail to the seat wakes it, and the node clears
+    // the mark once the answer is shown.
+    h.api
+        .post(&format!("/requests/{num}/answer"), json!({"option": "yes"}))
+        .await;
+    h.wait("wake-up for the answer", || async { inbox.count() == 2 })
+        .await;
+    let v = h
+        .hook(
+            "claude",
+            env.clone(),
+            with(
+                claude("UserPromptSubmit"),
+                &[("prompt", json!("[amail] You have new mail (wake #2)."))],
+            ),
+        )
+        .await;
     assert!(hook_text(&v).unwrap().contains("Ship the release?"), "{v}");
-    assert!(h.seat_status("w1").await["waiting_for"].is_null());
+    h.wait("the mark cleared by the answer", || async {
+        h.seat_status("w1").await["waiting_for"].is_null()
+    })
+    .await;
+    h.wait("the worklog says the wait ended", || async {
+        node_worklog(&h, "w1", "waiting").await.last().unwrap()["text"]
+            == format!("no longer waits: r{num} is closed")
+    })
+    .await;
     h.wait("presence without waiting_for", || async {
         h.api.get("/seats/w1").await["presence"]["waiting_for"].is_null()
     })
@@ -3352,4 +3394,46 @@ async fn asking_seat_waits_for_the_answer(b: Backend) {
     h.hook("claude", env.clone(), claude("Stop")).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(h.seat_status("w1").await["waiting_for"].is_null());
+
+    // A third request, asked; the person withdraws it. Withdrawal mail is
+    // not needed for the mark to go: the periodic look finds it closed.
+    let r3 = w1
+        .post(
+            "/requests",
+            json!({"title": "Tag it?", "options": [
+                {"key": "yes", "label": "Tag"}, {"key": "no", "label": "Skip"}]}),
+        )
+        .await["request"]["num"]
+        .as_i64()
+        .unwrap();
+    h.hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    let ask = with(
+        claude("PostToolUse"),
+        &[(
+            "tool_input",
+            json!({"command": "amail ask 'Tag it?' --option yes:Tag --option no:Skip"}),
+        )],
+    );
+    h.hook("claude", env.clone(), ask).await;
+    h.hook("claude", env.clone(), claude("Stop")).await;
+    h.wait("waiting for the third request", || async {
+        h.seat_status("w1").await["waiting_for"] == r3
+    })
+    .await;
+    h.api
+        .post(&format!("/requests/{r3}/withdraw"), json!({}))
+        .await;
+    // "Another one?" is still open: the mark moves to it.
+    h.wait("the mark on the request still open", || async {
+        h.seat_status("w1").await["waiting_for"] == r3 - 1
+    })
+    .await;
+    h.api
+        .post(&format!("/requests/{}/withdraw", r3 - 1), json!({}))
+        .await;
+    h.wait("the mark cleared after the withdrawals", || async {
+        h.seat_status("w1").await["waiting_for"].is_null()
+    })
+    .await;
 }
