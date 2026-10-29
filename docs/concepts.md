@@ -1028,7 +1028,9 @@ The web interface collects what waits for the user, urgent first:
   failed seat, turns that end in an error, or wake-ups that go unanswered.
 
 Opening a message in the web Inbox marks it read; **Mark unread** undoes
-that.
+that. Check boxes select several messages to mark read or unread at once,
+and **Mark all read** marks every unread message of the Inbox read
+(`POST /inbox/read`).
 
 With browser notifications on (Admin → Settings), a new entry in this queue
 shows a system notification while the tab is in the background.

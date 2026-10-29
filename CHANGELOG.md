@@ -505,6 +505,14 @@ The first public version.
   lists and adds kinds. Seat pages have **Handover** and **Worklog** tabs;
   "needs you" lists `decision` drafts to activate and the user's stale
   documents. All of it follows `doc` events live.
+- Inbox selection: each Inbox row has a check box (`x` ticks the row the
+  keyboard is on), a header check box selects every loaded row, and a bar
+  above the list marks the selected messages read or unread or clears the
+  selection. **Mark all read** marks every unread message of the Inbox
+  read and asks first when there are more than 20. Both use the new
+  `POST /v1/inbox/read` (user tokens), which marks the user's deliveries
+  of a list of message ids, or all of them (below a `before_seq`), read in
+  one transaction and answers how many changed.
 
 #### Public servers and getting started
 
