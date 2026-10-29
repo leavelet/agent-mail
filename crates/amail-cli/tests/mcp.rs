@@ -439,6 +439,13 @@ fn requests(url: &str, t1: &str, owner: &str, m1: &mut McpProc) {
         text(&asked).contains("the person's answer comes as mail"),
         "{asked}"
     );
+    // Also in the structured content, which Claude Code shows the model
+    // instead of the text.
+    let next = ok(&asked)["next"].as_str().unwrap();
+    assert!(
+        next.starts_with("Stop your turn here") && next.contains(&format!("[r{num}]")),
+        "{asked}"
+    );
     // Bad arguments are the tool's own errors.
     assert_eq!(
         err_code(&m1.call("ask", json!({"title": "x", "options": ["nolabel"]}))),

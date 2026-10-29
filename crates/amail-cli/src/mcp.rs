@@ -1620,14 +1620,20 @@ async fn requests(c: &Client, name: &str, a: &Args<'_>) -> Result<(Value, String
                 b.insert("deadline_s".into(), json!(d));
             }
             b.insert("source".into(), json!("mcp"));
-            let (v, _) = r::ask(c, b).await?;
+            let (mut v, _) = r::ask(c, b).await?;
             let d: p::RequestDetail = parse(&v)?;
-            let t = format!(
-                "{}\nStop your turn here unless other work is left: the person's answer comes as mail \
+            let next = format!(
+                "Stop your turn here unless other work is left: the person's answer comes as mail \
                  in this request's thread (Re: [r{n}] …) and wakes you. Do not ask again by mail.",
-                r::created_line(&d.request),
                 n = d.request.num
             );
+            let t = format!("{}\n{next}", r::created_line(&d.request));
+            // Claude Code gives the model the structured content of a tool
+            // result when there is one, not its text: the instruction goes
+            // into both.
+            if let Value::Object(m) = &mut v {
+                m.insert("next".into(), json!(next));
+            }
             Ok((v, t))
         }
         "requests" => match request_num(a, "num")? {
