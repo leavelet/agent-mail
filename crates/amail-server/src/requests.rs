@@ -200,6 +200,30 @@ fn options_text(r: &RequestRec) -> String {
     out
 }
 
+/// How the user answers a request, for its creation mail and reminders:
+/// by option (a reply that names one, or `amail answer rN <option>`), by
+/// free text (a free-text-only request takes any reply as the answer), or
+/// either.
+fn how_to_answer(r: &RequestRec) -> String {
+    let n = r.num;
+    if r.options.is_empty() && r.free_text {
+        return format!(
+            "reply in this thread with your answer (the whole reply is the answer), or run\n    \
+             amail answer r{n} \"<your answer>\"\n"
+        );
+    }
+    let cli = if r.free_text {
+        format!("amail answer r{n} <option>, or amail answer r{n} \"<your answer>\"")
+    } else {
+        format!("amail answer r{n} <option>")
+    };
+    format!(
+        "reply in this thread with the option's number, key or label on the first line, or \
+         run\n    {cli}\nAny other reply is a comment for {seat}.\n",
+        seat = r.seat
+    )
+}
+
 /// The block about a request in a reminder mail.
 pub fn reminder_block(r: &RequestRec) -> String {
     let mut s = format!(
@@ -216,11 +240,8 @@ pub fn reminder_block(r: &RequestRec) -> String {
     }
     s.push('\n');
     s.push_str(&options_text(r));
-    s.push_str(&format!(
-        "Answer it: amail answer r{} <option>, or reply in its thread with the option's number, key \
-         or label on the first line.\n",
-        r.num
-    ));
+    s.push_str("Answer it: ");
+    s.push_str(&how_to_answer(r));
     s
 }
 
@@ -445,12 +466,8 @@ async fn mail_created(st: &AppState, org: &Org, r: &RequestRec, from: &Seat) {
     if let Some(t) = r.task {
         body.push_str(&format!("  Task: t{t}"));
     }
-    body.push_str(&format!(
-        "\n\nAnswer: reply in this thread with the option's number, key or label on the first \
-         line, or run\n    amail answer r{n} <option>\nAny other reply is a comment for {seat}.\n",
-        n = r.num,
-        seat = r.seat
-    ));
+    body.push_str("\n\nAnswer: ");
+    body.push_str(&how_to_answer(r));
     let subject = format!("[r{}] {}", r.num, r.title);
     let urgent = r.class == RequestClass::Now;
     if let Some((mid, tid)) = mail(st, org, from, &user, None, subject, body, urgent).await

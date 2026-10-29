@@ -319,6 +319,11 @@ async fn create_mail_and_rules(srv: Server) {
     assert_eq!(v["request"]["free_text"], true);
     let (_, body) = org.mail("[r3] Name the release").await;
     assert!(body.contains("Answer with free text."), "{body}");
+    assert!(
+        body.contains("reply in this thread with your answer (the whole reply is the answer)"),
+        "{body}"
+    );
+    assert!(!body.contains("<option>"), "{body}");
 
     // The format rules.
     let mut bad = question("x");
@@ -686,6 +691,12 @@ async fn deadline_pass_and_reminders(srv: Server) {
     let mut q = question("Later");
     q["default"] = json!("yes");
     a.post("/requests", q).await;
+    // Free text, no default: reminded with how to answer in text.
+    a.post(
+        "/requests",
+        json!({ "title": "Version string?", "free_text": true, "deadline_s": 0 }),
+    )
+    .await;
     a.post(
         "/tasks",
         json!({ "title": "review the plan", "assignee": "owner", "due": "2020-01-01T00:00:00Z" }),
@@ -715,6 +726,12 @@ async fn deadline_pass_and_reminders(srv: Server) {
     assert!(body.contains("r2 waits for your answer (now"), "{body}");
     assert!(body.contains("t1 is past its due time"), "{body}");
     assert!(body.contains("amail answer r2 <option>"), "{body}");
+    assert!(
+        body.contains("Answer with free text.\nAnswer it: reply in this thread with your answer"),
+        "{body}"
+    );
+    assert!(body.contains("amail answer r4 \"<your answer>\""), "{body}");
+    assert!(!body.contains("amail answer r4 <option>"), "{body}");
     assert_eq!(org.get("/requests/2").await["request"]["state"], "open");
     assert_eq!(org.get("/requests/3").await["request"]["state"], "open");
     // `request` events on the user's stream.

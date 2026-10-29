@@ -162,13 +162,22 @@ pub fn relative(ts: &str) -> String {
     let Ok(t) = ts.parse::<jiff::Timestamp>() else {
         return l(ts).into_owned();
     };
-    let d = t.as_second() - jiff::Timestamp::now().as_second();
+    relative_secs(t.as_second() - jiff::Timestamp::now().as_second())
+}
+
+/// `5m ago` or `in 2h` for `d` seconds from now, rounded to the nearest
+/// unit (3 h 59 min is `4h`).
+fn relative_secs(d: i64) -> String {
     let a = d.unsigned_abs();
-    let n = match a {
-        0..60 => format!("{a}s"),
-        60..3_600 => format!("{}m", a / 60),
-        3_600..86_400 => format!("{}h", a / 3_600),
-        _ => format!("{}d", a / 86_400),
+    let round = |unit: u64| (a + unit / 2) / unit;
+    let n = if a < 60 {
+        format!("{a}s")
+    } else if round(60) < 60 {
+        format!("{}m", round(60))
+    } else if round(3_600) < 24 {
+        format!("{}h", round(3_600))
+    } else {
+        format!("{}d", round(86_400))
     };
     if d <= 0 {
         format!("{n} ago")
@@ -384,10 +393,13 @@ pub fn detail_text(d: &p::RequestDetail) -> String {
         relative(&r.created_at)
     ));
     if let Some(dl) = &r.deadline {
-        let what = if r.default.is_some() {
-            "the default is taken"
-        } else {
-            "reminders start"
+        // What the deadline does applies to an open request only.
+        let what = match r.state {
+            p::RequestState::Open if r.default.is_some() => "the default is taken",
+            p::RequestState::Open => "reminders start",
+            p::RequestState::Expired => "the default was taken",
+            p::RequestState::Answered => "answered before it",
+            _ => "no longer applies",
         };
         out.push(format!(
             "Deadline: {} ({}; {what})",
@@ -837,6 +849,18 @@ pub async fn run_interrupt(c: &Client, out: &Out, seat: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn relative_times_round_to_the_nearest_unit() {
+        assert_eq!(relative_secs(3 * 3_600 + 59 * 60), "in 4h");
+        assert_eq!(relative_secs(3 * 3_600 + 20 * 60), "in 3h");
+        assert_eq!(relative_secs(-(59 * 60 + 40)), "1h ago");
+        assert_eq!(relative_secs(89), "in 1m");
+        assert_eq!(relative_secs(90), "in 2m");
+        assert_eq!(relative_secs(45), "in 45s");
+        assert_eq!(relative_secs(23 * 3_600 + 40 * 60), "in 1d");
+        assert_eq!(relative_secs(0), "0s ago");
+    }
 
     #[test]
     fn numbers() {

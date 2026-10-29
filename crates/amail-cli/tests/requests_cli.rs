@@ -290,6 +290,9 @@ fn asking_and_answering(owner: &Amail, w1: &Amail, w2: &Amail) {
     );
     assert!(show.contains("Answer note: go ahead"), "{show}");
     assert!(!show.contains("Answer it (user)"), "{show}");
+    // The deadline no longer takes the default.
+    assert!(!show.contains("the default is taken"), "{show}");
+    assert!(show.contains("; answered before it)"), "{show}");
 
     // By key.
     let n = w1.ask(&[
