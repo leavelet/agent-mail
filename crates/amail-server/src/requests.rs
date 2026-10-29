@@ -663,7 +663,9 @@ pub struct ListParams {
 }
 
 /// `GET /v1/requests`: user tokens the org's requests, seat tokens their
-/// own (about them or made by them).
+/// own (about them or made by them), node tokens those of one seat
+/// (`seat` is required; a node checks whether a seat that ended its turn
+/// waits for an answer).
 pub async fn list(
     State(st): State<AppState>,
     auth: Auth,
@@ -694,6 +696,12 @@ pub async fn list(
     match auth.scope {
         TokenScope::User => {}
         TokenScope::Seat => query.mine = Some(auth.mail_seat()?.id),
+        TokenScope::Node if q.seat.is_some() => {}
+        TokenScope::Node => {
+            return Err(ApiError::bad_request(
+                "node tokens list the requests of one seat: give seat",
+            ));
+        }
         _ => return Err(ApiError::forbidden("requires a user or seat token")),
     }
     if let Some(name) = &q.seat {

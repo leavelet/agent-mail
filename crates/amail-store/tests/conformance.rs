@@ -1632,6 +1632,7 @@ async fn presence_store(s: S) {
         attention_hint: None,
         terminal_url: None,
         turn_failed: None,
+        waiting_for: Some(12),
     };
     let now = now_ms();
     let changed = s
@@ -1658,6 +1659,7 @@ async fn presence_store(s: S) {
     let p = s.presence(o.id, Some("a")).await.unwrap();
     assert_eq!(p.len(), 1);
     assert_eq!(p[0].since, now - 5000);
+    assert_eq!(p[0].waiting_for, Some(12));
     assert!(p[0].updated_at >= now);
     let changed = s
         .put_presence(o.id, &[rec("a", SeatState::Idle, now)], 90_000)
