@@ -281,7 +281,11 @@ The first public version.
     `GET /requests/{num}/wait` (a long poll of at most 600 s).
   - A new request is mailed to the user, `To`, subject `[r12] <title>`,
     with the options as numbered lines; class `now` is urgent. The answer
-    is mailed in the request's thread `To` the seat, which wakes it. A
+    is mailed in the request's thread `To` the seat, which wakes it. The
+    asker's lead (its team's root seat) gets both mails in `Cc`, reads the
+    requests of its team's seats and lists them with
+    `GET /requests?team=`. The creation mail and the reminders of a
+    free-text request say how to answer with text. A
     reply of the user in the thread whose first line names an option is
     the answer; any other reply is a comment that reaches the seat.
     `[r12]` in a subject links the thread to the request. When a request
@@ -324,31 +328,51 @@ The first public version.
   <option|text> [-m note] [--if-rev N]`, `amail withdraw r12 [-m note]`
   (`amail withdraw <id> --from <seat>` still withdraws a message),
   `amail requests` (open `now` first, with age, default and deadline;
-  filters by state, kind, seat, class and task), `amail request show r12`
-  (the options numbered as in the mail, the answer, the events, the
-  threads), `amail prompt <seat>` and `amail interrupt <seat>` (the 409s
+  filters by state, kind, seat, class, task and team), `amail request show
+  r12` (the options numbered as in the mail, the answer, the events, the
+  threads; the deadline line of a closed request says what became of it;
+  relative times round to the nearest unit), `amail prompt <seat>` and `amail interrupt <seat>` (the 409s
   in plain words). Task lines and `task show` print `blocked-on-human
   (r12)`; `task take` and `task steal` of such a task print the server's
   refusal. MCP tools `ask`, `requests`, `answer`, `prompt_seat` and
   `interrupt_seat` (the last three for the user's seat); the MCP
   instructions tell seats to use `ask` for the person's decisions and to
-  stop until the answer comes as mail.
+  stop until the answer comes as mail, and the `ask` result says so in its
+  text and in its structured content (`next`), which Claude Code shows the
+  model instead of the text. `amail node web-token` makes read-only tokens
+  unless `--writable` is given.
 - Requests for the person and web control of seats, M10 phase C (node
   side; migration `0029_presence_waiting.sql`):
   - The node carries out `prompt` (Claude Code: a line on the inbox
     socket; Codex: `codex queue` after the daemon check, also while a turn
     runs; dsh: `session/prompt`; a supervised seat that is asleep is
-    started first), `interrupt` (Codex: `turn/interrupt` on the turn in
-    progress; dsh: `session/cancel`; Claude Code: ignored) and
-    `attention_action` (`restart` stops and starts the seat's session,
-    `sleep` as `amail sleep`). A prompt is not a wake-up. Each is recorded
-    in the seat's worklog (`prompt`, `interrupt`, `attention_action`).
+    started first; every prompt starts with `[amail] Prompt from the
+    user: `, which the injected instructions name as the user's text, so
+    Claude Code no longer presents it as a message from another session),
+    `interrupt` (Codex: `turn/interrupt` on the turn in progress, then
+    the thread's background terminals are terminated, since Codex leaves
+    the interrupted turn's shell command running; dsh: `session/cancel`;
+    Claude Code: ignored) and `attention_action` (`restart` stops and
+    starts the seat's session, `sleep` as `amail sleep`). A prompt is not
+    a wake-up. Each is recorded in the seat's worklog (`prompt`,
+    `interrupt`, `attention_action`). `restart` and `amail wake` clear the
+    seat's failed turns, so a seat that fails again gets a new attention
+    card.
+  - After an interrupted Codex turn (`turn/interrupt` or Escape in the
+    TUI), codex-cli 0.160 stops running the thread's queue until a turn
+    completes, so wake-ups and prompts added with `codex queue` stayed
+    queued and the seat took no mail. Before each wake-up and prompt the
+    node now reads the thread's newest turn; when it was interrupted and
+    no turn runs, the node starts the queue with `thread/queue/start`.
   - A seat whose turn ran `amail ask` (or the `ask` tool) and ended with
     its `question`, `plan` or `merge` request still open and no mail
     waiting is marked as waiting for it: presence `waiting_for`, `waiting
     for r12` in `amail ps` and `amail seat ls`, worklog `waiting`. It sleeps by the team's
-    idle rule; the answer's mail wakes it, and its next turn clears the
-    mark.
+    idle rule; the answer's mail wakes it. The mark stays through turns
+    for other mail while the request is open: the node looks at the seat's
+    requests again at the end of each turn, when mail naming the request
+    (`[r12]`) reaches it, and every minute while it is idle or asleep, and
+    clears the mark when no request of the seat is open.
   - `GET /requests` takes node tokens for one seat (`seat` required).
   - The mail instructions tell seats to use `amail ask` for the person's
     decisions, then stop.
@@ -630,9 +654,15 @@ The first public version.
     page, the board and the table.
   - Seat pages: a prompt box under the conversation mirror, **Interrupt**
     for Codex and dsh seats, the terminal link with an explanation for
-    Claude Code seats, the seat's open requests, and "waiting for r12"
-    when the node reports it (presence `waiting_for`), which the seat's
-    row in the org tree shows too.
+    Claude Code seats (the link opens the group's zellij session; a
+    read-only login cannot switch to the seat's tab), the seat's open
+    requests, and "waiting for r12" when the node reports it (presence
+    `waiting_for`), which the seat's row in the org tree shows too. The
+    conversation mirror marks where the seat's requests were made,
+    answered, took their default or were withdrawn.
+  - At phone width the top bar is one row with the "needs you" count and
+    a menu button that opens the navigation over the page; the seat
+    page's mirror is no longer drawn over the prompt box.
   - `request` events refresh the cards, the pages, the lists and the
     navigation count live, and the views of the request's task.
 
