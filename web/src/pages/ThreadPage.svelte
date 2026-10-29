@@ -12,6 +12,8 @@
   import MessageCard from '../components/MessageCard.svelte';
   import TaskRefRow from '../components/TaskRefRow.svelte';
   import DocChip from '../components/DocChip.svelte';
+  import RequestStrip from '../components/RequestStrip.svelte';
+  import { subjectRequestTags } from '../lib/requests';
   import { docHref, docId } from '../lib/docs';
 
   let { id, focus }: { id: number; focus?: number } = $props();
@@ -75,6 +77,8 @@
     const d = data?.participants?.find((c) => c.address === a)?.description;
     return d ? visible(d) : undefined;
   };
+  // The requests the thread's subjects name (`[r12]`).
+  const requestTags = $derived([...new Set((data?.messages ?? []).flatMap((m) => subjectRequestTags(m.subject)))]);
   const participants = $derived(data ? [...new Set(data.messages.map((m) => m.from))] : []);
   // The section each comment on a document is on, by message id.
   const commentInfo = $derived(new Map((data?.doc_comments ?? []).map((c) => [c.message_id, c])));
@@ -96,6 +100,7 @@
       <span class="parts">{#each participants as p}<a class="mono chip neutral" title={cardOf(p)} href={p.includes('@') ? undefined : href(['org', p])}>{p}</a>{/each}</span>
       <button class="small danger" disabled={deleting} onclick={remove}>{t('thread.delete')}</button>
     </div>
+    {#if requestTags.length}<RequestStrip nums={requestTags} />{/if}
     {#if data.tasks?.length}
       <ul class="tasks" data-testid="thread-tasks" aria-label={t('thread.tasks')}>
         {#each data.tasks as x (x.num)}<TaskRefRow num={x.num} title={x.title} state={x.state} note={x.assignee} />{/each}

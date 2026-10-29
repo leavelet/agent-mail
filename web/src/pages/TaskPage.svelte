@@ -29,6 +29,7 @@
     waitsList,
   } from '../lib/tasks';
   import { addDep, getTask, patchTask, removeDep, taskError, taskPath } from '../lib/taskops';
+  import { requestId } from '../lib/requests';
   import type { Message, StoredTaskState, TaskCommentResponse, TaskDetail, TaskPriority, TaskRef, TaskResult, ThreadResponse } from '../lib/types';
 
   let { num }: { num: number } = $props();
@@ -384,6 +385,11 @@
 
         {#if task.state === 'open' && task.waits_on?.length}
           <p class="waits">{t('task.waitsOn', { list: waitsList(task, t('task.okNeeded')) })}</p>
+        {/if}
+        {#if task.blocked_on_human}
+          <p class="waits blocked" data-testid="task-blocked-on-human">
+            {t('task.blockedOnHuman')} (<a class="mono" href={href(['requests', requestId(task.blocked_on_human)])}>{requestId(task.blocked_on_human)}</a>)
+          </p>
         {/if}
         {#if task.stored_state === 'blocked'}
           <p class="waits blocked" data-testid="task-blocked">

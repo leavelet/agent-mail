@@ -10,6 +10,7 @@
   import { PRIORITIES, TASK_STATES, filterParams, overdue, stateTone, taskId, waitsList, type TaskFilters } from '../lib/tasks';
   import { listTasks, taskError } from '../lib/taskops';
   import type { Task } from '../lib/types';
+  import { requestId } from '../lib/requests';
 
   let { filters = $bindable() }: { filters: TaskFilters } = $props();
 
@@ -126,6 +127,7 @@
             {#if task.result === 'rejected'}<span class="chip tone-danger" data-testid="rejected">{t('task.result.rejected')}</span>{/if}
             {#if task.state === 'open' && task.waits_on?.length}<div class="sub warn">{t('task.waitsOn', { list: waitsList(task, t('task.okNeeded')) })}</div>{/if}
             {#if task.state === 'blocked' && task.waiting_on}<div class="sub danger">{t('task.waitsFor', { seat: task.waiting_on })}</div>{/if}
+            {#if task.blocked_on_human}<div class="sub danger" data-testid="blocked-on-human">{t('task.blockedOnHuman')} (<a class="mono" href={href(['requests', requestId(task.blocked_on_human)])}>{requestId(task.blocked_on_human)}</a>)</div>{/if}
           </td>
           <td><span class="chip tone-{stateTone(task.state)}">{t(`task.state.${task.state}`)}</span></td>
           <td class:urgent={task.priority === 'urgent'}>{t(`task.priority.${task.priority}`)}</td>

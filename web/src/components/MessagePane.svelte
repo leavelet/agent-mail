@@ -5,6 +5,8 @@
   import { href, go } from '../lib/router.svelte';
   import { ack, markRead, markUnread } from '../lib/mailops';
   import MessageCard from './MessageCard.svelte';
+  import RequestStrip from './RequestStrip.svelte';
+  import { subjectRequestTags } from '../lib/requests';
 
   /** One message with mail actions. It is fetched without marking it read;
    * with `markOnOpen` it is then marked read (a person opened it). */
@@ -77,6 +79,8 @@
 {:else if !message}
   <p class="faint pad">{t('app.loading')}</p>
 {:else}
+  {@const tags = subjectRequestTags(message.subject)}
+  {#if tags.length}<RequestStrip nums={tags} />{/if}
   <MessageCard {message} showThreadLink>
     {#snippet actions()}
       <button class="small primary" onclick={() => doReply(false)}>{t('mail.reply')} <kbd>r</kbd></button>

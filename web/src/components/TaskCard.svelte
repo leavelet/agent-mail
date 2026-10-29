@@ -8,6 +8,7 @@
   import { shortTime } from '../lib/time';
   import { PRIORITIES, overdue, taskId, waitsList } from '../lib/tasks';
   import type { Task, TaskPriority } from '../lib/types';
+  import { requestId } from '../lib/requests';
 
   let {
     task,
@@ -47,6 +48,9 @@
       {#if task.waiting_on}{t('task.waitsFor', { seat: task.waiting_on })}{:else}{t('task.blockedNoSeat')}{/if}
       {#if task.blocked_reason}<span class="reason">· <Vis text={task.blocked_reason} /></span>{/if}
     </div>
+  {/if}
+  {#if task.blocked_on_human}
+    <div class="wait blocked" data-testid="blocked-on-human">{t('task.blockedOnHuman')} (<a class="mono" href={href(['requests', requestId(task.blocked_on_human)])}>{requestId(task.blocked_on_human)}</a>)</div>
   {/if}
   {#if task.steal_requested_by}
     <div class="steal" data-testid="steal">{t('task.steal.asks', { seat: task.steal_requested_by })} · {shortTime(task.steal_requested_at, ui.now, ui.lang)}</div>
