@@ -15,6 +15,29 @@
 //!   (trust hashes cover the binary and the explicit node-context paths).
 //! - Wake-up: `codex queue --thread <session id> --message ...`, which starts
 //!   a turn on an idle thread and fires `UserPromptSubmit`.
+//! - After an interrupted turn (`turn/interrupt`, or Escape in the TUI)
+//!   Codex 0.160 holds the thread's queue: items already queued and items
+//!   added later stay in the queue, and no turn starts, until a turn of the
+//!   thread completes (one the person types in the TUI, or one started by
+//!   `turn/start` or `thread/queue/start`). This holds across a TUI restart
+//!   (`codex resume`) while the daemon runs. Measured on codex-cli 0.160:
+//!   `turn/start` on such a thread starts a turn the TUI shows, and the
+//!   queue runs again after it completes; `thread/queue/start {threadId}`
+//!   starts the head of the queue as a turn (the TUI shows it too) and
+//!   answers `-32600 "queue is empty"` on an empty queue and `-32600
+//!   "thread already has an active or pending turn"` while a turn runs. So
+//!   before a wake-up or a prompt the node reads the thread's newest turn
+//!   (`thread/turns/list`, limit 1) with its status and queue; when that
+//!   turn is `interrupted` and no turn runs, it starts the queue with
+//!   `thread/queue/start` (after adding the text with `codex queue`, or
+//!   instead of adding a wake-up when items already wait there). Reading
+//!   the daemon covers the node's own interrupt and an Escape in the TUI
+//!   alike, and survives a node restart.
+//! - `turn/interrupt` ends the turn but leaves its running shell command as
+//!   a background terminal; after its own interrupt the node terminates the
+//!   thread's background terminals (`thread/backgroundTerminals/list`,
+//!   `thread/backgroundTerminals/terminate`). An Escape in the TUI leaves
+//!   them running (the TUI's `/stop` closes them).
 //! - MCP: `[mcp_servers.amail]` in the same `config.toml` runs `amail mcp
 //!   --node`, which finds the seat from the thread id Codex sends with each
 //!   tool call (see `apply_mcp`).
@@ -1150,13 +1173,9 @@ impl Codex {
         Ok(())
     }
 
-    /// Why a wake-up must not be queued now, from the daemon: the thread
-    /// already holds one in its queue (it is busy, or has no terminal and
-    /// runs its queue when resumed), or a turn is running (the `Stop` hook
-    /// checks for mail at its end). `codex queue` on a busy thread adds a
-    /// turn that runs after the current one, when the mail has been shown
-    /// already; a second nudge would be another such turn.
-    async fn wake_held(&self, target: &str) -> Result<Option<&'static str>> {
+    /// What the daemon says about a thread before the node adds input:
+    /// its status, its queue, and whether its newest turn was interrupted.
+    async fn thread_view(&self, target: &str) -> Result<ThreadView> {
         let r = crate::codex_rpc::socket_calls(
             &self.control_socket(),
             &[
@@ -1165,35 +1184,90 @@ impl Codex {
                     json!({"threadId": target, "includeTurns": false}),
                 ),
                 ("thread/queue/list", json!({"threadId": target})),
+                (
+                    "thread/turns/list",
+                    json!({"threadId": target, "limit": 1, "sortDirection": "desc",
+                           "itemsView": "notLoaded"}),
+                ),
             ],
         )
         .await?;
-        let queued = r
-            .get(1)
-            .and_then(|q| q["data"].as_array())
-            .is_some_and(|items| {
-                items.iter().any(|item| {
-                    item["input"].as_array().is_some_and(|input| {
-                        input.iter().any(|part| {
-                            part["text"]
-                                .as_str()
-                                .is_some_and(crate::inject::is_wake_text)
-                        })
-                    })
-                })
-            });
-        if queued {
-            return Ok(Some("a wake-up is already queued on the thread"));
+        Ok(ThreadView::from_answers(&r))
+    }
+
+    /// `thread/queue/start`: start the head of the thread's queue as a
+    /// turn. Codex 0.160 stops running a thread's queue by itself once a
+    /// turn of the thread was interrupted (by `turn/interrupt` or by Escape
+    /// in the TUI), until a turn of the thread completes; this starts it.
+    async fn start_queue(&self, target: &str) -> Result<()> {
+        crate::codex_rpc::socket_calls(
+            &self.control_socket(),
+            &[("thread/queue/start", json!({"threadId": target}))],
+        )
+        .await
+        .context("thread/queue/start")?;
+        Ok(())
+    }
+
+    /// Start a queue that an interrupt holds. A failure is logged only:
+    /// the item stays in the queue, and the next attempt tries again.
+    async fn start_held_queue(&self, target: &str) {
+        match self.start_queue(target).await {
+            Ok(()) => tracing::info!(
+                "codex thread {target}: started its queue, held since an interrupted turn"
+            ),
+            Err(e) => tracing::warn!(
+                "codex thread {target}: starting its queue after an interrupted turn: {e:#}"
+            ),
         }
-        let status = r
+    }
+
+    /// Terminate every background terminal of the thread (the shell
+    /// commands that outlive an interrupted turn). Returns how many.
+    async fn stop_terminals(&self, target: &str) -> Result<usize> {
+        let r = crate::codex_rpc::socket_calls(
+            &self.control_socket(),
+            &[(
+                "thread/backgroundTerminals/list",
+                json!({"threadId": target}),
+            )],
+        )
+        .await?;
+        let ids: Vec<String> = r
             .first()
-            .and_then(|t| t["thread"]["status"]["type"].as_str());
-        if status == Some("active") {
-            return Ok(Some(
-                "the thread runs a turn; the Stop hook checks for mail at its end",
-            ));
+            .and_then(|v| v["data"].as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t["processId"].as_str().map(str::to_string))
+            .collect();
+        if ids.is_empty() {
+            return Ok(0);
         }
-        Ok(None)
+        let calls: Vec<(&str, Value)> = ids
+            .iter()
+            .map(|id| {
+                (
+                    "thread/backgroundTerminals/terminate",
+                    json!({"threadId": target, "processId": id}),
+                )
+            })
+            .collect();
+        crate::codex_rpc::socket_calls(&self.control_socket(), &calls).await?;
+        tracing::info!(
+            "codex thread {target}: stopped {} background terminal(s) after the interrupt",
+            ids.len()
+        );
+        Ok(ids.len())
+    }
+
+    /// `codex queue` the text; on a thread whose queue is held since an
+    /// interrupt, start the queue as well.
+    async fn deliver(&self, target: &str, text: &str, view: Option<&ThreadView>) -> Result<()> {
+        self.queue(target, text).await?;
+        if view.is_some_and(ThreadView::held_by_interrupt) {
+            self.start_held_queue(target).await;
+        }
+        Ok(())
     }
 
     /// The TUI can apply the shared home's default effort on attach.
@@ -1302,6 +1376,78 @@ impl Codex {
                 }
             }
         });
+    }
+}
+
+/// The daemon's answers about a thread (see [`Codex::thread_view`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct ThreadView {
+    /// `thread.status.type`: `notLoaded`, `idle`, `active`, `systemError`.
+    pub status: Option<String>,
+    /// The queue holds an amail wake-up.
+    pub wake_queued: bool,
+    /// The queue holds anything.
+    pub queued: bool,
+    /// The thread's newest turn ended as `interrupted`.
+    pub interrupted: bool,
+}
+
+impl ThreadView {
+    /// From the answers to `thread/read`, `thread/queue/list` and
+    /// `thread/turns/list` (newest first), in that order.
+    pub(crate) fn from_answers(r: &[Value]) -> Self {
+        let items: &[Value] = r
+            .get(1)
+            .and_then(|q| q["data"].as_array())
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let wake_queued = items.iter().any(|item| {
+            item["input"].as_array().is_some_and(|input| {
+                input.iter().any(|part| {
+                    part["text"]
+                        .as_str()
+                        .is_some_and(crate::inject::is_wake_text)
+                })
+            })
+        });
+        let interrupted = r
+            .get(2)
+            .map(parse_turns)
+            .and_then(|t| t.into_iter().next())
+            .is_some_and(|t| t.status == TurnStatus::Interrupted);
+        ThreadView {
+            status: r
+                .first()
+                .and_then(|t| t["thread"]["status"]["type"].as_str())
+                .map(str::to_string),
+            wake_queued,
+            queued: !items.is_empty(),
+            interrupted,
+        }
+    }
+
+    /// Codex holds the thread's queue: the newest turn was interrupted and
+    /// no turn runs. Items in the queue, and items added now, stay there
+    /// until a turn of the thread completes (codex-cli 0.160); the node
+    /// starts the queue with `thread/queue/start`.
+    pub(crate) fn held_by_interrupt(&self) -> bool {
+        self.interrupted && self.status.as_deref() != Some("active")
+    }
+
+    /// Why a wake-up must not be queued now: the thread already holds one
+    /// in its queue (it is busy, or has no terminal and runs its queue when
+    /// resumed), or a turn is running (the `Stop` hook checks for mail at
+    /// its end). `codex queue` on a busy thread adds a turn that runs after
+    /// the current one, when the mail has been shown already; a second
+    /// nudge would be another such turn.
+    pub(crate) fn wake_held(&self) -> Option<&'static str> {
+        if self.wake_queued {
+            return Some("a wake-up is already queued on the thread");
+        }
+        if self.status.as_deref() == Some("active") {
+            return Some("the thread runs a turn; the Stop hook checks for mail at its end");
+        }
+        None
     }
 }
 
@@ -1462,38 +1608,59 @@ impl Adapter for Codex {
 
     async fn wake(&self, target: &str, text: &str) -> Result<()> {
         self.restore_effort(target).await?;
-        match self.wake_held(target).await {
-            Ok(Some(why)) => {
+        let view = match self.thread_view(target).await {
+            Ok(view) => Some(view),
+            // Without an answer the nudge is queued as before.
+            Err(e) => {
+                tracing::debug!("codex thread {target}: asking the daemon before queueing: {e:#}");
+                None
+            }
+        };
+        if let Some(v) = &view {
+            if v.held_by_interrupt() && v.queued {
+                // Something waits in the queue (a wake-up or a prompt) that
+                // Codex does not run since the interrupt: start it. Its
+                // turn shows the mail (the `UserPromptSubmit` and `Stop`
+                // hooks), and the rest of the queue follows.
+                self.start_held_queue(target).await;
+                return Ok(());
+            }
+            if let Some(why) = v.wake_held() {
                 tracing::info!("codex thread {target}: not queueing a wake-up: {why}");
                 return Ok(());
             }
-            Ok(None) => {}
-            // Without an answer the nudge is queued as before.
-            Err(e) => {
-                tracing::debug!("codex thread {target}: asking the daemon before queueing: {e:#}")
-            }
         }
-        self.queue(target, text).await
+        self.deliver(target, text, view.as_ref()).await
     }
 
     /// A prompt from the person is queued whatever the thread does: the
     /// daemon is asked first, as for a wake-up, but a running turn or a
     /// queued wake-up does not hold it back (the queue gives it to the
-    /// thread when its current turn ends).
+    /// thread when its current turn ends). After an interrupted turn the
+    /// queue is started as well (see [`Codex::start_queue`]).
     async fn send_prompt(&self, target: &str, text: &str) -> Result<()> {
         self.restore_effort(target).await?;
-        match self.wake_held(target).await {
-            Ok(Some(why)) => tracing::info!("codex thread {target}: queueing a prompt: {why}"),
-            Ok(None) => {}
-            Err(e) => {
-                tracing::debug!("codex thread {target}: asking the daemon before queueing: {e:#}")
+        let view = match self.thread_view(target).await {
+            Ok(view) => {
+                if let Some(why) = view.wake_held() {
+                    tracing::info!("codex thread {target}: queueing a prompt: {why}");
+                }
+                Some(view)
             }
-        }
-        self.queue(target, text).await
+            Err(e) => {
+                tracing::debug!("codex thread {target}: asking the daemon before queueing: {e:#}");
+                None
+            }
+        };
+        self.deliver(target, text, view.as_ref()).await
     }
 
     /// `turn/interrupt` on the thread's running turn (the newest turn in
-    /// progress, from `thread/turns/list`).
+    /// progress, from `thread/turns/list`). Codex ends the turn but leaves
+    /// its shell commands running as background terminals (codex-cli
+    /// 0.160), so the node then stops the thread's background terminals
+    /// (`thread/backgroundTerminals/list` and `.../terminate`), as the
+    /// TUI's `/stop` does.
     async fn interrupt(&self, target: &str) -> Result<bool> {
         let turns = self.last_turns(target).await?;
         let Some(turn) = turns
@@ -1512,6 +1679,9 @@ impl Adapter for Codex {
         )
         .await
         .context("turn/interrupt")?;
+        if let Err(e) = self.stop_terminals(target).await {
+            tracing::warn!("codex thread {target}: stopping its background terminals: {e:#}");
+        }
         Ok(true)
     }
 

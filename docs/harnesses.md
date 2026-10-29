@@ -229,6 +229,33 @@ is already queued, it adds nothing, and the running turn's `Stop` hook
 shows the mail at its end. A nudge whose turn finds nothing pending any
 more is answered with one line that says so, and the agent ends the turn.
 
+**The queue after an interrupted turn.** Once a turn of a thread was
+interrupted (`turn/interrupt`, which `amail interrupt` and the web's
+Interrupt button send, or Escape in the TUI), Codex 0.160 stops running
+the thread's queue by itself: what is in the queue, and what `codex queue`
+adds later, stays there and no turn starts until a turn of the thread
+completes. This lasts through `codex resume` and a restart of the daemon.
+Measured with codex-cli 0.160 and the TUI attached:
+
+- `turn/start` with a text on such a thread starts a turn, and the TUI
+  shows the prompt and the answer; after that turn completes, the queue
+  runs again by itself.
+- `thread/queue/start {threadId}` starts the first item of the queue as a
+  turn (the TUI shows it, and `UserPromptSubmit` fires as for any turn);
+  the rest of the queue follows. On an empty queue it answers `-32600
+  "queue is empty"`, while a turn runs `-32600 "thread already has an
+  active or pending turn"`.
+
+So the node also reads the thread's newest turn (`thread/turns/list`,
+limit 1) before a wake-up or a prompt. When that turn is `interrupted` and
+no turn runs, the node adds a prompt with `codex queue` and then starts the
+queue with `thread/queue/start`; for a wake-up, when the queue already
+holds items (a held wake-up or prompt) it starts the queue instead of
+adding a nudge, and otherwise it adds the nudge and starts the queue.
+Reading the daemon covers the node's own interrupts and an Escape in the
+TUI alike. A queue start that fails is logged; the item stays queued and
+the next wake-up attempt tries again.
+
 **Control socket path.** The daemon's control socket lies in the state
 directory. When its path is longer than a Unix socket path may be (107
 bytes), the node reaches it through `/proc/self/fd` (Linux). A shorter
@@ -463,6 +490,17 @@ mail is delivered as usual.
 | Codex | the `Interrupt` hook (codex-cli 0.160: about 10 ms after Escape); the app-server check above also sees the status `interrupted` |
 | dsh | the wrapper reports a `turn/end` with reason `aborted` as an interruption (about 30 ms after the stop) |
 
+An interrupted Codex turn ends, but the shell command it was running does
+not: Codex 0.160 keeps it as a background terminal of the thread, and it
+runs to its end (a `sleep 240` ran its full 240 s). After `amail
+interrupt` or the web's Interrupt button the node terminates the thread's
+background terminals (`thread/backgroundTerminals/list` and
+`thread/backgroundTerminals/terminate`), as the TUI's `/stop` does; this
+also ends background commands that an earlier turn of the thread left
+running. After an Escape in the TUI the command keeps running; `/stop` in
+the TUI ends it. Mail and prompts after an interrupt are delivered as
+described under [Codex](#codex) ("The queue after an interrupted turn").
+
 Neither Claude Code check can end a turn that is still running: a long
 tool call leaves the tool call last in the transcript, and a long answer
 leaves the prompt last (Claude Code writes an answer when it is complete),
@@ -492,7 +530,7 @@ pane.
 | harness | prompt | interrupt |
 |---|---|---|
 | Claude Code | one line on the session's inbox socket, as a wake-up is sent, with the user's text: an idle session starts a turn on it, a busy one reads it between tool calls | none: Claude Code has no structured interrupt. The server refuses the route (409 `no_structured_interrupt`); a command that arrives anyway is logged by the node and ignored. Use the seat's terminal (Escape) |
-| Codex | `codex queue --thread <id> --message <text>`, after the node asked the app-server about the thread as for a wake-up. A wake-up is not queued while a turn runs or a wake-up is queued already; a prompt is queued in both cases, and the thread takes it when its current turn ends | `turn/interrupt` on the thread's turn in progress (the newest turn with status `inProgress` in `thread/turns/list`), through the app-server's control socket. No turn in progress: nothing is sent |
+| Codex | `codex queue --thread <id> --message <text>`, after the node asked the app-server about the thread as for a wake-up. A wake-up is not queued while a turn runs or a wake-up is queued already; a prompt is queued in both cases, and the thread takes it when its current turn ends. After an interrupted turn the node also starts the queue (`thread/queue/start`; see [Codex](#codex), "The queue after an interrupted turn") | `turn/interrupt` on the thread's turn in progress (the newest turn with status `inProgress` in `thread/turns/list`), through the app-server's control socket, then `thread/backgroundTerminals/terminate` for each of the thread's background terminals (`thread/backgroundTerminals/list`). No turn in progress: nothing is sent |
 | dsh | `session/prompt` (mode `queue`) on the seat's dsh host, as a wake-up is sent | `session/cancel` on the seat's dsh host. dsh fires no hook after a cancelled turn; the node ends the turn itself |
 
 A prompt is not a wake-up: the node does not wait for it to start a turn,

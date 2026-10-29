@@ -42,6 +42,7 @@ turn_tests!(
     codex_restart_holds_failed_surviving_session,
     codex_wake_asks_the_daemon_first,
     codex_prompt_and_interrupt,
+    codex_interrupted_thread_is_started,
 );
 
 fn claude(name: &str) -> Value {
@@ -363,6 +364,8 @@ struct FakeAppServer {
     history_error: Arc<Mutex<Option<Value>>>,
     thread: Arc<Mutex<Value>>,
     queue: Arc<Mutex<Value>>,
+    /// Results by method, for methods the fake has no other answer for.
+    answers: Arc<Mutex<std::collections::HashMap<String, Value>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -388,6 +391,8 @@ impl FakeAppServer {
         let history_error = Arc::new(Mutex::new(None::<Value>));
         let thread = Arc::new(Mutex::new(json!({})));
         let queue = Arc::new(Mutex::new(json!({"data":[],"nextCursor":null})));
+        let answers = Arc::new(Mutex::new(std::collections::HashMap::<String, Value>::new()));
+        let a2 = answers.clone();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let r2 = requests.clone();
         let (t2, c2, e2, th2, q2) = (
@@ -405,6 +410,7 @@ impl FakeAppServer {
                 let (turns, calls, history_error, thread, queue) =
                     (t2.clone(), c2.clone(), e2.clone(), th2.clone(), q2.clone());
                 let requests = r2.clone();
+                let answers = a2.clone();
                 tokio::spawn(async move {
                     // Handshake: read the request, answer 101.
                     let mut hdr = Vec::new();
@@ -464,7 +470,13 @@ impl FakeAppServer {
                         } else if req["method"] == "thread/queue/list" {
                             queue.lock().unwrap().clone()
                         } else {
-                            json!({})
+                            let method = req["method"].as_str().unwrap_or_default();
+                            answers
+                                .lock()
+                                .unwrap()
+                                .get(method)
+                                .cloned()
+                                .unwrap_or_else(|| json!({}))
                         };
                         let out = match error {
                             Some(error) => json!({"jsonrpc":"2.0","id":id,"error":error}),
@@ -493,6 +505,7 @@ impl FakeAppServer {
             history_error,
             thread,
             queue,
+            answers,
             task,
         }
     }
@@ -1101,4 +1114,178 @@ async fn codex_prompt_and_interrupt(b: Backend) {
             .count(),
         1
     );
+}
+
+/// After an interrupted turn Codex (0.160) holds the thread's queue: what
+/// `codex queue` adds stays there and no turn starts until a turn of the
+/// thread completes. The node reads the newest turn before it delivers:
+/// when that turn is `interrupted` and no turn runs, a prompt is queued and
+/// the queue started (`thread/queue/start`); a wake-up for a thread whose
+/// queue already holds items starts the queue instead of adding a nudge.
+/// Once a turn has completed, delivery is `codex queue` alone again. The
+/// node's own interrupt also stops the thread's background terminals.
+async fn codex_interrupted_thread_is_started(b: Backend) {
+    let mut o = opts(150, false);
+    o.wake_confirm = Duration::from_millis(600);
+    o.wake_backoff = Duration::from_millis(400);
+    let Some(h) = Harness::start(b, "codex_interrupted_thread_is_started", o).await else {
+        return;
+    };
+    h.seat("cx", "codex").await;
+    let home = h.dir.path().join("state/codex-home");
+    let app = FakeAppServer::start(&home.join("app-server-control/app-server-control.sock"));
+    let sid = "00000000-0000-7000-8000-00000000c0e2";
+    *app.thread.lock().unwrap() = json!({"thread":{"id":sid,"status":{"type":"active"}}});
+    app.answers.lock().unwrap().insert(
+        "thread/backgroundTerminals/list".into(),
+        json!({"data":[{"itemId":"exec-1","processId":"4711","command":"sleep 240",
+                        "cwd":"/w"}],"nextCursor":null}),
+    );
+    let cwd = h.dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let plan = h
+        .node
+        .as_ref()
+        .unwrap()
+        .node
+        .handle(amail_node::wire::Request::Launch {
+            seat: "cx".into(),
+            cwd: cwd.to_string_lossy().into(),
+            pid: std::process::id(),
+            harness: None,
+            extra: vec![],
+            pane: None,
+            mux_session: None,
+            permission_mode: Some(amail_proto::PermissionMode::Unattended),
+            git_access: None,
+            dsh_jail: None,
+            session: None,
+        })
+        .await;
+    assert!(plan.get("error").is_none(), "{plan}");
+    let args: Vec<String> = serde_json::from_value(plan["args"].clone()).unwrap();
+    let env = vec![
+        (
+            "CODEX_HOME".to_string(),
+            home.to_string_lossy().into_owned(),
+        ),
+        (
+            "AMAIL_CODEX_PASS".to_string(),
+            plan["env"]["AMAIL_CODEX_PASS"].as_str().unwrap().into(),
+        ),
+    ];
+    let hook = |name: &str, extra: &[(&str, Value)]| {
+        let mut fields = vec![("session_id", json!(sid))];
+        fields.extend(extra.iter().cloned());
+        with(fixture("codex", name), &fields)
+    };
+    h.hook(
+        "codex",
+        env.clone(),
+        hook(
+            "UserPromptSubmit",
+            &[("prompt", json!(args.last().unwrap()))],
+        ),
+    )
+    .await;
+    assert_eq!(h.state("cx").await, "busy");
+    h.wait("presence with a node", || async {
+        let p = &h.api.get("/seats/cx").await["presence"];
+        p["state"] == "busy" && p["node_connected"] == true
+    })
+    .await;
+    let queued = || {
+        h.codex_calls()
+            .into_iter()
+            .filter(|c| c.starts_with("queue"))
+            .collect::<Vec<_>>()
+    };
+    let count = |method: &str| app.methods().iter().filter(|m| *m == method).count();
+
+    // The person interrupts the running turn; the node also stops the
+    // command the turn left running.
+    app.set(json!([
+        {"id": "turn-2", "status": "inProgress", "startedAt": 2},
+        {"id": "turn-1", "status": "completed", "startedAt": 1},
+    ]));
+    h.api.post("/seats/cx/interrupt", json!({})).await;
+    h.wait("background terminals stopped", || async {
+        count("thread/backgroundTerminals/terminate") == 1
+    })
+    .await;
+    let terminate = app
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r["method"] == "thread/backgroundTerminals/terminate")
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        terminate["params"],
+        json!({"threadId": sid, "processId": "4711"})
+    );
+    h.wait("idle after the interrupt", || async {
+        h.state("cx").await == "idle"
+    })
+    .await;
+    app.thread.lock().unwrap()["thread"]["status"]["type"] = json!("idle");
+    app.set(json!([
+        {"id": "turn-2", "status": "interrupted", "startedAt": 2},
+        {"id": "turn-1", "status": "completed", "startedAt": 1},
+    ]));
+    assert_eq!(count("thread/queue/start"), 0);
+
+    // A prompt after the interrupt: queued, and the queue started.
+    let text = "Check whether the command still runs.";
+    h.api
+        .post("/seats/cx/prompt", json!({ "text": text }))
+        .await;
+    h.wait("thread/queue/start after the prompt", || async {
+        count("thread/queue/start") == 1
+    })
+    .await;
+    assert!(
+        queued().iter().any(|c| c
+            .ends_with(&format!("--message [amail] Prompt from the user: {text}"))
+            || c.ends_with(&format!("--message {text}"))),
+        "{:?}",
+        queued()
+    );
+    let start = app
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r["method"] == "thread/queue/start")
+        .cloned()
+        .unwrap();
+    assert_eq!(start["params"], json!({"threadId": sid}));
+
+    // Codex did not take it (the fake keeps it queued): mail for the seat
+    // starts the queue again instead of adding a nudge behind the prompt.
+    *app.queue.lock().unwrap() = json!({"data":[{"id":"q1","clientUserMessageId":"m1",
+        "input":[{"type":"text","text":text}]}],"nextCursor":null});
+    let before = queued().len();
+    h.api.send(&["cx"], &[], "after the interrupt", false).await;
+    h.wait("thread/queue/start for the wake-up", || async {
+        count("thread/queue/start") >= 2
+    })
+    .await;
+    assert_eq!(queued().len(), before, "no nudge is added: {:?}", queued());
+
+    // A turn of the thread completed: the queue runs by itself again, and
+    // the node only queues.
+    app.set(json!([
+        {"id": "turn-3", "status": "completed", "startedAt": 3},
+        {"id": "turn-2", "status": "interrupted", "startedAt": 2},
+    ]));
+    *app.queue.lock().unwrap() = json!({"data":[],"nextCursor":null});
+    let starts = count("thread/queue/start");
+    h.wait("codex queue for the wake-up", || async {
+        queued().len() > before
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(count("thread/queue/start"), starts);
 }
