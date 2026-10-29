@@ -63,14 +63,13 @@ fn waited_on(kind: RequestKind) -> bool {
     )
 }
 
-/// A prompt's text as the session gets it: as the user wrote it, unless it
-/// would read as a wake-up notice.
+/// A prompt's text as the session gets it: the user's text behind
+/// [`crate::inject::PROMPT_PREFIX`] on every harness. The prefix tells the
+/// model that the person sent it (Claude Code otherwise frames text from
+/// its inbox socket as a message from another session, not typed by the
+/// user), and the text never reads as a wake-up notice.
 pub(super) fn prompt_text(text: &str) -> String {
-    if crate::inject::is_wake_text(text) {
-        format!("Prompt from the user: {text}")
-    } else {
-        text.to_string()
-    }
+    format!("{}{text}", crate::inject::PROMPT_PREFIX)
 }
 
 /// How a prompt reaches a harness's session, for the worklog.
@@ -312,10 +311,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn prompts_never_read_as_wake_ups() {
-        assert_eq!(prompt_text("look at t3"), "look at t3");
+    fn prompts_are_marked_and_never_read_as_wake_ups() {
+        assert_eq!(
+            prompt_text("look at t3"),
+            "[amail] Prompt from the user: look at t3"
+        );
         let t = prompt_text("[amail] You have new mail (wake #3).");
         assert!(!crate::inject::is_wake_text(&t), "{t}");
+        assert!(t.starts_with("[amail] Prompt from the user: "), "{t}");
     }
 
     #[test]

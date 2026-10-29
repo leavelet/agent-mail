@@ -535,9 +535,12 @@ pane.
 
 A prompt is not a wake-up: the node does not wait for it to start a turn,
 does not send it again, and the turn it starts is an ordinary turn (mail
-that waits is shown with it as with any prompt). A prompt whose text would
-read as a wake-up notice (`[amail] You have new mail`) is given with
-`Prompt from the user: ` in front. A prompt for a supervised seat that is
+that waits is shown with it as with any prompt). Every prompt is given
+with `[amail] Prompt from the user: ` in front, on every harness; the
+instructions the node injects say that this text comes from the user. So
+the model reads it as the person's instruction (Claude Code presents text
+from its inbox socket as a message from another Claude session, "not
+typed by your user"), and a prompt never reads as a wake-up notice. A prompt for a supervised seat that is
 asleep or stopped starts the seat first and is given to the new session
 once it reports (at most 60 s); a seat that is not supervised and has no
 running session does not get it. After an interrupt the node marks the

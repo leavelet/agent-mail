@@ -1049,7 +1049,9 @@ async fn codex_prompt_and_interrupt(b: Backend) {
         .await;
     assert_eq!(
         queued(),
-        vec![format!("queue --thread {sid} --message {text}")]
+        vec![format!(
+            "queue --thread {sid} --message [amail] Prompt from the user: {text}"
+        )]
     );
     let methods = app.methods();
     assert!(
@@ -1246,9 +1248,9 @@ async fn codex_interrupted_thread_is_started(b: Backend) {
     })
     .await;
     assert!(
-        queued().iter().any(|c| c
-            .ends_with(&format!("--message [amail] Prompt from the user: {text}"))
-            || c.ends_with(&format!("--message {text}"))),
+        queued()
+            .iter()
+            .any(|c| c.ends_with(&format!("--message [amail] Prompt from the user: {text}"))),
         "{:?}",
         queued()
     );

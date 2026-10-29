@@ -3215,7 +3215,12 @@ async fn prompt_from_the_user_reaches_claude(b: Backend) {
     .await;
     let line: Value = serde_json::from_str(&inbox.lines.lock().unwrap()[0]).unwrap();
     let content = line["message"]["content"].as_str().unwrap();
-    assert!(content.contains(text), "{content}");
+    // Marked as the user's (Claude Code frames inbox-socket text as a
+    // message from another session).
+    assert!(
+        content.contains(&format!("[amail] Prompt from the user: {text}")),
+        "{content}"
+    );
     assert!(!content.contains("You have new mail"), "{content}");
     // Not a wake-up: nothing waits for its confirmation.
     let s = h.seat_status("w1").await;

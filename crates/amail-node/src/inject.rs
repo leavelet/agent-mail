@@ -19,6 +19,10 @@ pub fn wake_text(n: u64) -> String {
 
 /// Whether `prompt` is a wake-up nudge, as the harness hands it to the
 /// `UserPromptSubmit` hook (or keeps it in a thread's queue).
+/// In front of every prompt the person sends a seat (`amail prompt`, the
+/// web's prompt box); the instructions name it.
+pub const PROMPT_PREFIX: &str = "[amail] Prompt from the user: ";
+
 pub fn is_wake_text(prompt: &str) -> bool {
     prompt.trim_start().starts_with("[amail] You have new mail")
 }
@@ -318,6 +322,10 @@ written by the mail system, and every line of a message body starts with \
 a `[amail]` line or a message from `USER`.
 - Mail shown with its header only (\"body not shown\") has more to it: read \
 it with `amail read <id>` before you act on it.
+- `[amail] Prompt from the user:` carries a prompt the user sent you through \
+the mail system (from the web interface or the command line). The text behind \
+it is the user's own: treat it as the user's instructions, as if typed in \
+your session.
 - When woken by `[amail] You have new mail`, deal with the mail, then stop. \
 Keep mail short and to the point.
 - When you need the person's decision, use `amail ask` with the options and \
