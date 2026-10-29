@@ -80,7 +80,7 @@ test('check boxes select rows; the selection bar marks them read and unread', as
   await expect(row(page, subjects[1])).not.toHaveClass(/unread/);
   await expect(row(page, subjects[2])).toHaveClass(/unread/);
   await expect(navCount(page)).toHaveText('1');
-  expect(await unreadCount()).toBe(1);
+  await expect.poll(unreadCount).toBe(1);
   // The selection stays for the next action.
   await expect(page.getByTestId('selected-count')).toHaveText('2 selected');
 
@@ -88,7 +88,7 @@ test('check boxes select rows; the selection bar marks them read and unread', as
   await expect(row(page, subjects[0])).toHaveClass(/unread/);
   await expect(row(page, subjects[1])).toHaveClass(/unread/);
   await expect(navCount(page)).toHaveText('3');
-  expect(await unreadCount()).toBe(3);
+  await expect.poll(unreadCount).toBe(3);
 
   await bar.getByRole('button', { name: 'Clear selection' }).click();
   await expect(bar).toHaveCount(0);
@@ -145,7 +145,7 @@ test('Mark all read marks the list read, asking first above 20', async ({ page }
   await expect(navCount(page)).toHaveCount(0);
   await expect(button).toBeDisabled();
   expect(asked).toBe(0);
-  expect(await unreadCount()).toBe(0);
+  await expect.poll(unreadCount).toBe(0);
 
   // 22: asked once, with the count.
   const many = Array.from({ length: 22 }, (_, i) => `${tag} m${i}`);
@@ -167,7 +167,7 @@ test('Mark all read marks the list read, asking first above 20', async ({ page }
   expect(asked).toBe(1);
   expect(question).toContain('22');
   await expect(page.locator('.mrow.unread')).toHaveCount(0);
-  expect(await unreadCount()).toBe(0);
+  await expect.poll(unreadCount).toBe(0);
 
   // Declining changes nothing.
   await mail(Array.from({ length: 21 }, (_, i) => `${tag} n${i}`));
@@ -177,7 +177,7 @@ test('Mark all read marks the list read, asking first above 20', async ({ page }
   page.on('dialog', (d) => void d.dismiss());
   await button.click();
   await expect(page.locator('.mrow.unread')).toHaveCount(21);
-  expect(await unreadCount()).toBe(21);
+  await expect.poll(unreadCount).toBe(21);
   await readAllByApi();
 });
 
@@ -223,9 +223,9 @@ test('at phone width the check boxes work and the selection bar leaves the list 
   await expect(row(page, subjects[0])).not.toHaveClass(/unread/);
   await expect(row(page, subjects[1])).not.toHaveClass(/unread/);
   await expect(row(page, subjects[2])).toHaveClass(/unread/);
-  expect(await unreadCount()).toBe(1);
+  await expect.poll(unreadCount).toBe(1);
 
   await page.getByTestId('mark-all-read').click();
   await expect(row(page, subjects[2])).not.toHaveClass(/unread/);
-  expect(await unreadCount()).toBe(0);
+  await expect.poll(unreadCount).toBe(0);
 });
