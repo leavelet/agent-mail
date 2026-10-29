@@ -112,6 +112,9 @@ pub struct HookFacts {
     /// `PostToolUse`: whether the call may have written the seat's
     /// handover note (`amail handover write`, an amail handover tool).
     pub note_tool: bool,
+    /// `PostToolUse`: whether the call may have asked the person (`amail
+    /// ask`, the amail `ask` tool; see [`asks_person`]).
+    pub ask_tool: bool,
     /// `SessionEnd`: why the session ended.
     pub reason: Option<String>,
 }
@@ -127,7 +130,7 @@ impl HookFacts {
                 .map(str::to_string)
         };
         let tool = s("tool_name");
-        let (mut task_tool, mut note_tool) = (false, false);
+        let (mut task_tool, mut note_tool, mut ask_tool) = (false, false, false);
         let tool_input = input.get("tool_input").and_then(|v| {
             let text = match v {
                 Value::Null => return None,
@@ -146,6 +149,7 @@ impl HookFacts {
             if let Some(tool) = &tool {
                 task_tool = touches_tasks(tool, &text);
                 note_tool = writes_note(tool, &text);
+                ask_tool = asks_person(tool, &text);
             }
             let line = amail_proto::text::line(text.trim()).into_owned();
             Some(cut_chars(&line, TOOL_INPUT_CHARS))
@@ -153,6 +157,7 @@ impl HookFacts {
         if let Some(tool) = &tool {
             task_tool |= touches_tasks(tool, "");
             note_tool |= writes_note(tool, "");
+            ask_tool |= asks_person(tool, "");
         }
         HookFacts {
             cwd: s("cwd"),
@@ -161,6 +166,7 @@ impl HookFacts {
             tool_input,
             task_tool,
             note_tool,
+            ask_tool,
             reason: s("reason"),
         }
     }
@@ -181,6 +187,15 @@ pub fn writes_note(tool: &str, input: &str) -> bool {
     let t = tool.to_ascii_lowercase();
     (t.contains("amail") && t.contains("handover_write"))
         || runs_amail(input, &["handover", "write"])
+}
+
+/// Whether a tool call may have asked the person for a decision: `amail
+/// ask` in a shell command, or the amail MCP tool `ask` (its name ends in
+/// `ask` after a separator, e.g. `mcp__amail__ask`).
+pub fn asks_person(tool: &str, input: &str) -> bool {
+    let t = tool.to_ascii_lowercase();
+    let last = t.rsplit(['_', '.', '/', ':']).next().unwrap_or_default();
+    (t.contains("amail") && last == "ask") || runs_amail(input, &["ask"])
 }
 
 /// Whether a shell command runs `amail` with the subcommand `words`
@@ -410,6 +425,21 @@ pub trait Adapter: Send + Sync + 'static {
     /// hook then claims and shows the mail).
     async fn wake(&self, target: &str, text: &str) -> Result<()>;
 
+    /// Give the session `text` as a prompt from the person (a node command
+    /// `prompt`). It goes the way of [`Adapter::wake`], but is not a
+    /// wake-up: an idle session starts a turn on it, a busy one gets it
+    /// as the harness hands over input during a turn. Default: as a wake.
+    async fn send_prompt(&self, target: &str, text: &str) -> Result<()> {
+        self.wake(target, text).await
+    }
+
+    /// Stop the session's current turn through the harness's structured
+    /// interface (a node command `interrupt`). `Ok(false)`: no turn was
+    /// running. Harnesses without one answer an error.
+    async fn interrupt(&self, _target: &str) -> Result<bool> {
+        anyhow::bail!("{} has no structured interrupt", self.harness().as_str())
+    }
+
     /// Write harness configuration (called at node start).
     async fn prepare(&self) -> Result<()>;
 
@@ -600,6 +630,15 @@ mod tests {
         assert!(writes_note("Bash", "cd /w; amail handover write -m x"));
         assert!(writes_note("mcp__amail__handover_write", "{}"));
         assert!(!writes_note("Bash", "amail handover show w1"));
+        assert!(asks_person("Bash", "amail ask 'Ship it?' --option yes:Yes"));
+        assert!(asks_person(
+            "Bash",
+            "cd /w && amail --json ask x --default no"
+        ));
+        assert!(asks_person("mcp__amail__ask", "{}"));
+        assert!(!asks_person("mcp__amail__task_set", "{}"));
+        assert!(!asks_person("Bash", "amail send root -s ask -m x"));
+        assert!(!asks_person("Bash", "make ask"));
     }
 
     /// The command that closes the task comes after the part kept for the

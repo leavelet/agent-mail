@@ -444,6 +444,18 @@ impl ServerClient {
         .await
     }
 
+    /// The open requests about `seat` (`GET /requests?seat=&state=open`).
+    pub async fn open_requests(&self, seat: &str) -> Result<amail_proto::RequestList> {
+        self.json(
+            self.req(
+                reqwest::Method::GET,
+                &format!("/requests?seat={}&state=open", enc(seat)),
+            )
+            .timeout(Duration::from_secs(10)),
+        )
+        .await
+    }
+
     /// Append worklog entries (`POST /worklog`).
     pub async fn post_worklog(
         &self,
