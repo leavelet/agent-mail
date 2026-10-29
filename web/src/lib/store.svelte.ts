@@ -8,7 +8,9 @@ import { apiUrl } from './base';
 import { Coalescer } from './coalesce';
 import { announce, itemKey, newItems } from './notify';
 import { go } from './router.svelte';
-import { t } from './ui.svelte';
+import { t, ui } from './ui.svelte';
+import { load, save } from './storage';
+import { addSnooze, isSnoozed, parseSnoozes, splitAttention } from './requests';
 import { activeOrgs } from './openings';
 import type {
   AttentionItem,
@@ -30,6 +32,8 @@ import type {
   ServerInfo,
   TaskBusEvent,
   DocBusEvent,
+  Request,
+  RequestBusEvent,
   WhoAmI,
 } from './types';
 
@@ -38,6 +42,7 @@ export type AuthState = 'checking' | 'out' | 'in' | 'operator';
 const FLUSH_MS = 1000;
 const OVERVIEW_MIN_MS = 5000;
 const ALL_COUNTS_OVER = 25;
+const SNOOZE_KEY = 'amail.snooze';
 
 class Store {
   auth = $state<AuthState>('checking');
@@ -73,6 +78,22 @@ class Store {
   /** The documents changed in the last round; null when anything may have
    * changed. */
   docChanged = $state.raw<Set<number> | null>(null);
+  /** Counts the rounds of `request` events (and stream openings and the
+   * user's own answers): views that show requests reload when it changes. */
+  requestSeq = $state(0);
+  /** The requests changed in the last round; null when anything may have
+   * changed. */
+  requestChanged = $state.raw<Set<number> | null>(null);
+  /** Snoozed request cards in this browser: request number → end (ms). */
+  snoozes = $state.raw<Record<string, number>>(parseSnoozes(load(SNOOZE_KEY), Date.now()));
+
+  /** The queue as "needs you" shows it: the open requests, and the other
+   * entries without those a request card shows already. */
+  needs = $derived(splitAttention(this.attention));
+  /** The open requests not snoozed in this browser. */
+  shownRequests = $derived(this.needs.requests.filter((r) => !isSnoozed(this.snoozes, r.num, ui.now)));
+  /** What the navigation counts as waiting for the user. */
+  needsCount = $derived(this.shownRequests.length + this.needs.rest.length);
 
   seatMap = $derived(new Map(this.seats.map((s) => [s.name, s])));
 
@@ -195,6 +216,7 @@ class Store {
       // Task events are not replayed either: views that show tasks reload.
       this.coalescer.add('t:*');
       this.coalescer.add('x:*');
+      this.coalescer.add('q:*');
     };
     es.addEventListener('mailbox', (e) => {
       try {
@@ -241,6 +263,16 @@ class Store {
       try {
         const ev = JSON.parse((e as MessageEvent).data) as DocBusEvent;
         if (typeof ev.num === 'number') this.coalescer.add(`x:${ev.num}`);
+      } catch {
+        // Ignore malformed events.
+      }
+    });
+    // A request for the person changed: the queue, the request views and
+    // the tasks it blocks reload.
+    es.addEventListener('request', (e) => {
+      try {
+        const ev = JSON.parse((e as MessageEvent).data) as RequestBusEvent;
+        if (typeof ev.num === 'number') this.coalescer.add(`q:${ev.num}`);
       } catch {
         // Ignore malformed events.
       }
@@ -293,6 +325,8 @@ class Store {
     let anyTask = false;
     let docs: Set<number> | null = new Set();
     let anyDoc = false;
+    let reqs: Set<number> | null = new Set();
+    let anyRequest = false;
     for (const k of keys) {
       if (k.startsWith('m:')) mail.add(k.slice(2));
       else if (k.startsWith('p:')) presenceChanged = true;
@@ -306,7 +340,20 @@ class Store {
         const n = Number(k.slice(2));
         if (k === 'x:*' || !Number.isFinite(n)) docs = null;
         else docs?.add(n);
+      } else if (k.startsWith('q:')) {
+        anyRequest = true;
+        const n = Number(k.slice(2));
+        if (k === 'q:*' || !Number.isFinite(n)) reqs = null;
+        else reqs?.add(n);
       }
+    }
+    if (anyRequest) {
+      this.requestChanged = reqs;
+      this.requestSeq++;
+      // A task shows the open request that blocks it (the event does not
+      // say which task).
+      anyTask = true;
+      tasks = null;
     }
     if (anyDoc) {
       this.docChanged = docs;
@@ -338,7 +385,7 @@ class Store {
       else jobs.push(...[...mail].map((s) => this.refreshCounts(s)));
     }
     const userSeat = this.me?.seat;
-    if ((userSeat && mail.has(userSeat)) || presenceChanged) jobs.push(this.refreshAttention());
+    if ((userSeat && mail.has(userSeat)) || presenceChanged || anyRequest) jobs.push(this.refreshAttention());
     await Promise.all(jobs).catch(() => undefined);
     this.scheduleOverview();
   }
@@ -381,7 +428,8 @@ class Store {
     const fresh = newItems(this.seenAttention, r.items);
     this.seenAttention = new Set(r.items.map(itemKey));
     announce(fresh, t, (i) => {
-      if (i.message) go(['thread', i.message.thread_id], { m: i.message.id });
+      if (i.request) go(['requests', `r${i.request.num}`]);
+      else if (i.message) go(['thread', i.message.thread_id], { m: i.message.id });
       else go(['needs']);
     });
   }
@@ -451,6 +499,26 @@ class Store {
     const s = this.me?.seat;
     await Promise.all([this.refreshAttention(), s ? this.refreshCounts(s) : Promise.resolve()]).catch(() => undefined);
     this.scheduleOverview();
+  }
+
+  /** After the user answered or withdrew a request here: the views reload
+   * at once (the event from the server follows). */
+  async requestsChanged(r: Request): Promise<void> {
+    this.requestChanged = new Set([r.num]);
+    this.requestSeq++;
+    await this.refreshAttention().catch(() => undefined);
+  }
+
+  /** Hide a request's card in this browser for an hour (its deadline is
+   * unchanged). */
+  snooze(num: number): void {
+    this.snoozes = addSnooze(this.snoozes, num, Date.now());
+    save(SNOOZE_KEY, JSON.stringify(this.snoozes));
+  }
+
+  unsnoozeAll(): void {
+    this.snoozes = {};
+    save(SNOOZE_KEY, null);
   }
 
   async seatOp(name: string, op: 'sleep' | 'wake'): Promise<{ nodes: number }> {

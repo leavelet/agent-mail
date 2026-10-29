@@ -10,6 +10,7 @@ const KEY = 'amail.notify';
 
 /** A stable key for an attention item. */
 export function itemKey(i: AttentionItem): string {
+  if (i.request) return `request:r${i.request.num}`;
   if (i.message) return `${i.kind}:m${i.message.id}`;
   return `${i.kind}:s${i.seat ?? ''}:${i.attention ?? ''}`;
 }
@@ -51,8 +52,9 @@ export async function requestPermission(): Promise<boolean> {
 /** Title and body of the notification for an item. */
 export function describe(
   i: AttentionItem,
-  t: (k: 'notify.ack' | 'notify.reply' | 'notify.seat' | 'notify.notice' | 'mail.writtenBy', p?: Record<string, string>) => string,
+  t: (k: 'notify.ack' | 'notify.reply' | 'notify.seat' | 'notify.notice' | 'notify.request' | 'mail.writtenBy', p?: Record<string, string>) => string,
 ): { title: string; body: string } {
+  if (i.request) return { title: t('notify.request', { seat: i.request.seat, id: `r${i.request.num}` }), body: shortSubject(i.request.title) };
   if (i.kind === 'seat') return { title: t('notify.seat', { seat: i.seat ?? '' }), body: i.hint ?? i.attention ?? '' };
   const m = i.message;
   const from = m?.written_by ? `${m.from} (${t('mail.writtenBy', { user: m.written_by })})` : (m?.from ?? '');
