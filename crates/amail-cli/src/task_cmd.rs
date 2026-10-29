@@ -444,6 +444,9 @@ pub fn task_line(t: &p::Task) -> String {
             (None, None) => {}
         }
     }
+    if let Some(r) = t.blocked_on_human {
+        s.push_str(&format!("  · blocked-on-human (r{r})"));
+    }
     if let Some(w) = &t.steal_requested_by {
         s.push_str(&format!("  · {} asks to take over", l(w)));
     }
@@ -544,7 +547,12 @@ pub fn detail_text(d: &p::TaskDetail) -> String {
     } else {
         format!("{} (stored: {})", t.state, t.stored_state)
     };
-    out.push(format!("State: {state}"));
+    match t.blocked_on_human {
+        Some(r) => out.push(format!(
+            "State: {state} · blocked-on-human (r{r}: amail request show r{r})"
+        )),
+        None => out.push(format!("State: {state}")),
+    }
     out.push(format!("Rev: {}", t.rev));
     if let Some(r) = t.result {
         let mut s = format!("Result: {r}");
@@ -1034,7 +1042,19 @@ pub async fn run(c: &Client, out: &Out, cmd: TaskCmd) -> Result<()> {
     {
         out.show(&api.raw, || Ok(stale_text(&s, true)))?;
     }
-    r
+    // `take` and `steal` of a task that waits for the person: the server's
+    // refusal, with what it means.
+    r.map_err(|e| match e.downcast::<crate::client::ApiError>() {
+        Ok(mut a) if a.body.error.code == "blocked_on_human" => {
+            a.body.error.message = format!(
+                "{}; the task is blocked-on-human until the request is answered or withdrawn",
+                a.body.error.message
+            );
+            a.into()
+        }
+        Ok(a) => a.into(),
+        Err(e) => e,
+    })
 }
 
 /// `k=v` pairs, encoded.
@@ -1618,6 +1638,12 @@ mod tests {
         t.blocked_reason = Some("needs\nkeys".into());
         assert!(
             task_line(&t).ends_with("  · waits for w3: needs keys"),
+            "{}",
+            task_line(&t)
+        );
+        t.blocked_on_human = Some(4);
+        assert!(
+            task_line(&t).ends_with("  · waits for w3: needs keys  · blocked-on-human (r4)"),
             "{}",
             task_line(&t)
         );

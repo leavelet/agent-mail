@@ -9,6 +9,7 @@ mod onboard;
 mod openings_cmd;
 mod output;
 mod profiles;
+mod request_cmd;
 mod service;
 mod task_cmd;
 mod team_cmd;
@@ -161,12 +162,18 @@ enum Cmd {
     /// Withdraw a message you sent from a recipient of your org that has
     /// not been shown it yet: it leaves that seat's unread mail and is
     /// never injected (the seat can still read it by id). The org's user
-    /// can withdraw any message of the org.
+    /// can withdraw any message of the org. With a request (`r12`):
+    /// withdraw the request (the seat it is about, the seat that made it,
+    /// or the user).
     Withdraw {
-        id: i64,
-        /// The recipient seat.
+        /// A message id, or a request (r12).
+        id: String,
+        /// The recipient seat (messages only).
         #[arg(long = "from", value_name = "SEAT")]
-        from: String,
+        from: Option<String>,
+        /// A note for a withdrawn request.
+        #[arg(short = 'm', long)]
+        note: Option<String>,
     },
     /// Delivery state of each recipient of a message you sent.
     Status { id: i64 },
@@ -222,6 +229,39 @@ enum Cmd {
     /// reference material.
     #[command(subcommand)]
     Doc(doc_cmd::DocCmd),
+    /// Ask the org's user (the person) for a decision: the request (r12)
+    /// is mailed to the user, and the answer comes back as mail in its
+    /// thread. With --wait, wait for the answer and print it.
+    Ask(request_cmd::AskArgs),
+    /// Answer a request (user token): an option's number, key or label,
+    /// or free text where the request takes it.
+    Answer {
+        /// r12 or 12.
+        request: String,
+        /// The option (number, key or label) or the free-text answer.
+        answer: String,
+        /// A note that goes with the answer.
+        #[arg(short = 'm', long)]
+        note: Option<String>,
+        /// Refuse the answer if the request changed since this revision.
+        #[arg(long, value_name = "REV")]
+        if_rev: Option<i64>,
+    },
+    /// Requests for the person, one per line: open ones first (`now`,
+    /// then `soon`, then `later`, oldest first).
+    Requests(request_cmd::ListArgs),
+    /// One request for the person.
+    #[command(subcommand)]
+    Request(request_cmd::RequestCmd),
+    /// Give a seat's session a prompt from the user (user token), through
+    /// the seat's node. The text comes from -m or stdin.
+    Prompt {
+        seat: String,
+        #[arg(short = 'm', long)]
+        text: Option<String>,
+    },
+    /// Stop a seat's current turn (user token; Codex and dsh seats).
+    Interrupt { seat: String },
     /// A seat's handover note: what the next session of the seat reads
     /// first.
     #[command(subcommand)]
@@ -1535,7 +1575,19 @@ async fn run(cli: Cli) -> Result<()> {
                 .await?;
             out.show(&v, || Ok(format!("acked #{id}")))
         }
-        Cmd::Withdraw { id, from } => {
+        Cmd::Withdraw { id, from: _, note } if request_cmd::is_request_ref(&id) => {
+            request_cmd::run_withdraw(&c, &out, &id, note).await
+        }
+        Cmd::Withdraw { id, from, note } => {
+            let Ok(id) = id.trim().parse::<i64>() else {
+                bail!("{id:?} is neither a message id nor a request (r12)");
+            };
+            let Some(from) = from else {
+                bail!("withdrawing a message needs --from <seat> (the recipient)");
+            };
+            if note.is_some() {
+                bail!("-m is for requests (amail withdraw r12 -m note)");
+            }
             let v = c
                 .raw(
                     Method::POST,
@@ -1688,6 +1740,17 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Team(cmd) => openings_cmd::team(&c, &out, cmd).await,
         Cmd::Task(cmd) => task_cmd::run(&c, &out, cmd).await,
         Cmd::Doc(cmd) => doc_cmd::run(&c, &out, cmd).await,
+        Cmd::Ask(a) => request_cmd::run_ask(&c, &out, a).await,
+        Cmd::Answer {
+            request,
+            answer,
+            note,
+            if_rev,
+        } => request_cmd::run_answer(&c, &out, &request, &answer, note, if_rev).await,
+        Cmd::Requests(a) => request_cmd::run_list(&c, &out, a).await,
+        Cmd::Request(cmd) => request_cmd::run(&c, &out, cmd).await,
+        Cmd::Prompt { seat, text } => request_cmd::run_prompt(&c, &out, &seat, text).await,
+        Cmd::Interrupt { seat } => request_cmd::run_interrupt(&c, &out, &seat).await,
         Cmd::Handover(cmd) => handover_cmd::run(&c, &out, cmd).await,
         Cmd::Worklog(a) => handover_cmd::run_worklog(&c, &out, a).await,
         Cmd::Focus { cmd } => {
