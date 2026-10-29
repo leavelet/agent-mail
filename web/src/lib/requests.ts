@@ -72,20 +72,34 @@ export function isCreationMail(m: { subject: string; thread_id: number }, r: Pic
   return m.subject.trimStart().startsWith(`[r${r.num}]`);
 }
 
+const REST_KINDS: string[] = ['ack', 'reply', 'seat', 'notice'];
+
 /** The "needs you" queue split: the open requests, and the other entries
- * without those a request card already shows (a seat with an open
- * `attention` request; the creation mail of an open request). */
+ * of the kinds this interface knows, without the creation mail of an open
+ * request (its card shows it). */
+
 export function splitAttention(items: AttentionItem[]): { requests: Request[]; rest: AttentionItem[] } {
   const requests = items.filter((i) => i.kind === 'request' && i.request).map((i) => i.request as Request);
-  const attentionSeats = new Set(requests.filter((r) => r.kind === 'attention').map((r) => r.seat));
   const rest = items.filter((i) => {
-    if (i.kind === 'request') return false;
-    if (i.kind === 'seat') return !(i.seat && attentionSeats.has(i.seat));
+    // Kinds this interface does not know (a newer server) are left out
+    // rather than shown without words.
+    if (!REST_KINDS.includes(i.kind)) return false;
+    // A seat entry stays (it shows the condition and how to reach the
+    // seat's terminal); `countNeeds` counts it once with its request.
+    if (i.kind === 'seat') return true;
     const m = i.message;
     if (m && requests.some((r) => isCreationMail(m, r))) return false;
     return true;
   });
   return { requests, rest };
+}
+
+/** How many things wait for the user: the shown requests, and the other
+ * entries, where a seat entry with a shown `attention` request of that
+ * seat counts once (with the request). */
+export function countNeeds(shown: Request[], rest: AttentionItem[]): number {
+  const seats = new Set(shown.filter((r) => r.kind === 'attention').map((r) => r.seat));
+  return shown.length + rest.filter((i) => !(i.kind === 'seat' && i.seat && seats.has(i.seat))).length;
 }
 
 /** Snoozed cards: request number → end of the snooze (ms), kept in this

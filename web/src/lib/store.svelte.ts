@@ -10,7 +10,7 @@ import { announce, itemKey, newItems } from './notify';
 import { go } from './router.svelte';
 import { t, ui } from './ui.svelte';
 import { load, save } from './storage';
-import { addSnooze, isSnoozed, parseSnoozes, splitAttention } from './requests';
+import { addSnooze, countNeeds, isSnoozed, parseSnoozes, splitAttention } from './requests';
 import { activeOrgs } from './openings';
 import type {
   AttentionItem,
@@ -93,7 +93,7 @@ class Store {
   /** The open requests not snoozed in this browser. */
   shownRequests = $derived(this.needs.requests.filter((r) => !isSnoozed(this.snoozes, r.num, ui.now)));
   /** What the navigation counts as waiting for the user. */
-  needsCount = $derived(this.shownRequests.length + this.needs.rest.length);
+  needsCount = $derived(countNeeds(this.shownRequests, this.needs.rest));
 
   seatMap = $derived(new Map(this.seats.map((s) => [s.name, s])));
 

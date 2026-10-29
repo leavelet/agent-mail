@@ -3,6 +3,7 @@ import {
   SNOOZE_MS,
   addSnooze,
   allHaveDefault,
+  countNeeds,
   answerText,
   groupByClass,
   interruptKind,
@@ -94,10 +95,15 @@ describe('the queue', () => {
       mail(90, 'Unrelated'),
       { kind: 'seat', since: '', seat: 'fe-lead', attention: 'permission' },
       { kind: 'seat', since: '', seat: 'be-2', attention: 'wake-failed' },
+      { kind: 'future' as AttentionItem['kind'], since: '', seat: 'x' },
+      { kind: 'request', since: '', seat: 'y' },
     ];
     const { requests, rest } = splitAttention(items);
     expect(requests.map((r) => r.num)).toEqual([7, 8]);
-    expect(rest.map((i) => i.message?.id ?? i.seat)).toEqual([81, 90, 'be-2']);
+    expect(rest.map((i) => i.message?.id ?? i.seat)).toEqual([81, 90, 'fe-lead', 'be-2']);
+    // fe-lead counts once, with its attention request.
+    expect(countNeeds(requests, rest)).toBe(2 + 3);
+    expect(countNeeds([q], rest)).toBe(1 + 4);
   });
   it('keys request items by number', () => {
     const a: AttentionItem = { kind: 'request', since: '', seat: 'be-1', request: req(3) };

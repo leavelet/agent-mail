@@ -38,7 +38,7 @@
       <p class="waiting" data-testid="seat-waiting">{t('req.waitingFor')} <a class="mono" href={href(['requests', requestId(waiting)])}>{requestId(waiting)}</a></p>
     {/if}
     {#if rows.length}
-      <h3>{t('req.seatOpen')} <span class="count alert">{rows.length}</span></h3>
+      <h3>{t('req.seatOpen')} <span class="count hot">{rows.length}</span></h3>
       <ul>
         {#each rows as r (r.num)}
           <li data-request={r.num}>
