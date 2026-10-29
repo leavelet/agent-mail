@@ -463,9 +463,13 @@ and comes with the seat's next turn), keeps the seat flagged
 (`turn-failed`, with the harness's error text) and reports it to the
 user once by system mail (as part of the node's next notice report, so
 it counts against the org's daily notice budget; see
-[security](security.md#resource-limits)). `amail wake <seat>` (or Wake in the web interface) lets the
-node deliver the mail again until the next failure; a turn that ends
-normally clears the flag. A turn the person interrupts is not a failure,
+[security](security.md#resource-limits)). `amail wake <seat>` (or Wake in
+the web interface) and Restart on the seat's attention card are a manual
+retry: the node forgets the seat's failed turns, so the flag and its
+attention card go at once, the mail is delivered again, and a failure
+after that counts from one, flags the seat anew and opens a new attention
+card (and, after three more, sends a new notice). A turn that ends
+normally also clears the flag. A turn the person interrupts is not a failure,
 and its mail counts as delivered.
 
 How each harness's failed turns are found:
@@ -554,8 +558,8 @@ was interrupted, no turn was running, or the error).
 Answers to `attention` requests reach the node the same way (command
 `attention_action`), for supervised seats: `restart` stops the seat's
 process and starts it again at once, resuming its session (a seat that is
-not running is started; a failed seat's failures are cleared, as `amail
-wake` does), and `sleep` puts the seat to sleep as `amail sleep` does (mail
+not running is started; a failed seat's failures and its failed turns are
+cleared, as `amail wake` does, see [Failed turns](#failed-turns)), and `sleep` puts the seat to sleep as `amail sleep` does (mail
 already waiting does not start it again, new mail does). Recorded as
 `attention_action` with the request's number.
 

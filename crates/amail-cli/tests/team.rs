@@ -903,6 +903,16 @@ async fn crash_restart_backoff_and_resume_fallback(b: Backend) {
         "{f}"
     );
     assert_eq!(row(&h, "s").await.attention.as_deref(), Some("turn-failed"));
+    // Woken by hand: a manual retry forgets the failed turn at once, so the
+    // flag (and the attention card made from it) goes; a failure after
+    // this would count from one again.
+    let (ok, out) = cli(&h, &["wake", "s"]).await;
+    assert!(ok, "{out}");
+    assert!(
+        h.seat_status("s").await["turn_failed"].is_null(),
+        "{}",
+        h.seat_status("s").await
+    );
     wait_for("shown again", || {
         injected(&h, "s").matches(&format!("#{m} from")).count() == before + 1
     })

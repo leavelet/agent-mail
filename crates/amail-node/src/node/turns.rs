@@ -21,8 +21,10 @@
 //!   doubles per failure. After [`Config::turn_fail_limit`] failures in a
 //!   row the node stops waking the seat for it (the mail stays unread and
 //!   comes with the seat's next turn), keeps the seat flagged, and tells
-//!   the person once by system mail. `amail wake` lets the node deliver it
-//!   again until the next failure.
+//!   the person once by system mail. A manual retry (`amail wake`, or
+//!   Restart on the seat's attention card) clears the seat's failure
+//!   record: the flag goes, the count starts again at the next failure,
+//!   and that failure flags the seat (and opens an attention card) anew.
 //!
 //! Codex hooks report no failed turn, so for Codex seats the node asks the
 //! shared app-server how the turn ended (`thread/turns/list`): shortly
@@ -151,6 +153,23 @@ impl State {
             count: t.failures,
             retrying: t.failures < limit || t.manual_retry,
         })
+    }
+
+    /// Forget the seat's failed turns (a manual retry). Returns whether
+    /// there were any. The claims the node remembers stay.
+    pub(super) fn reset_turn_failures(&mut self, seat: &str) -> bool {
+        let Some(t) = self.saved.turns.get_mut(seat).filter(|t| t.failures > 0) else {
+            return false;
+        };
+        t.failures = 0;
+        t.reason = None;
+        t.failed_at = None;
+        t.noticed = false;
+        t.manual_retry = false;
+        self.save_dirty = true;
+        self.tidy_turn(seat);
+        self.dirty_presence.insert(seat.to_string());
+        true
     }
 
     /// The node does not wake the seat for mail: too many failed turns.
@@ -317,12 +336,12 @@ impl Node {
         }
     }
 
-    /// The person woke the seat: deliver its mail again even after too
-    /// many failed turns (until the next failure).
+    /// The person woke or restarted the seat: forget its failed turns, so
+    /// its mail is delivered again (also after too many failures) and a
+    /// failure after this counts from one and flags the seat anew.
     pub(super) fn turns_retry(&self, st: &mut State, seat: &str) {
-        if st.turns_exhausted(seat, self.cfg.turn_fail_limit) {
-            st.turn(seat).manual_retry = true;
-            st.dirty_presence.insert(seat.to_string());
+        if st.reset_turn_failures(seat) {
+            tracing::info!("seat {seat}: woken or restarted by the person; clearing its failures");
             self.presence_kick.notify_one();
             self.wake_kick.notify_one();
         }
@@ -1023,6 +1042,28 @@ fn status_word(s: &TurnStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_manual_retry_forgets_the_failures() {
+        let mut st = State::default();
+        st.seat("w1");
+        assert!(!st.reset_turn_failures("w1"));
+        let t = st.turn("w1");
+        t.failures = 4;
+        t.reason = Some("model_not_found".into());
+        t.failed_at = Some(1);
+        t.noticed = true;
+        t.keys.insert(7, "k".into());
+        assert!(st.turn_failure("w1", 3).is_some());
+        assert!(st.turns_exhausted("w1", 3));
+        assert!(st.reset_turn_failures("w1"));
+        assert!(st.turn_failure("w1", 3).is_none());
+        assert!(!st.turns_exhausted("w1", 3));
+        let t = &st.saved.turns["w1"];
+        assert!(!t.noticed && t.reason.is_none() && t.failed_at.is_none());
+        assert_eq!(t.keys.get(&7).map(String::as_str), Some("k"));
+        assert!(st.dirty_presence.contains("w1"));
+    }
 
     // Seed the first positive observation, then create the second adapter
     // proof. Tests interleave changes after this return and before commit.
