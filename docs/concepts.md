@@ -1043,7 +1043,8 @@ A request may name a task. While the request is open the task is
 `blocked-on-human` (`blocked_on_human` in the task names the request), and
 `take`, `steal` and `GET /tasks/next` leave the task alone.
 
-**Asking and waiting.** A seat asks with `POST /requests`; the request is
+**Asking and waiting.** A seat asks with `amail ask` or the MCP tool
+`ask` (both call `POST /requests`); the request is
 mailed to the user, `To`, subject `[r12] <title>`, with the options as
 numbered lines, from the asking seat. The seat then ends its turn and
 waits: the answer is mailed back to it in the request's thread, `To` it,
@@ -1057,8 +1058,9 @@ the `ask` tool). When that turn ends, the node asks the server for the
 seat's open requests; if the seat made a `question`, `plan` or `merge`
 request that is still open, and no mail waits for the seat, the node marks
 the seat as waiting for it: presence carries `waiting_for` (the request's
-number), and `amail ps` shows `waiting for r12` in the seat's row. The
-mark changes nothing else. A supervised seat goes to sleep by the team's
+number), and `amail ps` and `amail seat ls` show `waiting for r12` in the
+seat's line, as the web interface does in the seat's row of the org tree
+and on its page. The mark changes nothing else. A supervised seat goes to sleep by the team's
 `idle_sleep` rule as any idle seat does; the answer arrives as mail `To`
 the seat, which wakes it or starts it again, and the next turn clears the
 mark. A seat whose node restarts loses the mark (the request stays open,
@@ -1090,7 +1092,9 @@ with 409 `answered`, which carries the first. The seat that asked, or the
 user, may withdraw an open request; the other side is told in the thread.
 Answering an `attention` request runs its action through the seat's node
 (`restart`, `sleep`) or gives the seat's terminal link (`open_terminal`);
-nothing is mailed.
+nothing is mailed. When a request stops being open, by any of these paths
+or by its default at the deadline, the server marks the user's copy of the
+request's creation mail read, so it leaves the unread mail and the queue.
 
 **The queue.** `GET /attention`, the web interface's "needs you" list,
 shows the open requests first (`now` first, oldest first), then the
@@ -1107,7 +1111,8 @@ entries it showed before requests existed, urgent first:
   that the seat's turns work again (for a notice about several seats: once
   none of them fails); the mail stays in the Inbox and the archive;
 - seats whose node reports that they need a person (also listed as
-  `attention` requests above them).
+  `attention` requests above them; the request's entry carries the seat
+  entry's details: the hint, the failed turns, the failed wake-ups).
 
 **In the web interface.** "Needs you" shows the open requests as cards,
 grouped by class (`now`, `soon`, `later`), oldest first in each group, and
@@ -1119,13 +1124,15 @@ request that takes free text has a text field; **Add a note** opens a
 field for a note that goes with the answer. An answer carries the
 revision the card shows (`if_rev`); when someone answered first, the card
 says so and shows that answer. For an `attention` request the buttons are
-the system's actions; **Open the terminal** opens the seat's terminal link
+the system's actions, and the card shows the seat's failed turns (their
+count and last error) or its current hint when that differs from the
+request's body; **Open the terminal** opens the seat's terminal link
 when its node reported one. **Snooze 1 h** hides a card for an hour in
 this browser only; the deadline does not change. When every open request
 of a class has a default, the class has a button that answers them all
-with their defaults, after one confirmation. A request's creation mail is
-not listed again below its card; answering a request in the web interface
-marks that mail read. A seat entry stays below the cards (it shows the
+with their defaults, after one confirmation. A request's creation mail
+(the request's `message_id`) is not listed again below its card; the
+server marks it read when the request is closed. A seat entry stays below the cards (it shows the
 condition and how to reach the seat), and the navigation counts a seat
 with an open `attention` request once.
 

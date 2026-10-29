@@ -309,27 +309,66 @@ how to verify, pointers), and a **Worklog** tab, with what the seat did.
 
 ## 7. Answer a question
 
-When an agent needs a decision, it makes a request for you with the
-options it offers (`POST /requests`). The request (`r12`) appears at the top of **Needs
-you** as a card, grouped by how soon it needs an answer: click an option
-(or type an answer when the request takes free text). The answer is mailed
-to the agent and wakes it. A request with a default takes it at its
-deadline if you do not answer; **Snooze 1 h** hides a card for an hour in
-this browser without changing the deadline. **Requests** in the navigation
-lists every request, answered ones included.
+When an agent needs your decision on a fixed set of choices, it asks with
+`amail ask` (or the MCP tool `ask`) instead of plain mail. Suppose `app-1`,
+working on `t1`, does not know how to split words:
+
+```sh
+amail ask "Split on Unicode whitespace?" -m "ASCII only breaks the tests in t2." \
+  --option yes:"Split on any Unicode whitespace" --option no:"Keep ASCII only" \
+  --default no --task t1
+# r1  question  soon  Split on Unicode whitespace?  (deadline 2026-10-29 14:00Z, then the default no)  · t1 is blocked-on-human
+# The answer comes as mail in the request's thread (Re: [r1] …). Show it: amail request show r1
+```
+
+The worker then ends its turn. The node marks it as waiting for the
+answer: `amail ps` and `amail seat ls` show `waiting for r1` for `app-1`,
+and so do its row in **Org** and its page. Task `t1` shows
+`blocked-on-human (r1)` until the request is answered, and no other seat
+takes it meanwhile.
+
+You get the request as mail with the subject `[r1] Split on Unicode
+whitespace?` and the options as numbered lines. In the web interface it is
+a card at the top of **Needs you**, grouped by how soon it needs an answer
+(`now`, `soon`, `later`). The card shows the seat, the task, the title, the
+body (click **Details** to open it), and the deadline with the default.
+Click an option, or type an answer when the request takes free text;
+**Add a note** sends a note with the answer. **Snooze 1 h** hides the card
+for an hour in this browser without changing the deadline. **Requests** in
+the navigation lists every request, answered ones included, and each
+request has its own page.
+
+You can also reply in the request's thread with the option's number, key
+or label on the first line, or answer from the command line:
+
+```sh
+amail requests                   # open requests, `now` first
+amail request show r1
+amail answer r1 1 -m "Use str.split() without arguments."
+# r1 answered by owner: 1. yes — Split on any Unicode whitespace
+# Note: Use str.split() without arguments.
+```
+
+The answer is mailed to the worker in the request's thread and wakes it;
+`t1` is no longer blocked. The request's mail to you is marked read, so it
+leaves your unread mail. If nobody answers by the deadline (4 hours for
+class `soon`), the request takes its default and the worker is told the
+same way.
+
+A seat that needs a person and cannot ask (a trust or login prompt, a
+permission prompt, failing turns, unanswered wake-ups) appears as a card
+of kind `attention` in the `now` group. Its buttons are actions: restart
+the seat, put it to sleep, open its terminal, or dismiss the card. The
+card shows the failed turns and their last error when there are any. The
+seat's own entry stays below the cards, and the count in the navigation
+has the seat once.
 
 Below the requests, **Needs you** lists mail to you, oldest first, with
-mail that asks for an acknowledgement and seats that need a person (a
-permission prompt, a trust prompt, a failed seat). Open the message and
-reply; the reply wakes the agent, and your answer is injected as an
-instruction. The entry leaves the queue once you have replied in the
-thread (or marked it read; opening it in **Inbox** does that).
-
-To give a seat an instruction directly, open its page and use the prompt
-box under its conversation; **Interrupt** stops the current turn of a
-Codex or dsh seat (a Claude Code seat is interrupted in its terminal).
-
-From the command line:
+mail that asks for an acknowledgement and the seats that need a person.
+Open a message and reply; the reply wakes the agent, and your answer is
+injected as an instruction. The entry leaves the queue once you have
+replied in the thread (or marked it read; opening it in **Inbox** does
+that). From the command line:
 
 ```sh
 amail inbox                      # mail to you
@@ -337,37 +376,14 @@ amail read 4
 amail reply 4 -m "Yes: split on any Unicode whitespace."
 ```
 
+To give a seat an instruction directly, open its page and use the prompt
+box under its conversation (`amail prompt app-1 -m …` from the command
+line); **Interrupt** stops the current turn of a Codex or dsh seat (a
+Claude Code seat is interrupted in its terminal). Both are recorded in the
+seat's worklog.
+
 To be told about new entries while the tab is in the background, turn on
 **Admin → Settings → Notifications in this browser**.
-
-### Requests
-
-A worker that needs your decision on a fixed set of choices asks with
-`amail ask` (or the MCP tool `ask`) instead of plain mail:
-
-```sh
-amail ask "Split on Unicode whitespace?" -m "ASCII only breaks the tests in t4." \
-  --option yes:"Split on any Unicode whitespace" --option no:"Keep ASCII only" \
-  --default no --task t3
-# r1  question  soon  Split on Unicode whitespace?  (deadline 2026-10-29 14:00Z, then the default no)
-```
-
-The worker then stops its turn; task `t3` shows `blocked-on-human (r1)`
-until the request is answered. You get the request as mail with the
-subject `[r1] Split on Unicode whitespace?` and the options as numbered
-lines; it is listed first under **Needs you**. Answer it there, reply in
-its thread with the option's number, key or label on the first line, or
-from the command line:
-
-```sh
-amail requests                   # open requests, `now` first
-amail request show r1
-amail answer r1 1 -m "Use char::is_whitespace."
-```
-
-The answer is mailed to the worker in the request's thread and wakes it.
-If nobody answers by the deadline (4 hours for class `soon`), the request
-takes its default and the worker is told the same way.
 
 ## 8. Watch, pause, stop
 

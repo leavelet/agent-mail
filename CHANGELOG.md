@@ -270,7 +270,8 @@ The first public version.
     optional task, title, Markdown body, 2 to 6 options or free text, a
     default, a class (`now`, `soon`, `later`) that sets the deadline
     (15 minutes, 4 hours, 24 hours), the state, the answer, the mail
-    thread, the source, a revision and an append-only history.
+    thread and the creation mail (`message_id`), the source, a revision
+    and an append-only history.
   - `POST /requests` (seats ask for themselves; the user names a seat;
     nodes make `attention` requests), `GET /requests` (open ones first,
     `now` first, oldest first; filters by state, kind, seat, class and
@@ -283,7 +284,10 @@ The first public version.
     is mailed in the request's thread `To` the seat, which wakes it. A
     reply of the user in the thread whose first line names an option is
     the answer; any other reply is a comment that reaches the seat.
-    `[r12]` in a subject links the thread to the request.
+    `[r12]` in a subject links the thread to the request. When a request
+    stops being open (answered through the API or by a reply, its default
+    taken, withdrawn), the user's delivery of its creation mail is marked
+    read.
   - The deadline pass joins the reminder pass: a request with a default
     takes it at the deadline (`expired`, answered by `deadline`, mailed to
     the seat); one without a default is reminded to the user by class, in
@@ -295,8 +299,10 @@ The first public version.
     one sends the node an `attention_action` command (`restart`, `sleep`)
     or gives the seat's terminal link (`open_terminal`).
   - `GET /attention` lists the open requests first (`kind: "request"`),
-    then the entries as before; `request` events on `/v1/events` for user
-    tokens.
+    then the entries as before; the item of an `attention` request carries
+    its seat entry's hint, state and failed turns, and the overview's
+    `attention` counts such a seat once. `request` events on `/v1/events`
+    for user tokens (`{num, change, state, seat, task?}`).
   - A task with an open request shows `blocked_on_human`; `take` and
     `steal` refuse it with 409 `blocked_on_human`, and `GET /tasks/next`
     leaves it out.
@@ -340,7 +346,7 @@ The first public version.
   - A seat whose turn ran `amail ask` (or the `ask` tool) and ended with
     its `question`, `plan` or `merge` request still open and no mail
     waiting is marked as waiting for it: presence `waiting_for`, `waiting
-    for r12` in `amail ps`, worklog `waiting`. It sleeps by the team's
+    for r12` in `amail ps` and `amail seat ls`, worklog `waiting`. It sleeps by the team's
     idle rule; the answer's mail wakes it, and its next turn clears the
     mark.
   - `GET /requests` takes node tokens for one seat (`seat` required).
@@ -607,12 +613,13 @@ The first public version.
     default, the options as buttons with the default marked, a free-text
     field, an optional note, **Snooze 1 h** (this browser only), and for
     `attention` requests the system's actions (`open_terminal` opens the
-    terminal link the answer returns). Answers send `if_rev`; a card whose
-    request was answered first shows that answer. A class whose open
-    requests all have a default can be answered with the defaults after
-    one confirmation. A request's creation mail is not listed again below
-    its card and is marked read when the request is answered here; entry
-    kinds the page does not know are left out.
+    terminal link the answer returns; the card also shows the seat's
+    failed turns or current hint, and the navigation counts the seat
+    once). Answers send `if_rev`; a card whose request was answered first
+    shows that answer. A class whose open requests all have a default can
+    be answered with the defaults after one confirmation. A request's
+    creation mail (its `message_id`) is not listed again below its card;
+    entry kinds the page does not know are left out.
   - A request page (`#/requests/r12`) with the fields, options, answer,
     history, threads, the answer form and **Withdraw**, and a requests
     list (`#/requests`) with filters for state, kind, class and seat.
@@ -624,9 +631,10 @@ The first public version.
   - Seat pages: a prompt box under the conversation mirror, **Interrupt**
     for Codex and dsh seats, the terminal link with an explanation for
     Claude Code seats, the seat's open requests, and "waiting for r12"
-    when the node reports it.
+    when the node reports it (presence `waiting_for`), which the seat's
+    row in the org tree shows too.
   - `request` events refresh the cards, the pages, the lists and the
-    navigation count live.
+    navigation count live, and the views of the request's task.
 
 #### Public servers and getting started
 
