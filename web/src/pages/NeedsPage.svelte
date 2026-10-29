@@ -13,10 +13,60 @@
   import StateBadge from '../components/StateBadge.svelte';
   import NeedsTasks from '../components/NeedsTasks.svelte';
   import NeedsDocs from '../components/NeedsDocs.svelte';
+  import RequestCard from '../components/RequestCard.svelte';
+  import { allHaveDefault, groupByClass, isSnoozed } from '../lib/requests';
+  import { answerRequest, conflictRequest, requestError } from '../lib/requestops';
+  import type { Request, RequestClass } from '../lib/types';
 
   let selectedKey = $state<string | null>(null);
   let pane: MessagePane | undefined = $state();
-  const items = $derived(store.attention);
+  // The entries other than requests (a request's own card covers its
+  // creation mail and its seat's attention entry).
+  const items = $derived(store.needs.rest);
+
+  // Requests resolved in this view (answered here, or found answered by
+  // someone else): their cards stay, with the outcome, until hidden.
+  let resolved = $state.raw<Map<number, Request>>(new Map());
+  function setResolved(r: Request) {
+    resolved = new Map(resolved).set(r.num, r);
+  }
+  function hide(num: number) {
+    const m = new Map(resolved);
+    m.delete(num);
+    resolved = m;
+  }
+  const shownOpen = $derived(store.shownRequests);
+  const groups = $derived(
+    groupByClass([...shownOpen.map((r) => resolved.get(r.num) ?? r), ...[...resolved.values()].filter((r) => !shownOpen.some((o) => o.num === r.num))]),
+  );
+  const snoozed = $derived(store.needs.requests.filter((r) => isSnoozed(store.snoozes, r.num, ui.now)));
+  const snoozeEnd = $derived(Math.max(0, ...snoozed.map((r) => store.snoozes[String(r.num)] ?? 0)));
+  const total = $derived(store.needsCount);
+
+  let groupBusy = $state<RequestClass | null>(null);
+  let groupMsg = $state<{ cls: RequestClass; text: string; error: boolean } | null>(null);
+  /** Answer every open request of a class with its default (one confirm). */
+  async function answerDefaults(cls: RequestClass, reqs: Request[]) {
+    const open = reqs.filter((r) => r.state === 'open');
+    if (!open.length || groupBusy || !confirm(t('req.defaultAll.confirm', { n: open.length, cls: t(`req.class.${cls}`) }))) return;
+    groupBusy = cls;
+    groupMsg = null;
+    let done = 0;
+    const failed: string[] = [];
+    for (const r of open) {
+      try {
+        const d = await answerRequest(r.num, { option: r.default, if_rev: r.rev });
+        setResolved(d.request);
+        done++;
+      } catch (e) {
+        const cur = conflictRequest(e);
+        if (cur && cur.state !== 'open') setResolved(cur);
+        failed.push(`r${r.num}: ${requestError(e)}`);
+      }
+    }
+    groupBusy = null;
+    groupMsg = { cls, text: [t('req.defaultAll.done', { n: done }), ...failed].join(' · '), error: failed.length > 0 };
+  }
   const index = $derived(items.findIndex((it) => attentionKey(it) === selectedKey));
   const current = $derived<AttentionItem | undefined>(index >= 0 ? items[index] : undefined);
 
@@ -78,14 +128,41 @@
 <div class="needs">
   <section class="queue" aria-label={t('needs.title')}>
     <div class="qhead">
-      <h1>{t('needs.title')} <span class="count {items.length ? 'alert' : ''}">{items.length}</span></h1>
-      <p class="muted intro">{t('needs.intro')}</p>
+      <h1>{t('needs.title')} <span class="count {total ? 'alert' : ''}">{total}</span></h1>
+      <p class="muted intro">{t('needs.intro')} <a href={href(['requests'], { state: 'all' })}>{t('req.history')} →</a></p>
     </div>
+    <div class="scroll">
+    {#if groups.length || snoozed.length}
+      <div class="requests" data-testid="needs-requests">
+        {#each groups as g (g.cls)}
+          {@const openOnes = g.requests.filter((r) => r.state === 'open')}
+          <section class="rgroup" data-class={g.cls} aria-label={t(`req.class.${g.cls}.group`)}>
+            <div class="ghead">
+              <h3>{t(`req.class.${g.cls}.group`)} <span class="count {g.cls === 'now' ? 'alert' : ''}">{openOnes.length}</span></h3>
+              <span class="spacer"></span>
+              {#if openOnes.length > 1 && allHaveDefault(openOnes)}
+                <button class="small" disabled={!!groupBusy} onclick={() => answerDefaults(g.cls, openOnes)} data-testid="answer-defaults">{t('req.defaultAll', { n: openOnes.length })}</button>
+              {/if}
+            </div>
+            {#if groupMsg?.cls === g.cls}<p class={groupMsg.error ? 'error' : 'ok'} role="status">{groupMsg.text}</p>{/if}
+            {#each g.requests as r (r.num)}
+              <RequestCard request={r} onresolved={setResolved} ondismiss={r.state === 'open' ? undefined : () => hide(r.num)} />
+            {/each}
+          </section>
+        {/each}
+        {#if snoozed.length}
+          <p class="faint snoozed" data-testid="snoozed">
+            {t('req.snoozed', { n: snoozed.length, time: shortTime(new Date(snoozeEnd).toISOString(), ui.now, ui.lang) })}
+            <button class="small ghost" onclick={() => store.unsnoozeAll()}>{t('req.unsnooze')}</button>
+          </p>
+        {/if}
+      </div>
+    {/if}
     <NeedsTasks />
     <NeedsDocs />
-    {#if items.length === 0}
+    {#if items.length === 0 && groups.length === 0}
       <div class="empty done">✓ {t('needs.empty')}</div>
-    {:else}
+    {:else if items.length}
       <div class="items" role="listbox" aria-label={t('needs.title')}>
         {#each items as it (attentionKey(it))}
           {@const key = attentionKey(it)}
@@ -126,6 +203,7 @@
         {/each}
       </div>
     {/if}
+    </div>
     <p class="faint rule">{t('needs.rule')}</p>
   </section>
   <section class="reader">
@@ -181,10 +259,39 @@
     margin: 4px 0 0;
     font-size: 12px;
   }
-  .items {
+  .scroll {
     overflow-y: auto;
     flex: 1;
     min-height: 0;
+  }
+  .requests {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .rgroup {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .ghead {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .ghead h3 {
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .rgroup p {
+    margin: 0;
+  }
+  .snoozed {
+    margin: 0;
+    font-size: 12px;
   }
   .item {
     display: grid;
@@ -300,7 +407,7 @@
       min-height: auto;
       border-right: none;
     }
-    .items {
+    .scroll {
       flex: none;
       overflow: visible;
     }

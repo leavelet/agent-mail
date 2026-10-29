@@ -6,7 +6,7 @@
   import LangTheme from './LangTheme.svelte';
 
   const ov = $derived(store.overview);
-  const needs = $derived(store.attention.length);
+  const needs = $derived(store.needsCount);
   // Seats at a start prompt are offline for the server; they are shown as
   // starting, as on their rows.
   const starting = $derived(ov?.starting ?? 0);
