@@ -1951,16 +1951,6 @@ impl Node {
                     st.jobs.extend(head_job(true));
                     self.jobs_kick.notify_one();
                     let s = st.seat(seat);
-                    // The seat asked the person in this turn: once the turn
-                    // has ended, the node looks for the open request.
-                    if connected && std::mem::take(&mut s.rq.asked) {
-                        let job = handover::Job::Waiting {
-                            seat: seat.to_string(),
-                            turn_start: s.ho.turn_start,
-                        };
-                        st.jobs.push_back(job);
-                    }
-                    let s = st.seat(seat);
                     let focused = s.focused(now);
                     let pending = connected
                         && if focused {
@@ -1968,7 +1958,19 @@ impl Node {
                         } else {
                             s.pending.total() > 0 || s.pending.digest > 0
                         };
-                    if (pending || !s.stash.is_empty()) && s.stop_blocks < cap {
+                    let blocks = (pending || !s.stash.is_empty()) && s.stop_blocks < cap;
+                    // The seat asked the person in this turn, and the turn
+                    // ends: the node looks for the open request (see
+                    // `requests`).
+                    if !blocks && connected && std::mem::take(&mut s.rq.asked) {
+                        let job = handover::Job::Waiting {
+                            seat: seat.to_string(),
+                            turn_start: s.ho.turn_start,
+                        };
+                        st.jobs.push_back(job);
+                    }
+                    let s = st.seat(seat);
+                    if blocks {
                         plan.stash = std::mem::take(&mut s.stash);
                         if focused {
                             plan.claim_urgent_all = pending;
