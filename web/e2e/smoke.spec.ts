@@ -99,6 +99,8 @@ test('smoke: org, compose, reply, thread, delivery, search, mirror, needs-you', 
   await expect(item).toBeVisible();
   await expect(page.locator('.item').first()).toHaveAttribute('data-kind', 'ack');
   await expect(page.locator('.item[data-kind="seat"]', { hasText: 'fe-lead' })).toBeVisible();
+  // Its `attention` request is a card above the entries.
+  await expect(page.getByTestId('needs-requests').locator('.rcard', { hasText: 'fe-lead' })).toBeVisible();
   await item.click();
   await expect(page.locator('.reader')).toContainText('Scan the most recent 2,000 messages');
   await page.keyboard.press('a');

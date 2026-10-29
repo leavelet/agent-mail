@@ -1097,6 +1097,38 @@ entries it showed before requests existed, urgent first:
 - seats whose node reports that they need a person (also listed as
   `attention` requests above them).
 
+**In the web interface.** "Needs you" shows the open requests as cards,
+grouped by class (`now`, `soon`, `later`), oldest first in each group, and
+the other entries below them. A card shows the seat, the task (a link),
+the title, the body (Markdown, rendered and sanitized as document bodies
+are, collapsed until opened), the age and the deadline, or the default and
+when it is taken. The options are buttons (the default is marked); a
+request that takes free text has a text field; **Add a note** opens a
+field for a note that goes with the answer. An answer carries the
+revision the card shows (`if_rev`); when someone answered first, the card
+says so and shows that answer. For an `attention` request the buttons are
+the system's actions; **Open the terminal** opens the seat's terminal link
+when its node reported one. **Snooze 1 h** hides a card for an hour in
+this browser only; the deadline does not change. When every open request
+of a class has a default, the class has a button that answers them all
+with their defaults, after one confirmation. A request's creation mail is
+not listed again below its card; answering a request in the web interface
+marks that mail read. A seat entry stays below the cards (it shows the
+condition and how to reach the seat), and the navigation counts a seat
+with an open `attention` request once.
+
+Each request has a page (`#/requests/r12`, linked from its card, from
+`[r12]` mail and from the task it blocks) with its fields, options,
+answer, history and threads, the answer form while it is open, and
+**Withdraw**. **Requests** in the navigation lists all requests with
+filters for state, kind, class and seat (`#/requests?state=all&kind=
+&seat=&class=`). In the Inbox and on a thread page, mail whose subject
+names a request (`[r12]`) shows the request above the message: its
+options as buttons that answer through the API (not by a reply), or its
+answer. A task with an open request shows `blocked-on-human (r12)` on its
+page, its board card and its table row. All of this follows `request`
+events live.
+
 ### Web control of seats
 
 Two controls reach a seat through its harness's structured interface,
@@ -1116,6 +1148,15 @@ Both answer 409 `no_node` when no connected node reports the seat. The
 terminal (`amail node --web-terminal-port`) stays the fallback for what
 has no structured path: login and trust dialogs, and interrupting a Claude
 Code session.
+
+In the web interface, a seat's page has a prompt box under the
+conversation mirror (Ctrl+Enter sends; the page says "queued" and to how
+many nodes), and next to it an **Interrupt** button for Codex and dsh
+seats, or for a Claude Code seat the explanation that it has no
+structured interrupt and its terminal link (`amail attach <seat>` when
+its node reported none). The harness the node reports decides, as on the
+server. The page also lists the seat's open requests, and shows "waiting
+for r12" when the node reports the request the seat waits for.
 
 Opening a message in the web Inbox marks it read; **Mark unread** undoes
 that. Check boxes select several messages to mark read or unread at once,

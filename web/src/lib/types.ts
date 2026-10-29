@@ -44,6 +44,10 @@ export interface Presence {
   terminal_url?: string;
   turn_failed?: TurnFailure;
   node_connected?: boolean;
+  /** The open request the seat sleeps on (a node may report it as a
+   * number, `r12`, or in `waiting_request`); not reported by every node. */
+  waiting?: number | string | boolean;
+  waiting_request?: number;
 }
 
 export interface Seat {
@@ -314,7 +318,7 @@ export interface CountsResponse {
   seats: SeatCounts[];
 }
 
-export type AttentionKind = 'ack' | 'reply' | 'seat' | 'notice';
+export type AttentionKind = 'ack' | 'reply' | 'seat' | 'notice' | 'request';
 
 export interface AttentionItem {
   kind: AttentionKind;
@@ -329,6 +333,8 @@ export interface AttentionItem {
   turn_failed?: TurnFailure;
   /** The start of the message, its lines joined. */
   preview?: string;
+  /** `request` items: the open request. */
+  request?: Request;
 }
 
 export interface ListInfo {
@@ -582,6 +588,9 @@ export interface Task {
   /** A pending request of this seat to take the task over. */
   steal_requested_by?: string;
   steal_requested_at?: string;
+  /** The oldest open request for the person on this task (`r12`): the
+   * task is blocked on the person while it is open. */
+  blocked_on_human?: number;
   created_at: string;
   updated_at: string;
   closed_at?: string;
@@ -1039,4 +1048,86 @@ export interface WorklogSummary {
   kinds: { kind: string; count: number }[];
   tasks: { task: number; count: number; last_at: string }[];
   last: WorklogEntry[];
+}
+
+// --- requests for the person (M10) ---------------------------------------
+
+export type RequestKind = 'question' | 'permission' | 'plan' | 'merge' | 'attention';
+export type RequestClass = 'now' | 'soon' | 'later';
+export type RequestState = 'open' | 'answered' | 'expired' | 'withdrawn' | 'superseded';
+
+export interface RequestOption {
+  key: string;
+  label: string;
+  description?: string;
+}
+
+export interface RequestAnswer {
+  option?: string;
+  text?: string;
+  /** The user's name, a seat's name, or `deadline` (the default was taken). */
+  by: string;
+  at: string;
+  note?: string;
+}
+
+export interface Request {
+  num: number;
+  kind: RequestKind;
+  /** The seat the request is about (the one that waits). */
+  seat: string;
+  asker?: string;
+  task?: number;
+  title: string;
+  body?: string;
+  options?: RequestOption[];
+  free_text?: boolean;
+  default?: string;
+  class: RequestClass;
+  state: RequestState;
+  deadline?: string;
+  answer?: RequestAnswer;
+  thread?: number;
+  source: string;
+  attention?: string;
+  rev: number;
+  created_at: string;
+  answered_at?: string;
+}
+
+export interface RequestEvent {
+  seq: number;
+  at: string;
+  kind: string;
+  actor?: string;
+  note?: string;
+  message_id?: number;
+}
+
+export interface RequestDetail {
+  request: Request;
+  events?: RequestEvent[];
+  threads?: number[];
+  existing?: boolean;
+  terminal_url?: string;
+}
+
+export interface RequestList {
+  requests: Request[];
+  truncated?: boolean;
+}
+
+/** A `request` event on the user's event stream. */
+export interface RequestBusEvent {
+  num: number;
+  change: string;
+  state: RequestState;
+  seat: string;
+}
+
+/** Answer of `POST /v1/seats/{name}/prompt` and `/interrupt`. */
+export interface SeatControlResponse {
+  queued: boolean;
+  seat: string;
+  nodes: number;
 }

@@ -23,8 +23,9 @@
 <nav class="nav" aria-label="main">
   <a href={href(['needs'])} class:active={section === 'needs'}>
     <span>{t('nav.needs')}</span>
-    {#if store.attention.length}<span class="count alert">{store.attention.length}</span>{/if}
+    {#if store.needsCount}<span class="count alert">{store.needsCount}</span>{/if}
   </a>
+  <a href={href(['requests'], { state: 'all' })} class="sub" class:active={section === 'requests'}><span>{t('nav.requests')}</span></a>
   <a href={href(['org'])} class:active={section === 'org' || section === 'seat'}><span>{t('nav.org')}</span></a>
   <a href={href(['tasks'])} class:active={section === 'tasks'}><span>{t('nav.tasks')}</span></a>
   <a href={href(['docs'])} class:active={section === 'docs'}><span>{t('nav.docs')}</span></a>

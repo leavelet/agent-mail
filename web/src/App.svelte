@@ -32,7 +32,10 @@
   import DocPage from './pages/DocPage.svelte';
   import DocNewPage from './pages/DocNewPage.svelte';
   import DocKindsPage from './pages/DocKindsPage.svelte';
+  import RequestPage from './pages/RequestPage.svelte';
+  import RequestsPage from './pages/RequestsPage.svelte';
   import { parseTaskNum } from './lib/tasks';
+  import { parseRequestNum } from './lib/requests';
   import { parseDocTarget } from './lib/docs';
 
   const registering = currentPage() === 'register';
@@ -136,6 +139,10 @@
         {#key target.ref}<DocPage target={target.ref} anchor={target.anchor} />{/key}
       {:else if section === 'docs'}
         <DocsPage {query} />
+      {:else if section === 'requests' && parts[1] && parseRequestNum(parts[1])}
+        {#key parts[1]}<RequestPage num={parseRequestNum(parts[1]) ?? 0} />{/key}
+      {:else if section === 'requests'}
+        <RequestsPage {query} />
       {:else if section === 'needs'}
         <NeedsPage />
       {:else if section === 'inbox'}

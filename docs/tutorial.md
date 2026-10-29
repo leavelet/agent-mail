@@ -309,13 +309,25 @@ how to verify, pointers), and a **Worklog** tab, with what the seat did.
 
 ## 7. Answer a question
 
-When an agent needs a decision, it writes to you (the user seat, `owner`).
-Such mail appears under **Needs you**, oldest first, with mail that asks
-for an acknowledgement and seats that need a person (a permission prompt, a
-trust prompt, a failed seat). Open the message and reply; the reply wakes
-the agent, and your answer is injected as an instruction. The entry leaves
-the queue once you have replied in the thread (or marked it read;
-opening it in **Inbox** does that).
+When an agent needs a decision, it makes a request for you with the
+options it offers (`POST /requests`). The request (`r12`) appears at the top of **Needs
+you** as a card, grouped by how soon it needs an answer: click an option
+(or type an answer when the request takes free text). The answer is mailed
+to the agent and wakes it. A request with a default takes it at its
+deadline if you do not answer; **Snooze 1 h** hides a card for an hour in
+this browser without changing the deadline. **Requests** in the navigation
+lists every request, answered ones included.
+
+Below the requests, **Needs you** lists mail to you, oldest first, with
+mail that asks for an acknowledgement and seats that need a person (a
+permission prompt, a trust prompt, a failed seat). Open the message and
+reply; the reply wakes the agent, and your answer is injected as an
+instruction. The entry leaves the queue once you have replied in the
+thread (or marked it read; opening it in **Inbox** does that).
+
+To give a seat an instruction directly, open its page and use the prompt
+box under its conversation; **Interrupt** stops the current turn of a
+Codex or dsh seat (a Claude Code seat is interrupted in its terminal).
 
 From the command line:
 

@@ -580,6 +580,34 @@ The first public version.
   `POST /v1/inbox/read` (user tokens), which marks the user's deliveries
   of a list of message ids, or all of them (below a `before_seq`), read in
   one transaction and answers how many changed.
+- Requests for the person and seat control in the web interface (M10
+  phase D):
+  - "Needs you" shows the open requests as cards grouped by class (`now`,
+    `soon`, `later`), oldest first, above the other entries: seat, task,
+    title, the body (rendered Markdown, collapsed), age, deadline and
+    default, the options as buttons with the default marked, a free-text
+    field, an optional note, **Snooze 1 h** (this browser only), and for
+    `attention` requests the system's actions (`open_terminal` opens the
+    terminal link the answer returns). Answers send `if_rev`; a card whose
+    request was answered first shows that answer. A class whose open
+    requests all have a default can be answered with the defaults after
+    one confirmation. A request's creation mail is not listed again below
+    its card and is marked read when the request is answered here; entry
+    kinds the page does not know are left out.
+  - A request page (`#/requests/r12`) with the fields, options, answer,
+    history, threads, the answer form and **Withdraw**, and a requests
+    list (`#/requests`) with filters for state, kind, class and seat.
+  - Mail whose subject names a request (`[r12]`) shows it above the
+    message in the Inbox and on the thread page, with its options as
+    buttons that answer through the API, or its answer.
+  - Tasks with an open request show `blocked-on-human (r12)` on the task
+    page, the board and the table.
+  - Seat pages: a prompt box under the conversation mirror, **Interrupt**
+    for Codex and dsh seats, the terminal link with an explanation for
+    Claude Code seats, the seat's open requests, and "waiting for r12"
+    when the node reports it.
+  - `request` events refresh the cards, the pages, the lists and the
+    navigation count live.
 
 #### Public servers and getting started
 

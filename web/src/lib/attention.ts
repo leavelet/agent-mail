@@ -37,5 +37,6 @@ export function sortAttention(items: AttentionItem[]): AttentionItem[] {
 
 /** A stable key for an item (for selection across refreshes). */
 export function attentionKey(it: AttentionItem): string {
+  if (it.request) return `req:${it.request.num}`;
   return it.kind === 'seat' ? `seat:${it.seat}` : `msg:${it.message?.id}`;
 }
