@@ -443,8 +443,15 @@ zellij configuration and your own sessions are not touched.
 
 Browser terminals: `amail node --web-terminal-port <port>` runs a
 `zellij web` server of the node's own on `127.0.0.1:<port>` and the web
-interface links each seat to its session; create a login token with
-`amail node web-token`. Anyone logged in to that server sees the names of
+interface links each seat to its group's session; create a login token
+with `amail node web-token`. The token is read-only unless you pass
+`--writable`. The link opens the group's session, not the seat's tab:
+`zellij web` has no address for a tab. A read-only login shows the tab
+that has the focus in that session and cannot switch tabs (zellij 0.45),
+so it shows a chosen seat only when that seat's tab has the focus; to
+reach another seat, log in with a writable token and switch tabs (for
+example Ctrl-t, then the tab's number, then Enter), or use `amail attach
+<seat>` in a shell on the host. Anyone logged in to that server sees the names of
 all your zellij sessions and can attach to those that allow web sharing.
 `zellij web --stop` stops every zellij web server of your user, including
 the node's (the node restarts its own). Put it behind an HTTPS proxy and pass

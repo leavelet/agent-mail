@@ -673,10 +673,14 @@ enum NodeCmd {
     Status,
     /// Create a login token for the node's browser terminal
     /// (`--web-terminal-port`); shown once. Kept apart from your own zellij
-    /// tokens.
+    /// tokens. The token can only watch sessions unless `--writable` is
+    /// given.
     WebToken {
-        /// A token that can only watch sessions.
+        /// A token that can also type into sessions (and switch tabs).
         #[arg(long)]
+        writable: bool,
+        /// The default (kept for scripts that pass it).
+        #[arg(long, hide = true, conflicts_with = "writable")]
         read_only: bool,
         #[arg(long, env = "AMAIL_STATE_DIR")]
         state_dir: Option<PathBuf>,
@@ -1381,7 +1385,8 @@ async fn run(cli: Cli) -> Result<()> {
         Cmd::Node(NodeCli {
             cmd:
                 Some(NodeCmd::WebToken {
-                    read_only,
+                    writable,
+                    read_only: _,
                     state_dir,
                     zellij_bin,
                 }),
@@ -1391,11 +1396,7 @@ async fn run(cli: Cli) -> Result<()> {
             std::fs::create_dir_all(amail_node::node::web_terminal_data_dir(&dir))?;
             let status = amail_node::node::web_terminal_command(&zellij_bin, &dir)
                 .arg("web")
-                .arg(if read_only {
-                    "--create-read-only-token"
-                } else {
-                    "--create-token"
-                })
+                .arg(web_token_flag(writable))
                 .status()
                 .with_context(|| format!("running {zellij_bin}"))?;
             if !status.success() {
@@ -2840,8 +2841,45 @@ fn run_seat(
     Err(anyhow::anyhow!("starting {}: {err}", plan.program))
 }
 
+/// The `zellij web` flag for `amail node web-token`: read-only unless the
+/// token should type.
+fn web_token_flag(writable: bool) -> &'static str {
+    if writable {
+        "--create-token"
+    } else {
+        "--create-read-only-token"
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn web_tokens_are_read_only_by_default() {
+        let flag = |argv: &[&str]| match Cli::try_parse_from(argv).unwrap().cmd {
+            Cmd::Node(NodeCli {
+                cmd: Some(NodeCmd::WebToken { writable, .. }),
+                ..
+            }) => web_token_flag(writable),
+            _ => panic!("not web-token"),
+        };
+        assert_eq!(
+            flag(&["amail", "node", "web-token"]),
+            "--create-read-only-token"
+        );
+        assert_eq!(
+            flag(&["amail", "node", "web-token", "--read-only"]),
+            "--create-read-only-token"
+        );
+        assert_eq!(
+            flag(&["amail", "node", "web-token", "--writable"]),
+            "--create-token"
+        );
+        assert!(
+            Cli::try_parse_from(["amail", "node", "web-token", "--writable", "--read-only"])
+                .is_err()
+        );
+    }
     use super::*;
     use clap::CommandFactory;
 

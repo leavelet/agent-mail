@@ -113,3 +113,14 @@ export function terminalHref(url: string | undefined): string | undefined {
     return undefined;
   }
 }
+
+/** The zellij session a terminal link opens: its last path segment (the
+ * node links a seat to its group's session, not to the seat's tab). */
+export function terminalSession(url: string): string {
+  try {
+    const parts = new URL(url).pathname.split('/').filter(Boolean);
+    return decodeURIComponent(parts[parts.length - 1] ?? '');
+  } catch {
+    return '';
+  }
+}

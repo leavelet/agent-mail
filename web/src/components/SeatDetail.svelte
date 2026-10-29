@@ -8,7 +8,7 @@
   import { get, patch, qs, enc, ApiError } from '../lib/api';
   import { grantsOf } from '../lib/openings';
   import OpeningsEditor from './OpeningsEditor.svelte';
-  import { KNOWN_ATTENTION, focusUntil, seatStatus, stateLongKey, nodeOpBlock, terminalHref } from '../lib/presence';
+  import { KNOWN_ATTENTION, focusUntil, seatStatus, stateLongKey, nodeOpBlock, terminalHref, terminalSession } from '../lib/presence';
   import { duration, shortTime } from '../lib/time';
   import { fromEntry, fromSent, newestFirst, type MailRow } from '../lib/mailrows';
   import type { ArchiveResponse, InboxResponse } from '../lib/types';
@@ -221,6 +221,7 @@
         <dd>
           {#if terminal}
             <a href={terminal} target="_blank" rel="noopener noreferrer">{t('seat.openTerminal')} ↗</a>
+            <p class="faint" data-testid="terminal-note">{t('seat.terminalNote', { session: terminalSession(terminal), seat: seat.name })}</p>
           {:else}
             <span class="faint">{t('seat.attachCmd')}</span>
             <code class="cmd">{attachCmd}</code>

@@ -10,6 +10,7 @@ import {
   startingAtPrompt,
   stateAge,
   terminalHref,
+  terminalSession,
 } from '../../src/lib/presence';
 import { noteKey } from '../../src/lib/receipt';
 import { Coalescer } from '../../src/lib/coalesce';
@@ -176,6 +177,11 @@ describe('terminal links', () => {
     expect(terminalHref('data:text/html,x')).toBeUndefined();
     expect(terminalHref('not a url')).toBeUndefined();
     expect(terminalHref(undefined)).toBeUndefined();
+  });
+  it('names the group session the link opens', () => {
+    expect(terminalSession('http://127.0.0.1:18692/amail-m10acc-app')).toBe('amail-m10acc-app');
+    expect(terminalSession('https://h.example/term/amail-o-main/')).toBe('amail-o-main');
+    expect(terminalSession('not a url')).toBe('');
   });
 });
 
