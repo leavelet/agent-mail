@@ -134,6 +134,7 @@ pub async fn presence(
         .presence
         .update(auth.org.id, report.node.as_deref(), &seats)
         .await?;
+    crate::requests::sync_attention(&st, &auth.org, &seats).await;
     st.presence_changed(auth.org.id, changed);
     if !cleared.is_empty() {
         crate::notices::turns_recovered(&st, auth.org.id, &cleared).await;

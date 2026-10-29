@@ -1961,8 +1961,9 @@ pub struct CountsResponse {
 string_enum!(
     /// Why an entry is in the user's "needs you" queue: an acknowledgement
     /// asked, mail to answer, a seat that needs a person, or a notice from
-    /// the server (read it; it asks for nothing).
-    AttentionKind { Ack => "ack", Reply => "reply", Seat => "seat", Notice => "notice" }
+    /// the server (read it; it asks for nothing), or an open request for
+    /// the person (M10; listed first).
+    AttentionKind { Ack => "ack", Reply => "reply", Seat => "seat", Notice => "notice", Request => "request" }
 );
 
 /// One entry of `GET /v1/attention`.
@@ -1991,9 +1992,13 @@ pub struct AttentionItem {
     /// The seat's last turn failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_failed: Option<TurnFailure>,
-    /// The beginning of `message`'s body, its lines joined.
+    /// The beginning of `message`'s body (or the request's), its lines
+    /// joined.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
+    /// `request`: the open request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<Box<Request>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

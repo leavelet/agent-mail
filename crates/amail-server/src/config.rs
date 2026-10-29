@@ -75,6 +75,31 @@ pub struct Limits {
     pub worklog_batch_entries: Option<usize>,
     /// The resource rules of documents (`limits.docs.*`).
     pub docs: DocLimits,
+    /// The resource rules of requests for the person (`limits.requests.*`).
+    pub requests: RequestLimits,
+}
+
+/// The resource rules of requests for the person: one org's share of a
+/// shared server. Public mode only; a self-hosted server leaves them unset,
+/// so that the org's storage quota is the only bound. The format rules are
+/// constants (`amail_proto`, requests).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RequestLimits {
+    /// Open requests per org.
+    pub open_per_org: Option<i64>,
+    /// Requests one seat makes per hour (seat tokens; the user's and the
+    /// nodes' are not counted).
+    pub per_seat_per_hour: Option<i64>,
+}
+
+impl RequestLimits {
+    /// The defaults of public mode.
+    pub fn public() -> Self {
+        RequestLimits {
+            open_per_org: Some(10_000),
+            per_seat_per_hour: Some(600),
+        }
+    }
 }
 
 /// The resource rules of documents: one org's share of a shared server.
@@ -148,6 +173,7 @@ impl Limits {
             queries: Some(8),
             auth_failures_per_min: Some(10.0),
             docs: DocLimits::public(),
+            requests: RequestLimits::public(),
             worklog_days: Some(90),
             worklog_batch_entries: Some(5_000),
         }

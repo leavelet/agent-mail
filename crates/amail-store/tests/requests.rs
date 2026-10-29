@@ -161,7 +161,8 @@ async fn create_and_format_rules(s: S) {
     assert_eq!(r2.num, 2);
 
     // Format rules.
-    let cases: Vec<(&str, Box<dyn Fn(&mut NewRequestRec)>)> = vec![
+    type Change = Box<dyn Fn(&mut NewRequestRec)>;
+    let cases: Vec<(&str, Change)> = vec![
         ("title_empty", Box::new(|n| n.title = "  ".into())),
         ("invalid_title", Box::new(|n| n.title = "a\nb".into())),
         ("title_too_long", Box::new(|n| n.title = "t".repeat(513))),

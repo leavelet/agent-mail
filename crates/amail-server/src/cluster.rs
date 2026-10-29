@@ -76,6 +76,12 @@ pub enum Wire {
     /// A document of the org changed.
     #[serde(rename = "b")]
     Doc { o: i64, v: amail_proto::DocBusEvent },
+    /// A request of the org changed.
+    #[serde(rename = "q")]
+    Request {
+        o: i64,
+        v: amail_proto::RequestBusEvent,
+    },
     /// The sender's own liveness ping (others ignore it).
     #[serde(rename = "h")]
     Ping,
@@ -301,6 +307,7 @@ impl Cluster {
             Wire::Directory { o, d } => st.directory.deliver(o, d),
             Wire::Task { o, v } => st.tasks.deliver(o, v),
             Wire::Doc { o, v } => st.docs.deliver(o, v),
+            Wire::Request { o, v } => st.requests.deliver(o, v),
             Wire::Ping => {}
         }
     }
