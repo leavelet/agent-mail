@@ -437,7 +437,7 @@ URL (`AMAIL_URL=https://example.com/amail`). See
 | `POST /claim` | `{classes, min_priority?, via, limit?, inline_body_max?, include_digest?, digest_only?, mark_inlined_read?, key?, preview_chars?}`: atomically mark pending deliveries notified and return them; concurrent claims never return the same delivery. `key` (chosen by the caller) makes the claim idempotent: a claim with a key the seat used in the last six hours takes nothing new and returns what the first one took. `inline_body_max` and `preview_chars` are capped at 16,384 characters |
 | `POST /claim/release` | node tokens, `seat=`: `{key, messages}`: the turn that showed these messages of the claim with `key` failed; their deliveries go back to not notified, not read (unless acknowledged). Answers `{seat, released}` |
 | `GET /changes` | `since` (a sequence number): deliveries created or changed since (`limit` ≤ 5000, at most 2 MiB); continue from `next` while `more` is true. Takes one of the org's query slots |
-| `GET /events` | server-sent events: `mailbox` `{"seat","seq"}` per mailbox change (supports `Last-Event-ID`), `presence` (with `node_connected` as in `GET /seats`), for user tokens `directory` (`{kind: "seat"\|"list", name, change: "created"\|"updated"\|"deleted"}`) and `nodes` (`{connected}`: open node streams, sent at once and on change), for user and seat tokens `task` (`{num, change: "created"\|"changed"\|"assigned"\|"dependency"\|"link"\|"commented"\|"reminder"\|"steal", fields?}`: a task of the org changed; read it with `GET /tasks/{num}`) and `doc` (`{num, change: "created"\|"revised"\|"changed"\|"relation"\|"verified"\|"split"\|"extracted"\|"merged"\|"link"\|"commented"\|"reminder", fields?}`: a document of the org changed; read it with `GET /docs/{num}`), and for node tokens `command` (`{op: "transcript"\|"sleep"\|"wake", seat, lease_ms?, backfill?, node?}`) |
+| `GET /events` | server-sent events: `mailbox` `{"seat","seq"}` per mailbox change (supports `Last-Event-ID`), `presence` (with `node_connected` as in `GET /seats`), for user tokens `directory` (`{kind: "seat"\|"list", name, change: "created"\|"updated"\|"deleted"}`) and `nodes` (`{connected}`: open node streams, sent at once and on change), for user and seat tokens `task` (`{num, change: "created"\|"changed"\|"assigned"\|"dependency"\|"link"\|"commented"\|"reminder"\|"steal", fields?}`: a task of the org changed; read it with `GET /tasks/{num}`) and `doc` (`{num, change: "created"\|"revised"\|"changed"\|"relation"\|"verified"\|"split"\|"extracted"\|"merged"\|"link"\|"commented"\|"reminder", fields?}`: a document of the org changed; read it with `GET /docs/{num}`), for user tokens `request` (`{num, change: "created"\|"answered"\|"expired"\|"withdrawn"\|"commented"\|"reminded"\|"linked", state, seat}`: a request for the person changed; read it with `GET /requests/{num}`), and for node tokens `command` (`{op, seat, lease_ms?, backfill?, node?, text?, request?, action?}`; `op` is `transcript`, `sleep`, `wake`, `prompt` (with `text`), `interrupt` or `attention_action` (with `request` and `action`, `restart` or `sleep`); nodes ignore ops they do not know) |
 | `PUT /focus`, `DELETE /focus` | `seat=` (user tokens; seat tokens: their own): focus `{for_s?, until?}`, or end it |
 | `GET /sent` | `seat`, `before_id`, `limit` (≤ 500), `delivery`: messages a seat sent, newest first; paged like the archive. With `delivery=true` (`limit` ≤ 100) the answer also has `delivery: [{message_id, queued, notified, read, acked}]`, how many deliveries of each listed message are in each state (and `withdrawn`) (each delivery counted in its most advanced state, across orgs, as in `/messages/{id}/status`) |
 | `GET /archive/messages` | `since`, `until`, `from`, `to`, `thread`, `before_id`, `limit` (≤ 500) (user tokens): below |
@@ -457,7 +457,7 @@ events, event_count, existing?}`, where `task` is
 assignee?, team?, parent?, labels, due?, waiting_on?, blocked_reason?,
 thread?, waits_on, waits_on_ok, rev, progress?, result?, result_ref?,
 result_note?, result_by?, result_at?, import_key?, steal_requested_by?,
-steal_requested_at?, created_at, updated_at, closed_at?}`, `blockers`,
+steal_requested_at?, blocked_on_human?, created_at, updated_at, closed_at?}`, `blockers`,
 `blocked` and `children` are `{num, title, state, assignee?, result?,
 needs_ok?}` (`needs_ok` in `blockers`: the dependency needs an ok result),
 `links` are `{thread_id, linked_by?, linked_at}` and `events` are the
@@ -466,8 +466,10 @@ task whose dependencies are all satisfied); `stored_state` is the stored
 one; `waits_on` lists the blockers whose dependency is not satisfied, and
 `waits_on_ok` those of them whose dependency needs an ok result. `rev` is
 the sequence number of the newest event. `progress` is `{done, total}` for
-a task with children (`total` leaves out `cancelled` children). Listings
-leave `body` out.
+a task with children (`total` leaves out `cancelled` children).
+`blocked_on_human` is the number of the oldest open request for the person
+on the task ([requests](#requests-for-the-person)): the task is
+`blocked-on-human` while it is set. Listings leave `body` out.
 
 Every write to one task (`PATCH`, `take`, `deps`, `links`) takes
 `if_rev`, in the body (`PATCH`, `POST`) or the query (`DELETE …?if_rev=N`).
@@ -480,9 +482,9 @@ after if_rev]}`.
 | `POST /tasks` | create `{title, body?, priority?, assignee?, team?, parent?, labels?, due?, from_message?, client_key?}` (201, `TaskDetail`). `from_message` (a message the caller can read) gives the default title (its subject) and links its thread. `team` defaults to the assignee's team, else the reporter's. The assignee gets a reminder. `client_key` (1 to 64 characters, 422 `invalid_client_key` otherwise): when a task of the org was created with the same key in the last 24 hours, nothing is created and the answer is 200 with that task and `"existing": true`. A `parent` chain longer than 8 is refused with 422 `parent_too_deep` |
 | `GET /tasks/{num}` | `TaskDetail` |
 | `PATCH /tasks/{num}` | change `{title?, body?, state?, priority?, rank?, assignee?, team?, parent?, labels?, due?, waiting_on?, blocked_reason?, result?, result_ref?, result_note?, note?, force?, if_rev?}`; `null` clears `assignee`, `team`, `parent`, `due`, `waiting_on`, `blocked_reason`; `labels` replaces the labels. Each changed field is one event (`changed`; `assigned` for the assignee); a change of `body` records the whole old and new text. `state` is a stored state: `ready` is refused (400). `waiting_on` and `blocked_reason` only with `blocked` (422 `not_blocked`) and are cleared when the task leaves it. A `done` or `cancelled` task can only be reopened to `open` or `doing` (422 `invalid_transition`); reopening clears the result. Closing a task with children that are `open`, `doing`, `blocked` or `review` is refused with 409 `children_open` naming them, unless `force: true` (the state event's note names them). `result` (`ok` or `rejected`) only when the task is `done` after the change (422 `not_done`), with `result_ref` (at most 200 characters, one line: 422 `ref_too_long`, `invalid_ref`) and `result_note` (at most 2,000 characters: 422 `note_too_long`); it replaces the previous result and records `result_by` and `result_at`. `result_ref` or `result_note` without `result` is 400. `result: null` withdraws the result (event `result_withdrawn`, `from` the old result and ref, `note` the reason given in `note`). Answers `TaskDetail` |
-| `POST /tasks/{num}/take` | optional body `{if_rev}`: assign the task to the caller if it has no assignee, atomically; 409 `taken` when someone has it, 422 `closed` for a closed task; nothing changes when the caller has it |
+| `POST /tasks/{num}/take` | optional body `{if_rev}`: assign the task to the caller if it has no assignee, atomically; 409 `taken` when someone has it, 409 `blocked_on_human` while a request for the person on the task is open, 422 `closed` for a closed task; nothing changes when the caller has it |
 | `POST /tasks/{num}/deps` | `{blocked_by: <num>, needs_ok?, if_rev?}`: the task depends on that task; with `needs_ok: true` only a `done` blocker with result `ok` satisfies it. For an existing dependency, `needs_ok` changes it (event `changed`, field `needs_ok`; an `unblocked` event and reminder when this satisfies the last dependency); without it nothing changes. 422 `dependency_cycle` (including a task on itself), `dependency_too_deep` (the cycle check follows at most 32 tasks), `too_many_blockers` (50 per task), `too_many_blocked` (200 per task) |
-| `POST /tasks/{num}/steal` | ask to take over a task assigned to another seat that is not started (stored `open`): the task gets `steal_requested_by` and `steal_requested_at`, and the assignee system mail in `To` (`w2 asks to take over t12: <title>`) naming `amail task yield t12` and `amail task keep t12`. One pending request per task: 409 `steal_pending` for another seat (asking again changes nothing); 422 `not_assigned` (use `take`), `own_task`, `started` (any other state, closed included). A request not answered within 24 hours expires (`steal_expired`; the requester is told) |
+| `POST /tasks/{num}/steal` | ask to take over a task assigned to another seat that is not started (stored `open`): the task gets `steal_requested_by` and `steal_requested_at`, and the assignee system mail in `To` (`w2 asks to take over t12: <title>`) naming `amail task yield t12` and `amail task keep t12`. 409 `blocked_on_human` while a request for the person on the task is open. One pending request per task: 409 `steal_pending` for another seat (asking again changes nothing); 422 `not_assigned` (use `take`), `own_task`, `started` (any other state, closed included). A request not answered within 24 hours expires (`steal_expired`; the requester is told) |
 | `POST /tasks/{num}/yield` | the assignee or the org's user (403 `not_assignee` for anyone else; 404 without a pending request): the task is assigned to the requester (`assigned` event noted `yielded to <seat> on request`), who gets the `assigned` reminder |
 | `POST /tasks/{num}/keep` | the same callers: the request is cleared (`steal_declined`) and the requester is told. Changing the assignee or the state of a task (also by `PATCH`) ends a pending request the same way, with a note |
 | `DELETE /tasks/{num}/deps/{other}` | `if_rev` in the query: remove the dependency (404 when there is none); when it was the last unsatisfied one, the task gets an `unblocked` event and its assignee (else its reporter) a reminder |
@@ -492,7 +494,7 @@ after if_rev]}`.
 | `GET /tasks/{num}/events` | `after_seq`, `limit` (≤ 1,000, default 200): events oldest first `{events, next_after_seq?, events_compacted}`; every event is kept, so reading pages with `after_seq=next_after_seq` until it is absent gives the whole history (`events_compacted` counts events that earlier builds deleted; 0 otherwise). Event: `{seq, at, actor?, written_by?, kind, field?, from?, to?, note?, message_id?}`; kinds `created`, `changed`, `assigned`, `linked`, `unlinked`, `dependency_added`, `dependency_removed`, `commented`, `reminder_sent`, `unblocked`, `steal_requested`, `steal_declined`, `steal_expired`, `result_withdrawn`, `imported` (`actor` is the name the import file gives). Reminder kinds (`field` of `reminder_sent`) include `children_done` and `blocker_rejected` |
 | `GET /tasks` | filters `state` (comma-separated shown states, or `all`; default every state but `done` and `cancelled`), `assignee` (a seat, or `none`), `reporter`, `team` (tasks with that team, or whose assignee or reporter is in it), `priority`, `label`, `parent`, `due_before`, `stale=1` (`doing` or `review` and not changed for the org's stale period), `text` (substring of title or body; at most 200 characters), `result` (`ok`, `rejected` or `none`), `import_key` (the task imported from the record with that id, in any state), `before`, `limit` (≤ 500, default 50). Newest first: `{tasks, next_before?}`; continue with `before=next_before`. With `text`, a request looks at the 5,000 newest tasks below `before` and takes one of the org's query slots (other pool), so a page can be short and still have `next_before` |
 | `GET /tasks/mine` | the caller's unfinished tasks: `ready` first, then `doing`, `review`, `blocked`, `open`; within each by priority, rank and number. `state`, `limit` (≤ 500) as for the list. `{tasks, truncated}`. Node tokens pass `seat=` (an agent seat of the org) |
-| `GET /tasks/next` | the caller's `ready` tasks by priority, rank and number; `pool=1` adds the unassigned `ready` tasks of the caller's team |
+| `GET /tasks/next` | the caller's `ready` tasks by priority, rank and number; `pool=1` adds the unassigned `ready` tasks of the caller's team. Tasks with an open request for the person (`blocked_on_human`) are left out |
 | `GET /tasks/waiting` | `{items: [{task, seat?, blocker?}], truncated}`: the caller's tasks `blocked` with `waiting_on` (seat: that seat), and each unfinished blocker of the caller's unfinished tasks (seat: the blocker's assignee, else its reporter) |
 | `GET /tasks/owed` | `{items: [{task, seat?, blocks?}], truncated}`: tasks `blocked` with `waiting_on` the caller (seat: their assignee, else reporter), and the caller's unfinished tasks (assigned, or unassigned and reported by the caller) that are the last open blocker of another seat's task (`blocks`) |
 | `GET /tasks/report` | `team=` optional: `{team?, sections: [{name, count, items: [{task, seat?, waiting_for?, dependents?}]}]}`, the sections `not_started`, `in_progress`, `review`, `rejected`, `approved`, `parents`, `blocked` described under `amail task report` (the first 500 tasks of each; `count` is complete). `seat` is the assignee (in `review`, the reporter), `waiting_for` the seats a blocked task waits for, `dependents` the open tasks that depend on an approved one. Takes one of the org's query slots (other pool) |
@@ -623,7 +625,7 @@ created (draft runbook): title`, `d12#steps revised (rev 3): message`,
 `d12: draft → active; changed labels`, `d12 superseded by d14`, `d12
 verified until …`, `d12 split into d31, d32`, `d12#rollback extracted
 into d33`, `d33 merged into d12`, `d12#steps commented (m40)`; the entry's
-`doc` is the document). When a change closes a task and its assignee (an agent seat)
+`doc` is the document), `request` (`r12 created: title`, `r12 answered: 1. yes — Ship it: title`, `r12 expired: …`, `r12 withdrawn: …`; for the seat a request is about), `prompt_from_user` (`owner sent a prompt: text`) and `interrupt`. When a change closes a task and its assignee (an agent seat)
 holds no other task that is not `done` or `cancelled`, the server writes
 the seat's note itself (`source: server`): `State: idle: t12 closed, no
 other work`, `Summary` from the task's title, state and result, `Pointers`
@@ -633,6 +635,85 @@ or any agent's note when the node reported no turn of the seat. Notes and
 worklog entries count against the org's
 storage quota in `task_bytes`; a worklog entry that does not fit deletes
 the org's oldest entries to make room.
+
+### Requests for the person
+
+Requests are what waits for the org's user: a question a seat asks, a plan
+or merge to approve, a seat that needs a person ([concepts](concepts.md#the-users-queue-needs-you)).
+Each has a number per org (`r12`; `12` and `r12` are both accepted in
+paths), never reused. A request is `{num, kind, seat, asker?, task?,
+title, body?, options?, free_text?, default?, class, state, deadline?,
+answer?, thread?, source, attention?, rev, created_at, answered_at?}`:
+
+- `kind`: `question`, `plan`, `merge`, `attention` (`permission` is part
+  of the record but is not created yet: 422 `kind_not_supported`).
+- `seat`: the seat the request is about, which waits for the answer;
+  `asker`: the seat that made it (absent for a node).
+- `options`: 2 to 6 `{key, label, description?}`; a `question` or `plan`
+  may instead (or also) take free text (`free_text: true`).
+- `default`: the key of the option taken at the deadline.
+- `class`: `now`, `soon` (default) or `later`. It sets the default
+  deadline (15 minutes, 4 hours, 24 hours from creation), the urgency of
+  the mail to the user (`now` is urgent) and the reminders (`now`: at the
+  deadline, then every hour; `soon` and `later`: at the deadline, then
+  daily).
+- `state`: `open`, `answered`, `expired` (the default was taken),
+  `withdrawn`, `superseded` (not used yet).
+- `deadline`: with a default, when it is taken; without one, when the
+  first reminder goes out. `attention` requests have none.
+- `answer`: `{option?, text?, by, at, note?}`; `by` is the user's name, or
+  `deadline` when the default was taken.
+- `thread`: the thread of the request's mail to the user.
+- `source`: `cli` (default), `mcp`, `hook`, `node`, `mail`.
+- `attention`: for `attention` requests, the seat's attention code.
+- `rev`: the sequence number of the newest event.
+
+Answers about one request are `{request, events, threads, existing?,
+terminal_url?}`: the newest 100 events oldest first (`{seq, at, kind,
+actor?, note?, message_id?}`, kinds `created`, `answered`, `expired`,
+`withdrawn`, `commented`, `reminded`, `linked`), and the other threads
+that name the request (`[r12]` in a subject).
+
+| | |
+|---|---|
+| `POST /requests` | `{kind?, seat?, task?, title, body?, options?, free_text?, default?, class?, deadline_s?, source?, attention?}` (201). Seat tokens ask for themselves (`seat` left out or their own name; 403 otherwise) with `question`, `plan` or `merge`; user tokens name an agent seat (400 without one, 422 `not_an_agent`); node tokens make `attention` requests only (`seat` and `attention`, the code, required; the options, class `now` and the title are set by the server, `body` is kept as the hint). Other combinations are 422 `kind_not_allowed`. `task` is `12` or `"t12"` (404 for no such task). `deadline_s` is seconds from now. Format rules (422): `title_empty`, `invalid_title` (more than one line), `title_too_long` (512 characters), `body_too_large` (64 KiB), `options_count` (2 to 6, or none with `free_text`), `invalid_option_key` (1 to 32 characters of `A-Z`, `a-z`, `0-9`, `_`, `-`, `.`, not digits only), `duplicate_option` (keys compared without case), `invalid_option_label` (empty or several lines), `option_label_too_long` (200), `option_description_too_long` (1,000), `invalid_default` (not a key), `free_text_not_allowed` (not a `question` or `plan`). A node's `attention` request for a seat and code that has a live one answers that one (200, `existing: true`). Every request but `attention` is mailed to the user: from the asking seat (a user's request: from the mail system), `To` the user, subject `[r12] <title>`, urgent for class `now`, with the body, the options as lines `1. key — label`, the default and deadline, and how to answer. 507 `storage_quota` when the org is at its quota; on a public server 429 `too_many_open_requests` and `request_rate` |
+| `GET /requests` | `state` (`open` by default, `all`, or comma-separated states), `kind`, `seat`, `class`, `task`, `limit` (≤ 500, default 200): `{requests, truncated?}`, open ones first (`now`, then `soon`, then `later`, oldest first), then the others newest first. User tokens see the org's requests; seat tokens those about them or made by them |
+| `GET /requests/{num}` | user tokens any request of the org, seat tokens their own (404 otherwise) |
+| `POST /requests/{num}/answer` | user tokens: `{option?, text?, note?, if_rev?}`. `option` is a key, a number from 1 or a label (422 `invalid_option`); `text` alone answers a free-text request, or names an option like `option` does. 422 `answer_required`, `free_text_not_allowed`, `answer_too_long` (16,384 characters), `note_too_long` (4,000). 409 `stale` when `if_rev` is not the request's `rev`, `answered` when it was answered or expired already, `not_open` when it was withdrawn; each 409 carries `request` (with the first answer). The answer is mailed in the request's thread from the user `To` the seat (a sleeping seat wakes). For `attention`: `restart` and `sleep` go to the seat's node as an `attention_action` command, `open_terminal` answers the seat's `terminal_url` when its node reported one, `dismiss` does nothing; nothing is mailed |
+| `POST /requests/{num}/withdraw` | the seat the request is about, the seat that made it (seat tokens), or the user: `{note?}` (optional body). Withdraws an open request (409 `not_open` otherwise, with `request`); the other side (the user, or the seat when the user withdrew it) gets a reply in the thread |
+| `GET /requests/{num}/wait` | `timeout_s` (default 60, at most 600): waits until the request is no longer open or the time is up; `{request, done}` (`done: false` when it is still open). Seat tokens wait for their own requests, user and node tokens for any of the org's |
+
+A reply of the user in a request's thread answers an open request when its
+first line (empty and quoted `>` lines skipped) names an option: its number
+(`2` or `2.`), key or label, without regard to ASCII case, or a whole
+option line `2. no — Hold it`. A reply to a free-text request without
+options answers it with the reply's text. The answer is recorded with the
+reply as its message; when the reply did not reach the seat in `To`, the
+answer is also mailed to it. Any other reply in the thread is a comment
+(event `commented`): when the user wrote it and it did not reach the seat,
+it is mailed to the seat; the request stays open. Replies of seats are
+comments. A subject with `[r12]` links the message's thread to request 12
+(event `linked`), as `[t12]` and `[d12]` do.
+
+The deadline pass runs with the task reminder pass (every minute): an open
+request with a default whose deadline passed takes it (`expired`, answered
+by `deadline`), and the answer is mailed to the seat from the mail system;
+an open request without a default whose reminder time passed is listed in
+the user's one reminder mail of the pass, with the user's task and
+document reminders, and is reminded again after the class's interval.
+
+A node's presence report (`POST /presence`) keeps the `attention` requests
+in step: a seat reported with `attention` (or a failed turn,
+`turn-failed`, or a failed wake-up, `wake-failed`) gets one request per
+seat and code while the condition lasts; a seat reported without it ends
+the live request (withdrawn by `node` when still open). An answered
+`attention` request stays live until the condition is gone, so the next
+report does not make a new one.
+
+Changes publish `request` events on `GET /events` for user tokens.
+Requests and their events count against the org's storage quota in
+`request_bytes`. A task with an open request shows `blocked_on_human`
+(the oldest open request's number); see `POST /tasks/{num}/take`.
 
 ### Directory and settings
 
@@ -645,7 +726,7 @@ the org's oldest entries to make room.
 | `GET, POST /grants`; `DELETE /grants/{id}`; `POST /grants/preview` | openings; `POST` (user) `{target, audience?: "linked" \| org, managed?}`; changes and the preview `{add: [...], remove: [ids]}` answer `{grant?, changes: [{org, gains, loses}]}` |
 | `GET /orgs/{name}` | another org: `{card, link?, open_to_you, you_open, primary?}`; 404 for a name no org has and for a hidden org without an active link (600 lookups per hour per org) |
 | `DELETE /org/notice` | user: the one-time notice in `GET /org` was shown |
-| `GET, PATCH /org` | org settings (including `webhook_url`; `null` clears it; `display_name`, `description`, `visibility`, `outbound`, `new_threads_per_hour`, `task_stale_hours`: 0 to 8,760, 0 turns stale reminders off, default 24), `stored_bytes` (the mail the org sent with its deliveries, as counted for the storage quota) with `storage_quota_bytes` when the server has a quota, `task_bytes` (the org's tasks, counted against the quota with `stored_bytes`), `doc_bytes` (the org's documents, counted the same way), and `kept_bytes` (the mail of deleted orgs the org keeps, counted the same way but not against the quota) |
+| `GET, PATCH /org` | org settings (including `webhook_url`; `null` clears it; `display_name`, `description`, `visibility`, `outbound`, `new_threads_per_hour`, `task_stale_hours`: 0 to 8,760, 0 turns stale reminders off, default 24), `stored_bytes` (the mail the org sent with its deliveries, as counted for the storage quota) with `storage_quota_bytes` when the server has a quota, `task_bytes` (the org's tasks, counted against the quota with `stored_bytes`), `doc_bytes` (the org's documents, counted the same way), `request_bytes` (the org's requests for the person, counted the same way), and `kept_bytes` (the mail of deleted orgs the org keeps, counted the same way but not against the quota) |
 | `DELETE /org` | user tokens, `{"confirm": "<org name>"}`: delete the org and all its data; mail other orgs received from it stays with them, from `name@org (deleted org)` |
 | `GET, POST /tokens`; `DELETE /tokens/{id}` | tokens |
 | `POST /tokens/rotate` | user tokens, `{label?}`: a new user token (answered once); the calling token is revoked, its browser sessions end and its open streams close; a browser that rotated gets a new session |
@@ -660,12 +741,14 @@ the org's oldest entries to make room.
 | `POST /session`; `DELETE /session` | sign a browser in with `{token}` (user or operator tokens; needs `X-Amail-Csrf: 1`) / out |
 | `GET /overview` | user tokens: agent seats per state, `starting` (seats counted as offline whose session waits at a trust, login or permission prompt), seats needing a person, messages the org sent or received in the last hour and day (counted per minute, so a window starts at the beginning of its first minute; another server instance's counts appear within about a second), the user's unread count, the size of the attention queue |
 | `GET /counts` | user tokens: per seat (or `seat=`), `unread` and `pending` |
-| `GET /attention` | user tokens: what waits for the user ([concepts](concepts.md#the-users-queue-needs-you)), among the user seat's newest 5,000 deliveries |
+| `GET /attention` | user tokens: what waits for the user ([concepts](concepts.md#the-users-queue-needs-you)): first the open requests (`kind: "request"`, with `request`; `now` first, oldest first, at most 500), then the entries from the user seat's newest 5,000 deliveries and the seats that need a person, as before |
 | `GET /pending` | node and user tokens: per seat, pending deliveries by class, urgent count, digest counts, `focus_until`, the seat's counter |
 | `POST /node/notices` | node tokens: `{node?, notices: [{kind: "settings", changes: [{seat?, setting, old?, new}]} \| {kind: "agent_actions", seat?, actions: [{op, targets, count}]} \| {kind: "turn_failures", seat, count, harness?, error}]}` (the mail of a report with `turn_failures` names their seats of the org in its meta field `turn_failures`, separated by spaces); `setting` is `local_policy`, `permission_mode` or `git_access` with one of its values; `op` is `up`, `down`, `forget`, `run`, `wake`, `sleep`, `credentials` or `hook`. Each report becomes one `system` mail to the org's user seat, written by the server (at most 4 KB; what does not fit is counted); answers `{sent}` (1, or 0 when the org is over its daily notice budget and the report was dropped). Limits in [security](security.md#resource-limits) |
 | `POST /presence` | node tokens: `{node?, seats: [{seat, state, wake_failed?, harness?, since?, attention?, attention_hint?, terminal_url?, turn_failed?}]}`; `turn_failed` is `{reason, at, count, retrying}` (the seat's last `count` turns failed; `retrying: false` once the node stopped delivering their mail again) (at most 5,000 seats); valid for 90 s. A report without `turn_failed` for a seat whose stored entry had one marks read the user's unread `turn_failures` notices that name the seat, once no seat they name has a turn failure (among the user's newest 200 unread deliveries) |
 | `GET /seats/{name}/launch` | node and user tokens: harness, model, role, parent, permission mode (informational; the node does not use it) and a new seat token; the token of the seat's previous launch is revoked |
 | `POST /seats/{name}/sleep`, `POST /seats/{name}/wake` | user tokens: ask the node hosting the seat; 202, or 409 `node_offline` |
+| `POST /seats/{name}/prompt` | user tokens: `{text}` (not empty: 422 `prompt_empty`; at most 64 KiB: 422 `prompt_too_large`) is given to the seat's session as a prompt from the user. The server writes the seat's worklog entry `prompt_from_user` and a system mail `Prompt from <user> to <seat>` with the text, delivered to the seat in `Cc` as an archive delivery (it notifies nobody; the org's mail archive keeps it), then sends the node a `prompt` command. Answers `{queued: true, seat, nodes}`; 409 `no_node` when no connected node reports the seat; 422 `not_an_agent` |
+| `POST /seats/{name}/interrupt` | user tokens: stop the seat's current turn (Codex, dsh). 409 `no_structured_interrupt` for a Claude Code seat (use its terminal); otherwise the worklog entry `interrupt` and an `interrupt` command to the node. Answers and errors as for `prompt` |
 | `GET /seats/{name}/transcript` | user tokens: the seat's conversation as server-sent events: `status`, `reset`, `events`. The stream ends when the watcher falls too far behind (reconnect to start again); HTTP 503 `mirror_full` when the server has no room for another watcher |
 | `POST /seats/{name}/transcript` | node tokens: `{node?, reset, status?, events}` for the watchers of the seat; at most 1 MiB (HTTP 413 `too_large` beyond) |
 

@@ -262,6 +262,55 @@ The first public version.
   each section went (`#rollback -> d31`). `handover write` reads the note
   from `-m`, a file or stdin; a note lacking fields prints the missing
   labels and points to `amail handover template`.
+- Requests for the person, M10 phase A (server side; migration
+  `0028_requests.sql`):
+  - One record per thing that waits for the org's user, numbered per org
+    (`r12`): kind (`question`, `plan`, `merge`, `attention`; `permission`
+    is in the record but not created yet), the seat it is about, an
+    optional task, title, Markdown body, 2 to 6 options or free text, a
+    default, a class (`now`, `soon`, `later`) that sets the deadline
+    (15 minutes, 4 hours, 24 hours), the state, the answer, the mail
+    thread, the source, a revision and an append-only history.
+  - `POST /requests` (seats ask for themselves; the user names a seat;
+    nodes make `attention` requests), `GET /requests` (open ones first,
+    `now` first, oldest first; filters by state, kind, seat, class and
+    task), `GET /requests/{num}`, `POST /requests/{num}/answer` (user
+    tokens; by key, number, label or text; `if_rev`; 409 `answered` with
+    the first answer), `POST /requests/{num}/withdraw` and
+    `GET /requests/{num}/wait` (a long poll of at most 600 s).
+  - A new request is mailed to the user, `To`, subject `[r12] <title>`,
+    with the options as numbered lines; class `now` is urgent. The answer
+    is mailed in the request's thread `To` the seat, which wakes it. A
+    reply of the user in the thread whose first line names an option is
+    the answer; any other reply is a comment that reaches the seat.
+    `[r12]` in a subject links the thread to the request.
+  - The deadline pass joins the reminder pass: a request with a default
+    takes it at the deadline (`expired`, answered by `deadline`, mailed to
+    the seat); one without a default is reminded to the user by class, in
+    the user's one reminder mail of the pass with task and document
+    reminders.
+  - Presence reports keep `attention` requests in step: one per seat and
+    condition (`attention`, a failed turn, a failed wake-up) while it
+    lasts, withdrawn by `node` when the node reports it gone. Answering
+    one sends the node an `attention_action` command (`restart`, `sleep`)
+    or gives the seat's terminal link (`open_terminal`).
+  - `GET /attention` lists the open requests first (`kind: "request"`),
+    then the entries as before; `request` events on `/v1/events` for user
+    tokens.
+  - A task with an open request shows `blocked_on_human`; `take` and
+    `steal` refuse it with 409 `blocked_on_human`, and `GET /tasks/next`
+    leaves it out.
+  - Requests count against the storage quota in `request_bytes` (shown in
+    `GET /org`).
+- Web control of seats, M10 phase A (server side):
+  `POST /seats/{name}/prompt {text}` and `POST /seats/{name}/interrupt`
+  (user tokens) record a worklog entry (`prompt_from_user`, `interrupt`;
+  a prompt also as system mail kept in the archive, notifying nobody) and
+  send the seat's node a `prompt` or `interrupt` command; they answer
+  `{queued: true, seat, nodes}`, 409 `no_node` when no connected node
+  reports the seat, and `interrupt` 409 `no_structured_interrupt` for a
+  Claude Code seat. Node commands gain the fields `text`, `request` and
+  `action`.
 
 #### Running agents
 
@@ -627,6 +676,11 @@ Changes made after a security review, before the first public server.
   rules (documents, indexed sections and links, search hits, kinds per
   org, how many documents the index and the candidates look at) in public
   mode only; on a self-hosted server the storage quota is the only bound.
+- Requests for the person have the same two classes: format rules (title
+  512 characters, body 64 KiB, 2 to 6 options with keys of 32 characters
+  and labels of 200, answers 16,384 characters, waits of at most 600 s,
+  prompts of 64 KiB) everywhere, and resource rules (10,000 open requests
+  per org, 600 requests per seat per hour) in public mode only.
 - Conversation mirrors are bounded per post (1 MiB), per watcher (8 MiB),
   per seat (16 MiB) and per server instance (`--max-mirror-mb`, 256 MiB by
   default in public mode); a watcher that falls behind is disconnected and

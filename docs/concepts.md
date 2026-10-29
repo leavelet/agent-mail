@@ -512,7 +512,9 @@ imported task by its id.
 A task has one assignee or none; shared work is split into child tasks.
 `take` assigns an unassigned task to the caller in one step, and is
 refused when another seat took it first, so a pool of workers can share
-unassigned tasks.
+unassigned tasks. A task with an open request for the person
+(`blocked-on-human`, see [the user's queue](#the-users-queue-needs-you))
+is refused to `take` and `steal` and left out of `GET /tasks/next`.
 
 ### Taking over a task
 
@@ -1011,7 +1013,76 @@ and the tasks the entries name; a count selects its filter.
 
 ## The user's queue ("needs you")
 
-The web interface collects what waits for the user, urgent first:
+Agents work cheaply; the user's attention is what is scarce. Everything
+that waits for the user is one kind of record, a **request**
+([reference](reference.md#requests-for-the-person)), numbered per org
+(`r12`), with a kind, typed options, a default, a deadline and an answer.
+
+Kinds:
+
+- `question`: a seat asks the user and waits. It lists 2 to 6 options
+  (`key` and `label`, and a description if needed), or asks for free
+  text, and may name a default.
+- `plan`: a seat asks for approval before it starts (the body is the plan,
+  or names a document); the options are usually `approve` and `change`.
+- `merge`: a merge request to the user, with the branch and a summary of
+  the diff as the body; usually `merge`, `changes` and `reject`. Merge
+  requests between agents stay mail.
+- `attention`: a seat needs a person and cannot ask: Claude Code's
+  directory-trust prompt, a harness that is not logged in, a permission
+  prompt, a failed seat, turns that end in an error, wake-ups that go
+  unanswered. The node reports the condition in its presence report; the
+  server makes the request (one per seat and condition) and ends it when
+  the node reports the condition gone. Its options are actions the system
+  can take: `restart` the seat, put it to `sleep`, `open_terminal`,
+  `dismiss`.
+- `permission` (a harness asks before a tool call) is part of the record
+  but nothing creates it yet: the teams run unattended.
+
+A request may name a task. While the request is open the task is
+`blocked-on-human` (`blocked_on_human` in the task names the request), and
+`take`, `steal` and `GET /tasks/next` leave the task alone.
+
+**Asking and waiting.** A seat asks with `POST /requests`; the request is
+mailed to the user, `To`, subject `[r12] <title>`, with the options as
+numbered lines, from the asking seat. The seat then ends its turn and
+waits: the answer is mailed back to it in the request's thread, `To` it,
+so a sleeping seat wakes as it does for any mail. A script can instead
+wait on `GET /requests/{num}/wait`, which returns when the request is
+answered (at most 10 minutes per call). Questions a lead asks a worker
+stay mail; requests are for the person.
+
+**Classes, deadlines and defaults.** The class says how soon the user
+should answer:
+
+| Class | Mail to the user | Deadline unless given | Reminder |
+|---|---|---|---|
+| `now` | urgent | 15 minutes | at the deadline, then every hour while open |
+| `soon` | normal | 4 hours | at the deadline, then daily |
+| `later` | normal | 24 hours | at the deadline, then daily |
+
+A request with a default takes it at its deadline: the request becomes
+`expired`, the default is recorded as the answer by `deadline`, and the
+seat gets the answer as mail. A request without a default never expires by
+itself: it stays open and is reminded to the user, in the user's one
+reminder mail per pass together with task and document reminders, until
+it is answered or withdrawn. `attention` requests have no deadline.
+
+**Answering.** The user answers with `POST /requests/{num}/answer` (by
+key, by number or by label, or with text), or by replying in the request's
+thread: a reply whose first line names an option (`2`, `no`, `Hold it`)
+is the answer; for a free-text request without options, the reply's text
+is. Any other reply is a comment: the request stays open, and the comment
+reaches the seat. A request has one answer: a second answer is refused
+with 409 `answered`, which carries the first. The seat that asked, or the
+user, may withdraw an open request; the other side is told in the thread.
+Answering an `attention` request runs its action through the seat's node
+(`restart`, `sleep`) or gives the seat's terminal link (`open_terminal`);
+nothing is mailed.
+
+**The queue.** `GET /attention`, the web interface's "needs you" list,
+shows the open requests first (`now` first, oldest first), then the
+entries it showed before requests existed, urgent first:
 
 - mail to the user that asks for an acknowledgement not yet given;
 - an unread message that reached the user through `To` from someone else,
@@ -1023,9 +1094,28 @@ The web interface collects what waits for the user, urgent first:
   turns are failing is marked read by the server once the node reports
   that the seat's turns work again (for a notice about several seats: once
   none of them fails); the mail stays in the Inbox and the archive;
-- seats whose node reports that they need a person: a permission prompt,
-  Claude Code's directory-trust prompt, a harness that is not logged in, a
-  failed seat, turns that end in an error, or wake-ups that go unanswered.
+- seats whose node reports that they need a person (also listed as
+  `attention` requests above them).
+
+### Web control of seats
+
+Two controls reach a seat through its harness's structured interface,
+never as keystrokes typed into its pane:
+
+- **Prompt** (`POST /seats/{name}/prompt`): the user's text is given to
+  the seat's session as a prompt. The server records it in the seat's
+  worklog (`prompt_from_user`) and as system mail that the mail archive
+  keeps (delivered to the seat as an archive copy, so it notifies nobody),
+  then sends the node a `prompt` command.
+- **Interrupt** (`POST /seats/{name}/interrupt`): stops the seat's current
+  turn (Codex, dsh), recorded in the worklog (`interrupt`). Claude Code has
+  no structured interrupt: the route refuses it with 409
+  `no_structured_interrupt`, and the seat's terminal is the way to do it.
+
+Both answer 409 `no_node` when no connected node reports the seat. The
+terminal (`amail node --web-terminal-port`) stays the fallback for what
+has no structured path: login and trust dialogs, and interrupting a Claude
+Code session.
 
 Opening a message in the web Inbox marks it read; **Mark unread** undoes
 that. Check boxes select several messages to mark read or unread at once,

@@ -643,6 +643,13 @@ server. Resource rules (worklog retention, entries per request) protect a
 shared server from one org; they are marked *public* and are off on a
 self-hosted server, where the org's storage quota is the only bound on
 how many note revisions and worklog entries are kept.
+The bounds of requests for the person come in the same two classes.
+Format rules (title, body, options, answers, the long poll, prompts) keep
+a request short enough for the person to read and apply on every server.
+Resource rules (open requests per org, requests per seat per hour) protect
+a shared server from one org; they are marked *public* (`limits.requests.*`
+in the server's configuration, no flags of their own yet) and are off on a
+self-hosted server, where the org's storage quota is the only bound.
 
 | What | Limit |
 |---|---|
@@ -711,6 +718,10 @@ how many note revisions and worklog entries are kept.
 | Document kinds per org | 200 (*public*); 422 `too_many_kinds` beyond |
 | Document storage | every revision counts its whole text, each section and link of the current revision its text plus 128 bytes, each event and relation 128 bytes plus its texts, each document 512 bytes plus its fields, against the org's storage quota together with its mail and tasks (`doc_bytes`); a write over it is refused with 507 `storage_quota`. On a server without the *public* limits this is the only bound on documents |
 | Task queries | `GET /tasks` and the personal lists at most 500 tasks per page; `GET /tasks?text=` looks at the 5,000 newest tasks below its cursor; `GET /tasks/board` shows at most 100 tasks per column and 200 waiting tasks; `GET /tasks/report` at most 500 tasks per section; these take a query slot of the other pool |
+| One request for the person (format rules; always) | title 512 characters, one line; body 64 KiB; 2 to 6 options (or none with free text), keys 1 to 32 characters of `A-Z`, `a-z`, `0-9`, `_`, `-`, `.` and not digits only, labels 200 characters, descriptions 1,000; a free-text answer 16,384 characters, an answer's note 4,000; an `attention` code 64 characters and its hint 4,000 (422 beyond each) |
+| Requests for the person (resource rules) | open requests per org 10,000 (*public*; 429 `too_many_open_requests` beyond); requests per seat per hour 600, counted for seat tokens (*public*; 429 `request_rate`). Each request counts its title, body, options and attention code plus 256 bytes, each event its note and actor plus 64 bytes, and an answer its text and note, against the org's storage quota together with its mail, tasks and documents (`request_bytes`); a request over it is refused with 507 `storage_quota`. The mail of a request (to the user, answers, comments, reminders) is never refused at the quota. On a server without the *public* limits the quota is the only bound |
+| Request waits and lists | `GET /requests/{num}/wait` at most 600 s per call (default 60); `GET /requests` at most 500 per page; `GET /attention` lists at most 500 open requests |
+| Prompts to a seat (`POST /seats/{name}/prompt`) | 64 KiB of text (422 `prompt_too_large`) |
 | Handover note (a format rule, on every server) | seven fields (`State`, `Summary`, `Next`, `Waiting on`, `Traps`, `Verify`, `Pointers`), the first six required (422 `note_fields_missing`); 16,384 characters stored (422 `note_too_large` with the count); a session id 200 characters; the newest 20 revisions are listed with a note |
 | Worklog entry (a format rule, on every server) | text 1,000 characters (longer text is cut: an entry points at evidence, it does not hold it); kind 40 characters of `a-z`, `0-9`, `_`, `-`, `.`; session id 200 characters; a page of `GET /seats/{name}/worklog` at most 1,000 entries; the summary lists at most 100 tasks and the newest 10 entries; these queries take a query slot of the other pool |
 | Note revisions and worklog entries (storage) | not counted per org on any server: the storage quota is their only bound. Each revision counts its text, session id and author plus 128 bytes, each worklog entry its text, kind and session id plus 64 bytes, in `task_bytes`. A note over the quota is refused with 507 `storage_quota`; a worklog entry over it deletes the org's oldest worklog entries to make room instead of being refused |
