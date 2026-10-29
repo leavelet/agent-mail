@@ -317,7 +317,9 @@ findings and procedures as documents (d12): search them with `doc_search` before
 something is done here and read one section at a time with `doc_read`. A fact you verified \
 about the code, a tool or the environment is a `finding` document with its evidence (`doc_new` \
 with kind finding); a decision is a `decision` document; neither goes in mail. `doc_comment` is \
-for correcting or discussing an existing document.";
+for correcting or discussing an existing document. When you need the person's decision, use `ask` \
+with the options and a default, then stop; the answer comes as mail and wakes you. Do not ask the \
+person by plain mail for a decision that `ask` can carry.";
 
 /// One tool: its name, description, input schema and whether it only reads.
 struct ToolDef {
@@ -1171,6 +1173,105 @@ const TOOLS: &[ToolDef] = &[
             )
         },
     },
+    ToolDef {
+        name: "ask",
+        description: "Ask the org's user (the person) for a decision. The request (r12) is \
+            mailed to the user with its options; the tool answers at once with its number. \
+            Then stop your turn unless other work is left: the answer comes as mail in the \
+            request's thread and wakes you. Give 2 to 6 options and a `default` (taken at the \
+            deadline when nobody answers); without a default the request stays open and is \
+            reminded. A `task` shows blocked-on-human while the request is open. Questions \
+            to other seats stay mail.",
+        read_only: false,
+        schema: || {
+            obj(
+                json!({
+                    "title": {"type": "string", "description": "One line."},
+                    "body": {"type": "string", "description": "The question or the detail (Markdown)."},
+                    "options": {
+                        "type": "array",
+                        "items": {
+                            "type": ["object", "string"],
+                            "properties": {
+                                "key": {"type": "string"},
+                                "label": {"type": "string"},
+                                "description": {"type": "string"},
+                            },
+                            "required": ["key", "label"],
+                        },
+                        "description": "2 to 6 typed answers, each {key, label, description?} or \"key:label\". Keys: letters, digits, _, -, . (not digits only), at most 32 characters.",
+                    },
+                    "free_text": {"type": "boolean", "description": "The answer may be free text (question and plan)."},
+                    "default": {"type": "string", "description": "The key of the option taken at the deadline."},
+                    "class": {"type": "string", "enum": ["now", "soon", "later"], "description": "How soon: now (minutes, urgent mail), soon (hours; default), later (a day)."},
+                    "deadline": {"type": ["string", "integer"], "description": "From now: 30m, 2h, 1d, or seconds. Default: from the class (15m, 4h, 24h)."},
+                    "task": {"type": ["integer", "string"], "description": "The task the request belongs to, 12 or \"t12\"."},
+                    "kind": {"type": "string", "enum": ["question", "plan", "merge"], "description": "Default question."},
+                }),
+                &["title"],
+            )
+        },
+    },
+    ToolDef {
+        name: "requests",
+        description: "Requests for the person: by default your open ones (for the user: the \
+            org's), open `now` first, with age and deadline. With `num`, one request: its \
+            options, the answer, the events and the thread.",
+        read_only: true,
+        schema: || {
+            obj(
+                json!({
+                    "num": {"type": ["integer", "string"], "description": "One request, 12 or \"r12\"."},
+                    "state": {"type": "string", "description": "open (default), all, or comma-separated states: answered, expired, withdrawn, superseded."},
+                    "kind": {"type": "string"},
+                    "seat": {"type": "string"},
+                    "class": {"type": "string", "enum": ["now", "soon", "later"]},
+                    "task": {"type": ["integer", "string"]},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                }),
+                &[],
+            )
+        },
+    },
+    ToolDef {
+        name: "answer",
+        description: "Answer a request for the person (the user's seat only; other seats are \
+            refused): `option` by number, key or label, or `text` for a free-text request. \
+            The answer is mailed to the seat that waits, which wakes it.",
+        read_only: false,
+        schema: || {
+            obj(
+                json!({
+                    "num": {"type": ["integer", "string"], "description": "The request, 12 or \"r12\"."},
+                    "option": {"type": ["string", "integer"], "description": "An option's number from 1, key or label."},
+                    "text": {"type": "string", "description": "A free-text answer, or text that names an option."},
+                    "note": {"type": "string", "description": "A note that goes with the answer."},
+                    "if_rev": {"type": "integer", "description": "Refuse with `stale` if the request changed since this revision (its `rev`)."},
+                }),
+                &["num"],
+            )
+        },
+    },
+    ToolDef {
+        name: "prompt_seat",
+        description: "Give a seat's session a prompt from the user, through the seat's node \
+            (the user's seat only). The text is kept in the seat's worklog and the mail \
+            archive.",
+        read_only: false,
+        schema: || {
+            obj(
+                json!({"seat": {"type": "string"}, "text": {"type": "string"}}),
+                &["seat", "text"],
+            )
+        },
+    },
+    ToolDef {
+        name: "interrupt_seat",
+        description: "Stop a seat's current turn (the user's seat only; Codex and dsh seats). \
+            A Claude Code seat has no structured interrupt: use its terminal.",
+        read_only: false,
+        schema: || obj(json!({"seat": {"type": "string"}}), &["seat"]),
+    },
 ];
 
 /// The tool list as MCP describes it.
@@ -1447,10 +1548,133 @@ async fn call(c: &Client, name: &str, args: &JsonObject) -> Result<(Value, Strin
             Ok((v, t))
         }
         n if n.starts_with("task_") => task(c, n, &a).await,
+        "ask" | "requests" | "answer" | "prompt_seat" | "interrupt_seat" => {
+            requests(c, name, &a).await
+        }
         n if n.starts_with("doc_") || n.starts_with("handover_") || n == "worklog" => {
             let (v, t) = docs(c, n, &a).await?;
             Ok(cut_result(n, v, t))
         }
+        _ => bail!("no tool {name}"),
+    }
+}
+
+/// A request number: `12`, `"12"` or `"r12"`.
+fn request_num(a: &Args, k: &str) -> Result<Option<i64>> {
+    match a.get(k) {
+        Some(Value::String(s)) => crate::request_cmd::num(s)
+            .map(Some)
+            .map_err(|_| arg_err(format!("`{k}` must be a request number such as 12 or r12"))),
+        _ => a.int(k),
+    }
+}
+
+/// The request tools.
+async fn requests(c: &Client, name: &str, a: &Args<'_>) -> Result<(Value, String)> {
+    use crate::request_cmd as r;
+    match name {
+        "ask" => {
+            let mut b = Map::new();
+            b.insert("title".into(), json!(a.req_str("title")?));
+            for k in ["body", "default", "class", "kind"] {
+                if let Some(v) = a.str(k)? {
+                    b.insert(k.into(), json!(v));
+                }
+            }
+            if let Some(t) = a.task("task")? {
+                b.insert("task".into(), json!(t));
+            }
+            if a.bool("free_text")? {
+                b.insert("free_text".into(), json!(true));
+            }
+            let mut options = Vec::new();
+            if let Some(Value::Array(items)) = a.get("options") {
+                for o in items {
+                    options.push(match o {
+                        Value::String(s) => r::option(s).map_err(|e| arg_err(format!("{e:#}")))?,
+                        Value::Object(_) => serde_json::from_value::<p::RequestOption>(o.clone())
+                            .map_err(|e| arg_err(format!("`options`: {e}")))?,
+                        _ => return Err(arg_err("`options` must be a list".into())),
+                    });
+                }
+            } else if a.get("options").is_some() {
+                return Err(arg_err("`options` must be a list".into()));
+            }
+            if !options.is_empty() {
+                b.insert("options".into(), json!(options));
+            }
+            let deadline = match a.get("deadline") {
+                None => None,
+                Some(Value::Number(n)) => n.as_u64().filter(|n| *n > 0),
+                Some(Value::String(s)) => {
+                    Some(r::deadline_s(s).map_err(|e| arg_err(format!("`deadline`: {e:#}")))?)
+                }
+                Some(_) => None,
+            };
+            if a.get("deadline").is_some() && deadline.is_none() {
+                return Err(arg_err(
+                    "`deadline` must be a duration such as 2h, or seconds".into(),
+                ));
+            }
+            if let Some(d) = deadline {
+                b.insert("deadline_s".into(), json!(d));
+            }
+            b.insert("source".into(), json!("mcp"));
+            let (v, _) = r::ask(c, b).await?;
+            let d: p::RequestDetail = parse(&v)?;
+            let t = format!(
+                "{}\nStop your turn here unless other work is left: the person's answer comes as mail \
+                 in this request's thread (Re: [r{n}] …) and wakes you. Do not ask again by mail.",
+                r::created_line(&d.request),
+                n = d.request.num
+            );
+            Ok((v, t))
+        }
+        "requests" => match request_num(a, "num")? {
+            Some(n) => r::show(c, n).await,
+            None => {
+                r::list(
+                    c,
+                    &[
+                        ("state", a.str("state")?),
+                        ("kind", a.str("kind")?),
+                        ("seat", a.str("seat")?),
+                        ("class", a.str("class")?),
+                        ("task", a.task("task")?.map(|t| format!("t{t}"))),
+                        ("limit", a.int("limit")?.map(|n| n.to_string())),
+                    ],
+                )
+                .await
+            }
+        },
+        "answer" => {
+            let n = request_num(a, "num")?.ok_or_else(|| arg_err("`num` is required".into()))?;
+            let mut b = Map::new();
+            match a.get("option") {
+                Some(Value::Number(x)) => {
+                    b.insert("option".into(), json!(x.to_string()));
+                }
+                Some(Value::String(s)) => {
+                    b.insert("option".into(), json!(s));
+                }
+                Some(_) => return Err(arg_err("`option` must be a string or a number".into())),
+                None => {}
+            }
+            for k in ["text", "note"] {
+                if let Some(v) = a.str(k)? {
+                    b.insert(k.into(), json!(v));
+                }
+            }
+            if let Some(x) = a.int("if_rev")? {
+                b.insert("if_rev".into(), json!(x));
+            }
+            if !b.contains_key("option") && !b.contains_key("text") {
+                return Err(arg_err("give `option` or `text`".into()));
+            }
+            r::answer(c, n, b).await
+        }
+        "prompt_seat" => r::prompt(c, &a.req_str("seat")?, &a.req_str("text")?).await,
+        "interrupt_seat" => r::interrupt(c, &a.req_str("seat")?).await,
         _ => bail!("no tool {name}"),
     }
 }
@@ -2565,6 +2789,9 @@ fn task_line(t: &p::Task) -> String {
     }
     if let Some(by) = &t.steal_requested_by {
         s.push_str(&format!(" takeover requested by {}", output::l(by)));
+    }
+    if let Some(r) = t.blocked_on_human {
+        s.push_str(&format!(" blocked-on-human (r{r})"));
     }
     s
 }
