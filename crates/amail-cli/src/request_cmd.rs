@@ -170,7 +170,7 @@ pub fn relative(ts: &str) -> String {
         3_600..86_400 => format!("{}h", a / 3_600),
         _ => format!("{}d", a / 86_400),
     };
-    if d < 0 {
+    if d <= 0 {
         format!("{n} ago")
     } else {
         format!("in {n}")
@@ -203,7 +203,7 @@ pub fn answer_value(r: &p::Request) -> String {
 /// and the task, the deadline or the answer.
 pub fn request_line(r: &p::Request) -> String {
     let mut s = format!(
-        "{:<5} {:<9} {:<5} {:<9} {:<8} {:<8} {}",
+        "{:<5} {:<9} {:<6} {:<9} {:<8} {:<8} {}",
         format!("r{}", r.num),
         r.state.as_str(),
         r.class.as_str(),

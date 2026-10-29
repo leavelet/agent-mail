@@ -67,6 +67,11 @@ const TOOLS: &[&str] = &[
     "handover_show",
     "handover_write",
     "worklog",
+    "ask",
+    "requests",
+    "answer",
+    "prompt_seat",
+    "interrupt_seat",
 ];
 
 /// `amail --json <args>` as the seat with `token`.
@@ -104,13 +109,13 @@ async fn run(b: Backend) {
     let w1 = h.seat("w1", "claude").await;
     let w2 = h.seat("w2", "claude").await;
     let url = h.api.base.clone();
-    let (t1, t2) = (w1.token.clone(), w2.token.clone());
-    tokio::task::spawn_blocking(move || drive(&url, &t1, &t2))
+    let (t1, t2, owner) = (w1.token.clone(), w2.token.clone(), h.api.token.clone());
+    tokio::task::spawn_blocking(move || drive(&url, &t1, &t2, &owner))
         .await
         .unwrap();
 }
 
-fn drive(url: &str, t1: &str, t2: &str) {
+fn drive(url: &str, t1: &str, t2: &str, owner: &str) {
     // w1 as a person registers it by hand; w2 as the node registers it.
     let mut m1 = McpProc::start(&[], &[("AMAIL_URL", url), ("AMAIL_TOKEN", t1)]);
     let mut m2 = McpProc::start(&["--node"], &[("AMAIL_URL", url), ("AMAIL_TOKEN", t2)]);
@@ -126,6 +131,8 @@ fn drive(url: &str, t1: &str, t2: &str) {
     for part in [
         "A fact you verified about the code, a tool or the environment is a `finding` document",
         "`doc_comment` is for correcting or discussing an existing document",
+        "When you need the person's decision, use `ask` with the options and a default, then stop; \
+         the answer comes as mail and wakes you.",
     ] {
         assert!(instructions.contains(part), "{instructions}");
     }
@@ -358,6 +365,7 @@ fn drive(url: &str, t1: &str, t2: &str) {
     );
 
     documents(url, t1, &mut m1, &mut m2);
+    requests(url, t1, owner, &mut m1);
 
     // Errors: an unknown task is the server's error as a tool error; bad
     // arguments too.
@@ -395,6 +403,120 @@ fn drive(url: &str, t1: &str, t2: &str) {
 
 fn text(v: &Value) -> &str {
     v["content"][0]["text"].as_str().unwrap()
+}
+
+/// The request tools: `m1` (w1) asks; the user's MCP server answers and
+/// uses the seat controls; w1 may not.
+fn requests(url: &str, t1: &str, owner: &str, m1: &mut McpProc) {
+    let asked = m1.call(
+        "ask",
+        json!({
+            "title": "Ship the parser?",
+            "body": "The tests pass.",
+            "options": [{"key": "yes", "label": "Ship it"}, "no:Hold it:until the docs are done"],
+            "default": "no",
+            "deadline": "2h",
+            "class": "now",
+        }),
+    );
+    let r = ok(&asked)["request"].clone();
+    let num = r["num"].as_i64().unwrap();
+    assert_eq!(r["source"], "mcp", "{asked}");
+    assert_eq!(r["seat"], "w1", "{asked}");
+    assert_eq!(r["class"], "now", "{asked}");
+    assert_eq!(
+        r["options"][1],
+        json!({"key": "no", "label": "Hold it", "description": "until the docs are done"}),
+        "{asked}"
+    );
+    assert!(
+        text(&asked).starts_with(&format!(
+            "r{num}  question  now  Ship the parser?  (deadline "
+        )),
+        "{asked}"
+    );
+    assert!(
+        text(&asked).contains("the person's answer comes as mail"),
+        "{asked}"
+    );
+    // Bad arguments are the tool's own errors.
+    assert_eq!(
+        err_code(&m1.call("ask", json!({"title": "x", "options": ["nolabel"]}))),
+        "invalid_arguments"
+    );
+    assert_eq!(
+        err_code(&m1.call("ask", json!({"title": "x", "deadline": "soon"}))),
+        "invalid_arguments"
+    );
+    // The server's format rules.
+    let one = m1.call("ask", json!({"title": "x", "options": ["a:A"]}));
+    assert_eq!(err_code(&one), "options_count", "{one}");
+
+    // The caller's open requests by default; the same JSON as the command.
+    let list = m1.call("requests", json!({}));
+    assert_eq!(ok(&list), &cli_json(url, t1, &["requests"]), "requests");
+    assert_eq!(ok(&list)["requests"][0]["num"], json!(num), "{list}");
+    assert!(text(&list).starts_with(&format!("r{num}  ")), "{list}");
+    let one = m1.call("requests", json!({"num": format!("r{num}")}));
+    assert!(text(&one).contains("  2. no — Hold it  (default)"), "{one}");
+    assert_eq!(
+        ok(&one),
+        &cli_json(url, t1, &["request", "show", &format!("r{num}")]),
+        "request show"
+    );
+
+    // Only the user's seat answers and controls seats.
+    let refused = m1.call("answer", json!({"num": num, "option": 1}));
+    assert_eq!(err_code(&refused), "forbidden", "{refused}");
+    assert_eq!(refused["structuredContent"]["error"]["status"], 403);
+    let refused = m1.call("prompt_seat", json!({"seat": "w2", "text": "hi"}));
+    assert_eq!(refused["structuredContent"]["error"]["status"], 403);
+    let refused = m1.call("interrupt_seat", json!({"seat": "w2"}));
+    assert_eq!(refused["structuredContent"]["error"]["status"], 403);
+    assert_eq!(
+        err_code(&m1.call("answer", json!({"num": num}))),
+        "invalid_arguments"
+    );
+
+    let mut user = McpProc::start(&[], &[("AMAIL_URL", url), ("AMAIL_TOKEN", owner)]);
+    user.initialize();
+    let stale = user.call("answer", json!({"num": num, "option": 1, "if_rev": 999}));
+    assert_eq!(err_code(&stale), "stale", "{stale}");
+    assert_eq!(
+        stale["structuredContent"]["request"]["state"], "open",
+        "{stale}"
+    );
+    let answered = user.call(
+        "answer",
+        json!({"num": format!("r{num}"), "option": 1, "note": "go ahead"}),
+    );
+    assert_eq!(ok(&answered)["request"]["state"], "answered", "{answered}");
+    assert_eq!(
+        text(&answered),
+        format!("r{num} answered by owner: 1. yes — Ship it\nNote: go ahead")
+    );
+    let again = user.call("answer", json!({"num": num, "text": "no"}));
+    assert_eq!(err_code(&again), "answered", "{again}");
+    assert_eq!(
+        again["structuredContent"]["request"]["answer"]["option"], "yes",
+        "{again}"
+    );
+    // Answered requests leave the open list.
+    let list = m1.call("requests", json!({}));
+    assert_eq!(text(&list), "no open requests", "{list}");
+    let all = m1.call("requests", json!({"state": "all"}));
+    assert_eq!(ok(&all)["requests"].as_array().unwrap().len(), 1, "{all}");
+
+    // The seat controls: the seats of this test have no session, so no
+    // connected node reports them; the 409 is said plainly.
+    let p = user.call("prompt_seat", json!({"seat": "w1", "text": "status?"}));
+    assert_eq!(err_code(&p), "no_node", "{p}");
+    assert!(
+        text(&p).contains("w1: no node is connected for this seat"),
+        "{p}"
+    );
+    let i = user.call("interrupt_seat", json!({"seat": "w1"}));
+    assert_eq!(i["structuredContent"]["error"]["status"], 409, "{i}");
 }
 
 /// The document, handover and worklog tools. `m1` is w1 (token `t1`), `m2`
