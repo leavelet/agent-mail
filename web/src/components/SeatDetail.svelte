@@ -18,6 +18,9 @@
   import SeatTasks from './SeatTasks.svelte';
   import SeatHandover from './SeatHandover.svelte';
   import SeatWorklog from './SeatWorklog.svelte';
+  import SeatControls from './SeatControls.svelte';
+  import SeatRequests from './SeatRequests.svelte';
+  import { requestId, waitingRequest } from '../lib/requests';
 
   let { name }: { name: string } = $props();
 
@@ -99,6 +102,7 @@
   const starting = $derived(!!status?.starting);
   const tf = $derived(p?.turn_failed);
   const terminal = $derived(terminalHref(p?.terminal_url));
+  const waiting = $derived(waitingRequest(p));
 
   // The description: what others read about the seat (other orgs too, when open).
   let editingDesc = $state(false);
@@ -136,6 +140,7 @@
         <h1 class="mono">{seat.name}</h1>
         {#if seat.display_name}<span class="muted"><Vis text={seat.display_name} /></span>{/if}
         {#if seat.kind === 'agent'}<StateBadge state={seatState} {age} {starting} failing={!!tf} long />{:else}<span class="chip neutral">{t('org.you')}</span>{/if}
+        {#if waiting}<a class="chip attn" href={href(['requests', requestId(waiting)])} data-testid="seat-waiting-chip">{t('req.waitingFor')} {requestId(waiting)}</a>{/if}
         {#if focus}<span class="chip focus" title={t('flag.focus.long')}>◐ {t('flag.focus', { time: shortTime(focus, now, ui.lang) })}</span>{/if}
       </div>
       <div class="actions row wrap">
@@ -229,6 +234,7 @@
       {#if seat.role}<pre><Vis text={seat.role} /></pre>{:else}<p class="faint">{t('seat.noRole')}</p>{/if}
     </details>
 
+    {#if seat.kind === 'agent'}<SeatRequests seat={seat.name} {waiting} />{/if}
     <SeatTasks seat={seat.name} />
 
     <div class="tabs" role="tablist">
@@ -247,6 +253,7 @@
     <div class="tabbody">
       {#if tab === 'mirror' && seat.kind === 'agent'}
         <Transcript seat={seat.name} />
+        <SeatControls {seat} presence={p} />
       {:else if tab === 'mirror'}
         <div class="empty">—</div>
       {:else if tab === 'handover' && seat.kind === 'agent'}
