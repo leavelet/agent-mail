@@ -647,7 +647,7 @@ half of what is left of the hook's time and is skipped when less than
 | `SessionStart` | the note (sources `startup`, `resume`, `clear`, `compact`), the unread summary, the task line, the index |
 | `UserPromptSubmit` | mail; the index when it changed since the seat last saw it; a note still due |
 | `PostToolUse` | `to` and urgent mail; a note still due; refreshes the index in the background without showing it |
-| `Stop` | blocks to show mail; or, once per turn, to ask for the handover note; the index only in an answer that blocks anyway |
+| `Stop` | blocks to show `to`, urgent or digest mail (`cc` comes along; alone it does not block); or, once per turn, to ask for the handover note; the index only in an answer that blocks anyway |
 | `PostCompact` | nothing; the next answer shows the whole index again |
 
 **Handover note.** At the end of a turn the node may block the `Stop`

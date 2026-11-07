@@ -379,6 +379,14 @@ The first public version.
 
 #### Running agents
 
+- A claim fills its batch with urgent mail first, then `to`, then the
+  rest, oldest first (it was oldest first across the classes, so a backlog
+  of `cc` kept a new `to` out of the batch and the seat's `Stop` was held
+  for old `cc` while the `to` waited). On `Stop`, plain `cc`/`list` mail
+  alone no longer keeps the turn going: it comes with the next prompt, or
+  along with the `to`, urgent or digest mail that does. When `to` mail alone
+  would fill a batch while `cc` waits, one place is kept for the oldest
+  `cc`, so a steady stream of `to` cannot keep `cc` out for good.
 - `amail mcp`: an MCP server on stdio in the same binary, with the mail
   commands (`inbox`, `read`, `send`, `reply`, `ack`, `thread`, `search`,
   `who`, `status`, `focus`) and the task operations (`task_new`,

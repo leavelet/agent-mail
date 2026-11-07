@@ -47,6 +47,7 @@ conformance!(
     changes_feed,
     archive,
     claim_filters,
+    claim_takes_urgent_and_to_first,
     claim_concurrent_never_duplicates,
     seq_concurrent_sends_monotonic,
     seq_mixed_workload_feed_complete,
@@ -1052,6 +1053,38 @@ async fn claim_filters(s: S) {
     assert!(d.notified_at.is_none());
     let (got, _) = s.claim(a.id, &filter(&[])).await.unwrap();
     assert!(got.is_empty());
+}
+
+/// A claim fills its batch with urgent mail first, then `to`, then the rest,
+/// each oldest first: a backlog of `cc` cannot keep a new `to` out. The
+/// entries come back in `seq` order.
+async fn claim_takes_urgent_and_to_first(s: S) {
+    let (o, u) = org(&s, "acme").await;
+    let a = seat(&s, o.id, "a").await;
+    let send = |subject: &'static str, class: C, urgent: bool| {
+        let s = s.clone();
+        let mut m = msg(o.id, u.id, subject, &[(&a, class)]);
+        if urgent {
+            m.priority = Priority::Urgent;
+        }
+        async move { s.send(&m).await.unwrap().message_id }
+    };
+    let cc1 = send("cc1", C::Cc, false).await;
+    let cc2 = send("cc2", C::Cc, false).await;
+    let cc3 = send("cc3", C::Cc, false).await;
+    let to = send("to", C::To, false).await;
+    let urgent = send("urgent", C::Cc, true).await;
+    let ids = |v: Vec<Entry>| v.into_iter().map(|e| e.message.id).collect::<Vec<_>>();
+    let two = |classes: &[C]| ClaimFilter {
+        limit: 2,
+        ..filter(classes)
+    };
+    let (got, _) = s.claim(a.id, &two(&[C::To, C::Cc, C::List])).await.unwrap();
+    assert_eq!(ids(got), vec![to, urgent], "urgent and to before older cc");
+    let (got, _) = s.claim(a.id, &two(&[C::To, C::Cc, C::List])).await.unwrap();
+    assert_eq!(ids(got), vec![cc1, cc2], "then the rest, oldest first");
+    let (got, _) = s.claim(a.id, &two(&[C::To, C::Cc, C::List])).await.unwrap();
+    assert_eq!(ids(got), vec![cc3]);
 }
 
 /// Many concurrent claimers on one seat while new mail keeps arriving: every

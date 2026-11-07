@@ -683,6 +683,11 @@ fn alive(pid: u32, start: Option<u64>) -> bool {
 struct Plan {
     /// Claim `to`/`cc`/`list` (all immediate classes).
     claim_all: bool,
+    /// With `claim_all`: pending `to` and urgent deliveries, and whether
+    /// plain `cc`/`list` mail waits too. Under a flood of direct mail one
+    /// place of the batch is kept for the oldest `cc`/`list` (see step 2).
+    direct: i64,
+    background: bool,
     /// Claim class `to`.
     claim_to: bool,
     /// Claim urgent `cc`/`list`.
@@ -1898,6 +1903,8 @@ impl Node {
                         plan.claim_urgent_all = connected && s.pending.urgent > 0;
                     } else {
                         plan.claim_all = connected && s.pending.total() > 0;
+                        plan.direct = s.pending.to + s.pending.urgent;
+                        plan.background = s.pending.cc + s.pending.list > 0;
                         plan.digest = connected && s.pending.digest > 0;
                     }
                     plan.summary = connected && registered;
@@ -1956,11 +1963,14 @@ impl Node {
                     self.jobs_kick.notify_one();
                     let s = st.seat(seat);
                     let focused = s.focused(now);
+                    // Plain `cc`/`list` mail alone does not keep a turn
+                    // going: it comes with the next prompt, or along with
+                    // the `to`, urgent or digest mail that does.
                     let pending = connected
                         && if focused {
                             s.pending.urgent > 0
                         } else {
-                            s.pending.total() > 0 || s.pending.digest > 0
+                            s.pending.to > 0 || s.pending.urgent > 0 || s.pending.digest > 0
                         };
                     let blocks = (pending || !s.stash.is_empty()) && s.stop_blocks < cap;
                     // The seat asked the person in this turn, or has a
@@ -1980,6 +1990,8 @@ impl Node {
                             plan.claim_urgent_all = pending;
                         } else {
                             plan.claim_all = pending && s.pending.total() > 0;
+                            plan.direct = s.pending.to + s.pending.urgent;
+                            plan.background = s.pending.cc + s.pending.list > 0;
                             plan.digest = pending && s.pending.digest > 0;
                         }
                         plan.index = connected.then_some(false);
@@ -2131,30 +2143,41 @@ impl Node {
         let mut failed = false;
         let mut more = false;
         use DeliveryClass::*;
-        let spec = |classes: &[DeliveryClass], urgent_only: bool, digest: bool| ClaimSpec {
-            classes: classes.to_vec(),
-            urgent_only,
-            digest,
-            via: via.clone(),
-            limit: if digest { DIGEST_LIMIT } else { limit },
-        };
+        let spec =
+            |classes: &[DeliveryClass], urgent_only: bool, digest: bool, limit: u32| ClaimSpec {
+                classes: classes.to_vec(),
+                urgent_only,
+                digest,
+                via: via.clone(),
+                limit,
+            };
         let mut calls: Vec<ClaimSpec> = Vec::new();
         if limit == 0 {
             more = plan.claim_all || plan.claim_urgent_all || plan.claim_to || plan.claim_urgent;
         } else if plan.claim_all {
-            calls.push(spec(&[To, Cc, List], false, false));
+            // The server fills a batch with urgent mail first, then `to`,
+            // then the rest, oldest first. When direct mail alone would
+            // fill the batch while `cc`/`list` mail waits, one place is
+            // kept for the oldest of those, so a steady stream of `to`
+            // cannot keep them out for good.
+            if limit >= 2 && plan.direct >= i64::from(limit) && plan.background {
+                calls.push(spec(&[To, Cc, List], false, false, limit - 1));
+                calls.push(spec(&[Cc, List], false, false, 1));
+            } else {
+                calls.push(spec(&[To, Cc, List], false, false, limit));
+            }
         } else if plan.claim_urgent_all {
-            calls.push(spec(&[To, Cc, List], true, false));
+            calls.push(spec(&[To, Cc, List], true, false, limit));
         } else {
             if plan.claim_to {
-                calls.push(spec(&[To], false, false));
+                calls.push(spec(&[To], false, false, limit));
             }
             if plan.claim_urgent {
-                calls.push(spec(&[Cc, List], true, false));
+                calls.push(spec(&[Cc, List], true, false, limit));
             }
         }
         if plan.digest {
-            calls.push(spec(&[To, Cc, List], false, true));
+            calls.push(spec(&[To, Cc, List], false, true, DIGEST_LIMIT));
         }
         let made_calls = !calls.is_empty() || plan.summary || plan.tasks;
         // A server answer that came after the deadline: the mail is shown
@@ -2171,7 +2194,7 @@ impl Node {
                     if spec.digest {
                         digest.extend(r.entries);
                     } else {
-                        more |= r.entries.len() as u32 >= limit;
+                        more |= r.entries.len() as u32 >= spec.limit;
                         claimed.extend(r.entries);
                     }
                     continue;

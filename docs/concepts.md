@@ -127,7 +127,7 @@ the highest class. The class decides how mail reaches a session:
 |---|---|---|
 | urgent | injected after the next tool call | woken at once |
 | `to` | injected after the next tool call | woken after a 3-second coalescing window |
-| `cc` | shown at the end of the turn or with the next prompt | not woken; comes with the next turn |
+| `cc` | shown with the next prompt, or at the end of a turn that `to`, urgent or digest mail keeps going (`cc` alone does not); urgent mail and `to` are taken before it | not woken; comes with the next turn |
 
 **Lists do not change the class.** The members of a list in `To` get class
 `to` and are woken like direct recipients; the members of a list in `Cc`

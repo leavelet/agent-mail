@@ -91,7 +91,11 @@ resumes them when mail arrives. See [team files](teams.md).
 4. **Busy session.** If `be-1` is in a turn, its next hook asks the node.
    On `PostToolUse` (after each tool call) only `to` and urgent mail is
    taken; on `UserPromptSubmit` all classes; on `Stop` the node keeps the
-   turn going so the agent handles the mail (at most three times in a row).
+   turn going for `to`, urgent or digest mail so the agent handles it (at
+   most three times in a row); `cc` comes along but alone does not keep a
+   turn going. A batch is filled with urgent mail first, then `to`, then
+   the rest, oldest first, and when `to` mail alone would fill it while
+   `cc` waits, one place is kept for the oldest `cc`.
 5. **Idle session.** If `be-1` is idle and the mail is `to` or urgent, the
    node waits a 3-second coalescing window (urgent: no wait) and sends a
    one-line nudge, `[amail] You have new mail (wake #n).`, through the

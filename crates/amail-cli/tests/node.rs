@@ -33,6 +33,7 @@ macro_rules! node_tests {
 node_tests!(
     claude_state_machine,
     claude_stop_block_cap,
+    stop_takes_to_before_old_cc,
     claude_ignores_internal_agents,
     codex_registration_and_rows,
     wake_coalesces_and_skips_cc,
@@ -356,6 +357,78 @@ async fn claude_state_machine(b: Backend) {
     // Delivery status shows the hook path.
     let st = w1.get(&format!("/messages/{m}")).await;
     assert_eq!(st["delivery"]["notified_via"], "hook:Stop");
+    assert_eq!(inbox.count(), 0, "no wake-up was needed");
+}
+
+/// A backlog of `cc` beyond the batch limit and a new `to`: the `Stop`
+/// takes the `to` in its first batch (urgent mail and `to` are taken before
+/// the rest), `cc` alone does not keep the turn going but comes with the
+/// next prompt, and under a flood of `to` one place of the batch is kept
+/// for the oldest `cc`.
+async fn stop_takes_to_before_old_cc(b: Backend) {
+    let Some(h) = setup(b, "stop_takes_to_before_old_cc", Opts::default()).await else {
+        return;
+    };
+    h.seat("w1", "claude").await;
+    let inbox = FakeInbox::start(h.dir.path().join("cc.sock"), None);
+    let env = claude_env("w1", &inbox.path);
+    h.hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    let mut cc = Vec::new();
+    for i in 0..9 {
+        cc.push(h.api.send(&[], &["w1"], &format!("fyi {i}"), false).await);
+    }
+    let to = h.api.send(&["w1"], &[], "do this", false).await;
+    h.wait_pending("w1", 1, 9, 0).await;
+    // Claude Code's batch is 8: the `to` and the seven oldest `cc`.
+    let v = h.hook("claude", env.clone(), claude("Stop")).await;
+    assert_eq!(v["decision"], "block");
+    let got = injected_ids(v["reason"].as_str().unwrap());
+    assert_eq!(got.len(), 8, "{got:?}");
+    assert!(
+        got.contains(&to),
+        "the new to is in the first batch: {got:?}"
+    );
+    assert_eq!(&got[..7], &cc[..7], "the oldest cc fill the rest, in order");
+    assert_eq!(h.state("w1").await, "busy");
+    // Two `cc` are left: they do not keep the turn going.
+    h.wait_pending("w1", 0, 2, 0).await;
+    let stop_again = with(claude("Stop"), &[("stop_hook_active", json!(true))]);
+    let v = h.hook("claude", env.clone(), stop_again.clone()).await;
+    assert_eq!(v, Value::Null, "cc alone must not block the Stop");
+    assert_eq!(h.state("w1").await, "idle");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(inbox.count(), 0, "cc must not wake");
+    // They come with the next prompt.
+    let v = h
+        .hook("claude", env.clone(), claude("UserPromptSubmit"))
+        .await;
+    assert_eq!(injected_ids(&hook_text(&v).unwrap()), cc[7..].to_vec());
+
+    // A flood of `to` with one `cc` waiting: the batch keeps one place for
+    // the `cc`, the rest of the `to` follow with the next Stop.
+    let fyi = h.api.send(&[], &["w1"], "fyi late", false).await;
+    let mut tos = Vec::new();
+    for i in 0..9 {
+        tos.push(h.api.send(&["w1"], &[], &format!("task {i}"), false).await);
+    }
+    h.wait_pending("w1", 9, 1, 0).await;
+    let v = h.hook("claude", env.clone(), claude("Stop")).await;
+    assert_eq!(v["decision"], "block");
+    let got = injected_ids(v["reason"].as_str().unwrap());
+    assert_eq!(got.len(), 8, "{got:?}");
+    assert!(got.contains(&fyi), "one place is kept for the cc: {got:?}");
+    assert_eq!(got.iter().filter(|id| tos.contains(id)).count(), 7);
+    h.wait_pending("w1", 2, 0, 0).await;
+    let v = h.hook("claude", env.clone(), stop_again.clone()).await;
+    assert_eq!(v["decision"], "block");
+    assert_eq!(
+        injected_ids(v["reason"].as_str().unwrap()),
+        tos[7..].to_vec()
+    );
+    h.wait_pending("w1", 0, 0, 0).await;
+    assert_eq!(h.hook("claude", env.clone(), stop_again).await, Value::Null);
+    assert_eq!(h.state("w1").await, "idle");
     assert_eq!(inbox.count(), 0, "no wake-up was needed");
 }
 

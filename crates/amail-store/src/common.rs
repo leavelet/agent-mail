@@ -121,7 +121,10 @@ macro_rules! entry_select_body {
     };
 }
 
-/// Candidate deliveries for a claim. Postgres appends a row-locking clause.
+/// Candidate deliveries for a claim: urgent mail first, then class `to`,
+/// then the rest, each oldest first, so that a backlog of `cc` cannot keep
+/// a new `to` out of a batch (the entries themselves are returned in
+/// `seq` order). Postgres appends a row-locking clause.
 /// Binds: seat_id, mode mask (1 immediate, 2 digest), to, cc, list,
 /// urgent_only, limit, and an idempotency key: when the seat already used
 /// that key, nothing is a candidate (SQLite; Postgres binds NULL and checks
@@ -138,7 +141,8 @@ macro_rules! claim_select {
          AND (($3 AND d.class = 'to') OR ($4 AND d.class = 'cc') OR ($5 AND d.class = 'list')) \
          AND (NOT $6 OR m.priority = 'urgent') \
          AND NOT EXISTS (SELECT 1 FROM claim_keys k WHERE k.seat_id = $1 AND k.key = $8) \
-         ORDER BY d.seq LIMIT $7"
+         ORDER BY CASE WHEN m.priority = 'urgent' THEN 0 ELSE 1 END, \
+                  CASE WHEN d.class = 'to' THEN 0 ELSE 1 END, d.seq LIMIT $7"
         )
     };
 }
