@@ -3,6 +3,7 @@
 //! session, how to launch one). The seat state machine in [`crate::node`] is
 //! harness-independent and talks to harnesses only through [`Adapter`].
 
+pub mod agy;
 pub mod claude;
 pub mod codex;
 pub mod dsh;
@@ -20,6 +21,8 @@ pub enum Harness {
     Codex,
     /// DeepSeek Harness.
     Dsh,
+    /// Antigravity CLI.
+    Agy,
 }
 
 impl Harness {
@@ -28,6 +31,7 @@ impl Harness {
             "claude" | "claude-code" | "claude_code" => Some(Harness::Claude),
             "codex" => Some(Harness::Codex),
             "dsh" | "deepseek" | "deepseek-harness" => Some(Harness::Dsh),
+            "agy" | "antigravity" | "antigravity-cli" => Some(Harness::Agy),
             _ => None,
         }
     }
@@ -37,6 +41,7 @@ impl Harness {
             Harness::Claude => "claude",
             Harness::Codex => "codex",
             Harness::Dsh => "dsh",
+            Harness::Agy => "agy",
         }
     }
 }
@@ -282,6 +287,8 @@ pub struct AdapterEnv {
     pub dsh_bin: String,
     /// Environment given only to dsh hosts.
     pub dsh_env: BTreeMap<String, String>,
+    /// The Antigravity CLI (`agy`).
+    pub agy_bin: String,
     /// The `auth.json` the dedicated Codex home links to.
     pub codex_auth: PathBuf,
     /// The node's Codex pass ([`crate::wire::CODEX_PASS_ENV`]).
@@ -387,6 +394,29 @@ pub trait Adapter: Send + Sync + 'static {
     }
 
     fn session_hint(&self, env: &BTreeMap<String, String>, hook: &Hook) -> SessionHint;
+
+    /// Whether the session's process is the process the node launched for
+    /// the seat (`amail run`, which becomes the harness) while its hooks do
+    /// not name a pid: the node then takes the pid from that launch.
+    fn root_is_session(&self) -> bool {
+        false
+    }
+
+    /// Whether the harness takes text from this hook's answer. A hook that
+    /// does not (Antigravity CLI's `PostToolUse`, whose only accepted
+    /// answer is `{}`) still updates the seat's state, facts and worklog,
+    /// but claims no mail and shows nothing: what it would show waits for
+    /// the next hook that injects.
+    fn injects(&self, _hook: &Hook) -> bool {
+        true
+    }
+
+    /// Variables that an `amail` command run inside a session reported
+    /// ([`crate::wire::Request::SessionEnv`]): the session id they name, if
+    /// any, and the session's wake target. `None`: nothing usable.
+    fn session_env(&self, _env: &BTreeMap<String, String>) -> Option<(Option<String>, String)> {
+        None
+    }
 
     /// The transcript file of `hook`'s session of `seat` (default: the
     /// path the hook reports).

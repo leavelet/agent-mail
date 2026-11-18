@@ -115,6 +115,12 @@ pub(super) fn find_dsh(seat_home: &Path, id: &str) -> Option<PathBuf> {
     found.into_iter().next()
 }
 
+/// agy: whether conversation `id` has its directory under agy's `brain`
+/// directory.
+pub(super) fn find_agy(brain: &Path, id: &str) -> bool {
+    brain.join(id).is_dir()
+}
+
 fn same_dir(a: &str, b: &str) -> bool {
     let canon = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| PathBuf::from(p));
     a == b || canon(a) == canon(b)
@@ -254,6 +260,22 @@ impl Node {
                     home.display(),
                     sessions.display()
                 ))
+            }
+            Harness::Agy => {
+                // A conversation is a directory of agy's state, under the
+                // node's home (agy has no flag for another place).
+                let brain = crate::adapter::agy::brain_dir(&crate::paths::home());
+                if find_agy(&brain, id) {
+                    Ok(Found::default())
+                } else {
+                    Err(format!(
+                        "seat {}: no Antigravity CLI conversation {id} on this host: no \
+                         directory {} (agy keeps its conversations under \
+                         ~/.gemini/antigravity-cli/brain)",
+                        c.seat,
+                        brain.join(id).display()
+                    ))
+                }
             }
             Harness::Dsh => {
                 let home = crate::adapter::dsh::seat_home_in(&self.cfg.state_dir, &c.seat);
@@ -442,5 +464,10 @@ mod tests {
         std::fs::create_dir_all(home.join("sessions").join("--w-c--").join("session-7")).unwrap();
         assert!(find_dsh(&home, "session-7").is_some());
         assert!(find_dsh(&home, "session-8").is_none());
+        // agy.
+        let brain = d.path().join("brain");
+        std::fs::create_dir_all(brain.join("601130f6-5ef4").join(".system_generated")).unwrap();
+        assert!(find_agy(&brain, "601130f6-5ef4"));
+        assert!(!find_agy(&brain, "601130f6-0000"));
     }
 }

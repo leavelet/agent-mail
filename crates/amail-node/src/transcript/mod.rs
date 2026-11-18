@@ -1,7 +1,8 @@
 //! Conversation mirroring: harness transcript parsers and a file follower.
 //!
 //! Each harness writes its session as a JSONL file (Claude Code: one record
-//! per line under its projects directory; Codex: a "rollout" file). Neither
+//! per line under its projects directory; Codex: a "rollout" file; dsh: a
+//! session log; Antigravity CLI: one step per line). None
 //! format is a stable contract, so the parsers here are deliberately
 //! forgiving: lines that are not JSON are skipped and counted, records and
 //! fields they do not know are ignored, and nothing panics.
@@ -11,6 +12,7 @@
 //! starts with `[amail`) is marked as a `notice`, so the mirror can tell it
 //! apart from what a person typed.
 
+pub mod agy;
 pub mod claude;
 pub mod codex;
 pub mod dsh;
@@ -91,6 +93,7 @@ pub fn parser_for(h: Harness) -> Box<dyn Parser> {
         Harness::Claude => Box::new(claude::ClaudeParser::default()),
         Harness::Codex => Box::new(codex::CodexParser::default()),
         Harness::Dsh => Box::new(dsh::DshParser::default()),
+        Harness::Agy => Box::new(agy::AgyParser::default()),
     }
 }
 

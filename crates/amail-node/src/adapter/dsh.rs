@@ -882,6 +882,7 @@ mod tests {
             codex_sandbox: None,
             dsh_bin: "dsh".into(),
             dsh_env: BTreeMap::from([("DEEPSEEK_API_KEY".to_string(), "k".to_string())]),
+            agy_bin: "agy".into(),
             codex_auth: dir.join("auth.json"),
             codex_pass: String::new(),
         })

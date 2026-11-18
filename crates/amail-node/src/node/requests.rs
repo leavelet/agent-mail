@@ -9,7 +9,7 @@
 //!   the node neither waits for it to be confirmed nor treats the turn it
 //!   starts as one. `interrupt` stops the running turn where the harness
 //!   has a structured interface for it (Codex `turn/interrupt`, dsh
-//!   `session/cancel`); Claude Code has none, and the server refuses the
+//!   `session/cancel`, agy `CancelCascadeInvocation`); Claude Code has none, and the server refuses the
 //!   route for its seats. `attention_action` restarts a supervised seat or
 //!   puts it to sleep. Each records a worklog entry (`prompt`,
 //!   `interrupt`, `attention_action`).
@@ -94,6 +94,7 @@ fn prompt_path(h: Harness) -> &'static str {
         Harness::Claude => "Claude Code inbox socket",
         Harness::Codex => "codex queue",
         Harness::Dsh => "dsh session/prompt",
+        Harness::Agy => "agy language server",
     }
 }
 
@@ -216,7 +217,7 @@ impl Node {
                     "interrupt",
                     format!("the running turn was interrupted ({})", h.as_str()),
                 );
-                // dsh fires no hook after a cancelled turn; the node ends
+                // dsh and agy fire no hook after a cancelled turn; the node ends
                 // the turn as it ends one the person interrupted.
                 if st
                     .seats

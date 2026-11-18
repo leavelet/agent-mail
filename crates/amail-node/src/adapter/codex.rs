@@ -1956,6 +1956,7 @@ mod tests {
             codex_sandbox: None,
             dsh_bin: "dsh".into(),
             dsh_env: BTreeMap::new(),
+            agy_bin: "agy".into(),
             codex_auth: root.join("auth.json"),
             codex_pass: String::new(),
         });

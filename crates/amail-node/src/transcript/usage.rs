@@ -11,8 +11,11 @@
 //! - Codex: `event_msg` records of payload type `token_count` carry
 //!   `info.last_token_usage.input_tokens` (cached input included) and
 //!   `info.model_context_window`; `turn_context` records name the `model`.
+//! - Antigravity CLI: `PLANNER_RESPONSE` steps carry `input_tokens` (the
+//!   uncached part) and `cache_read_tokens`; the request's input is their
+//!   sum. The model is the step's `model`.
 //!
-//! Neither format is a contract: records and fields the parser does not
+//! No format is a contract: records and fields the parser does not
 //! know are skipped, and a missing figure is unknown (`None`), never zero.
 
 use super::{ParseStats, parse_object, str_at};
@@ -40,6 +43,7 @@ pub fn last_usage(h: Harness, tail: &str) -> Option<Usage> {
         Harness::Claude => claude(tail),
         Harness::Codex => codex(tail),
         Harness::Dsh => None,
+        Harness::Agy => agy(tail),
     }
 }
 
@@ -72,6 +76,31 @@ fn claude(tail: &str) -> Option<Usage> {
                 .pointer("/message/model")
                 .and_then(Value::as_str)
                 .filter(|m| !m.is_empty() && !m.starts_with('<'))
+                .map(str::to_string),
+            context_window: None,
+        });
+    }
+    out
+}
+
+fn agy(tail: &str) -> Option<Usage> {
+    let mut stats = ParseStats::default();
+    let mut out = None;
+    for line in tail.lines() {
+        let Some(v) = parse_object(line, &mut stats) else {
+            continue;
+        };
+        if str_at(&v, "type") != Some("PLANNER_RESPONSE") {
+            continue;
+        }
+        let parts = [num(v.get("input_tokens")), num(v.get("cache_read_tokens"))];
+        if parts.iter().all(Option::is_none) {
+            continue;
+        }
+        out = Some(Usage {
+            input_tokens: parts.iter().flatten().sum(),
+            model: str_at(&v, "model")
+                .filter(|m| !m.is_empty())
                 .map(str::to_string),
             context_window: None,
         });
@@ -223,6 +252,25 @@ mod tests {
         assert_eq!(u.input_tokens, 3210);
         assert_eq!(u.model.as_deref(), Some("claude-sonnet-4"));
         assert_eq!(last_usage(Harness::Claude, "{}\n"), None);
+    }
+
+    #[test]
+    fn agy_usage_sums_cached_input() {
+        let tail = concat!(
+            r#"{"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "model": "gemini-3.8-flash-low", "input_tokens": 9213, "cache_read_tokens": 0, "output_tokens": 90}"#,
+            "\n",
+            r#"{"step_index": 2, "source": "MODEL", "type": "GENERIC", "content": "ok"}"#,
+            "\n",
+            r#"{"step_index": 3, "source": "MODEL", "type": "PLANNER_RESPONSE", "model": "gemini-3.8-flash-low", "input_tokens": 2218, "cache_read_tokens": 7172, "output_tokens": 1}"#,
+            "\n",
+            r#"{"step_index": 4, "source": "MODEL", "type": "PLANNER_RESPONSE", "content": "no counts"}"#,
+            "\n",
+        );
+        let u = last_usage(Harness::Agy, tail).unwrap();
+        assert_eq!(u.input_tokens, 9390);
+        assert_eq!(u.model.as_deref(), Some("gemini-3.8-flash-low"));
+        assert_eq!(u.context_window, None);
+        assert_eq!(last_usage(Harness::Agy, "{}\n"), None);
     }
 
     #[test]

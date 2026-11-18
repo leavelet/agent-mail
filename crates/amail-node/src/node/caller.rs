@@ -18,6 +18,8 @@
 //!   bwrap jail: the jail has its own PID namespace, but `SO_PEERCRED` and
 //!   `/proc` give the node pids of its own namespace, so the chain of
 //!   parents reaches that process.
+//! - Antigravity CLI runs its hooks and tool commands as children of the
+//!   `agy` process, which is the process the node launched.
 //!
 //! Under the restricted local policy, requests that tie a caller to a seat
 //! (hooks, credentials) are served only to that seat's session; requests
@@ -177,6 +179,11 @@ impl Node {
             Some(Harness::Dsh) => env
                 .get("AMAIL_SEAT")
                 .is_some_and(|seat| caller.is_seat(seat, Harness::Dsh)),
+            // agy hooks are children of the `agy` process, which is the
+            // process the node launched (`amail run` execs it).
+            Some(Harness::Agy) => env
+                .get("AMAIL_SEAT")
+                .is_some_and(|seat| caller.is_seat(seat, Harness::Agy)),
             None => false,
         }
     }

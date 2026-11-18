@@ -70,6 +70,8 @@ pub struct Config {
     pub dsh_bin: String,
     /// Environment given only to dsh hosts (e.g. the model provider's key).
     pub dsh_env: BTreeMap<String, String>,
+    /// The Antigravity CLI (`agy`).
+    pub agy_bin: String,
     pub codex_auth: PathBuf,
     /// Coalescing window for wake-ups caused by normal `to` mail.
     pub wake_window: Duration,
@@ -202,6 +204,7 @@ impl Config {
             codex_sandbox: None,
             dsh_bin: "dsh".into(),
             dsh_env: BTreeMap::new(),
+            agy_bin: "agy".into(),
             codex_auth: crate::paths::home().join(".codex").join("auth.json"),
             wake_window: Duration::from_secs(3),
             wake_confirm: Duration::from_secs(10),
@@ -802,6 +805,7 @@ pub struct Node {
     claude: Arc<dyn Adapter>,
     codex: Arc<dyn Adapter>,
     dsh: Arc<dyn Adapter>,
+    agy: Arc<dyn Adapter>,
     prepared: HashMap<Harness, Arc<OnceCell<Result<(), String>>>>,
     st: Mutex<State>,
     state_file: PathBuf,
@@ -932,12 +936,14 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
         codex_sandbox: cfg.codex_sandbox,
         dsh_bin: cfg.dsh_bin.clone(),
         dsh_env: cfg.dsh_env.clone(),
+        agy_bin: cfg.agy_bin.clone(),
         codex_auth: cfg.codex_auth.clone(),
         codex_pass,
     };
     let claude: Arc<dyn Adapter> = Arc::new(crate::adapter::claude::Claude::new(env.clone()));
     let codex: Arc<dyn Adapter> = Arc::new(crate::adapter::codex::Codex::new(env.clone()));
-    let dsh: Arc<dyn Adapter> = Arc::new(crate::adapter::dsh::Dsh::new(env));
+    let dsh: Arc<dyn Adapter> = Arc::new(crate::adapter::dsh::Dsh::new(env.clone()));
+    let agy: Arc<dyn Adapter> = Arc::new(crate::adapter::agy::Agy::new(env));
     // A surviving process is not evidence of a normal last turn. Codex can
     // retain a live CLI after a failed request; hold automatic wakes until
     // positive reconciliation or a real new in-progress hook.
@@ -946,6 +952,7 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
             Some(Harness::Claude) => &claude,
             Some(Harness::Codex) => &codex,
             Some(Harness::Dsh) => &dsh,
+            Some(Harness::Agy) => &agy,
             None => continue,
         };
         let ok = alive(l.pid, l.pid_start)
@@ -982,6 +989,7 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
         Some(Harness::Claude) => Some(claude.harness()),
         Some(Harness::Codex) => Some(codex.harness()),
         Some(Harness::Dsh) => Some(dsh.harness()),
+        Some(Harness::Agy) => Some(agy.harness()),
         None => None,
     });
     restore_activity(&mut st);
@@ -992,7 +1000,8 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
         claude,
         codex,
         dsh,
-        prepared: [Harness::Claude, Harness::Codex, Harness::Dsh]
+        agy,
+        prepared: [Harness::Claude, Harness::Codex, Harness::Dsh, Harness::Agy]
             .into_iter()
             .map(|h| (h, Arc::new(OnceCell::new())))
             .collect(),
@@ -1014,7 +1023,7 @@ pub async fn start_with_mux(cfg: Config, mux: Arc<dyn crate::mux::Mux>) -> Resul
     });
 
     let mut tasks = Vec::new();
-    for h in [Harness::Claude, Harness::Codex, Harness::Dsh] {
+    for h in [Harness::Claude, Harness::Codex, Harness::Dsh, Harness::Agy] {
         let n = node.clone();
         tasks.push(tokio::spawn(async move {
             n.ensure_prepared(h).await.ok();
@@ -1067,6 +1076,7 @@ impl Node {
             Harness::Claude => &self.claude,
             Harness::Codex => &self.codex,
             Harness::Dsh => &self.dsh,
+            Harness::Agy => &self.agy,
         }
     }
 
@@ -1213,8 +1223,12 @@ impl Node {
         let caller = match (&req, self.cfg.check_callers) {
             (Ok(r), true) => match peer {
                 Some((pid, uid)) if pid > 0 && uid == crate::paths::uid() => {
-                    let for_person =
-                        !matches!(r, Request::Hook { .. } | Request::Credentials { .. });
+                    let for_person = !matches!(
+                        r,
+                        Request::Hook { .. }
+                            | Request::Credentials { .. }
+                            | Request::SessionEnv { .. }
+                    );
                     if restricted {
                         Some(self.caller(pid, for_person))
                     } else {
@@ -1249,14 +1263,15 @@ impl Node {
                     let _ = w.write_all(b"{\"stdout\":\"\"}\n").await;
                     return;
                 }
-                // Open policy: a Claude Code or dsh session sending a hook
-                // in another seat's name reads and claims that seat's mail.
-                // (dsh sessions are identified from inside their jail too.)
+                // Open policy: a Claude Code, dsh or agy session sending a
+                // hook in another seat's name reads and claims that seat's
+                // mail. (dsh sessions are identified from inside their jail
+                // too.)
                 if let Some(c) = &caller
                     && !restricted
                     && let Some(seat) = env.get("AMAIL_SEAT")
                     && let Some((own, h)) = &c.session
-                    && matches!(h, Harness::Claude | Harness::Dsh)
+                    && matches!(h, Harness::Claude | Harness::Dsh | Harness::Agy)
                     && own != seat
                 {
                     self.note_request(c, amail_proto::NoticeOp::Hook, vec![seat.clone()]);
@@ -1283,6 +1298,26 @@ impl Node {
                 }
                 return;
             }
+            Ok(Request::SessionEnv { harness, env }) => match &caller {
+                // Under both policies: the variables are taken only from a
+                // process of the session the node launched for the seat.
+                Some(c) => match (&c.session, Harness::parse(&harness)) {
+                    (Some((seat, h)), Some(want))
+                        if *h == want && env.get("AMAIL_SEAT").is_none_or(|s| s == seat) =>
+                    {
+                        self.session_env(seat, *h, &env)
+                    }
+                    _ => {
+                        tracing::debug!(
+                            "ignored the {harness} session environment from process {}: not a \
+                             session this node launched for the seat it names",
+                            c.pid
+                        );
+                        json!({"error": "not a session this node launched for a seat of this harness"})
+                    }
+                },
+                None => self.handle(Request::SessionEnv { harness, env }).await,
+            },
             Ok(req) => {
                 let up = matches!(req, Request::Up { .. } | Request::Ps | Request::Status);
                 let mut v = self.handle_from(&caller, restricted, req).await;
@@ -1336,6 +1371,14 @@ impl Node {
                 input,
                 ..
             } => json!({"stdout": self.hook(&harness, &env, &input).await}),
+            // Without a caller (in-process requests): the seat the
+            // environment names.
+            Request::SessionEnv { harness, env } => {
+                match (Harness::parse(&harness), env.get("AMAIL_SEAT")) {
+                    (Some(h), Some(seat)) => self.session_env(seat, h, &env),
+                    _ => json!({}),
+                }
+            }
             Request::Launch {
                 seat,
                 cwd,
@@ -1452,6 +1495,10 @@ impl Node {
     /// parent processes) only for requests that are reported when an agent
     /// session makes them.
     fn open_caller(&self, pid: u32, req: &Request) -> caller::Caller {
+        // Taken only from the seat's own session, under both policies.
+        if matches!(req, Request::SessionEnv { .. }) {
+            return self.caller(pid, false);
+        }
         let watched = match req {
             Request::Hook { env, .. } => env.contains_key("AMAIL_SEAT"),
             Request::Credentials { .. } => true,
@@ -1644,7 +1691,8 @@ impl Node {
 
     /// Directories where the harness writes `seat`'s transcripts: for
     /// Codex the dedicated home's `sessions`; for dsh the seat's dsh home's
-    /// `sessions`; for Claude Code `projects` of
+    /// `sessions`; for agy `.gemini/antigravity-cli/brain` under the node's
+    /// home and the home of the seat's session; for Claude Code `projects` of
     /// the configuration directory the seat's session was started with
     /// (from its environment) and of the node's.
     fn transcript_bases(&self, h: Harness, seat: &str) -> Vec<PathBuf> {
@@ -1654,6 +1702,21 @@ impl Node {
             }
             Harness::Dsh => {
                 vec![crate::adapter::dsh::seat_home_in(&self.cfg.state_dir, seat).join("sessions")]
+            }
+            Harness::Agy => {
+                // agy keeps its state under the home directory of the
+                // process (it has no flag for another place).
+                let mut v = vec![crate::adapter::agy::brain_dir(&crate::paths::home())];
+                let root = self.lock().saved.roots.get(seat).cloned();
+                if let Some(r) = root.filter(|r| alive(r.pid, r.pid_start))
+                    && let Some(home) = caller::environ_var(r.pid, "HOME").filter(|h| !h.is_empty())
+                {
+                    let b = crate::adapter::agy::brain_dir(std::path::Path::new(&home));
+                    if !v.contains(&b) {
+                        v.push(b);
+                    }
+                }
+                v
             }
             Harness::Claude => {
                 let mut v = vec![self.cfg.claude_config_dir.join("projects")];
@@ -1718,6 +1781,9 @@ impl Node {
         deadline: Instant,
     ) -> (Output, Vec<InboxEntry>) {
         let hint = adapter.session_hint(env, hook);
+        // A hook whose answer the harness does not take claims nothing and
+        // shows nothing (see `Adapter::injects`).
+        let injects = adapter.injects(hook);
         let cap = self.cfg.stop_block_cap;
         let transcript = adapter
             .transcript(hook, seat)
@@ -1762,6 +1828,18 @@ impl Node {
             if connected && st.want_note_state(seat, false) {
                 self.jobs_kick.notify_one();
             }
+            // The process the node launched for the seat, for harnesses
+            // whose hooks name no pid.
+            let root = (hint.pid.is_none() && adapter.root_is_session())
+                .then(|| {
+                    st.saved
+                        .roots
+                        .get(seat)
+                        .filter(|r| Harness::parse(&r.harness) == Some(adapter.harness()))
+                        .filter(|r| alive(r.pid, r.pid_start))
+                        .map(|r| (r.pid, r.pid_start))
+                })
+                .flatten();
             {
                 let s = st.seat(seat);
                 s.harness = Some(adapter.harness());
@@ -1783,6 +1861,10 @@ impl Node {
                     && sess.pid.map(|p| p.0) != Some(pid)
                 {
                     sess.pid = Some((pid, proc_start(pid)));
+                } else if let Some(r) = root
+                    && sess.pid != Some(r)
+                {
+                    sess.pid = Some(r);
                 }
                 if hint.wake_target.is_some() {
                     sess.target = hint.wake_target.clone();
@@ -1839,9 +1921,9 @@ impl Node {
                     }
                     // A new (or resumed) session has seen nothing yet.
                     st.seat(seat).listed.clear();
-                    plan.summary = connected;
-                    plan.tasks = connected;
-                    plan.index = connected.then_some(true);
+                    plan.summary = connected && injects;
+                    plan.tasks = connected && injects;
+                    plan.index = (connected && injects).then_some(true);
                     let ho = &mut st.seat(seat).ho;
                     ho.index_hash = None;
                     ho.asked = false;
@@ -1859,8 +1941,8 @@ impl Node {
                     ho.draft_wait = (source == "compact" && ho.draft_expected())
                         .then(|| Instant::now() + handover::DRAFT_WAIT);
                     ho.compacted = None;
-                    plan.index_wait = ho.index.is_none();
-                    plan.note_wait = ho.note_pending;
+                    plan.index_wait = injects && ho.index.is_none();
+                    plan.note_wait = injects && ho.note_pending;
                     st.log(seat, "session_start", format!("source: {source}"));
                     st.jobs.extend(head_job(false));
                     self.jobs_kick.notify_one();
@@ -1944,12 +2026,14 @@ impl Node {
                         st.log(seat, "tool", text);
                     }
                     let s = st.seat(seat);
-                    plan.stash = std::mem::take(&mut s.stash);
-                    if s.focused(now) {
-                        plan.claim_urgent_all = connected && s.pending.urgent > 0;
-                    } else {
-                        plan.claim_to = connected && s.pending.to > 0;
-                        plan.claim_urgent = connected && s.pending.urgent > 0;
+                    if injects {
+                        plan.stash = std::mem::take(&mut s.stash);
+                        if s.focused(now) {
+                            plan.claim_urgent_all = connected && s.pending.urgent > 0;
+                        } else {
+                            plan.claim_to = connected && s.pending.to > 0;
+                            plan.claim_urgent = connected && s.pending.urgent > 0;
+                        }
                     }
                 }
                 Event::Stop | Event::Interrupt if st.seat(seat).restore_pending => {
@@ -2072,21 +2156,26 @@ impl Node {
             // shows what has arrived (see `handover`).
             if connected {
                 let ho = &mut st.seat(seat).ho;
-                // A tool call refreshes the cache without showing it.
-                let refresh = plan.index.is_some() || hook.event == Event::PostToolUse;
+                // A tool call, or a hook that shows nothing, refreshes the
+                // cache without showing it.
+                let refresh = plan.index.is_some() || hook.event == Event::PostToolUse || !injects;
                 if refresh && !ho.index_fetching && (index_due || ho.index.is_none()) {
                     ho.index_fetching = true;
                     plan.index_fetch = true;
                 }
-                let shows = matches!(
-                    hook.event,
-                    Event::SessionStart { .. }
-                        | Event::UserPromptSubmit { .. }
-                        | Event::PostToolUse
-                        | Event::Stop
-                );
-                if shows && ho.note_pending {
-                    plan.note = true;
+                let shows = injects
+                    && matches!(
+                        hook.event,
+                        Event::SessionStart { .. }
+                            | Event::UserPromptSubmit { .. }
+                            | Event::PostToolUse
+                            | Event::Stop
+                    );
+                // A session start that shows nothing fetches the note for
+                // the next hook.
+                let prefetch = !injects && matches!(hook.event, Event::SessionStart { .. });
+                if (shows || prefetch) && ho.note_pending {
+                    plan.note = shows;
                     if ho.note_fetched.is_none() && !ho.note_fetching {
                         ho.note_fetching = true;
                         plan.note_fetch = true;
@@ -2829,6 +2918,66 @@ impl Node {
         Ok(plan)
     }
 
+    /// `SessionEnv` from a process of `seat`'s session (harness `h`): keep
+    /// the wake target the variables name. A report naming another
+    /// conversation than the seat's session is ignored.
+    fn session_env(&self, seat: &str, h: Harness, env: &BTreeMap<String, String>) -> Value {
+        let Some((id, target)) = self.adapter(h).session_env(env) else {
+            return json!({});
+        };
+        let mut st = self.lock();
+        if st
+            .seats
+            .get(seat)
+            .and_then(|s| s.harness)
+            .is_some_and(|x| x != h)
+        {
+            return json!({});
+        }
+        let root = self.adapter(h).root_is_session().then(|| {
+            st.saved
+                .roots
+                .get(seat)
+                .filter(|r| Harness::parse(&r.harness) == Some(h))
+                .filter(|r| alive(r.pid, r.pid_start))
+                .map(|r| (r.pid, r.pid_start))
+        });
+        let s = st.seat(seat);
+        s.harness = Some(h);
+        let sess = s.session.get_or_insert_with(SessionRt::default);
+        if let (Some(cur), Some(new)) = (&sess.id, &id)
+            && cur != new
+        {
+            tracing::debug!(
+                "seat {seat}: ignored the address of {} conversation {new}, not the seat's ({cur})",
+                h.as_str()
+            );
+            return json!({});
+        }
+        if sess.id.is_none() {
+            sess.id = id;
+        }
+        if let Some(Some(r)) = root
+            && sess.pid.is_none()
+        {
+            sess.pid = Some(r);
+        }
+        let changed = sess.target.as_deref() != Some(target.as_str());
+        if changed {
+            sess.target = Some(target);
+            tracing::info!(
+                "seat {seat}: learned how to reach its {} session",
+                h.as_str()
+            );
+        }
+        st.record_live(seat);
+        drop(st);
+        if changed {
+            self.wake_kick.notify_one();
+        }
+        json!({})
+    }
+
     fn credentials(&self, thread: &str) -> Option<Credentials> {
         let st = self.lock();
         let seat = st.saved.sessions.get(thread)?.seat.clone();
@@ -2847,6 +2996,7 @@ impl Node {
             ("claude", &self.cfg.claude_bin),
             ("codex", &self.cfg.codex_bin),
             ("dsh", &self.cfg.dsh_bin),
+            ("agy", &self.cfg.agy_bin),
             ("zellij", &self.cfg.zellij_bin),
         ]
         .iter()
