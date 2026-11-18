@@ -27,6 +27,19 @@ pub fn is_wake_text(prompt: &str) -> bool {
     prompt.trim_start().starts_with("[amail] You have new mail")
 }
 
+/// The number `n` of a wake-up text (`... (wake #n).`), if `prompt` is one
+/// and names it.
+pub fn wake_number(prompt: &str) -> Option<u64> {
+    if !is_wake_text(prompt) {
+        return None;
+    }
+    let rest = &prompt[prompt.find("(wake #")? + "(wake #".len()..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
 /// Shown when a wake-up starts a turn and nothing is pending any more: its
 /// mail was shown by an earlier turn or read in the meantime (a nudge
 /// queued behind a running turn arrives after that turn).
@@ -539,6 +552,18 @@ pub fn tasks_summary(tasks: &[amail_proto::Task], more: bool) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wake_numbers() {
+        assert_eq!(wake_number(&wake_text(7)), Some(7));
+        assert_eq!(
+            wake_number("  [amail] You have new mail (wake #12)."),
+            Some(12)
+        );
+        assert_eq!(wake_number("[amail] You have new mail."), None);
+        assert_eq!(wake_number("[amail] You have new mail (wake #x)."), None);
+        assert_eq!(wake_number("hello (wake #3)."), None);
+    }
 
     /// The rule for findings is stated concretely where agents read it.
     #[test]

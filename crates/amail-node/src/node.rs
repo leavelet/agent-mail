@@ -331,6 +331,11 @@ struct SeatRt {
     ho: handover::SeatHo,
     /// Requests for the person (see [`requests`]).
     rq: requests::SeatRq,
+    /// The number of the last wake-up text that started a turn. A harness
+    /// that reports the session's last prompt with each turn (Antigravity
+    /// CLI's `lastUserInput`) repeats it for a turn nobody prompted; such
+    /// a turn is not a wake-up.
+    last_wake_prompt: Option<u64>,
 }
 
 impl SeatRt {
@@ -366,6 +371,7 @@ impl SeatRt {
             restore_pending: false,
             ho: Default::default(),
             rq: Default::default(),
+            last_wake_prompt: None,
         }
     }
 
@@ -1970,7 +1976,14 @@ impl Node {
                     s.wake_out = None;
                     s.clear_wake_failure();
                     plan.stash = std::mem::take(&mut s.stash);
-                    let wake = crate::inject::is_wake_text(prompt);
+                    // A wake-up text counts once: the same number again is
+                    // the session's earlier prompt, repeated.
+                    let number = crate::inject::wake_number(prompt);
+                    let wake = crate::inject::is_wake_text(prompt)
+                        && (number.is_none() || number != s.last_wake_prompt);
+                    if number.is_some() {
+                        s.last_wake_prompt = number;
+                    }
                     plan.wake_prompt = connected && wake;
                     s.ho.turn_start = Some(now);
                     s.ho.asked = false;
