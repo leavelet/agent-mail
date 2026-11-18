@@ -379,6 +379,26 @@ The first public version.
 
 #### Running agents
 
+- Antigravity CLI (`agy`, checked with 1.5.11) seats: `harness = "agy"` in
+  the team file (`antigravity` and `antigravity-cli` are accepted too) and
+  `amail node --agy-bin` (`AMAIL_AGY_BIN`). The node writes a workspace
+  plugin into the seat's working directory (`.agents/plugins/amail/`:
+  the hooks, the mail rules, a `.gitignore`) and starts `agy` with the
+  directory trusted for that session only, the seat intro in the first
+  prompt and `--conversation` to resume. `PreInvocation` injects mail as an
+  ephemeral message (the first model call of a turn shows what
+  `UserPromptSubmit` shows elsewhere, later ones `to` and urgent mail), `Stop` keeps the turn going with `continue`, and
+  `PostToolUse` only records the tool call. The language server's address
+  and token are only in the environment of the agent's shell commands, so
+  every `amail` command run in a session reports them to the node (new
+  node request `session_env`, taken only from the seat's own session);
+  wake-ups and the user's prompts then go to the conversation with
+  `SendUserCascadeMessage`, and interrupts with `CancelCascadeInvocation`.
+  The conversation mirror reads agy's `transcript_full.jsonl`; `amail
+  doctor` checks for agy 1.5.x. No MCP server is registered for agy seats,
+  a turn the person cancels in the TUI is not noticed, and agy has no
+  session-end, compaction or permission events (see
+  [harness support](docs/harnesses.md#antigravity-cli-agy)).
 - A claim fills its batch with urgent mail first, then `to`, then the
   rest, oldest first (it was oldest first across the classes, so a backlog
   of `cc` kept a new `to` out of the batch and the seat's `Stop` was held

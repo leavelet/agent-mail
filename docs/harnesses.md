@@ -14,6 +14,7 @@ verified range.
 | Claude Code | 2.1.x | hooks: `UserPromptSubmit`, `PostToolUse`, `Stop` | the session's inbox socket | `claude --resume` | JSONL transcript |
 | Codex (codex-cli) | 0.160.x | the same hooks | `codex queue` (the shared app-server) | `codex resume` | rollout file |
 | DeepSeek Harness (dsh) | 0.2.x | the same hooks, through dsh's Codex hook bridge | the web host's API (`session/prompt`) | the host loads the session again | JSONL session log |
+| Antigravity CLI (agy) | 1.5.x | hooks: `PreInvocation`, `Stop` | the process's language server RPC | `agy --conversation` | JSONL transcript |
 | zellij | 0.45.x | | | sessions and panes for `amail up` | |
 
 Other harnesses are not supported yet.
@@ -433,6 +434,161 @@ throwaway machine or a container.
   restart; mail it had already read is not delivered again.
 - Each seat runs a host process (about 200 MB when idle).
 
+## Antigravity CLI (agy)
+
+Antigravity CLI (`agy`) is a terminal agent. Each `agy` process runs a
+language server inside it, and amail reaches a session through that
+server's HTTP interface. Checked with agy 1.5.11 on Linux.
+
+**Launch.** `amail run <seat>` (which `amail up` runs in each seat's pane)
+starts `agy` with:
+
+- `--model <model>` when the seat has a model;
+- `--settings '{"trustedWorkspaces":["<cwd>"]}'`: the seat's working
+  directory is trusted for this session only, so agy does not ask whether
+  to trust it, and nothing is written to the user's
+  `~/.gemini/antigravity-cli/settings.json`. agy compares exact paths, so
+  the list holds the directory as given and, when it differs, the same
+  directory with symbolic links resolved;
+- `--dangerously-skip-permissions` when the seat's permission mode is
+  `unattended`;
+- `--conversation <id>` to resume the seat's conversation;
+- the arguments given after `--`, then `-i <first prompt>`.
+
+agy has no option for a system prompt. The first prompt of a new session
+holds the mail instructions and the seat's intro (its role and its lead)
+and ends by telling the agent to run `amail inbox` in the shell. The first
+prompt of a resumed session says that the session was resumed and also
+tells the agent to run `amail inbox`; an adopted conversation gets the
+adoption prompt instead, and a session that replaces a lost one the
+context-lost prompt. The environment has `AMAIL_SEAT`, `AMAIL_URL`,
+`AMAIL_TOKEN` and the node socket, with the `amail` directory in front of
+`PATH`; `AMAIL_PROFILE` and the `ANTIGRAVITY_*` variables of the launching
+shell are removed. The node finds the program as `agy` on `PATH`, or as
+`amail node --agy-bin` (`AMAIL_AGY_BIN`).
+
+**Workspace plugin.** At each launch the node writes a plugin into the
+seat's working directory, `.agents/plugins/amail/`:
+
+- `plugin.json`: the plugin's name and description;
+- `hooks.json`: the command `amail hook agy` for `SessionStart`,
+  `PreInvocation`, `PostToolUse` and `Stop`, with a timeout of 5 s;
+- `rules/AGENTS.md`: the mail instructions (agy reads rules again before
+  each turn);
+- `.gitignore` with `*`, so that git ignores the plugin.
+
+A file is written only when its content changed. agy loads a workspace
+plugin without an entry in the user's configuration. Seats that share a
+working directory share the plugin; the hooks tell the seats apart by
+`AMAIL_SEAT`. A symbolic link at one of the plugin's paths makes the launch
+fail.
+
+**Hooks and injection.** Hooks run as children of the `agy` process, with
+its environment, so the seat comes from `AMAIL_SEAT`. Under the restricted
+local policy the node answers them only from processes under the process
+it launched for the seat.
+
+| agy hook | for the node | answer |
+|---|---|---|
+| `SessionStart` (a new conversation; not on resume) | the session starts; the seat is idle | nothing. No answer of this hook was seen to reach the model, so the handover note and the document index come with the first `PreInvocation`. The unread summary and the task line that other harnesses show at session start are not shown; the first prompt has the agent run `amail inbox` instead |
+| `PreInvocation` with `invocationNum` 0 (the first model call of a turn) | a turn starts; its prompt is `lastUserInput` | `{"injectSteps": [{"ephemeralMessage": ...}]}` with what `UserPromptSubmit` shows on other harnesses. The model gets the text; the TUI does not show it; the transcript records an `EPHEMERAL_MESSAGE` step |
+| `PreInvocation` with `invocationNum` above 0 (a later model call of the turn) | handled like `PostToolUse` without a tool | `to` and urgent mail, a note still due, as an ephemeral message |
+| `PostToolUse` | the tool call, for the worklog (`toolCall.name`; for `run_command`, `args.CommandLine`) | nothing: agy accepts only `{}` from this hook. Mail waits for the next `PreInvocation` |
+| `Stop` with `fullyIdle: true` | the turn ends | `{"decision": "continue", "reason": ...}` to show mail or to ask for the handover note; the turn then goes on |
+| `Stop` with `fullyIdle: false` | ignored: a command runs in the background, and agy continues the turn when it ends | nothing |
+
+**How the node learns where the session is.** The language server's
+address (`ANTIGRAVITY_LS_ADDRESS`, `localhost:<port>`) and CSRF token
+(`ANTIGRAVITY_CSRF_TOKEN`) are only in the environment of the agent's
+shell commands. The hooks, the `agy` process itself and MCP servers do not
+have them. They stay the same for the life of the process and change when
+the conversation is resumed in a new process. So every `amail` command run
+in a session (every subcommand except `hook`, `mcp`, `node`, `run`, `up`
+and `serve`) sends these two variables and `ANTIGRAVITY_CONVERSATION_ID` to
+the node: once per command, waiting at most 500 ms, and printing nothing
+when that fails. The node takes them only from a process under the process
+it launched for a seat of harness agy, only when they name that seat's
+conversation, and only for an address on the local machine (`localhost`,
+`127.0.0.1`, `[::1]`).
+
+The first prompt has the agent run `amail inbox`, so the node knows the
+address after the first command of a session's first turn. Until then the
+node cannot wake the session: mail waits for the session's next turn,
+whose hooks show it. A seat that starts again (after sleep, a restart or a
+resume) runs a new process with a new address and token, and the node
+learns them at that process's first `amail` command, which the resume
+prompt asks for. The node does not type into the pane to wake such a
+session.
+
+**Wake-up, prompts and interrupts.** The node calls the language server
+with `POST http://<address>/exa.language_server_pb.LanguageServerService/<method>`,
+a JSON body and the header `x-codeium-csrf-token`, with a timeout of 5 s.
+
+- Wake-up: `SendUserCascadeMessage` with `cascadeId` (the conversation),
+  `items: [{"text": ...}]` and `deliveryStrategy:
+  MESSAGE_DELIVERY_STRATEGY_WHEN_IDLE`. On an idle conversation this starts
+  a turn at once, and the turn's first `PreInvocation` shows the mail. On a
+  busy conversation agy runs the message as a turn of its own after the
+  current turn ends.
+- The user's prompt (`amail prompt`, the web's prompt box): the same call
+  with the prompt's text.
+- Interrupt (`amail interrupt`, the web's Interrupt button):
+  `GetAllCascadeTrajectories`; when the conversation's status is
+  `CASCADE_RUN_STATUS_RUNNING` (or `BUSY`), `CancelCascadeInvocation`. agy
+  fires no hook for a cancelled turn, so the node ends the turn itself. Any
+  other status: nothing is sent.
+
+An answer that is not a success (`404 page not found` for the token of an
+earlier process, `401` without a token) or a refused connection is an
+error: the node logs it, and an unanswered wake-up is retried as for the
+other harnesses.
+
+**No MCP server in this version.** agy can start an MCP server from a
+plugin's `mcp_config.json`, with the session's environment. That
+environment does not contain the language server's address and token, so
+an agent that used amail only through MCP tools would never report them,
+and the node could not wake its session. The plugin therefore registers no
+MCP server, and agents use the `amail` command in the shell.
+
+**Transcript and mirror.** Every hook names the conversation's transcript
+(`transcriptPath`):
+`~/.gemini/antigravity-cli/brain/<conversation>/.system_generated/logs/transcript_full.jsonl`.
+The node follows it when it lies under `.gemini/antigravity-cli/brain` in
+the node's home directory or in the home directory of the seat's process.
+The mirror shows the person's prompts (without the blocks agy adds around
+them), the model's text, tool calls (the shell command of `run_command`,
+the arguments of other tools), tool results, and the text amail injected,
+as notices. For the handover note's rule on the context's size the node
+adds `input_tokens` and `cache_read_tokens` of the newest
+`PLANNER_RESPONSE` step; the window is the node's default unless
+`--context-window` sets one.
+
+**Resume and adoption.** The session id is agy's conversation id
+(`conversationId` in the hooks); a supervised seat resumes it with
+`--conversation`. `amail seat adopt`, `amail run --session` and a seat's
+`session` in the team file accept an agy conversation when its directory
+`~/.gemini/antigravity-cli/brain/<id>/` exists under the node's home
+directory.
+
+**Limitations.**
+
+- A turn the person cancels in the TUI fires no hook, and the node does
+  not ask the language server about it in this version. The seat stays
+  `busy` until the session's next hook (the person's next prompt).
+- agy has no session-end or compaction events: the end of a session is
+  found when its process ends, and compactions are not recorded.
+- agy has no distinct state for a pending permission prompt (it looks
+  like a running tool), so a seat that is not `unattended` and waits for
+  an approval shows `busy`, not `awaiting`.
+- agy has no option for another state directory, so the seats'
+  conversations, and those of amail's tests with a real agy, are kept in
+  the user's agy history under `~/.gemini/antigravity-cli/`.
+- Not checked: hooks of sub-agent conversations (the node ignores an
+  address report that names another conversation than the seat's), agy's
+  `--sandbox` (an `amail` command in it may not reach the node socket), and
+  how agy reports a turn that ends in a model error (such a turn is found
+  only when the session process ends during it).
+
 ## zellij
 
 `amail up` runs one zellij session per group (`amail-<org>-<group>`, seats
@@ -486,6 +642,7 @@ How each harness's failed turns are found:
 | Claude Code | the `StopFailure` hook, sent instead of `Stop` when a turn ends in an API error. Claude Code 2.1.289 sends `error` (the error type, e.g. `authentication_failed`) and `last_assistant_message` (the text shown); its documentation names `error_type` and `error_message`, which are read as well. Found within about a second |
 | Codex | Codex hooks have no failure event (0.160: `Stop` and `Interrupt` only), and a turn that fails sends no hook at all. The node asks the shared app-server how the turn ended (`thread/turns/list`; status `failed` with the error message): about a second after `Stop` or `Interrupt`, and every 3 s while a busy seat sends no hooks. The same ended turn must be listed twice in a row, so a failed turn is found about 6-9 s after it started (codex-cli 0.160 with a model the account cannot use: 7 s and 9 s); until then the sender sees `read` and the seat `busy` |
 | dsh | the wrapper (`amail dsh-host`) follows the session log; a `turn/end` with reason `error` (with dsh's message) or `interrupted` (a turn whose host stopped during it) is reported as a failed turn; `aborted` (cancelled in the GUI) and other reasons count as an interruption. dsh 0.2.0-rc.2 sends no `Stop` for a failed turn |
+| agy | none in this version: how agy 1.5.x reports a turn that ends in a model error was not checked. Only the row below applies |
 | all | the session process ends while the seat is busy (supervised seats: the pane's process exits other than with status 0; other seats: the process the hooks named is gone) |
 
 ## Interrupted turns
@@ -500,6 +657,7 @@ mail is delivered as usual.
 | Claude Code | Claude Code fires no hook for an interrupted turn. It writes a user record `[Request interrupted by user]` (or `... for tool use]`) to the session's transcript. When a busy seat has sent no hook for 3 s, the node reads the end of its transcript every 3 s (only when the file changed) and ends the turn if the last record of the turn is that interrupt and is not older than the turn. Found 1-2 s after the Escape with Claude Code 2.1.289. Fallback, for supervised seats whose transcript says nothing: after 60 s without hooks the node also looks at the pane; Claude Code's status line says `esc to interrupt` while a turn runs (model output or a tool call), and the turn counts as ended only when two looks at least 3 s apart, with no hook in between, both show no such line |
 | Codex | the `Interrupt` hook (codex-cli 0.160: about 10 ms after Escape); the app-server check above also sees the status `interrupted` |
 | dsh | the wrapper reports a `turn/end` with reason `aborted` as an interruption (about 30 ms after the stop) |
+| agy | not found in this version: agy fires no hook for a cancelled turn, and the seat stays `busy` until its next hook. An interrupt sent through amail (`amail interrupt`, the web) ends the turn in the node at once |
 
 An interrupted Codex turn ends, but the shell command it was running does
 not: Codex 0.160 keeps it as a background terminal of the thread, and it
@@ -543,6 +701,7 @@ pane.
 | Claude Code | one line on the session's inbox socket, as a wake-up is sent, with the user's text: an idle session starts a turn on it, a busy one reads it between tool calls | none: Claude Code has no structured interrupt. The server refuses the route (409 `no_structured_interrupt`); a command that arrives anyway is logged by the node and ignored. Use the seat's terminal (Escape) |
 | Codex | `codex queue --thread <id> --message <text>`, after the node asked the app-server about the thread as for a wake-up. A wake-up is not queued while a turn runs or a wake-up is queued already; a prompt is queued in both cases, and the thread takes it when its current turn ends. After an interrupted turn the node also starts the queue (`thread/queue/start`; see [Codex](#codex), "The queue after an interrupted turn") | `turn/interrupt` on the thread's turn in progress (the newest turn with status `inProgress` in `thread/turns/list`), through the app-server's control socket, then `thread/backgroundTerminals/terminate` for each of the thread's background terminals (`thread/backgroundTerminals/list`). No turn in progress: nothing is sent |
 | dsh | `session/prompt` (mode `queue`) on the seat's dsh host, as a wake-up is sent | `session/cancel` on the seat's dsh host. dsh fires no hook after a cancelled turn; the node ends the turn itself |
+| agy | `SendUserCascadeMessage` (delivery `WHEN_IDLE`) on the session's language server, as a wake-up is sent: an idle conversation starts a turn on it, a busy one runs it after the current turn | `CancelCascadeInvocation` when `GetAllCascadeTrajectories` says the conversation is running. agy fires no hook after a cancelled turn; the node ends the turn itself |
 
 A prompt is not a wake-up: the node does not wait for it to start a turn,
 does not send it again, and the turn it starts is an ordinary turn (mail
@@ -582,12 +741,12 @@ seats that need a restart. `amail sleep <seat>` then `amail wake <seat>`
 (or `amail down --only <seat>` then `amail up --only <seat>`) starts the
 seat again, resuming its session; what the resumed session takes:
 
-| setting | Claude Code | Codex | dsh |
-|---|---|---|---|
-| model | yes (`--model` at each start) | yes (see below) | yes: a resumed dsh session keeps the model it had, so the wrapper selects the seat's model for it (`session/selectModel`; checked with dsh 0.2.0-rc.2). dsh refuses a model it does not offer; the session then keeps its model and the pane says so |
-| permission mode, `git_access` | yes | yes (see below) | yes |
-| role text | yes (the system prompt is given at each start) | no: it is part of the session's first prompt only | the overlay is written at each start (not checked with a resumed session) |
-| harness | a new session is started (a session cannot move to another harness) | | |
+| setting | Claude Code | Codex | dsh | agy |
+|---|---|---|---|---|
+| model | yes (`--model` at each start) | yes (see below) | yes: a resumed dsh session keeps the model it had, so the wrapper selects the seat's model for it (`session/selectModel`; checked with dsh 0.2.0-rc.2). dsh refuses a model it does not offer; the session then keeps its model and the pane says so | `--model` is given at each start (not checked with a resumed conversation) |
+| permission mode, `git_access` | yes | yes (see below) | yes | permission mode: yes (`--dangerously-skip-permissions` at each start); `git_access` is not used |
+| role text | yes (the system prompt is given at each start) | no: it is part of the session's first prompt only | the overlay is written at each start (not checked with a resumed session) | no: it is part of the session's first prompt only; the mail rules in the plugin are read before each turn |
+| harness | a new session is started (a session cannot move to another harness) | | | |
 
 Codex keeps a thread loaded in the shared app-server for a moment after
 its session ends, and a session that resumes a loaded thread keeps the
@@ -610,6 +769,7 @@ resumed session: tell the agent by mail, which `amail up` says.
 | Claude Code | `SessionStart`, `UserPromptSubmit`, `PostToolUse`, `Stop`, `StopFailure`, `Notification`, `PermissionRequest`, `SessionEnd`, `PreCompact`, `PostCompact` |
 | Codex | `SessionStart`, `UserPromptSubmit`, `PostToolUse`, `PermissionRequest`, `Stop`, `Interrupt`, `SessionEnd`, `PreCompact`, `PostCompact` (codex-cli 0.160 lists all nine in `hooks/list`) |
 | dsh | `SessionStart`, `UserPromptSubmit`, `PostToolUse`, `Stop`, through the Codex hook bridge (no compaction events) |
+| agy | `SessionStart`, `PreInvocation`, `PostToolUse`, `Stop`, in the workspace plugin (see [Antigravity CLI](#antigravity-cli-agy) for how they map to the node's events) |
 
 The node reads from each input only what it needs and treats a missing or
 unknown field as unknown: the session id, the transcript path, `cwd`,
@@ -622,7 +782,7 @@ seat's handover note, then mail (new mail in full, a digest, the unread
 summary), then the task line, then the document index under
 `Documents:`. Mail is fitted first; the note may then take up to two
 thirds of the harness's injection budget and the index up to a third
-(Claude Code and dsh: 9,000 characters, so about 6,000 and 3,000; Codex:
+(Claude Code, dsh and agy: 9,000 characters, so about 6,000 and 3,000; Codex:
 6,000, so about 4,000 and 2,000), each cut to what is left. The index is
 cut first.
 
@@ -659,7 +819,8 @@ records `message.usage` on assistant records, and the node adds
 `cache_read_input_tokens` (with prompt caching `input_tokens` alone counts
 only the uncached part); Codex records `token_count` events with
 `info.last_token_usage.input_tokens` (cached input included) and
-`info.model_context_window`. The context window comes from, in this order:
+`info.model_context_window`; agy records `input_tokens` and
+`cache_read_tokens` on `PLANNER_RESPONSE` steps, which the node adds. The context window comes from, in this order:
 `--context-window N`, `--context-window MODEL=N` for a model whose name
 contains MODEL, the window the harness recorded (Codex), the node's table
 (`[1m]` models 1,000,000 tokens; Claude models 200,000; `gpt-5`, `gpt-6`
@@ -691,7 +852,7 @@ task.
   (`to` and urgent) or at the end of its turn; a long tool call or a long
   generation delays it, and `urgent` does not interrupt either.
 - **Long bodies are not inlined.** One hook shows at most 8 (Claude Code,
-  dsh) or 5 (Codex) messages, each with its body only up to 800 characters; longer
+  dsh, agy) or 5 (Codex) messages, each with its body only up to 800 characters; longer
   mail says `body not shown (N lines): run amail read <id>` and stays
   unread until the agent reads it. Agents do not always read it before
   acting.
