@@ -393,7 +393,13 @@ The first public version.
   every `amail` command run in a session reports them to the node (new
   node request `session_env`, taken only from the seat's own session);
   wake-ups and the user's prompts then go to the conversation with
-  `SendUserCascadeMessage`, and interrupts with `CancelCascadeInvocation`.
+  `SendUserCascadeMessage`, and interrupts with `CancelCascadeInvocation`
+  (also when only a background command of the conversation runs, which it
+  then kills). Every `Stop` ends the turn, also one with `fullyIdle: false`
+  (a command in the background), because agy fires no hook when such a
+  command fails or is killed. A wake-up text counts as a wake-up once per
+  number, so a turn that repeats the session's last prompt (agy's
+  completion turn of a background command) is not taken for a wake-up.
   The conversation mirror reads agy's `transcript_full.jsonl`; `amail
   doctor` checks for agy 1.5.x. No MCP server is registered for agy seats,
   a turn the person cancels in the TUI is not noticed, and agy has no

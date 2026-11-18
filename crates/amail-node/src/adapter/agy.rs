@@ -19,9 +19,11 @@
 //!   model call: number 0 starts a turn (as `UserPromptSubmit`), later ones
 //!   are model calls inside the turn (as a `PostToolUse` without a tool),
 //!   answered with `{"injectSteps": [{"ephemeralMessage": ...}]}`;
-//!   `PostToolUse` gives the worklog facts but cannot inject; `Stop` with
-//!   `fullyIdle: false` (a command moved to the background) does not end
-//!   the turn, and a `Stop` is held with `{"decision": "continue"}`.
+//!   `PostToolUse` gives the worklog facts but cannot inject; `Stop` ends
+//!   the turn, also with `fullyIdle: false` (a command moved to the
+//!   background: agy fires no hook if it fails or is killed, and starts a
+//!   short turn when it completes), and is held with `{"decision":
+//!   "continue"}`.
 //! - Learning the address: the in-process language server's address and
 //!   CSRF token are only in the environment of the agent's own shell
 //!   commands (`ANTIGRAVITY_LS_ADDRESS`, `ANTIGRAVITY_CSRF_TOKEN`), not in
@@ -32,8 +34,9 @@
 //! - Wake-up and prompts: `SendUserCascadeMessage` with delivery
 //!   `WHEN_IDLE` (an idle conversation starts a turn at once; a busy one
 //!   runs it as its own turn after the current one). Interrupt:
-//!   `CancelCascadeInvocation`, when `GetAllCascadeTrajectories` says the
-//!   conversation is running.
+//!   `CancelCascadeInvocation` with `killBackgroundTasks`, when
+//!   `GetAllCascadeTrajectories` says the conversation is running or
+//!   `ListBackgroundTasks` lists a task of the conversation.
 //!
 //! Not done in this version: a turn the person cancels in the TUI fires no
 //! hook, and the node does not ask the language server about it
@@ -337,12 +340,12 @@ impl Adapter for Agy {
                 facts = tool_facts(input);
                 Event::PostToolUse
             }
-            "Stop" => match input.get("fullyIdle").and_then(Value::as_bool) {
-                // A command still runs in the background: the turn goes on
-                // when it ends.
-                Some(false) => return None,
-                _ => Event::Stop,
-            },
+            // Also with `fullyIdle: false` (a command runs in the
+            // background): agy fires no hook when such a command fails or is
+            // killed, so the turn ends here. A command that completes starts
+            // a short turn of its own (`PostToolUse`, `PreInvocation` 0,
+            // `Stop`).
+            "Stop" => Event::Stop,
             _ => return None,
         };
         let s = |k: &str| {
@@ -429,8 +432,10 @@ impl Adapter for Agy {
         .map(drop)
     }
 
-    /// `CancelCascadeInvocation`, when the conversation runs. agy fires no
-    /// hook after a cancelled turn.
+    /// `CancelCascadeInvocation` with `killBackgroundTasks`, when the
+    /// conversation runs or has a command running in the background (agy
+    /// then reports the conversation as idle). agy fires no hook after a
+    /// cancelled turn or a killed background task.
     async fn interrupt(&self, target: &str) -> Result<bool> {
         let t = Self::target(target)?;
         let all = self
@@ -445,13 +450,22 @@ impl Adapter for Agy {
             .and_then(|m| m.get(&t.conversation))
             .and_then(|s| str_field(s, "status"))
             .unwrap_or_default();
-        if !(status.ends_with("RUNNING") || status.ends_with("BUSY")) {
+        let running = status.ends_with("RUNNING") || status.ends_with("BUSY");
+        let background = running || {
+            let list = self.rpc(&t, "ListBackgroundTasks", json!({})).await?;
+            list.get("tasks")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .any(|task| str_field(task, "conversationId") == Some(t.conversation.as_str()))
+        };
+        if !background {
             return Ok(false);
         }
         self.rpc(
             &t,
             "CancelCascadeInvocation",
-            json!({"cascadeId": t.conversation}),
+            json!({"cascadeId": t.conversation, "killBackgroundTasks": true}),
         )
         .await?;
         Ok(true)
@@ -606,9 +620,10 @@ mod tests {
 
         let h = a.parse(&fixture("Stop")).unwrap();
         assert_eq!(h.event, Event::Stop);
+        // A command in the background: the turn ends too.
         let mut bg = fixture("Stop");
         bg["fullyIdle"] = json!(false);
-        assert!(a.parse(&bg).is_none());
+        assert_eq!(a.parse(&bg).unwrap().event, Event::Stop);
         bg.as_object_mut().unwrap().remove("fullyIdle");
         assert_eq!(a.parse(&bg).unwrap().event, Event::Stop);
 

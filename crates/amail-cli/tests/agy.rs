@@ -47,6 +47,8 @@ struct Ls {
     calls: Mutex<Vec<(String, Value)>>,
     /// The conversation's run status `GetAllCascadeTrajectories` reports.
     status: Mutex<String>,
+    /// What `ListBackgroundTasks` answers.
+    tasks: Mutex<Value>,
 }
 
 /// A stand-in for agy's in-process language server: Connect RPC with JSON
@@ -92,12 +94,14 @@ impl FakeLs {
                     CONV: {"status": ls.status.lock().unwrap().clone(), "stepCount": 12},
                     "other-conversation": {"status": "CASCADE_RUN_STATUS_RUNNING"},
                 }}),
+                "ListBackgroundTasks" => ls.tasks.lock().unwrap().clone(),
                 _ => json!({}),
             };
             axum::Json(out).into_response()
         }
         let ls = Arc::new(Ls::default());
         *ls.status.lock().unwrap() = "CASCADE_RUN_STATUS_IDLE".into();
+        *ls.tasks.lock().unwrap() = json!({});
         let app = axum::Router::new()
             .route(
                 "/exa.language_server_pb.LanguageServerService/{method}",
@@ -125,6 +129,22 @@ impl FakeLs {
 
     fn set_status(&self, s: &str) {
         *self.ls.status.lock().unwrap() = s.to_string();
+    }
+
+    /// Background tasks of these conversations.
+    fn set_tasks(&self, conversations: &[&str]) {
+        let tasks: Vec<Value> = conversations
+            .iter()
+            .map(|c| {
+                json!({"conversationId": c, "task": {"taskId": format!("{c}/task-39"),
+                    "toolName": "run_command", "description": "sleep 600", "stepIndex": 39}})
+            })
+            .collect();
+        *self.ls.tasks.lock().unwrap() = if tasks.is_empty() {
+            json!({})
+        } else {
+            json!({ "tasks": tasks })
+        };
     }
 }
 
@@ -345,7 +365,9 @@ async fn agy_hooks_wake_and_interrupt(b: Backend) {
     assert_eq!(ls.calls("SendUserCascadeMessage").len(), 1);
 
     // A command moved to the background: `Stop` with `fullyIdle: false`
-    // does not end the turn.
+    // ends the turn too (agy fires no hook if the command fails or is
+    // killed). When the command completes, agy runs a short turn of its
+    // own, whose `lastUserInput` is the earlier prompt.
     let prompt = agy(
         "PreInvocation",
         &[("lastUserInput", json!("run the tests"))],
@@ -364,9 +386,50 @@ async fn agy_hooks_wake_and_interrupt(b: Backend) {
         .await,
         Value::Null
     );
+    assert_eq!(h.state("ag").await, "idle");
+    h.hook("agy", env.clone(), agy("PostToolUse", &[])).await;
+    h.hook("agy", env.clone(), prompt.clone()).await;
     assert_eq!(h.state("ag").await, "busy");
     h.hook("agy", env.clone(), agy("Stop", &[])).await;
     assert_eq!(h.state("ag").await, "idle");
+
+    // A wake-up whose mail is gone ends at once; the same wake text again
+    // (agy repeats the last prompt for such a completion turn) is not a
+    // wake-up: nothing is injected, and the turn is logged as a plain one.
+    let stale = agy(
+        "PreInvocation",
+        &[(
+            "lastUserInput",
+            json!("[amail] You have new mail (wake #900)."),
+        )],
+    );
+    let out = h.hook("agy", env.clone(), stale.clone()).await;
+    assert!(
+        out["injectSteps"][0]["ephemeralMessage"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("[amail] Nothing is waiting")),
+        "{out}"
+    );
+    h.hook("agy", env.clone(), agy("Stop", &[])).await;
+    assert_eq!(h.hook("agy", env.clone(), stale).await, Value::Null);
+    h.hook("agy", env.clone(), agy("Stop", &[])).await;
+    // Turn starts so far: the first wake-up and #900; "run the tests", the
+    // completion turn and the repeated #900.
+    let starts = |text: &'static str| {
+        let h = &h;
+        async move {
+            h.api.get("/seats/ag/worklog?limit=200").await["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["kind"] == "turn_start" && e["text"] == text)
+                .count()
+        }
+    };
+    h.wait("turn starts in the worklog", || async {
+        starts("turn started by a wake-up").await == 2 && starts("turn started").await == 3
+    })
+    .await;
 
     // A hook in another seat's name is refused.
     let other = vec![("AMAIL_SEAT".to_string(), "nobody".to_string())];
@@ -400,6 +463,10 @@ async fn agy_hooks_wake_and_interrupt(b: Backend) {
     .await;
     assert_eq!(ls.calls("CancelCascadeInvocation")[0]["cascadeId"], CONV);
     assert_eq!(
+        ls.calls("CancelCascadeInvocation")[0]["killBackgroundTasks"],
+        true
+    );
+    assert_eq!(
         ls.calls("GetAllCascadeTrajectories")[0]["excludeSubtrajectories"],
         true
     );
@@ -408,8 +475,10 @@ async fn agy_hooks_wake_and_interrupt(b: Backend) {
     })
     .await;
 
-    // Interrupt while it is idle: asked, not cancelled.
+    // Interrupt while it is idle, with a background task of another
+    // conversation only: asked, not cancelled.
     ls.set_status("CASCADE_RUN_STATUS_IDLE");
+    ls.set_tasks(&["other-conversation"]);
     h.api.post("/seats/ag/interrupt", json!({})).await;
     h.wait("status asked", || async {
         ls.calls("GetAllCascadeTrajectories").len() == 2
@@ -429,6 +498,19 @@ async fn agy_hooks_wake_and_interrupt(b: Backend) {
     };
     h.wait("not interrupted", logged).await;
     assert_eq!(ls.calls("CancelCascadeInvocation").len(), 1);
+    assert_eq!(ls.calls("ListBackgroundTasks").len(), 1);
+
+    // Idle status, but a command of the conversation runs in the
+    // background: cancelled, with its background tasks.
+    ls.set_tasks(&["other-conversation", CONV]);
+    h.api.post("/seats/ag/interrupt", json!({})).await;
+    h.wait("background cancel", || async {
+        ls.calls("CancelCascadeInvocation").len() == 2
+    })
+    .await;
+    let c = &ls.calls("CancelCascadeInvocation")[1];
+    assert_eq!(c["cascadeId"], CONV);
+    assert_eq!(c["killBackgroundTasks"], true);
 
     // A wrong token: the language server's answer is the error.
     let a = amail_node::adapter::agy::Agy::new(amail_node::adapter::AdapterEnv {

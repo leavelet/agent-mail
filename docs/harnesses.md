@@ -495,7 +495,7 @@ it launched for the seat.
 | `PreInvocation` with `invocationNum` above 0 (a later model call of the turn) | handled like `PostToolUse` without a tool | `to` and urgent mail, a note still due, as an ephemeral message |
 | `PostToolUse` | the tool call, for the worklog (`toolCall.name`; for `run_command`, `args.CommandLine`) | nothing: agy accepts only `{}` from this hook. Mail waits for the next `PreInvocation` |
 | `Stop` with `fullyIdle: true` | the turn ends | `{"decision": "continue", "reason": ...}` to show mail or to ask for the handover note; the turn then goes on |
-| `Stop` with `fullyIdle: false` | ignored: a command runs in the background, and agy continues the turn when it ends | nothing |
+| `Stop` with `fullyIdle: false` (a command was moved to the background) | the turn ends, as with any `Stop`. agy fires no hook when a background command fails or is killed, so the node does not wait for one. When the command completes, agy runs a short turn of its own (`PostToolUse`, `PreInvocation` 0, `Stop`). While the command runs, a wake-up starts a turn at once, as on Claude Code seats whose agent started a background command | as for `Stop` |
 
 **How the node learns where the session is.** The language server's
 address (`ANTIGRAVITY_LS_ADDRESS`, `localhost:<port>`) and CSRF token
@@ -534,9 +534,19 @@ a JSON body and the header `x-codeium-csrf-token`, with a timeout of 5 s.
   with the prompt's text.
 - Interrupt (`amail interrupt`, the web's Interrupt button):
   `GetAllCascadeTrajectories`; when the conversation's status is
-  `CASCADE_RUN_STATUS_RUNNING` (or `BUSY`), `CancelCascadeInvocation`. agy
-  fires no hook for a cancelled turn, so the node ends the turn itself. Any
-  other status: nothing is sent.
+  `CASCADE_RUN_STATUS_RUNNING` (or `BUSY`), or when `ListBackgroundTasks`
+  lists a task of the conversation (while a command runs in the background
+  agy reports the conversation as idle), `CancelCascadeInvocation` with
+  `killBackgroundTasks: true`, which also ends the conversation's
+  background commands. agy fires no hook for a cancelled turn or a killed
+  background command, so the node ends the turn itself. Otherwise nothing
+  is sent.
+
+The completion turn of a background command reports the session's last
+prompt again as its `lastUserInput`. When that prompt was a wake-up text,
+the node sees the same wake-up number again and treats the turn as a turn
+that nobody prompted, not as a wake-up (on every harness, a wake-up text
+counts once per number).
 
 An answer that is not a success (`404 page not found` for the token of an
 earlier process, `401` without a token) or a refused connection is an
@@ -575,6 +585,9 @@ directory.
 - A turn the person cancels in the TUI fires no hook, and the node does
   not ask the language server about it in this version. The seat stays
   `busy` until the session's next hook (the person's next prompt).
+- A command the agent moved to the background is not visible to the node:
+  the seat shows `idle` while it runs, and if it fails or is killed agy
+  fires no hook and the transcript keeps its step as `RUNNING`.
 - agy has no session-end or compaction events: the end of a session is
   found when its process ends, and compactions are not recorded.
 - agy has no distinct state for a pending permission prompt (it looks
@@ -701,7 +714,7 @@ pane.
 | Claude Code | one line on the session's inbox socket, as a wake-up is sent, with the user's text: an idle session starts a turn on it, a busy one reads it between tool calls | none: Claude Code has no structured interrupt. The server refuses the route (409 `no_structured_interrupt`); a command that arrives anyway is logged by the node and ignored. Use the seat's terminal (Escape) |
 | Codex | `codex queue --thread <id> --message <text>`, after the node asked the app-server about the thread as for a wake-up. A wake-up is not queued while a turn runs or a wake-up is queued already; a prompt is queued in both cases, and the thread takes it when its current turn ends. After an interrupted turn the node also starts the queue (`thread/queue/start`; see [Codex](#codex), "The queue after an interrupted turn") | `turn/interrupt` on the thread's turn in progress (the newest turn with status `inProgress` in `thread/turns/list`), through the app-server's control socket, then `thread/backgroundTerminals/terminate` for each of the thread's background terminals (`thread/backgroundTerminals/list`). No turn in progress: nothing is sent |
 | dsh | `session/prompt` (mode `queue`) on the seat's dsh host, as a wake-up is sent | `session/cancel` on the seat's dsh host. dsh fires no hook after a cancelled turn; the node ends the turn itself |
-| agy | `SendUserCascadeMessage` (delivery `WHEN_IDLE`) on the session's language server, as a wake-up is sent: an idle conversation starts a turn on it, a busy one runs it after the current turn | `CancelCascadeInvocation` when `GetAllCascadeTrajectories` says the conversation is running. agy fires no hook after a cancelled turn; the node ends the turn itself |
+| agy | `SendUserCascadeMessage` (delivery `WHEN_IDLE`) on the session's language server, as a wake-up is sent: an idle conversation starts a turn on it, a busy one runs it after the current turn | `CancelCascadeInvocation` with `killBackgroundTasks` when `GetAllCascadeTrajectories` says the conversation is running or `ListBackgroundTasks` lists a task of the conversation. agy fires no hook after a cancelled turn; the node ends the turn itself |
 
 A prompt is not a wake-up: the node does not wait for it to start a turn,
 does not send it again, and the turn it starts is an ordinary turn (mail
