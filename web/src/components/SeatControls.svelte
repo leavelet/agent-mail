@@ -1,7 +1,7 @@
 <script lang="ts">
   // Under a seat's conversation mirror: a prompt box (`POST
   // /seats/{name}/prompt`; the node gives the text to the session) and the
-  // way to stop the current turn: an Interrupt button for Codex and dsh
+  // way to stop the current turn: an Interrupt button for Codex, dsh and agy
   // seats, the terminal for Claude Code seats, which have no structured
   // interrupt.
   import { t } from '../lib/ui.svelte';

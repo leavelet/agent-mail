@@ -260,7 +260,7 @@ enum Cmd {
         #[arg(short = 'm', long)]
         text: Option<String>,
     },
-    /// Stop a seat's current turn (user token; Codex and dsh seats).
+    /// Stop a seat's current turn (user token; Codex, dsh and agy seats).
     Interrupt { seat: String },
     /// A seat's handover note: what the next session of the seat reads
     /// first.
@@ -308,7 +308,7 @@ enum Cmd {
     Org(OrgCmd),
     /// Run the per-host node daemon (or manage it, see `amail node --help`).
     Node(NodeCli),
-    /// Hook entry point for a harness (`claude`, `codex` or `dsh`). Reads the hook
+    /// Hook entry point for a harness (`claude`, `codex`, `dsh` or `agy`). Reads the hook
     /// input on stdin; never fails and never blocks for long.
     #[command(hide = true)]
     Hook {
@@ -366,7 +366,7 @@ enum Cmd {
     /// Start a harness session for a seat in this terminal (through the node).
     Run {
         seat: String,
-        /// Override the seat's harness (`claude`, `codex` or `dsh`).
+        /// Override the seat's harness (`claude`, `codex`, `dsh` or `agy`).
         #[arg(long)]
         harness: Option<String>,
         /// `unattended` runs the harness without permission prompts;
@@ -725,6 +725,9 @@ struct NodeArgs {
     /// to DeepSeek Harness hosts, not to the node's other children.
     #[arg(long, env = "AMAIL_DSH_ENV_FILE")]
     dsh_env_file: Option<PathBuf>,
+    /// The Antigravity CLI.
+    #[arg(long, env = "AMAIL_AGY_BIN", default_value = "agy")]
+    agy_bin: String,
     #[arg(long, env = "AMAIL_ZELLIJ_BIN", default_value = "zellij")]
     zellij_bin: String,
     /// Most supervised sessions starting at once.
@@ -1214,6 +1217,7 @@ fn main() -> ExitCode {
             }
         };
     }
+    report_session_env(&cli.cmd);
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -1226,6 +1230,49 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Inside an Antigravity CLI session (its language server's address and
+/// CSRF token are in the environment of the agent's shell commands, and
+/// nowhere else), tell the node how to reach the session, so that it can
+/// wake it. Once per command an agent may run; best effort: at most about
+/// half a second, nothing printed, and the command goes on whatever
+/// happens.
+fn report_session_env(cmd: &Cmd) {
+    use amail_node::adapter::agy;
+    if matches!(
+        cmd,
+        Cmd::Hook { .. }
+            | Cmd::Mcp { .. }
+            | Cmd::Node(_)
+            | Cmd::Run { .. }
+            | Cmd::Up { .. }
+            | Cmd::DshHost { .. }
+            | Cmd::Serve { .. }
+    ) {
+        return;
+    }
+    let get = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    if get(agy::CSRF_ENV).is_none() || get(agy::ADDRESS_ENV).is_none() {
+        return;
+    }
+    let Some(seat) = get("AMAIL_SEAT") else {
+        return;
+    };
+    let socket = amail_node::paths::socket();
+    if !socket.exists() {
+        return;
+    }
+    let mut env: std::collections::BTreeMap<String, String> = agy::SESSION_ENV
+        .iter()
+        .filter_map(|k| Some((k.to_string(), get(k)?)))
+        .collect();
+    env.insert("AMAIL_SEAT".into(), seat);
+    let req = amail_node::wire::Request::SessionEnv {
+        harness: amail_node::adapter::Harness::Agy.as_str().into(),
+        env,
+    };
+    let _ = amail_node::request(&socket, &req, std::time::Duration::from_millis(500));
 }
 
 /// Print either the raw JSON or the text rendering.
@@ -2520,6 +2567,7 @@ impl NodeArgs {
             &mut self.claude_bin,
             &mut self.codex_bin,
             &mut self.dsh_bin,
+            &mut self.agy_bin,
             &mut self.zellij_bin,
         ] {
             *b = absolute_bin(b);
@@ -2544,6 +2592,7 @@ fn node_args(a: &NodeArgs) -> (Vec<String>, Option<String>) {
         codex_sandbox,
         dsh_bin,
         dsh_env_file,
+        agy_bin,
         zellij_bin,
         start_limit,
         codex_auth,
@@ -2574,6 +2623,7 @@ fn node_args(a: &NodeArgs) -> (Vec<String>, Option<String>) {
     );
     opt("--dsh-bin", Some(dsh_bin.clone()));
     opt("--dsh-env-file", path(dsh_env_file));
+    opt("--agy-bin", Some(agy_bin.clone()));
     opt("--zellij-bin", Some(zellij_bin.clone()));
     opt("--start-limit", Some(start_limit.to_string()));
     opt("--codex-auth", path(codex_auth));
@@ -2651,6 +2701,7 @@ async fn node_daemon(a: NodeArgs) -> Result<()> {
     if let Some(f) = &a.dsh_env_file {
         cfg.dsh_env = amail_node::adapter::dsh::read_env_file(f)?;
     }
+    cfg.agy_bin = a.agy_bin;
     cfg.zellij_bin = a.zellij_bin;
     cfg.start_limit = a.start_limit;
     if let Some(p) = a.codex_auth {
@@ -2912,7 +2963,7 @@ mod tests {
         assert!(
             Cli::try_parse_from(["amail", "hook", "codex", "--node-socket", "/node.sock"]).is_err()
         );
-        for harness in ["claude", "codex", "dsh"] {
+        for harness in ["claude", "codex", "dsh", "agy"] {
             assert!(Cli::try_parse_from(["amail", "hook", harness]).is_ok());
         }
     }
@@ -2929,6 +2980,7 @@ mod tests {
         "--codex-sandbox=danger-full-access",
         "--dsh-bin=/opt/dsh/node_modules/.bin/dsh",
         "--dsh-env-file=/tmp/amail-test/dsh.env",
+        "--agy-bin=/opt/agy/bin/agy",
         "--zellij-bin=/opt/zellij",
         "--start-limit=7",
         "--codex-auth=/tmp/amail-test/auth.json",

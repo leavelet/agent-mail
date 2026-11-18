@@ -297,7 +297,7 @@ idle_sleep = "30m"                  # idle seats sleep (no process); mail wakes 
 # restart = "on-failure"            # or "never"
 
 [defaults]
-harness = "claude"                  # or "codex", or "dsh" (DeepSeek Harness)
+harness = "claude"                  # or "codex", "dsh" (DeepSeek Harness) or "agy" (Antigravity CLI)
 model = "sonnet"
 # "unattended" runs agents without permission prompts (Claude Code:
 # --dangerously-skip-permissions; Codex: -a never with a sandbox; dsh: its
@@ -379,12 +379,13 @@ impl Report {
 
 /// Harness versions amail has been tested with: the adapters use
 /// interfaces the harnesses do not document (Claude Code's session inbox
-/// socket, Codex's app-server and hook trust, dsh's web host API), which
-/// may change.
+/// socket, Codex's app-server and hook trust, dsh's web host API, agy's
+/// language server), which may change.
 const VERIFIED: &[(&str, &str, &str)] = &[
     ("claude", "2.1.", "Claude Code 2.1.x"),
     ("codex", "0.160.", "codex-cli 0.160.x"),
     ("dsh", "0.2.", "DeepSeek Harness 0.2.x"),
+    ("agy", "1.5.", "agy 1.5.x"),
     ("zellij", "0.45.", "zellij 0.45.x"),
 ];
 
@@ -646,14 +647,17 @@ pub async fn doctor(profile: Option<&Path>, team_file: &Path, out: &Out) -> Resu
         let (name, path) = match node_bins.get(*bin) {
             Some((name, path)) => (name.clone(), path.clone()),
             None => {
-                // The node finds dsh as AMAIL_DSH_BIN (or `amail node --dsh-bin`).
-                let name = match *bin {
-                    "dsh" => std::env::var("AMAIL_DSH_BIN")
-                        .ok()
-                        .filter(|v| !v.is_empty())
-                        .unwrap_or_else(|| "dsh".into()),
-                    _ => bin.to_string(),
+                // The node finds dsh as AMAIL_DSH_BIN (or `amail node
+                // --dsh-bin`), agy as AMAIL_AGY_BIN.
+                let var = match *bin {
+                    "dsh" => Some("AMAIL_DSH_BIN"),
+                    "agy" => Some("AMAIL_AGY_BIN"),
+                    _ => None,
                 };
+                let name = var
+                    .and_then(|v| std::env::var(v).ok())
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| bin.to_string());
                 let path = amail_node::paths::find_program(&name)
                     .map(|p| p.to_string_lossy().into_owned());
                 (name, path)
