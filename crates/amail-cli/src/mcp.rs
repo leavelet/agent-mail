@@ -1269,7 +1269,7 @@ const TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "interrupt_seat",
-        description: "Stop a seat's current turn (the user's seat only; Codex and dsh seats). \
+        description: "Stop a seat's current turn (the user's seat only; Codex, dsh and agy seats). \
             A Claude Code seat has no structured interrupt: use its terminal.",
         read_only: false,
         schema: || obj(json!({"seat": {"type": "string"}}), &["seat"]),

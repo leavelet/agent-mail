@@ -268,7 +268,7 @@ fn render(n: &NodeNotice, host: &str, seats: &HashSet<String>) -> Section {
             };
             let harness = harness
                 .as_deref()
-                .filter(|h| matches!(*h, "claude" | "codex" | "dsh"))
+                .filter(|h| matches!(*h, "claude" | "codex" | "dsh" | "agy"))
                 .map(|h| format!(" ({h})"))
                 .unwrap_or_default();
             let error: String = amail_proto::text::line(error)

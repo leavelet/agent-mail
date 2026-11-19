@@ -45,8 +45,9 @@ user's machine beyond what such mail and role text can talk an agent into:
   `unattended` and the local side did not choose that, the node logs a
   notice and `amail run` prints it;
 - it cannot choose which program runs. The harness binaries come from the
-  node's configuration (`claude`, `codex` and `dsh` on `PATH`, or the node's
-  `--claude-bin`, `--codex-bin` and `--dsh-bin`); the server's `harness`
+  node's configuration (`claude`, `codex`, `dsh` and `agy` on `PATH`, or the
+  node's `--claude-bin`, `--codex-bin`, `--dsh-bin` and `--agy-bin`); the
+  server's `harness`
   setting only picks one of them for a seat that is not in a team file and is
   started without `--harness`. A model name from the server that could be
   read as a command-line option is ignored;
@@ -154,6 +155,15 @@ its socket the node takes the connecting process's id from the kernel
   host's sessions, is kept in a file in the node's state directory
   (mode 0600); the jail shows a seat only its own endpoint file and its own
   dsh home.
+- An Antigravity CLI (agy) seat runs its hooks and the agent's shell
+  commands as children of the `agy` process, which is the process the node
+  launched. The node answers an agy hook only from below the session of the
+  seat it names, and takes the language server's address and CSRF token
+  (which an `amail` command in the session reports, see [harness
+  support](harnesses.md#antigravity-cli-agy)) only from below the session
+  of that seat, only for that seat's conversation and only for an address
+  on the local machine. The token is kept in the node's state file (mode
+  0600) while the session runs.
 - Requests meant for the person (`amail run`, `up`, `down`, `ps`,
   `attach`, `sleep`, `wake`, `amail node status`) are refused to processes
   that run below a session the node launched or with the node's Codex

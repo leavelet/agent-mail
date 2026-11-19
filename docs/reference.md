@@ -32,7 +32,7 @@ exit code.
 | `amail register <url> --invite <code> --org <name> [--user-name owner] [--name n \| --no-save]` | register an org on a public server and print the user token once. It saves the token as a login (default name `<org>@<host>`) and makes that login the current one, so later commands go to the new org; it prints the name of the previous current login (switch back with `amail profile use <name>`). `--no-save` saves nothing and keeps the current login |
 | `amail profile ls` / `use <name>` / `rm <name>` | saved logins |
 | `amail init [-f amail.toml] [--force]` | write a commented sample team file |
-| `amail doctor [-f amail.toml]` | check the platform, server, token, node, harness and zellij versions, Codex socket path and sandbox, `bwrap` (for unattended dsh seats), Claude Code trust of this directory, and the team file; exits non-zero on a failure. When the node runs, it checks the programs the node starts (`--claude-bin`, `--codex-bin`, `--dsh-bin`, `--zellij-bin`), else the ones on its own `PATH`. A missing harness is a warning when the team file or a seat on the server uses it; a dsh seat with a node started without `--dsh-env-file` is a warning too |
+| `amail doctor [-f amail.toml]` | check the platform, server, token, node, harness and zellij versions, Codex socket path and sandbox, `bwrap` (for unattended dsh seats), Claude Code trust of this directory, and the team file; exits non-zero on a failure. When the node runs, it checks the programs the node starts (`--claude-bin`, `--codex-bin`, `--dsh-bin`, `--agy-bin`, `--zellij-bin`), else the ones on its own `PATH`. A missing harness is a warning when the team file or a seat on the server uses it; a dsh seat with a node started without `--dsh-env-file` is a warning too |
 
 ### Mail
 
@@ -201,8 +201,8 @@ wakes it. See the [HTTP API](#requests-for-the-person) for the rules.
 | `amail withdraw <r12> [-m note]` | withdraw an open request: the seat it is about, the seat that made it, or the user. The other side gets a reply in the request's thread |
 | `amail requests [--state open\|all\|s,s] [--kind k] [--seat s] [--class c] [--task tN] [--team t] [--limit n]` | one line per request: number, state, class, kind, seat, age, title, the task, and for an open request its default and deadline (`· default no at 2026-10-29 14:00Z (in 2h)`, or `· no default, reminders at …`), for a closed one the answer. Open requests first (`now`, then `soon`, then `later`, oldest first). User tokens see the org's requests, seat tokens their own; `--team t` lists the requests of team `t`'s seats, for the user and for the team's lead (its root seat) |
 | `amail request show <r12>` | the fields (`Kind:`, `Class:`, `State:`, `Rev:`, `Seat:`, `Task:`, `Source:`, `Created:`, `Deadline:`, `Default:`), the options numbered as in the mail (the default marked), the answer with who gave it and its note, the thread and other threads that name the request, the events, the body behind `  > `, and for an open request how to answer it |
-| `amail prompt <seat> (-m text \| stdin)` | user token: give an agent seat's session a prompt through its node (Claude Code: the inbox socket; Codex: the queue; dsh: a session prompt). The server keeps the text in the seat's worklog and in the mail archive. Prints `prompt sent to w1 (through 1 node)`; fails with `no node is connected for this seat` when no connected node reports the seat |
-| `amail interrupt <seat>` | user token: stop the seat's current turn (Codex, dsh). For a Claude Code seat it fails with `Claude Code sessions have no structured interrupt; use the terminal` (`amail attach`, or the terminal link on the seat's web page); without a node, as `prompt` |
+| `amail prompt <seat> (-m text \| stdin)` | user token: give an agent seat's session a prompt through its node (Claude Code: the inbox socket; Codex: the queue; dsh: a session prompt; agy: a message through the session's language server). The server keeps the text in the seat's worklog and in the mail archive. Prints `prompt sent to w1 (through 1 node)`; fails with `no node is connected for this seat` when no connected node reports the seat |
+| `amail interrupt <seat>` | user token: stop the seat's current turn (Codex, dsh, agy). For a Claude Code seat it fails with `Claude Code sessions have no structured interrupt; use the terminal` (`amail attach`, or the terminal link on the seat's web page); without a node, as `prompt` |
 
 Task lines and `amail task show` print `blocked-on-human (r12)` while a
 request on the task is open; `amail task take` and `amail task steal` of
@@ -213,7 +213,7 @@ for the person's answer to r12`).
 
 | command | |
 |---|---|
-| `amail seat add <name> [--parent p] [--role r] [--harness claude\|codex\|dsh] [--model m] [--display-name d] [--permission-mode default\|unattended] [--description d] [--team t] [--contact]` | create a seat (the permission mode is stored for display; launches take it from the team file or `amail run --permission-mode`) |
+| `amail seat add <name> [--parent p] [--role r] [--harness claude\|codex\|dsh\|agy] [--model m] [--display-name d] [--permission-mode default\|unattended] [--description d] [--team t] [--contact]` | create a seat (the permission mode is stored for display; launches take it from the team file or `amail run --permission-mode`) |
 | `amail seat adopt <seat> <id> [--restart]` | node command: the supervised seat resumes the existing harness session `id` from its next start; `--restart` restarts a running seat now. The node checks that the session exists on this host and belongs to no other seat ([teams](teams.md#starting-from-existing-conversations)) |
 | `amail seat set/ls/rm/token` | change, list, delete a seat; issue a seat token. `ls` prints one line per seat with its fields and, from its presence, `state=…`, `waiting_for=r12` when the seat asked the person and waits for the answer, `wake_failed` and `turn_failed=N turn_error="…"`. `set` also takes `--description d \| --no-description`, `--team t \| --no-team`, `--contact \| --no-contact`. `rm` also stops the seat and drops it from the node on this host, if that node runs it |
 | `amail team ls` / `show <team>` / `set <team> [--description d] [--root seat] [--parent team] [--contacts a,b]` / `rm <team>` | teams (`set` creates a missing team; each option has a `--no-...` form) |
@@ -239,7 +239,7 @@ for the person's answer to r12`).
 | `amail node token [--save]` | issue a node token (user token needed) and print it; with `--save` it is written with the URL to `<state dir>/node.toml` (mode 0600) and not printed |
 | `amail node status` | the node's view of its seats, its local policy and where that comes from, the program it starts for each harness (and whether it was found), and the names of the variables `--dsh-env-file` sets |
 | `amail node web-token [--writable]` | a login token for the node's browser terminal, shown once. Read-only (it can watch sessions, not type or switch tabs) unless `--writable` is given. The seat links open the group's zellij session, see [harnesses](harnesses.md#zellij) |
-| `amail run <seat> [--harness claude\|codex\|dsh] [--permission-mode default\|unattended] [--git-access worktree\|full\|off] [--dsh-jail on\|off] [--session id] [-- args]` | start the seat's harness session in this terminal. `--session` resumes an existing session of the seat's harness instead (it must exist on this host and belong to no other seat; see [starting from existing conversations](teams.md#starting-from-existing-conversations)). `--permission-mode unattended` runs it without permission prompts; without the flag a seat placed by `amail up` uses its team file's `permission_mode` and any other seat keeps the prompts. The server's seat setting is not used. `--git-access` (Codex seats) sets what the sandbox may write in the git repository (see [harness support](harnesses.md)); without it a seat placed by `amail up` uses its team file's `git_access`, any other seat `worktree` |
+| `amail run <seat> [--harness claude\|codex\|dsh\|agy] [--permission-mode default\|unattended] [--git-access worktree\|full\|off] [--dsh-jail on\|off] [--session id] [-- args]` | start the seat's harness session in this terminal. `--session` resumes an existing session of the seat's harness instead (it must exist on this host and belong to no other seat; see [starting from existing conversations](teams.md#starting-from-existing-conversations)). `--permission-mode unattended` runs it without permission prompts; without the flag a seat placed by `amail up` uses its team file's `permission_mode` and any other seat keeps the prompts. The server's seat setting is not used. `--git-access` (Codex seats) sets what the sandbox may write in the git repository (see [harness support](harnesses.md)); without it a seat placed by `amail up` uses its team file's `git_access`, any other seat `worktree` |
 | `amail mcp [--node]` | an MCP server on stdin and stdout with mail and task tools ([below](#mcp-server)) |
 | `amail up [-f amail.toml] [--only g,s] [--no-start] [--prune]` | bring a team up from a team file ([team files](teams.md)) |
 | `amail down [--only g,s]` / `amail ps` | stop the sessions of every seat the node runs (of all team files; `--only` for some groups or seats) / one line per seat: state, zellij pane, pending mail, last activity (ACTIVE: the seat's last hook or launch; after a node restart, the last write to its conversation log until its next hook), whether its handover note is current (NOTE: `current`, `stale` or `none`; fetched from the server when the node connects, when a seat is added and after the seat writes its note; `-` while not known) and whether a person is needed (ATTENTION: what the person must do, or `waiting for r12` when the seat asked the person and waits for the answer, see [concepts](concepts.md#the-users-queue-needs-you)) |
@@ -251,7 +251,8 @@ Node options: `--url`, `--token` (`AMAIL_NODE_TOKEN`), `--state-dir`
 `<state dir>/run/node.sock` without `XDG_RUNTIME_DIR`), `--label`,
 `--claude-bin`, `--codex-bin`, `--dsh-bin` (`AMAIL_DSH_BIN`),
 `--dsh-env-file` (`AMAIL_DSH_ENV_FILE`: `NAME=value` lines given only to
-DeepSeek Harness hosts, for the model provider's key), `--zellij-bin`,
+DeepSeek Harness hosts, for the model provider's key), `--agy-bin`
+(`AMAIL_AGY_BIN`, the Antigravity CLI), `--zellij-bin`,
 `--start-limit` (4),
 `--codex-auth`, `--wake-window-ms` (3000), `--wake-confirm-ms` (10000),
 `--web-terminal-port`, `--web-terminal-url`, `--local-policy open|restricted`
@@ -390,7 +391,8 @@ starts get the server without any setup (see [harness
 support](harnesses.md)): Claude Code through `--mcp-config <state
 dir>/claude/mcp.json`, Codex through `[mcp_servers.amail]` in the node's
 Codex home. The node rewrites both when it starts; your own harness
-configuration is not changed. dsh seats do not get it.
+configuration is not changed. dsh and agy seats do not get it (for agy,
+see [harness support](harnesses.md#antigravity-cli-agy)).
 
 **Registering it by hand**, for a session you start yourself with
 `AMAIL_TOKEN` and `AMAIL_URL` set, or with a saved login. Claude Code: a
@@ -789,7 +791,7 @@ Requests and their events count against the org's storage quota in
 | `GET /seats/{name}/launch` | node and user tokens: harness, model, role, parent, permission mode (informational; the node does not use it) and a new seat token; the token of the seat's previous launch is revoked |
 | `POST /seats/{name}/sleep`, `POST /seats/{name}/wake` | user tokens: ask the node hosting the seat; 202, or 409 `node_offline` |
 | `POST /seats/{name}/prompt` | user tokens: `{text}` (not empty: 422 `prompt_empty`; at most 64 KiB: 422 `prompt_too_large`) is given to the seat's session as a prompt from the user. The server writes the seat's worklog entry `prompt_from_user` and a system mail `Prompt from <user> to <seat>` with the text, delivered to the seat in `Cc` as an archive delivery (it notifies nobody; the org's mail archive keeps it), then sends the node a `prompt` command. Answers `{queued: true, seat, nodes}`; 409 `no_node` when no connected node reports the seat; 422 `not_an_agent` |
-| `POST /seats/{name}/interrupt` | user tokens: stop the seat's current turn (Codex, dsh). 409 `no_structured_interrupt` for a Claude Code seat (use its terminal); otherwise the worklog entry `interrupt` and an `interrupt` command to the node. Answers and errors as for `prompt` |
+| `POST /seats/{name}/interrupt` | user tokens: stop the seat's current turn (Codex, dsh, agy). 409 `no_structured_interrupt` for a Claude Code seat (use its terminal); otherwise the worklog entry `interrupt` and an `interrupt` command to the node. Answers and errors as for `prompt` |
 | `GET /seats/{name}/transcript` | user tokens: the seat's conversation as server-sent events: `status`, `reset`, `events`. The stream ends when the watcher falls too far behind (reconnect to start again); HTTP 503 `mirror_full` when the server has no room for another watcher |
 | `POST /seats/{name}/transcript` | node tokens: `{node?, reset, status?, events}` for the watchers of the seat; at most 1 MiB (HTTP 413 `too_large` beyond) |
 

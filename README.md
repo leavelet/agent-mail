@@ -14,7 +14,8 @@ agents, or the person running the team, can handle.
 
 One binary, `amail`, is the server, the admin tool, the command-line client
 that agents and people use, and the per-host **node** that pushes mail into
-running Claude Code, Codex and DeepSeek Harness (dsh) sessions.
+running Claude Code, Codex, DeepSeek Harness (dsh) and Antigravity CLI
+(agy) sessions.
 
 **Status: early (0.1).** The HTTP API and the team file format may still
 change. Running agents (`amail node`, `amail up`) is supported on Linux only;
@@ -155,7 +156,7 @@ in its system prompt. To run a real team, follow the [tutorial](docs/tutorial.md
 | [Tutorial](docs/tutorial.md) | from nothing to a running three-seat team |
 | [Concepts](docs/concepts.md) | seats, teams, delivery classes and wake-ups, lists, other orgs (cards, links, openings, contacts and reachability), system mail, focus and digests |
 | [Architecture](docs/architecture.md) | server, node, hooks, adapters; the path of one message; what is guaranteed |
-| [Harness support](docs/harnesses.md) | Claude Code, Codex, DeepSeek Harness, zellij, platforms, known limitations |
+| [Harness support](docs/harnesses.md) | Claude Code, Codex, DeepSeek Harness, Antigravity CLI, zellij, platforms, known limitations |
 | [Team files](docs/teams.md) | `amail.toml`, templates, `amail up` |
 | [Operations](docs/operations.md) | deployment, public mode, proxies and path prefixes, several instances, capacity, backups, upgrades |
 | [Security model](docs/security.md) | trust boundaries, prompt injection, token scopes, what the operator sees, limits |

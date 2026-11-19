@@ -481,6 +481,7 @@ fn harness_name(s: &str) -> Option<&'static str> {
         "claude" | "claude-code" | "claude_code" => Some("claude"),
         "codex" => Some("codex"),
         "dsh" | "deepseek" | "deepseek-harness" => Some("dsh"),
+        "agy" | "antigravity" | "antigravity-cli" => Some("agy"),
         _ => None,
     }
 }
@@ -609,7 +610,7 @@ pub fn parse(text: &str, base: &Path) -> Result<Team, TeamError> {
             })?;
         let harness = harness_name(&harness_raw).ok_or_else(|| {
             TeamError(format!(
-                "{what}: unknown harness {harness_raw:?} (claude, codex or dsh)"
+                "{what}: unknown harness {harness_raw:?} (claude, codex, dsh or agy)"
             ))
         })?;
         let pm = match s
@@ -1914,6 +1915,19 @@ workers = [{ name = "store-1" }, { name = "store-2", description = "On call.", o
         .unwrap();
         assert!(t.teams[0].open.is_empty());
         assert_eq!(t.teams[0].contacts, Some(vec!["w".to_string()]));
+    }
+
+    #[test]
+    fn agy_harness_names() {
+        let t = team(
+            "[defaults]\nharness = \"antigravity\"\n[[seat]]\nname = \"a\"\ncwd = \"/x\"\n\
+             [[seat]]\nname = \"b\"\ncwd = \"/y\"\nharness = \"agy\"\n",
+        )
+        .unwrap();
+        assert_eq!(t.seat("a").unwrap().harness, "agy");
+        assert_eq!(t.seat("b").unwrap().harness, "agy");
+        let e = team("[[seat]]\nname = \"a\"\ncwd = \"/x\"\nharness = \"gemini\"\n").unwrap_err();
+        assert!(e.to_string().contains("claude, codex, dsh or agy"), "{e}");
     }
 
     #[test]

@@ -100,7 +100,9 @@ resumes them when mail arrives. See [team files](teams.md).
    node waits a 3-second coalescing window (urgent: no wait) and sends a
    one-line nudge, `[amail] You have new mail (wake #n).`, through the
    harness (Claude Code's session inbox socket, `codex queue` for Codex,
-   `session/prompt` on the web host's API for DeepSeek Harness).
+   `session/prompt` on the web host's API for DeepSeek Harness,
+   `SendUserCascadeMessage` on the session's language server for
+   Antigravity CLI).
    The nudge carries no mail: it starts a turn, and that turn's
    `UserPromptSubmit` hook does step 4. A sleeping seat is resumed first.
 6. **Claim.** The node calls `/v1/claim` for the seat with the classes the
@@ -240,7 +242,7 @@ mirrors of an instance at most the `--max-mirror-mb` limit (see
 | `amail-proto` | wire types and address parsing |
 | `amail-store` | the `Store` trait, SQLite and Postgres backends, migrations, conformance tests |
 | `amail-server` | the HTTP API, event streams, policy and limits, public mode |
-| `amail-node` | the node, the hook client, the Claude Code, Codex and DeepSeek Harness adapters (and the dsh host wrapper), team supervision |
+| `amail-node` | the node, the hook client, the Claude Code, Codex, DeepSeek Harness and Antigravity CLI adapters (and the dsh host wrapper), team supervision |
 | `amail-cli` | the `amail` binary |
 | `amail-bench` | load generator used for the capacity numbers in [operations](operations.md) |
 | `web/` | the web interface (Svelte, TypeScript), embedded into the binary at build time |

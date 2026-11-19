@@ -42,6 +42,9 @@ const CLEAR_ENV: &[&str] = &[
     "AMAIL_DSH_ENDPOINT",
     "DSH_HOME",
     "AMAIL_CODEX_PASS",
+    "ANTIGRAVITY_LS_ADDRESS",
+    "ANTIGRAVITY_CSRF_TOKEN",
+    "ANTIGRAVITY_CONVERSATION_ID",
 ];
 
 pub fn fixture(harness: &str, name: &str) -> Value {

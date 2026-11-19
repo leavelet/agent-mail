@@ -1,5 +1,5 @@
 //! The amail node: the per-host daemon that connects running agent sessions
-//! (Claude Code, Codex) to an amail server, the `amail hook` client their
+//! (Claude Code, Codex, DeepSeek Harness, Antigravity CLI) to an amail server, the `amail hook` client their
 //! hooks run, and the launch logic behind `amail run`.
 
 pub mod adapter;

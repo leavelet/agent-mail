@@ -140,7 +140,8 @@ role_file = "roles/docs.md"
 `permission_mode = "unattended"` runs agents without permission prompts
 (Claude Code: `--dangerously-skip-permissions`; Codex: `-a never` inside its
 sandbox; DeepSeek Harness: no prompts, with the whole host in a bwrap jail;
-see [harness support](harnesses.md)). Use it only in a repository
+Antigravity CLI: `--dangerously-skip-permissions`; see [harness
+support](harnesses.md)). Use it only in a repository
 you can afford to lose. With `"default"`, or without `permission_mode`, the
 harness asks as usual; answer in the seat's pane (`amail attach <seat>`);
 such seats show `awaiting` and appear in the web interface's queue.

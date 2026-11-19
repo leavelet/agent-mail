@@ -2064,10 +2064,12 @@ pub struct SeatOpResponse {
 /// - `prompt` (M10): give the seat `text` as a prompt from the user,
 ///   through the harness's structured interface (Claude Code: the inbox
 ///   socket; Codex: `thread/queue/add` after the daemon check of the wake
-///   path; dsh: `session/prompt`). The server recorded it in the seat's
+///   path; dsh: `session/prompt`; agy: `SendUserCascadeMessage`). The
+///   server recorded it in the seat's
 ///   worklog and the mail archive before sending.
 /// - `interrupt` (M10): stop the seat's current turn (Codex:
-///   `turn/interrupt`; dsh: `session/cancel`). A Claude Code seat has no
+///   `turn/interrupt`; dsh: `session/cancel`; agy:
+///   `CancelCascadeInvocation`). A Claude Code seat has no
 ///   structured interrupt: the node leaves it alone (the web offers the
 ///   terminal instead).
 /// - `attention_action` (M10): the user answered the seat's `attention`

@@ -126,6 +126,17 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pass: Option<String>,
     },
+    /// Variables of an `amail` command's environment that tell the node how
+    /// to reach the session the command runs in, for harnesses that give
+    /// them only to the agent's own shell commands (Antigravity CLI: its
+    /// language server's address and CSRF token). Accepted only from a
+    /// process of a session the node launched for a seat of `harness`; the
+    /// node answers `{}`.
+    SessionEnv {
+        harness: String,
+        #[serde(default)]
+        env: BTreeMap<String, String>,
+    },
     /// Node state, for people and tests. This and the requests below are
     /// for the person: under the restricted local policy, the node refuses
     /// them from processes of the sessions it launched.
